@@ -1,0 +1,10 @@
+{
+  "time_axis": 0,
+  "sampling_interval_s": 1.0,
+  "spatial_representation": "surface",
+  "space_name": "demo_surface",
+  "normalization": "raw",
+  "generation_profile_id": "other_profile",
+  "sample_id": "incompat_ref",
+  "fmri_path": "arrays/incompat.npy"
+}

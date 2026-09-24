@@ -1,0 +1,10 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": ["."],
+  "graphs": {
+    "agent": "./src/react_agent/graph.py:graph",
+    "fmri_check": "./src/react_agent/fmri/graph.py:graph",
+    "fmri_pipeline": "./src/react_agent/fmri/pipeline_graph.py:graph"
+  },
+  "env": ".env"
+}

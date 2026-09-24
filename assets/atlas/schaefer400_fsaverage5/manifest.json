@@ -1,0 +1,14 @@
+{
+  "atlas_id": "schaefer400_fsaverage5_lh_rh",
+  "source": "cbig.Schaefer2018_400Parcels_7Networks_fsaverage5",
+  "space": "fsaverage5",
+  "hemisphere_order": [
+    "lh",
+    "rh"
+  ],
+  "n_vertices_per_hemisphere": 10242,
+  "n_vertices": 20484,
+  "n_parcels": 400,
+  "labels_sha256": "69f3b25c126b1ede5b227372b2f1ad54f0a92af7970dd93db39decf3ea1d2727",
+  "note": "Structural Schaefer-400 for CortexMAE-P. Not a functional network."
+}

@@ -1,0 +1,95 @@
+schema_version: fmri_check.v1.1
+required_checks:
+  - validate_input
+  - basic_statistics
+enabled_tools:
+  - validate_input
+  - basic_statistics
+  - temporal_diagnostics
+  - roi_summary
+  - reference_distribution
+  - gray_control_contrast
+  - stimulus_temporal_profile
+  - surface_roi_profile
+  - cross_image_specificity
+  - cortex_mae
+  - semantic_consistency
+check_profile:
+  name: tribe_diagnostic
+  required_questions:
+    - input_mapping
+    - gray_contrast
+basic_statistics:
+  near_constant:
+    abs_tol: 1.0e-8
+    rel_tol: 1.0e-6
+  quantiles: [0.05, 0.5, 0.95]
+  enable_demo_temporal_heuristics: false
+  demo_temporal_change_low: 0.05
+  demo_temporal_spike_ratio: 8.0
+temporal_diagnostics:
+  min_length: 4
+  spike_ratio_heuristic: 8.0
+  threshold_source: heuristic
+reference:
+  stats_path: examples/tribe_1s7s_smoke/reference_stats.json
+  min_samples: 2
+  mad_eps: 1.0e-12
+  robust_z_flag: 6.0
+  quality_verdict_enabled: false
+  quality_min_n: 30
+  required_compat_fields:
+    - generation_profile_id
+    - spatial_representation
+    - normalization
+resources:
+  gray_control_id: gray_control
+  gray_control_path: ../../tribev2/exp/things_static_1s_7s/preds/gray_control.npy
+  atlas_dir: examples/tribe_1s7s_smoke/atlas_destrieux
+  atlas_id: destrieux_fsaverage5_lh_rh
+  cohort_index_path: examples/tribe_1s7s_smoke/cohort_index.json
+  cohort_manifest_id: tribe_1s7s_smoke
+  asset_root: ../assets
+  cortexmae_model_id: cortex_mae_parcel
+  schaefer_atlas_dir: ../assets/atlas/schaefer400_fsaverage5
+  image_encoder_id: clip
+  image_embedding_dir: ../assets/image_embeddings/clip
+  samples_manifest_path: examples/tribe_1s7s_smoke/samples_v1_1.jsonl
+score:
+  w_a: 0.6
+  w_m: 0.4
+  w_d: 0.0
+budgets:
+  max_rounds: 12
+  max_tool_calls: 12
+  max_lm_calls: 4
+  no_progress_limit: 2
+  max_retries: 1
+  walltime_s: 180
+  max_batch_lm_calls: 6
+  usd_input_per_million: null
+  usd_output_per_million: null
+  price_source: null
+  price_date: null
+fast:
+  model: deepseek-chat
+  thinking: false
+  timeout_s: 60
+  max_tokens: 800
+  supports_temperature: false
+  supports_thinking: true
+  supports_json_object: true
+reasoning:
+  model: deepseek-chat
+  thinking: true
+  timeout_s: 90
+  max_tokens: 1200
+  supports_temperature: false
+  supports_thinking: true
+  supports_json_object: true
+hybrid:
+  upgrade_once: true
+  candidate_count_for_reasoning: 2
+cache_enabled: true
+backend_default: none
+policy_default: rule

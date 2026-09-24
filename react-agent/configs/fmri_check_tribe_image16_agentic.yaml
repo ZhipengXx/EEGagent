@@ -1,0 +1,142 @@
+schema_version: fmri_check.v1.1
+required_checks:
+  - validate_input
+  - basic_statistics
+enabled_tools:
+  - validate_input
+  - basic_statistics
+  - temporal_diagnostics
+  - roi_summary
+  - gray_control_contrast
+  - stimulus_temporal_profile
+  - surface_roi_profile
+  - cross_image_specificity
+  - reference_distribution
+  - cortex_mae
+  - semantic_consistency
+check_profile:
+  name: tribe_diagnostic
+  required_questions:
+    - input_mapping
+    - gray_contrast
+    - temporal
+basic_statistics:
+  near_constant:
+    abs_tol: 1.0e-8
+    rel_tol: 1.0e-6
+  quantiles: [0.05, 0.5, 0.95]
+  enable_demo_temporal_heuristics: false
+  demo_temporal_change_low: 0.05
+  demo_temporal_spike_ratio: 8.0
+temporal_diagnostics:
+  min_length: 4
+  spike_ratio_heuristic: 8.0
+  threshold_source: heuristic
+reference:
+  stats_path: examples/tribe_image16_panel/reference_stats.json
+  min_samples: 3
+  mad_eps: 1.0e-12
+  robust_z_flag: 6.0
+  quality_verdict_enabled: false
+  quality_min_n: 30
+  required_compat_fields:
+    - generation_profile_id
+    - spatial_representation
+    - normalization
+resources:
+  gray_control_id: null
+  gray_control_path: null
+  atlas_dir: examples/tribe_1s7s_smoke/atlas_destrieux
+  atlas_id: destrieux_fsaverage5_lh_rh
+  cohort_index_path: examples/tribe_image16_panel/cohort_index.json
+  cohort_manifest_id: tribe_image16_panel
+  asset_root: ../assets
+  cortexmae_model_id: cortex_mae_parcel
+  schaefer_atlas_dir: ../assets/atlas/schaefer400_fsaverage5
+  image_encoder_id: clip
+  image_embedding_dir: ../assets/image_embeddings/clip
+  samples_manifest_path: examples/tribe_image16_panel/samples.jsonl
+generation:
+  backend: worker
+  repo_path: ../../tribev2
+  python_executable: "${TRIBE_PYTHON}"
+  checkpoint: facebook/tribev2
+  cache_folder: ../assets/generation/hf_cache
+  artifact_root: ../assets/generation
+  device: cuda
+  cuda_visible_devices: "4"
+  profile_id: static_gray4_image1_gray11_tribev2_v1
+  fps: 10
+  pre_gray_s: 4.0
+  image_s: 1.0
+  post_gray_s: 11.0
+  gray_rgb: [128, 128, 128]
+  codec: libx264
+  missing_audio: zero_fill_aggregate_features
+  missing_text: zero_fill_aggregate_features
+  export_rule_id: segment_time_window_0_16_exclusive_v1
+score:
+  w_a: 0.6
+  w_m: 0.4
+  w_d: 0.0
+budgets:
+  max_rounds: 12
+  max_tool_calls: 8
+  max_lm_calls: 6
+  no_progress_limit: 2
+  max_retries: 1
+  walltime_s: 600
+  max_generation_requests: 4
+  max_new_tribe_predictions: 4
+  generation_walltime_s: 1800
+  max_batch_lm_calls: 24
+  max_json_repairs: 1
+  max_replans: 2
+  usd_input_per_million: null
+  usd_output_per_million: null
+  price_source: null
+  price_date: null
+planning:
+  enabled: true
+  prompt_version: planner_v1
+  max_replans: 2
+  require_initial_plan: true
+  require_gray_question_for_non_control: true
+  require_temporal_description_for_non_control: true
+  api_failure_mode: fail
+  run_goal: quality_screening
+memory:
+  enabled: true
+  mode: read_write
+  repository: sqlite
+  path: ../assets/memory/fmri_memory.sqlite3
+  namespace: image16_v1_3
+  max_retrieved_items: 6
+  curator_enabled: true
+  promote_candidates_automatically: false
+reporting:
+  emit_plan: true
+  emit_memory_retrieval: true
+  emit_llm_usage: true
+fast:
+  model: deepseek-chat
+  thinking: false
+  timeout_s: 60
+  max_tokens: 1600
+  supports_temperature: false
+  supports_thinking: true
+  supports_json_object: true
+reasoning:
+  model: deepseek-chat
+  thinking: true
+  timeout_s: 90
+  max_tokens: 1600
+  supports_temperature: false
+  supports_thinking: true
+  supports_json_object: true
+hybrid:
+  upgrade_once: true
+  candidate_count_for_reasoning: 2
+cache_enabled: true
+backend_default: deepseek
+policy_default: planned

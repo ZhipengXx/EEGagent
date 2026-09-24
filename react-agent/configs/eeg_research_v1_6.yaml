@@ -1,0 +1,77 @@
+mode: one_trial
+bounded_research: false
+budget:
+  max_trials: 1
+  max_lm_calls: 4
+  max_execution_attempts: 2
+  max_concurrent_trials: 1
+  gpu_seconds: null
+  wall_seconds: null
+  per_trial_timeout_s: 30
+mock_scores:
+  profile_baseline: 0.25
+models:
+  - model_id: mock_eeg_encoder
+    adapter_id: mock_retrieval
+    supported_tasks: [eeg_image_retrieval]
+    input_contract: "EEG trials aligned to frozen image ids"
+    code_revision: unverified
+    dependency_environment: react-agent
+    checkpoint_origin: null
+    approved_profiles: [profile_baseline, profile_weight_decay]
+    estimated_resources: null
+    estimate_source: unknown
+    availability: unverified
+    reason: "mock fixture; not a probed training entry"
+    last_probe: null
+  - model_id: eeg_image_retrieval
+    adapter_id: unavailable_retrieval
+    supported_tasks: [eeg_image_retrieval]
+    input_contract: unknown
+    code_revision: missing
+    dependency_environment: unknown
+    checkpoint_origin: null
+    approved_profiles: []
+    estimated_resources: null
+    estimate_source: unknown
+    availability: unavailable
+    reason: "No EEG training entry exists in react-agent."
+    last_probe: null
+profiles:
+  - profile_id: profile_baseline
+    fidelity: full
+    allowed_changes: []
+    factors: {}
+  - profile_id: profile_weight_decay
+    fidelity: full
+    allowed_changes: [weight_decay]
+    factors: {weight_decay: 0.01}
+task:
+  task_id: mock_retrieval_v1
+  task_type: eeg_image_retrieval
+  research_scope: eeg_task_validation
+  dataset_id: fixture
+  dataset_version: v0
+  dataset_manifest_hash: fixture-manifest
+  train_ids: [img_a, img_b]
+  validation_ids: [img_c]
+  test_ids: [img_d]
+  split_unit: image
+  generalization_target: within_subject
+  subject_scope: seen_subjects
+  preprocessing_hash: fixture-prep
+  primary_metric: top1
+  direction: higher
+  metric_implementation_hash: mock_fixed
+  target_feature_hash: features-v1
+  candidate_bank_hash: bank-v1
+  candidate_count: 3
+  similarity: cosine
+  trial_aggregation: mean
+  query_unit: image
+  permitted_model_ids: [mock_eeg_encoder]
+  permitted_profile_ids: [profile_baseline, profile_weight_decay]
+  training_fidelity: full
+  seed_schedule: [0]
+  uses_test_for_tuning: false
+  provenance_ref: null

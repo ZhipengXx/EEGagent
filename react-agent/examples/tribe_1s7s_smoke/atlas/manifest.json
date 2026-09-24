@@ -1,0 +1,13 @@
+{
+  "atlas_id": "destrieux_fsaverage5_lh_rh",
+  "source": "synthetic_test",
+  "space": "fsaverage5",
+  "hemisphere_order": [
+    "lh",
+    "rh"
+  ],
+  "n_vertices_per_hemisphere": 10242,
+  "n_vertices": 20484,
+  "labels_sha256": "94a949389a60fb14d1522eaee1547c86c02a3434dc2d1b0e7e77fb56047c75dc",
+  "note": "Synthetic labels for tests. Not a biological atlas."
+}

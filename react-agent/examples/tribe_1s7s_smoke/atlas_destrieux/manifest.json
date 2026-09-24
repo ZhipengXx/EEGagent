@@ -1,0 +1,13 @@
+{
+  "atlas_id": "destrieux_fsaverage5_lh_rh",
+  "source": "nilearn.fetch_atlas_surf_destrieux",
+  "space": "fsaverage5",
+  "hemisphere_order": [
+    "lh",
+    "rh"
+  ],
+  "n_vertices_per_hemisphere": 10242,
+  "n_vertices": 20484,
+  "labels_sha256": "76d3d3347825cbe93bdfbc613245d0d6dd352273299ca0b29d8eb5c3485677da",
+  "note": "Structural Destrieux parcels. Not a functional network."
+}

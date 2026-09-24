@@ -1,0 +1,93 @@
+{
+  "version": "reference_stats.v1",
+  "n_samples": 3,
+  "features": {
+    "T": {
+      "median": 16.0,
+      "mad": 0.0,
+      "q25": 16.0,
+      "q75": 16.0,
+      "n": 3
+    },
+    "V": {
+      "median": 20484.0,
+      "mad": 0.0,
+      "q25": 20484.0,
+      "q75": 20484.0,
+      "n": 3
+    },
+    "mean": {
+      "median": -0.007255956015748631,
+      "mad": 0.0011003675618095725,
+      "q25": -0.007806139796653417,
+      "q75": -0.006159113523641151,
+      "n": 3
+    },
+    "std": {
+      "median": 0.19729560876543278,
+      "mad": 0.0003163697480765837,
+      "q25": 0.1971374238913945,
+      "q75": 0.19782448831800814,
+      "n": 3
+    },
+    "finite_ratio": {
+      "median": 1.0,
+      "mad": 0.0,
+      "q25": 1.0,
+      "q75": 1.0,
+      "n": 3
+    },
+    "zero_fraction": {
+      "median": 0.0,
+      "mad": 0.0,
+      "q25": 0.0,
+      "q75": 0.0,
+      "n": 3
+    },
+    "near_constant_spatial_fraction": {
+      "median": 0.0,
+      "mad": 0.0,
+      "q25": 0.0,
+      "q75": 0.0,
+      "n": 3
+    },
+    "temporal_change_ratio": {
+      "median": 0.561965519450867,
+      "mad": 0.03727279387410454,
+      "q25": 0.5433291225138148,
+      "q75": 0.5850548702224527,
+      "n": 3
+    },
+    "time_var_mean": {
+      "median": 0.00352284513528083,
+      "mad": 5.8929659117988586e-05,
+      "q25": 0.003493380305721836,
+      "q75": 0.0036873335533445283,
+      "n": 3
+    },
+    "space_var_mean": {
+      "median": 0.03854231216475051,
+      "mad": 0.0003277758169919903,
+      "q25": 0.03837842425625451,
+      "q75": 0.03872451087473068,
+      "n": 3
+    }
+  },
+  "fingerprints": [
+    "09e9d8600576b224564f63e71025ff12934b354b18b92520d7dec06cfd3f6d3c",
+    "e7a715c5278b436a506b87f41afbb2d4b6e326f2ec1702fcde8a54e3508fcf92",
+    "fd88063864d39cee3c7831fe74e2a24b505c2c4f001fa256d1dd888b5df8fcf1"
+  ],
+  "protocol": {
+    "generation_profile_id": "static_gray4_image1_gray11_tribev2_v1",
+    "spatial_representation": "surface",
+    "normalization": "none_raw_signed"
+  },
+  "reference_type": "image16_engineering_smoke",
+  "compat_fields": [
+    "generation_profile_id",
+    "spatial_representation",
+    "normalization"
+  ],
+  "min_samples": 3
+}

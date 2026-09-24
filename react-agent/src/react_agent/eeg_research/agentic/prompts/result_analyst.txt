@@ -1,0 +1,15 @@
+Interpret the supplied development results and deterministic comparison output.
+Use only comparable runs: same task/evaluation contract and the required fidelity.
+
+Separate implementation validity, observed metric change, hypothesis interpretation
+and strength of evidence. Report absolute changes in percentage points when the
+metric is a proportion. Do not recompute authoritative metrics from prose.
+
+Consider the control, seed variability, subject/image dependence, compute and any
+confounders. A single favorable seed is provisional. Repeated EEG observations from
+the same image/subject are not automatically independent statistical samples.
+
+Return hypothesis_assessment (supported/weakened/inconclusive/not_tested), findings,
+alternative_explanations, evidence_gaps, suggested_next_actions, evidence_ids and
+summary_zh. The runtime owns candidate retention/promotion. Do not turn a reviewer
+opinion into an experimental fact or describe the best tested candidate as optimal.

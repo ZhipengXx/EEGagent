@@ -1,0 +1,68 @@
+schema_version: fmri_check.v1
+required_checks:
+  - validate_input
+  - basic_statistics
+enabled_tools:
+  - validate_input
+  - basic_statistics
+  - temporal_diagnostics
+  - roi_summary
+  - reference_distribution
+basic_statistics:
+  near_constant:
+    abs_tol: 1.0e-8
+    rel_tol: 1.0e-6
+  quantiles: [0.05, 0.5, 0.95]
+  enable_demo_temporal_heuristics: false
+  demo_temporal_change_low: 0.05
+  demo_temporal_spike_ratio: 8.0
+temporal_diagnostics:
+  min_length: 4
+  spike_ratio_heuristic: 8.0
+  threshold_source: heuristic
+reference:
+  stats_path: examples/tribe_1s7s_smoke/reference_stats.json
+  min_samples: 2
+  mad_eps: 1.0e-12
+  robust_z_flag: 6.0
+  required_compat_fields:
+    - generation_profile_id
+    - spatial_representation
+    - normalization
+score:
+  w_a: 0.6
+  w_m: 0.4
+  w_d: 0.0
+budgets:
+  max_rounds: 6
+  max_tool_calls: 6
+  max_lm_calls: 6
+  no_progress_limit: 2
+  max_retries: 1
+  walltime_s: 120
+  usd_input_per_million: null
+  usd_output_per_million: null
+  price_source: null
+  price_date: null
+fast:
+  model: deepseek-chat
+  thinking: false
+  timeout_s: 60
+  max_tokens: 800
+  supports_temperature: false
+  supports_thinking: true
+  supports_json_object: true
+reasoning:
+  model: deepseek-chat
+  thinking: true
+  timeout_s: 90
+  max_tokens: 1200
+  supports_temperature: false
+  supports_thinking: true
+  supports_json_object: true
+hybrid:
+  upgrade_once: true
+  candidate_count_for_reasoning: 2
+cache_enabled: true
+backend_default: none
+policy_default: rule

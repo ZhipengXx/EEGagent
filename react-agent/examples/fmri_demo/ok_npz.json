@@ -1,0 +1,11 @@
+{
+  "time_axis": 0,
+  "sampling_interval_s": 1.0,
+  "spatial_representation": "surface",
+  "space_name": "demo_surface",
+  "normalization": "demo_z",
+  "generation_profile_id": "static_image_profile_v1",
+  "sample_id": "ok_npz",
+  "fmri_path": "arrays/ok.npz",
+  "array_key": "fmri"
+}

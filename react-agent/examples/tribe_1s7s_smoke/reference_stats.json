@@ -1,0 +1,93 @@
+{
+  "version": "reference_stats.v1",
+  "n_samples": 3,
+  "features": {
+    "T": {
+      "median": 12.0,
+      "mad": 0.0,
+      "q25": 12.0,
+      "q75": 12.0,
+      "n": 3
+    },
+    "V": {
+      "median": 20484.0,
+      "mad": 0.0,
+      "q25": 20484.0,
+      "q75": 20484.0,
+      "n": 3
+    },
+    "mean": {
+      "median": -0.025370582521160732,
+      "mad": 0.0031322726354212904,
+      "q25": -0.026936718838871377,
+      "q75": -0.02286013866172023,
+      "n": 3
+    },
+    "std": {
+      "median": 0.20418465280719922,
+      "mad": 0.0020988838949279054,
+      "q25": 0.20313521085973527,
+      "q75": 0.2062741091806771,
+      "n": 3
+    },
+    "finite_ratio": {
+      "median": 1.0,
+      "mad": 0.0,
+      "q25": 1.0,
+      "q75": 1.0,
+      "n": 3
+    },
+    "zero_fraction": {
+      "median": 0.0,
+      "mad": 0.0,
+      "q25": 0.0,
+      "q75": 0.0,
+      "n": 3
+    },
+    "near_constant_spatial_fraction": {
+      "median": 0.0,
+      "mad": 0.0,
+      "q25": 0.0,
+      "q75": 0.0,
+      "n": 3
+    },
+    "temporal_change_ratio": {
+      "median": 0.7896224335372541,
+      "mad": 0.010944352884081798,
+      "q25": 0.7841502570952132,
+      "q75": 0.8441732769340853,
+      "n": 3
+    },
+    "time_var_mean": {
+      "median": 0.0028753489624750435,
+      "mad": 0.00019743605250610976,
+      "q25": 0.0027766309362219884,
+      "q75": 0.0030643417563493165,
+      "n": 3
+    },
+    "space_var_mean": {
+      "median": 0.04144180809683629,
+      "mad": 0.0009767370632461497,
+      "q25": 0.04095343956521322,
+      "q75": 0.042201220880003706,
+      "n": 3
+    }
+  },
+  "fingerprints": [
+    "6b86d7f5b98908e7ba7865bb82e1ac7691b880d0810b9146649331df0e76ff5b",
+    "9a759b4bbf7a19e4c427773c434238d1595a5b95bf6d0020115499c64be8b5ba",
+    "112520b30aa19b732dd66764fdc89f3e99ec4cabccea28e3be5be301801207bb"
+  ],
+  "protocol": {
+    "generation_profile_id": "static_1s_7s_tribev2",
+    "spatial_representation": "surface",
+    "normalization": "none_raw_signed"
+  },
+  "reference_type": "tribe_static_1s_7s_smoke",
+  "compat_fields": [
+    "generation_profile_id",
+    "spatial_representation",
+    "normalization"
+  ],
+  "min_samples": 2
+}

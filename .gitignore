@@ -1,0 +1,23 @@
+# Secrets
+react-agent/.env
+
+# Upstream clone metadata; do not publish
+react-agent/.git.upstream-backup/
+
+# Local runtime and generated artifacts
+react-agent/.venv/
+react-agent/runs/
+react-agent/.langgraph_api/
+react-agent/**/__pycache__/
+react-agent/**/*.egg-info/
+react-agent/examples/fmri_demo~/
+
+# Model caches, generation outputs, local memory DB
+assets/hf/
+assets/generation/
+assets/memory/*.sqlite3
+
+# Editor and agent skill caches
+.cursor/
+.agents/
+skills-lock.json

@@ -1,0 +1,11 @@
+{
+  "time_axis": 1,
+  "sampling_interval_s": 1.0,
+  "spatial_representation": "surface",
+  "space_name": "demo_surface",
+  "normalization": "demo_z",
+  "generation_profile_id": "static_image_profile_v1",
+  "sample_id": "time_axis1",
+  "fmri_path": "arrays/time_axis1.npy",
+  "metadata_path": "metadata/time_axis1.json"
+}

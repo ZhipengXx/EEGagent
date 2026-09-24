@@ -1,0 +1,92 @@
+{
+  "version": "reference_stats.v1",
+  "n_samples": 2,
+  "features": {
+    "T": {
+      "median": 12.0,
+      "mad": 0.0,
+      "q25": 12.0,
+      "q75": 12.0,
+      "n": 2
+    },
+    "V": {
+      "median": 16.0,
+      "mad": 0.0,
+      "q25": 16.0,
+      "q75": 16.0,
+      "n": 2
+    },
+    "mean": {
+      "median": -0.027327008656963397,
+      "mad": 0.0,
+      "q25": -0.027327008656963397,
+      "q75": -0.027327008656963397,
+      "n": 2
+    },
+    "std": {
+      "median": 0.8932947552733266,
+      "mad": 0.0,
+      "q25": 0.8932947552733266,
+      "q75": 0.8932947552733266,
+      "n": 2
+    },
+    "finite_ratio": {
+      "median": 1.0,
+      "mad": 0.0,
+      "q25": 1.0,
+      "q75": 1.0,
+      "n": 2
+    },
+    "zero_fraction": {
+      "median": 0.0,
+      "mad": 0.0,
+      "q25": 0.0,
+      "q75": 0.0,
+      "n": 2
+    },
+    "near_constant_spatial_fraction": {
+      "median": 0.0,
+      "mad": 0.0,
+      "q25": 0.0,
+      "q75": 0.0,
+      "n": 2
+    },
+    "temporal_change_ratio": {
+      "median": 0.8009493764777939,
+      "mad": 0.0,
+      "q25": 0.8009493764777939,
+      "q75": 0.8009493764777939,
+      "n": 2
+    },
+    "time_var_mean": {
+      "median": 0.7177365204134845,
+      "mad": 0.0,
+      "q25": 0.7177365204134845,
+      "q75": 0.7177365204134845,
+      "n": 2
+    },
+    "space_var_mean": {
+      "median": 0.7435707954488422,
+      "mad": 1.1102230246251565e-16,
+      "q25": 0.7435707954488422,
+      "q75": 0.7435707954488422,
+      "n": 2
+    }
+  },
+  "fingerprints": [
+    "b24a76832c137d41c289f40d5bd571b95bfb9296cab7da7b13377389ddbe8426",
+    "d1a5fec300ed798cf7e0cdc43a0343499fe2a65828303a0bb74fc1473b7712c5"
+  ],
+  "protocol": {
+    "generation_profile_id": "static_image_profile_v1",
+    "spatial_representation": "surface",
+    "normalization": "demo_z"
+  },
+  "reference_type": "demo_synthetic",
+  "compat_fields": [
+    "generation_profile_id",
+    "spatial_representation",
+    "normalization"
+  ],
+  "min_samples": 2
+}
