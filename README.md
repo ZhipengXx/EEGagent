@@ -1,79 +1,62 @@
 # EEGagent
 
-EEG image-retrieval experiments and an fMRI quality-check workbench, built beside a [LangGraph](https://github.com/langchain-ai/langgraph) ReAct template.
-
-Numeric checks describe consistency. They do not certify that a predicted response is biologically correct.
+EEGagent is a multi-agent workflow for EEG-to-image retrieval and fMRI screening. It sits on a [LangGraph](https://github.com/langchain-ai/langgraph) ReAct template and runs two research loops: one that screens fMRI predictions, and one that proposes, reviews, and trains EEG retrieval models.
 
 ## Contents
 
-- [Layout](#layout)
-- [fMRI checks](#fmri-checks)
-- [EEG retrieval](#eeg-retrieval)
-- [Setup](#setup)
-- [Environment](#environment)
+- [Workflow](#workflow)
+- [Repository](#repository)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
 - [Commands](#commands)
 - [What stays local](#what-stays-local)
 - [Tests](#tests)
 
-## Layout
+## Workflow
+
+Two agent loops share one package. A separate ReAct chat graph in `react-agent/src/react_agent/graph.py` remains available for tool-calling conversation. It is not part of either research loop.
+
+### fMRI screening
+
+The planner chooses the next check. Tools run numeric screening and, when configured, TRIBE image-to-fMRI generation. Memory stores episodes in SQLite, apart from LangGraph checkpoints. The workbench is a local UI at `127.0.0.1:8765`.
+
+Profiles live in `react-agent/configs/`. `fmri_check.yaml` is the numeric demo. `fmri_check_tribe_*.yaml` covers TRIBE diagnostics, planned screening, and the image-16 protocol. Generation calls an external TRIBE checkout through `TRIBE_PYTHON`. From `react-agent`, that checkout is the relative path `../../tribev2`.
+
+### EEG retrieval
+
+The planner proposes a candidate change. The coder writes the patch. The reviewer checks it. The training worker then launches retrieval training under a frozen protocol.
+
+Designs are EEG or MEG, intra-subject or inter-subject. The test split is held out of fitting. A run without `EEG_GPU_SECONDS` stays a dry probe. Campaign output goes to `react-agent/runs/` and is not committed.
+
+## Repository
+
+Commands run from `react-agent/`. YAML paths resolve from that directory.
 
 ```text
 EEGagent/
 ├── README.md
-├── assets/                         # atlases and frozen vectors (weights are not committed)
+├── assets/                         # atlases and frozen vectors
 │   ├── atlas/                      # Schaefer-400 on fsaverage5
-│   ├── image_embeddings/clip/      # frozen CLIP vectors keyed by image id
+│   ├── image_embeddings/clip/      # CLIP vectors keyed by image id
 │   ├── markers/
-│   ├── hf/                         # local Hugging Face cache (gitignored)
-│   ├── generation/                 # videos and predictions (gitignored)
-│   └── memory/                     # sqlite memory store (gitignored)
-└── react-agent/                    # Python package, configs, examples, docs
+│   ├── hf/                         # weight cache, not committed
+│   ├── generation/                 # videos and predictions, not committed
+│   └── memory/                     # episode database, not committed
+└── react-agent/
     ├── src/react_agent/
-    │   ├── graph.py                # original ReAct chat graph
-    │   ├── fmri/                   # inspection loop, TRIBE generation, workbench
-    │   ├── eeg_research/           # campaign loop and code-level agent
-    │   └── eeg_training/           # EEG/MEG retrieval training entry
+    │   ├── graph.py                # ReAct chat graph
+    │   ├── fmri/                   # fMRI planner, tools, memory, workbench
+    │   ├── eeg_research/           # EEG planner, coder, reviewer
+    │   └── eeg_training/           # retrieval training worker
     ├── configs/
     ├── examples/
     ├── docs/
     └── tests/
 ```
 
-Run package commands from `react-agent/`. Paths in the YAML configs are resolved from that directory.
+## Quick start
 
-## fMRI checks
-
-`react_agent.fmri` inspects surface time series and, when configured, image-conditioned predictions. The original ReAct graph in `graph.py` is unchanged.
-
-| Piece | Role |
-| --- | --- |
-| `fmri.cli` | Checks, reference stats, TRIBE image-to-fMRI, memory export |
-| `fmri.workbench` | Local UI on `127.0.0.1:8765` |
-| `configs/fmri_check.yaml` | Numeric demo profile |
-| `configs/fmri_check_tribe_*.yaml` | TRIBE diagnostic, agentic planning, and v1.4 coverage profiles |
-| `fmri.planning` | Persistent plan. A planned policy does not silently fall back to rules |
-| `fmri.memory` | SQLite episodes, separate from LangGraph checkpoints |
-
-`claim_scope` for numeric screening stays `numeric_consistency_only`. Passing a check is not evidence that an image-conditioned response matches real fMRI.
-
-Generation talks to an external TRIBE checkout through `TRIBE_PYTHON`. The repository path in config is relative (`../../tribev2` from `react-agent`). Cache and prediction files under `assets/generation/` are not committed.
-
-## EEG retrieval
-
-Two layers share the same package:
-
-**Training entry** (`react_agent.eeg_training`). Four designs: EEG or MEG, intra-subject or inter-subject. The test split is not used for fitting. Without `EEG_GPU_SECONDS`, a run stays a dry probe.
-
-**Research campaigns**
-
-- `react_agent.eeg_research.cli` plans and records trials against a frozen task card (`configs/eeg_research_v1_6.yaml`).
-- `react_agent.eeg_research.agentic.cli` runs a code-level campaign: propose a candidate, review it, and launch a training job. Default output root is `react-agent/runs/eeg_research_v18` (gitignored).
-
-`mock_retrieval` is for contract tests. A mock pass does not set `real_training_passed`.
-
-## Setup
-
-Requires Python 3.11+.
+Python 3.11 or newer.
 
 ```bash
 cd react-agent
@@ -81,39 +64,47 @@ uv sync --group dev
 cp .env.example .env
 ```
 
-Optional weights for CortexMAE and CLIP:
+Fill in `.env`, then open the workbench or run a demo check:
+
+```bash
+uv run python -m react_agent.fmri.workbench
+uv run python -m react_agent.fmri.cli make-demo --out examples/fmri_demo
+```
+
+Optional CortexMAE and CLIP weights:
 
 ```bash
 uv sync --group dev --extra p2
 uv run python -m react_agent.fmri.cli prepare-p2 --kind all --download
 ```
 
-Downloaded weights land in `assets/hf/` and are not part of the git tree. See `assets/README.md`.
+Weights download into `assets/hf/` and stay out of git. See `assets/README.md`.
 
-## Environment
+## Configuration
 
-Copy names from `react-agent/.env.example`. Put real values only in `.env`.
+Copy names from `react-agent/.env.example`. Real values belong only in `.env`.
 
 | Variable | Used for |
 | --- | --- |
-| `DEEPSEEK_API_KEY` | Planned fMRI policies and EEG research when the backend is DeepSeek |
+| `DEEPSEEK_API_KEY` | Planned fMRI runs and DeepSeek-backed EEG research |
 | `DEEPSEEK_BASE_URL` | API base, default `https://api.deepseek.com` |
-| `DEEPSEEK_FAST_MODEL` / `DEEPSEEK_REASONING_MODEL` | Profile model names |
-| `TRIBE_PYTHON` | Interpreter that can import the TRIBE worker |
+| `DEEPSEEK_FAST_MODEL` / `DEEPSEEK_REASONING_MODEL` | Model names for the two profiles |
+| `TRIBE_PYTHON` | Interpreter for the TRIBE generation worker |
 | `EEG_DATA_ROOT` | THINGS-EEG / THINGS-MEG preprocessed data |
 | `EEG_TRAIN_PYTHON` | Torch interpreter for retrieval training |
-| `EEG_GPU_SECONDS` | Required before a non-dry training run |
-| `MODEL` | ReAct chat model (`provider/model-name`) |
-| `TAVILY_API_KEY` | Only the original search tool in the ReAct template |
+| `EEG_GPU_SECONDS` | Budget required before a real training run |
+| `MODEL` | ReAct chat model, as `provider/model-name` |
+| `TAVILY_API_KEY` | Search tool on the ReAct chat graph only |
 
-fMRI numeric checks do not need Tavily, Anthropic, or LangSmith keys. A planned DeepSeek policy refuses to start when `DEEPSEEK_API_KEY` is missing.
+The fMRI and EEG loops do not need Tavily, Anthropic, or LangSmith keys. A planned DeepSeek run needs `DEEPSEEK_API_KEY`.
 
 ## Commands
 
-From `react-agent`:
+From `react-agent`.
+
+### fMRI
 
 ```bash
-# Synthetic fixtures and a rule-only check
 uv run python -m react_agent.fmri.cli make-demo --out examples/fmri_demo
 uv run python -m react_agent.fmri.cli check \
   --sample examples/fmri_demo/ok_numeric.json \
@@ -121,35 +112,36 @@ uv run python -m react_agent.fmri.cli check \
   --backend none --policy rule \
   --out runs/rule_ok
 
-# Image to prediction, then the existing checker
 uv run python -m react_agent.fmri.cli check-image \
   --config configs/fmri_check_tribe_image16.yaml \
   --image /path/to/image.jpg \
   --out runs/image_check
 
-# Local workbench
 uv run python -m react_agent.fmri.workbench
+```
 
-# EEG campaign (offline planner unless EEG_RESEARCH_BACKEND=deepseek)
+The same CLI also covers `batch`, `from-tribe`, `fit-reference`, `prepare-assets`, `build-cohort-index`, `cache-embeddings`, `prepare-image-video`, `generate-from-image`, `batch-images`, `probe-backend`, `memory-inspect`, `memory-export`, and `record-feedback`.
+
+### EEG
+
+```bash
 uv run python -m react_agent.eeg_research.cli plan \
   --config configs/eeg_research_v1_6.yaml \
   --out runs/eeg_research/campaign --dry-run
 
-# One retrieval design, dry
 uv run python -m react_agent.eeg_training.cli run \
   --dataset eeg --exp-setting intra-subject --subject sub-01 \
   --out runs/eeg_training/probe --dry-run
 
-# Code-level research campaign
 uv run python -m react_agent.eeg_research.agentic.cli create --campaign eeg_retrieval_research_v1
 uv run python -m react_agent.eeg_research.agentic.cli status --campaign eeg_retrieval_research_v1
 ```
 
-`fmri.cli` also provides `batch`, `from-tribe`, `fit-reference`, `prepare-assets`, `build-cohort-index`, `cache-embeddings`, `prepare-image-video`, `generate-from-image`, `batch-images`, `probe-backend`, `memory-inspect`, `memory-export`, and `record-feedback`.
+Set `EEG_RESEARCH_BACKEND=deepseek` when the research planner should call DeepSeek. Otherwise it stays offline.
 
 ## What stays local
 
-[`.gitignore`](.gitignore) keeps these out of git:
+[`.gitignore`](.gitignore) keeps secrets, caches, and run output off the remote:
 
 | Path | Why |
 | --- | --- |
@@ -161,10 +153,10 @@ uv run python -m react_agent.eeg_research.agentic.cli status --campaign eeg_retr
 | `assets/generation/` | Videos and predicted arrays |
 | `assets/memory/*.sqlite3` | Episode database |
 | `react-agent/.git.upstream-backup/` | Previous upstream clone metadata |
-| `react-agent/version/` | Local version notes (`agent.md`) |
+| `react-agent/version/` | Local version notes |
 | `react-agent/src/react_agent/version/` | Local cursor prompts |
 
-Committed on purpose: source, tests, `configs/`, `docs/`, small atlases, frozen CLIP vectors, and `react-agent/.env.example` (placeholders only).
+The repository does include source, tests, `configs/`, `docs/`, small atlases, frozen CLIP vectors, and `react-agent/.env.example`.
 
 ## Tests
 
@@ -173,4 +165,4 @@ cd react-agent
 uv run python -m pytest tests/unit_tests tests/fmri tests/eeg_research tests/eeg_training
 ```
 
-`make test` in `react-agent` runs `tests/unit_tests/` only. Integration tests that call a live model are under `tests/integration_tests/` and are separate from the numeric fMRI suite.
+`make test` runs `tests/unit_tests/` only. Live-model checks sit in `tests/integration_tests/` and are separate from the fMRI and EEG suites.
