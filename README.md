@@ -14,7 +14,6 @@ Numeric checks describe consistency. They do not certify that a predicted respon
 - [Commands](#commands)
 - [What stays local](#what-stays-local)
 - [Tests](#tests)
-- [Further reading](#further-reading)
 
 ## Layout
 
@@ -162,6 +161,8 @@ uv run python -m react_agent.eeg_research.agentic.cli status --campaign eeg_retr
 | `assets/generation/` | Videos and predicted arrays |
 | `assets/memory/*.sqlite3` | Episode database |
 | `react-agent/.git.upstream-backup/` | Previous upstream clone metadata |
+| `react-agent/version/` | Local version notes (`agent.md`) |
+| `react-agent/src/react_agent/version/` | Local cursor prompts |
 
 Committed on purpose: source, tests, `configs/`, `docs/`, small atlases, frozen CLIP vectors, and `react-agent/.env.example` (placeholders only).
 
@@ -173,20 +174,3 @@ uv run python -m pytest tests/unit_tests tests/fmri tests/eeg_research tests/eeg
 ```
 
 `make test` in `react-agent` runs `tests/unit_tests/` only. Integration tests that call a live model are under `tests/integration_tests/` and are separate from the numeric fMRI suite.
-
-## Further reading
-
-Version notes live in `react-agent/docs/`:
-
-| Doc | Topic |
-| --- | --- |
-| `fmri_check.md` | Numeric check boundaries |
-| `tribe_tools_v1_1.md` | TRIBE sidecar tools |
-| `tribe_image16_v1_2.md` | 16-second image protocol |
-| `fmri_agentic_v1_3.md` | Planning and memory |
-| `fmri_diagnostic_v1_4.md` | Coverage and follow-up routing |
-| `fmri_workbench_ui_v1_5.md` | Workbench UI |
-| `eeg_autoresearch_v1_6.md` | EEG research loop |
-| `eeg_research_v1_8.md` | Code-level retrieval campaigns |
-
-`react-agent/README.md` is the upstream ReAct template note. This file is the project overview.

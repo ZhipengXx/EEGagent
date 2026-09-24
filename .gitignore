@@ -17,6 +17,10 @@ assets/hf/
 assets/generation/
 assets/memory/*.sqlite3
 
+# Local version notes and cursor prompts
+react-agent/version/
+react-agent/src/react_agent/version/
+
 # Editor and agent skill caches
 .cursor/
 .agents/
