@@ -193,6 +193,10 @@ def main(argv: list[str] | None = None) -> int:
         request_control(camp, "resume")
         align_interrupt(camp)
         state = load_state(camp)
+        failure = state.get("failure") if isinstance(state.get("failure"), dict) else {}
+        if args.command == "resume" and state.get("status") == "blocked" and failure.get("recoverable") is False:
+            print(json.dumps({"status": "blocked", "detail": state.get("detail")}, ensure_ascii=False))
+            return 0
         if state.get("status") in {"paused", "blocked"} and args.command == "resume":
             state["status"] = "created"
         if state.get("status") == "finished" and args.command == "resume" and args.reopen_reason:

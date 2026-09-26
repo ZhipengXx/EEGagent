@@ -21,6 +21,107 @@ Backend = Callable[[dict[str, Any]], dict[str, Any]]
 _READ_TOOLS = {"list_project_files", "search_code", "read_code", "inspect_check_result"}
 
 
+class RecoveryBlocked(RuntimeError):
+    """Disk and the coder log disagree. The caller must not rerun tools."""
+
+
+def _load_coder_rows(log_path: Path) -> list[dict[str, Any]]:
+    """Return complete rows. A partial tail is not a safe resume point."""
+    if not log_path.is_file():
+        return []
+    raw = log_path.read_text(encoding="utf-8")
+    if raw == "":
+        return []
+    if not raw.endswith("\n"):
+        raise RecoveryBlocked("coder_log_tail_incomplete")
+    rows: list[dict[str, Any]] = []
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RecoveryBlocked("coder_log_tail_incomplete") from exc
+        if not isinstance(payload, dict):
+            raise RecoveryBlocked("coder_log_tail_incomplete")
+        rows.append(payload)
+    return rows
+
+
+def _restore_coder(workspace: Path) -> dict[str, Any]:
+    """Replay complete log rows without executing their tools again."""
+    from react_agent.eeg_research.agentic.binding import file_sha256
+
+    rows = _load_coder_rows(workspace / "coder_log.jsonl")
+    history: list[dict[str, Any]] = []
+    last_check: dict[str, Any] | None = None
+    last_patch_sha = ""
+    failed_checks = 0
+    writes = 0
+    reads = 0
+    finished = False
+    last_step = 0
+    for row in rows:
+        tool = str(row.get("tool") or "")
+        result = row.get("result")
+        if not isinstance(result, dict):
+            raise RecoveryBlocked("coder_log_result_unreadable")
+        history.append({"tool": tool, "result": result})
+        last_step = max(last_step, int(row.get("step") or 0))
+        if tool in _READ_TOOLS:
+            reads += 1
+        if tool == "apply_candidate_patch" and result.get("ok"):
+            writes += 1
+            last_patch_sha = str(result.get("sha256") or "")
+            auto_check = result.get("auto_check")
+            if isinstance(auto_check, dict):
+                last_check = auto_check
+                if not auto_check.get("ok"):
+                    failed_checks += 1
+        if tool == "run_candidate_check":
+            last_check = result
+            if not result.get("ok"):
+                failed_checks += 1
+        if tool == "finish_patch" and result.get("ok"):
+            finished = True
+    checks_path = workspace / "checks.json"
+    if checks_path.is_file():
+        try:
+            stored = json.loads(checks_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RecoveryBlocked("checks_unreadable") from exc
+        if not isinstance(stored, dict):
+            raise RecoveryBlocked("checks_unreadable")
+        last_check = stored
+    entry = workspace / "extension" / "eeg_candidate.py"
+    if entry.is_file():
+        current = file_sha256(entry)
+        if not last_patch_sha or current != last_patch_sha:
+            raise RecoveryBlocked("unlogged_code_change")
+    if (workspace / "source_manifest.json").is_file() and not finished:
+        raise RecoveryBlocked("unlogged_finish")
+    if finished:
+        manifest_path = workspace / "source_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+        return {
+            "done": {
+                "status": "ready_for_review",
+                "manifest": manifest,
+                "check": last_check,
+                "steps": last_step,
+            }
+        }
+    return {
+        "history": history,
+        "last_check": last_check,
+        "last_hash": last_patch_sha,
+        "failed_checks": failed_checks,
+        "writes": writes,
+        "reads": reads,
+        "next_step": last_step + 1,
+    }
+
+
 def implement(
     workspace: Path,
     spec: dict[str, Any],
@@ -32,13 +133,22 @@ def implement(
     calls_left: Callable[[], int] | None = None,
     reserve: int = 2,
 ) -> dict[str, Any]:
-    """Run the coder loop. finish_patch is refused until a check has passed."""
+    """Run the coder loop. finish_patch is refused until a check has passed.
+
+    A complete coder log is replayed in memory. Tools already in that log are not executed again.
+    """
     (workspace / "extension").mkdir(parents=True, exist_ok=True)
+    restored = _restore_coder(workspace)
+    if restored.get("done"):
+        return restored["done"]
     log_path = workspace / "coder_log.jsonl"
-    history: list[dict[str, Any]] = []
-    last_check: dict[str, Any] | None = None
-    last_hash = ""
-    failed_checks = 0
+    history: list[dict[str, Any]] = list(restored["history"])
+    last_check: dict[str, Any] | None = restored["last_check"]
+    last_hash = str(restored["last_hash"] or "")
+    failed_checks = int(restored["failed_checks"])
+    writes = int(restored["writes"])
+    reads = int(restored["reads"])
+    next_step = int(restored["next_step"])
     from react_agent.eeg_research.agentic.binding import file_sha256
     from react_agent.eeg_research.agentic.coder import _REFERENCES
 
@@ -53,10 +163,8 @@ def implement(
     }
     references = {name: path.read_text(encoding="utf-8")[:6000] for name, path in _REFERENCES.items()}
     entry = workspace / "extension" / "eeg_candidate.py"
-    writes = 0
-    reads = 0
     extension_answered = False
-    for step in range(1, max_steps + 1):
+    for step in range(next_step, max_steps + 1):
         if calls_left is not None and calls_left() <= reserve:
             return {"status": "implementation_failed", "detail": "budget_exhausted", "check": last_check, "steps": step - 1}
         current = None
@@ -242,7 +350,14 @@ def apply_review_filter(result: dict[str, Any]) -> dict[str, Any]:
     return updated
 
 
-def review(workspace: Path, spec: dict[str, Any], contract_summary: dict[str, Any], backend: Backend, model: str) -> dict[str, Any]:
+def review(
+    workspace: Path,
+    spec: dict[str, Any],
+    contract_summary: dict[str, Any],
+    backend: Backend,
+    model: str,
+    identity: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Reviewer sees spec, code and checks. It returns blocking issues, not a score."""
     entry = workspace / "extension" / "eeg_candidate.py"
     from react_agent.eeg_research.agentic.interface import CANDIDATE_INTERFACE
@@ -284,5 +399,15 @@ def review(workspace: Path, spec: dict[str, Any], contract_summary: dict[str, An
             "same_family_as_executor": True,
         }
     )
-    (workspace / "review.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    if identity:
+        for key in ("candidate_id", "attempt_id", "phase", "operation_id"):
+            if identity.get(key):
+                result[key] = identity[key]
+    from react_agent.eeg_research.agentic.identity import source_hash
+
+    result["input_hash"] = source_hash(workspace)
+    result["phase"] = result.get("phase") or "review_candidate"
+    tmp = workspace / "review.json.tmp"
+    tmp.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(workspace / "review.json")
     return result

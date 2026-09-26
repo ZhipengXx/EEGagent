@@ -7,9 +7,10 @@ import hashlib
 import json
 import os
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Callable
+
+from react_agent.eeg_research.agentic.identity import new_call_row
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
 
@@ -64,16 +65,21 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
     prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
     loop = asyncio.new_event_loop()
     client = DeepSeekBackend(config)
+    bound: dict[str, Any] = {}
+
+    def bind(**fields: Any) -> None:
+        bound.clear()
+        bound.update({key: value for key, value in fields.items() if value is not None})
 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
         started = time.time()
-        row: dict[str, Any] = {
-            "call_id": uuid.uuid4().hex[:12],
-            "role": role,
-            "prompt_hash": prompt_hash,
-            "requested_model": config.fast.model,
-            "started_at": started,
-        }
+        row = new_call_row(
+            role=role,
+            prompt_hash=prompt_hash,
+            requested_model=config.fast.model,
+            started_at=started,
+            **bound,
+        )
         try:
             reply, usage = loop.run_until_complete(
                 client.complete_json(
@@ -101,4 +107,5 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
         return reply if isinstance(reply, dict) else {"_not_object": reply}
 
     call.model = config.fast.model  # type: ignore[attr-defined]
+    call.bind = bind  # type: ignore[attr-defined]
     return call

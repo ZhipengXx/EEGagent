@@ -9,6 +9,7 @@ from typing import Any, Callable
 
 from react_agent.eeg_research.agentic.coder import apply_candidate_patch, finish_patch, run_candidate_check
 from react_agent.eeg_research.agentic.contract import public_contract
+from react_agent.eeg_research.agentic.llm import LlmUnavailable
 from react_agent.eeg_research.agentic.memory import episode, retrieve
 from react_agent.eeg_research.agentic.planner import available_actions, decide, evidence_count
 from react_agent.eeg_research.agentic.runner import accept_job, comparable
@@ -100,7 +101,10 @@ def _decision_number(stem: str) -> int:
 
 
 def incomplete_candidate_id(camp: Path, state: dict[str, Any]) -> str | None:
-    """Directory with a spec and no coder log that never entered state or evidence."""
+    """Candidate directory that has a spec but never entered state or evidence.
+
+    A coder log does not drop the id. Resume still has to finish that same candidate.
+    """
     recorded = {row.get("candidate_id") for row in state.get("candidates") or []}
     evidenced = {row.get("candidate_id") for row in state.get("evidence") or []}
     root = camp / "candidates"
@@ -115,11 +119,70 @@ def incomplete_candidate_id(camp: Path, state: dict[str, Any]) -> str | None:
             continue
         if name in recorded or name in evidenced:
             continue
-        if (path / "spec.json").is_file() and not (path / "coder_log.jsonl").is_file():
+        if (path / "spec.json").is_file():
             names.append(name)
     if not names:
         return None
     return sorted(names, key=lambda name: int(name[1:]))[0]
+
+
+def persist_failure(
+    camp: Path,
+    state: dict[str, Any],
+    *,
+    phase: str,
+    error_type: str,
+    detail: str,
+    recoverable: bool,
+) -> None:
+    """Record a blocked phase. Pause and stop are left untouched."""
+    if state.get("status") in {"paused", "cancelled"}:
+        return
+    state["status"] = "blocked"
+    state["detail"] = detail
+    state["failure"] = {"phase": phase, "recoverable": recoverable, "error_type": error_type}
+    event(
+        camp,
+        "llm_unavailable" if recoverable else "worker_error",
+        error_type=error_type,
+        phase=phase,
+        recoverable=recoverable,
+    )
+
+
+def _sync_ledger(camp: Path, state: dict[str, Any]) -> None:
+    """Use the cost ledger when it exists. A missing file does not reset the state counter."""
+    if not (camp / "cost.json").is_file():
+        return
+    ledger = _read(camp / "cost.json").get("llm_calls")
+    if isinstance(ledger, int):
+        state["llm_calls"] = ledger
+        state["llm_calls_left"] = int(state.get("max_llm_calls", 100)) - ledger
+
+
+def _unexecuted_decision(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Only an explicit executed false is unfinished. Older decisions omit the field."""
+    decisions = state.get("decisions") or []
+    if not decisions:
+        return None
+    last = decisions[-1]
+    if last.get("ok") and last.get("executed") is False:
+        return last
+    return None
+
+
+def _decision_raw(camp: Path, decision_id: str) -> dict[str, Any]:
+    payload = _read(camp / "decisions" / f"{decision_id}.json")
+    raw = payload.get("raw")
+    return raw if isinstance(raw, dict) else {}
+
+
+def _mark_executed(state: dict[str, Any]) -> None:
+    if state.get("status") in {"blocked", "paused", "cancelled"}:
+        return
+    decisions = state.get("decisions") or []
+    if decisions and decisions[-1].get("ok"):
+        decisions[-1]["executed"] = True
 
 
 def pending_implement(camp: Path, state: dict[str, Any]) -> dict[str, Any] | None:
@@ -280,24 +343,24 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
             state["status"] = "paused"
             save_state(camp, state)
         return state
-    ledger = _read(camp / "cost.json").get("llm_calls")
-    if isinstance(ledger, int):
-        state["llm_calls"] = ledger
-        state["llm_calls_left"] = int(state.get("max_llm_calls", 100)) - ledger
+    _sync_ledger(camp, state)
     queued = state.get("queued") or []
     if queued and services.get("launch") is not None:
         candidate_id, fidelity = queued.pop(0)
         state["queued"] = queued
         _launch(camp, state, services, candidate_id, fidelity)
-        save_state(camp, state)
+        _finish_step(camp, state)
+        return state
+    pending = _unexecuted_decision(state)
+    if pending is not None and state.get("status") not in {"paused", "cancelled"}:
+        _apply_action(camp, state, str(pending.get("action") or ""), pending, runner, services, observation(camp))
+        _finish_step(camp, state)
         return state
     if pending_implement(camp, state) is not None and services.get("implement") is not None:
         if state.get("status") not in {"paused", "cancelled"}:
             state["status"] = "planning"
             services["implement"](camp, state)
-            if state.get("pause_after_step") and state["status"] not in _TERMINAL and not state.get("live_job"):
-                state["status"] = "paused"
-            save_state(camp, state)
+            _finish_step(camp, state)
             return state
     if state.get("llm_calls_left", 1) <= 0:
         state["status"] = "blocked"
@@ -305,12 +368,25 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         save_state(camp, state)
         return state
     obs = observation(camp)
-    state["llm_calls"] = int(state.get("llm_calls", 0)) + 1
-    state["llm_calls_left"] = int(state.get("llm_calls_left", 1)) - 1
-    decision = decide(obs, backend)
-    if decision.get("repairs"):
-        state["llm_calls"] += 1
-        state["llm_calls_left"] -= 1
+    try:
+        decision = decide(obs, backend)
+    except LlmUnavailable as exc:
+        _sync_ledger(camp, state)
+        persist_failure(camp, state, phase="planner", error_type=str(exc), detail=str(exc), recoverable=True)
+        save_state(camp, state)
+        return state
+    except Exception as exc:
+        persist_failure(
+            camp,
+            state,
+            phase="planner",
+            error_type=type(exc).__name__,
+            detail=f"{type(exc).__name__}: {exc}",
+            recoverable=False,
+        )
+        save_state(camp, state)
+        return state
+    _sync_ledger(camp, state)
     record = {
         "decision_id": f"d{len(state.get('decisions') or []) + 1}",
         "action": decision.get("action"),
@@ -319,47 +395,92 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         "evidence_ids": (decision.get("raw") or {}).get("evidence_ids") or [],
         "detail": decision.get("detail"),
         "evidence_count": evidence_count(state),
+        "executed": bool(decision.get("ok")) is False,
     }
-    state["decisions"].append(record)
+    state.setdefault("decisions", []).append(record)
     _write(camp / "decisions" / f"{record['decision_id']}.json", {"decision": record, "raw": decision.get("raw")})
     event(camp, "decision", **record)
     if not decision.get("ok"):
         state["status"] = "blocked"
         state["detail"] = decision.get("detail")
+        state["failure"] = {
+            "phase": "planner",
+            "recoverable": True,
+            "error_type": str(decision.get("detail") or "schema"),
+        }
         save_state(camp, state)
         return state
-    action = decision["action"]
+    _apply_action(camp, state, str(decision.get("action") or ""), decision, runner, services, obs)
+    _finish_step(camp, state)
+    return state
+
+
+def _finish_step(camp: Path, state: dict[str, Any]) -> None:
+    _sync_ledger(camp, state)
+    _mark_executed(state)
+    if state.get("pause_after_step") and state.get("status") not in _TERMINAL and not state.get("live_job"):
+        state["status"] = "paused"
+    save_state(camp, state)
+
+
+def _apply_action(
+    camp: Path,
+    state: dict[str, Any],
+    action: str,
+    decision: dict[str, Any],
+    runner: Any,
+    services: Services,
+    obs: dict[str, Any],
+) -> None:
+    """Run one already chosen action. Does not allocate a new decision id."""
     state["status"] = "planning"
+    raw = decision.get("raw") if isinstance(decision.get("raw"), dict) else _decision_raw(camp, str(decision.get("decision_id") or ""))
     if action == "stop":
         state["status"] = "finished"
-        state["stop_reason"] = (decision.get("raw") or {}).get("stop_reason") or decision.get("reason_zh")
+        state["stop_reason"] = raw.get("stop_reason") or decision.get("reason_zh")
     elif action == "inspect_data":
         state["data_audit"] = _inspect(camp)
         _append_derived(state, {"evidence_id": f"ev_audit_{len(state['evidence']) + 1}", "kind": "data_audit", "summary": state["data_audit"]})
     elif action == "retrieve_memory":
-        state["memory_hits"] = [row.get("candidate_id") for row in obs["memory"]]
+        state["memory_hits"] = [row.get("candidate_id") for row in obs.get("memory") or []]
     elif action == "diagnose_results":
         _append_derived(state, _diagnose(camp, state))
     elif action == "propose_experiment":
-        raw = decision.get("raw") or {}
-        state["hypothesis"] = raw.get("hypothesis_draft") or {"mechanism": decision.get("reason_zh")}
-        state["experiment"] = raw.get("experiment_draft") or {"initial_fidelity": "pilot"}
-        state["experiment"]["parent_candidate_id"] = state["experiment"].get("parent_candidate_id") or "baseline"
-        state["candidate_ready"] = False
-        state["experiment_failed"] = False
-        _write(camp / "hypotheses" / f"h{len(state['decisions'])}.json", {"hypothesis": state["hypothesis"], "experiment": state["experiment"]})
+        _propose_experiment(camp, state, decision, raw)
     elif action == "implement_candidate":
         implementer = services.get("implement")
         if implementer is None:
-            _implement_inline(camp, state, decision)
+            _implement_inline(camp, state, decision if decision.get("raw") else {"raw": raw, "reason_zh": decision.get("reason_zh")})
         else:
             implementer(camp, state)
     elif action in {"run_pilot", "run_full", "replicate"}:
         _train(camp, state, action, runner, services)
-    if state.get("pause_after_step") and state["status"] not in _TERMINAL and not state.get("live_job"):
-        state["status"] = "paused"
-    save_state(camp, state)
-    return state
+
+
+def _propose_experiment(camp: Path, state: dict[str, Any], decision: dict[str, Any], raw: dict[str, Any]) -> None:
+    path = camp / "hypotheses" / f"h{len(state.get('decisions') or [])}.json"
+    if path.is_file():
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            persist_failure(
+                camp,
+                state,
+                phase="propose_experiment",
+                error_type="hypothesis_unreadable",
+                detail="hypothesis_unreadable",
+                recoverable=False,
+            )
+            return
+        state["hypothesis"] = saved.get("hypothesis")
+        state["experiment"] = saved.get("experiment") or {}
+    else:
+        state["hypothesis"] = raw.get("hypothesis_draft") or {"mechanism": decision.get("reason_zh")}
+        state["experiment"] = raw.get("experiment_draft") or {"initial_fidelity": "pilot"}
+        state["experiment"]["parent_candidate_id"] = state["experiment"].get("parent_candidate_id") or "baseline"
+        _write(path, {"hypothesis": state["hypothesis"], "experiment": state["experiment"]})
+    state["candidate_ready"] = False
+    state["experiment_failed"] = False
 
 
 def _append_derived(state: dict[str, Any], row: dict[str, Any]) -> None:
@@ -506,9 +627,37 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
 
 
 def _launch(camp: Path, state: dict[str, Any], services: Services, candidate_id: str, fidelity: str) -> None:
-    """Start one job. The control runs at the same fidelity before its candidate."""
+    """Start one job, or adopt a job.json already on disk. Never start a second process for the same id."""
     job_index = int(state["training_jobs"]) + 1
     job_id = f"j{job_index}_{candidate_id}_{fidelity}"
+    job_dir = camp / "jobs" / job_id
+    if job_dir.exists() and not (job_dir / "job.json").is_file():
+        persist_failure(
+            camp,
+            state,
+            phase="train",
+            error_type="training_start_unconfirmed",
+            detail="training_start_unconfirmed",
+            recoverable=False,
+        )
+        return
+    if (job_dir / "job.json").is_file():
+        record = _read(job_dir / "job.json")
+        recorded = record.get("candidate_id")
+        if recorded and recorded != candidate_id:
+            persist_failure(
+                camp,
+                state,
+                phase="train",
+                error_type="job_identity_mismatch",
+                detail="job_identity_mismatch",
+                recoverable=False,
+            )
+            return
+        state["training_jobs"] = job_index
+        state["live_job"] = job_id
+        state["status"] = "training"
+        return
     record = services["launch"](camp, state, job_id, candidate_id, fidelity)
     state["training_jobs"] = job_index
     state["live_job"] = record["job_id"]
@@ -524,6 +673,17 @@ def _train(camp: Path, state: dict[str, Any], action: str, runner: Any, services
     fidelity = "pilot" if action == "run_pilot" else "full"
     candidate_id = state.get("candidate_id") or "c1"
     job_index = state["training_jobs"] + 1
+    job_dir = camp / "jobs" / f"j{job_index}"
+    if job_dir.exists() and not (job_dir / "job.json").is_file() and not (job_dir / "metrics.json").is_file():
+        persist_failure(
+            camp,
+            state,
+            phase="train",
+            error_type="training_start_unconfirmed",
+            detail="training_start_unconfirmed",
+            recoverable=False,
+        )
+        return
     if services.get("launch") is not None:
         has_control = any(
             row.get("candidate_id") == "baseline" and row.get("fidelity") == fidelity and row.get("evaluation_valid")

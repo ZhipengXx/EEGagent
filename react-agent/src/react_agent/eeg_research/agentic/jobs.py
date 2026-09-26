@@ -142,6 +142,7 @@ def start_job(
         "manifest": manifest,
         "command": command,
         "execution_fingerprint": None if protocol is None else protocol.get("fingerprint"),
+        "source_hash": manifest.get("entry_sha256") if isinstance(manifest, dict) else None,
     }
     (job_dir / "job.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return record
