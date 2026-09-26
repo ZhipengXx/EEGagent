@@ -286,10 +286,18 @@ def submit_retrieval(form: dict[str, str]) -> tuple[int, dict[str, Any]]:
         payload["campaigns"] = _research_campaigns()
         return 200, payload
     payload = launch_design(design, RESEARCH / design.campaign_id(), action)
-    if action == "run" and design.policy == "agentic" and not payload.get("blockers"):
+    if action == "run" and design.policy == "agentic":
         from react_agent.eeg_research.agentic.cli import DEFAULT_ROOT, open_agentic_run
+        from react_agent.eeg_research.agentic.execution_protocol import unsupported_agentic_reason
 
-        payload = open_agentic_run(design, payload, request_id=(form.get("request_id") or "").strip(), root=DEFAULT_ROOT)
+        reason = unsupported_agentic_reason(design)
+        if reason:
+            payload["ok"] = False
+            payload["started"] = False
+            payload["blockers"] = list(payload.get("blockers") or []) + [reason]
+            payload["log"] = list(payload.get("log") or []) + [reason]
+        elif not payload.get("blockers"):
+            payload = open_agentic_run(design, payload, request_id=(form.get("request_id") or "").strip(), root=DEFAULT_ROOT)
     payload["campaigns"] = _research_campaigns()
     return 200, payload
 

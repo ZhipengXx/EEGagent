@@ -491,6 +491,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         "test_result": None,
         "train_image_count": len(set(train_images)),
         "validation_image_count": len(set(val_images)),
+        "validation_image_ids": sorted(set(val_images)),
         "train_validation_overlap": False,
     }
 
@@ -527,9 +528,13 @@ def main(argv: list[str] | None = None) -> int:
             metrics.write_text(json.dumps(payload), encoding="utf-8")
             return 0
         payload = fit(design, args.data_root, out_dir)
-        if os.environ.get("EEG_FINAL_TEST", "1") == "0":
-            payload["test_result"] = None
-        else:
+        image_ids = payload.pop("validation_image_ids", None)
+        from react_agent.eeg_research.agentic.execution_protocol import apply_final_test_policy, validation_identity_for
+
+        if isinstance(image_ids, list):
+            payload["validation_identity"] = validation_identity_for(design, args.data_root, [str(item) for item in image_ids])
+        payload = apply_final_test_policy(payload, os.environ.get("EEG_FINAL_TEST", "1") != "0")
+        if os.environ.get("EEG_FINAL_TEST", "1") != "0":
             payload["test_result"] = score_held_out(design, args.data_root, out_dir)
     except SplitError as exc:
         (out_dir / "error.txt").write_text(str(exc), encoding="utf-8")

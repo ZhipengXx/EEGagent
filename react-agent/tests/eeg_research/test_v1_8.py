@@ -208,6 +208,8 @@ def test_ui_agentic_run_writes_a_new_campaign(tmp_path: Path) -> None:
     v1 = Path(__file__).resolve().parents[2] / "runs/eeg_research_v18/eeg_retrieval_research_v1/campaign_state.json"
     before = v1.read_bytes()
     design = _design(tmp_path)
+    (Path(design.train_dir) / "train.pt").write_text(json.dumps(["img-a", "img-b", "img-c", "img-d"]), encoding="utf-8")
+    (Path(design.test_dir) / "test.pt").write_text(json.dumps(["img-z"]), encoding="utf-8")
     spawned: list[str] = []
 
     def spawn(_root, campaign, _poll):
@@ -696,3 +698,4 @@ def test_new_planner_does_not_stop_on_a_small_gap() -> None:
     text = prompt.read_text(encoding="utf-8")
     assert "0.005" not in text
     assert "Do not stop because the best two scores are close" in text
+

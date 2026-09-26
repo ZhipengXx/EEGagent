@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from react_agent.eeg_research.agentic.binding import manifest_for
+from react_agent.eeg_research.agentic.execution_protocol import command_matches, fidelity_settings, load_protocol
 from react_agent.eeg_research.agentic.runner import accept_job, research_env
 from react_agent.eeg_training.protocol import Design, train_command
 
@@ -63,14 +64,23 @@ def start_job(
     extension: Path | None,
     fidelity: str,
     root: Path,
+    protocol_path: Path | None = None,
 ) -> dict[str, Any]:
     """Start one train_entry child. The candidate module comes from the job environment."""
     job_dir = job_dir.resolve()
     job_dir.mkdir(parents=True, exist_ok=True)
     if (job_dir / "job.json").is_file():
         return json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
-    epochs = PILOT_EPOCHS if fidelity == "pilot" else design.epochs
-    stop = "single_full" if fidelity == "pilot" else "single_early"
+    protocol = None
+    if protocol_path is not None and protocol_path.is_file():
+        protocol = load_protocol(protocol_path.parent)
+    if protocol is None:
+        protocol = load_protocol(job_dir.parent.parent)
+    if protocol is not None:
+        epochs, stop = fidelity_settings(protocol, fidelity)
+    else:
+        epochs = PILOT_EPOCHS if fidelity == "pilot" else design.epochs
+        stop = "single_full" if fidelity == "pilot" else "single_early"
     run_design = replace(design, epochs=epochs, stop=stop, policy="agentic")
     env = research_env(extension)
     env["EEG_CANDIDATE_MODULE"] = "eeg_candidate" if extension is not None else BASELINE_MODULE
@@ -79,6 +89,18 @@ def start_job(
         (extension.parent / "source_manifest.json").read_text(encoding="utf-8")
     )
     command = train_command(run_design, job_dir, root)
+    if protocol is not None and not command_matches(command, protocol, fidelity):
+        record = {
+            "job_id": job_dir.name,
+            "candidate_id": candidate_id,
+            "fidelity": fidelity,
+            "status": "blocked",
+            "detail": "protocol_mismatch",
+            "command": command,
+            "execution_fingerprint": protocol.get("fingerprint"),
+        }
+        (job_dir / "job.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+        return record
     log = (job_dir / "train.log").open("wb")
     proc = subprocess.Popen(  # noqa: S603
         command,
@@ -102,6 +124,7 @@ def start_job(
         "status": "running",
         "manifest": manifest,
         "command": command,
+        "execution_fingerprint": None if protocol is None else protocol.get("fingerprint"),
     }
     (job_dir / "job.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return record
@@ -143,7 +166,8 @@ def reconcile(job_dir: Path) -> dict[str, Any]:
     record["ended_at"] = record.get("ended_at") or (max(marks) if marks else time.time())
     elapsed = float(record["ended_at"]) - float(record["started_at"])
     record["gpu_seconds"] = elapsed * max(1, len(record.get("gpu") or []))
-    accepted = accept_job(job_dir, record.get("manifest"), str(record.get("fidelity")))
+    protocol = load_protocol(job_dir.parent.parent)
+    accepted = accept_job(job_dir, record.get("manifest"), str(record.get("fidelity")), protocol=protocol)
     record["result"] = accepted
     if accepted.get("evaluation_valid"):
         record["status"] = "finished"

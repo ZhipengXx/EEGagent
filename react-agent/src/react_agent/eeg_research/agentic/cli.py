@@ -8,7 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from react_agent.eeg_research.agentic.contract import freeze_contract
+from react_agent.eeg_research.agentic.contract import freeze_contract, research_scope
+from react_agent.eeg_research.agentic.execution_protocol import ProtocolError, build_execution_protocol
 from react_agent.eeg_research.agentic.loop import create_campaign, event, load_state, request_control, save_state
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[4] / "runs" / "eeg_research_v18"
@@ -26,12 +27,13 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def goal(campaign: str) -> dict:
+def goal(campaign: str, design=None) -> dict:
+    scope = "pooled_subject_retrieval" if design is None else research_scope(design)
     return {
         "goal_id": campaign,
         "objective": "改进指定数据与协议下的 EEG 到图像检索",
         "task_type": "eeg_image_retrieval",
-        "research_scope": "pooled_subject_retrieval",
+        "research_scope": scope,
         "primary_metric": "validation.fixed_gallery_top1",
         "direction": "maximize",
         "min_practical_gain_pp": None,
@@ -82,8 +84,16 @@ def open_agentic_run(
     known = json.loads(index.read_text(encoding="utf-8")) if index.is_file() else {}
     already = request_id in known
     base = Path(design.data_root) if design.data_root else data_root()
+    try:
+        protocol = build_execution_protocol(design, base)
+    except ProtocolError as exc:
+        result["ok"] = False
+        result["blockers"] = list(result.get("blockers") or []) + [str(exc)]
+        result["log"] = list(result.get("log") or []) + [str(exc)]
+        return result
     contract = freeze_contract(design, base)
-    state = create_campaign(root, goal=goal(campaign), contract=contract, request_id=request_id)
+    contract["execution_fingerprint"] = protocol["fingerprint"]
+    state = create_campaign(root, goal=goal(campaign, design), contract=contract, request_id=request_id, protocol=protocol)
     camp = root / campaign
     if not already:
         state["gpu"] = [int(item) for item in (design.gpu or (0,))]
@@ -126,8 +136,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         from react_agent.eeg_training.protocol import data_root
 
-        contract = freeze_contract(design, data_root())
-        state = create_campaign(root, goal=goal(args.campaign), contract=contract, request_id=args.request_id or args.campaign)
+        base = data_root()
+        try:
+            protocol = build_execution_protocol(design, base)
+        except ProtocolError as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
+        contract = freeze_contract(design, base)
+        contract["execution_fingerprint"] = protocol["fingerprint"]
+        state = create_campaign(
+            root,
+            goal=goal(args.campaign, design),
+            contract=contract,
+            request_id=args.request_id or args.campaign,
+            protocol=protocol,
+        )
         state["gpu"] = [int(item) for item in args.gpu.split(",") if item.strip()]
         save_state(camp, state)
         print(json.dumps({"status": state["status"], "fingerprint": state["contract_fingerprint"]}, ensure_ascii=False))

@@ -35,7 +35,14 @@ def event(camp: Path, kind: str, **fields: Any) -> None:
         handle.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
 
 
-def create_campaign(root: Path, *, goal: dict[str, Any], contract: dict[str, Any], request_id: str) -> dict[str, Any]:
+def create_campaign(
+    root: Path,
+    *,
+    goal: dict[str, Any],
+    contract: dict[str, Any],
+    request_id: str,
+    protocol: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Idempotent create. The same request id does not open a second campaign."""
     index = root / "request_index.json"
     known = _read(index)
@@ -52,6 +59,7 @@ def create_campaign(root: Path, *, goal: dict[str, Any], contract: dict[str, Any
         "request_id": request_id,
         "status": "created",
         "contract_fingerprint": contract["fingerprint"],
+        "execution_fingerprint": None if protocol is None else protocol.get("fingerprint"),
         "evidence": [],
         "memory": [],
         "training_jobs": 0,
@@ -73,6 +81,8 @@ def create_campaign(root: Path, *, goal: dict[str, Any], contract: dict[str, Any
     _write(camp / "goal.json", goal)
     _write(camp / "resolved_goal.json", goal)
     _write(camp / "evaluation_contract.json", contract)
+    if protocol is not None:
+        _write(camp / "execution_protocol.json", protocol)
     _write(camp / "campaign_state.json", state)
     known[request_id] = str(camp)
     _write(index, known)
@@ -359,8 +369,9 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
     result["candidate_id"] = record.get("candidate_id")
     result["job_dir"] = str(camp / "jobs" / str(record.get("job_id")))
     result["seed"] = record.get("seed")
-    result["contract_fingerprint"] = state.get("contract_fingerprint")
     result["job_status"] = record.get("status")
+    if result.get("evaluation_valid"):
+        result["contract_fingerprint"] = result.get("execution_fingerprint") or state.get("contract_fingerprint")
     state["gpu_seconds_left"] = float(state.get("gpu_seconds_left", 0)) - float(record.get("gpu_seconds") or 0)
     cost_path = camp / "cost.json"
     cost = _read(cost_path)
