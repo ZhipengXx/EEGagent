@@ -10,7 +10,8 @@ from pathlib import Path
 
 from react_agent.eeg_research.agentic.contract import freeze_contract, research_scope
 from react_agent.eeg_research.agentic.execution_protocol import ProtocolError, build_execution_protocol
-from react_agent.eeg_research.agentic.loop import create_campaign, event, load_state, request_control, save_state
+from react_agent.eeg_research.agentic.jobs import worker_disconnected
+from react_agent.eeg_research.agentic.loop import align_interrupt, create_campaign, event, load_state, request_control, save_state
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[4] / "runs" / "eeg_research_v18"
 
@@ -110,9 +111,20 @@ def open_agentic_run(
 
 def status_view(camp: Path) -> dict:
     state = load_state(camp)
+    status = state.get("status")
+    detail = state.get("detail")
+    if status not in {"paused", "finished", "blocked", "cancelled"}:
+        worker = {}
+        worker_path = camp / "worker.json"
+        if worker_path.is_file():
+            worker = json.loads(worker_path.read_text(encoding="utf-8"))
+        pid = int(worker.get("pid") or 0)
+        if pid > 0 and worker_disconnected(pid):
+            status = "interrupted"
+            detail = "worker 已退出"
     return {
-        "status": state.get("status"),
-        "detail": state.get("detail"),
+        "status": status,
+        "detail": detail,
         "live_job": state.get("live_job"),
         "training_jobs": state.get("training_jobs"),
         "llm_calls": state.get("llm_calls"),
@@ -169,7 +181,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     state = load_state(camp)
     if args.command in {"start", "resume"}:
+        from react_agent.eeg_research.agentic.worker import worker_lock_held
+
+        if worker_lock_held(camp):
+            worker_path = camp / "worker.json"
+            pid = 0
+            if worker_path.is_file():
+                pid = int(json.loads(worker_path.read_text(encoding="utf-8")).get("pid") or 0)
+            print(json.dumps({"status": "worker_already_running", "pid": pid}, ensure_ascii=False))
+            return 0
         request_control(camp, "resume")
+        align_interrupt(camp)
+        state = load_state(camp)
         if state.get("status") in {"paused", "blocked"} and args.command == "resume":
             state["status"] = "created"
         if state.get("status") == "finished" and args.command == "resume" and args.reopen_reason:

@@ -37,7 +37,13 @@ python -m react_agent.eeg_research.agentic.cli stop   --campaign eeg_retrieval_r
 
 ## 恢复
 
-当前 campaign 已结束，API 调用 138/140。c10 的 3 epoch pilot 低于 baseline，d64 只记录了 `propose_experiment`，没有执行。继续需要新的预算，再执行 `resume --reopen-reason`。详见 `runs/eeg_research_v18/eeg_retrieval_research_v1/report.md`。
+worker 异常退出后先备份，再检查，最后才由操作者决定是否 resume。这三步不启动训练，也不调用模型。
+
+1. 备份：复制整个 campaign 目录，至少包含 `campaign_state.json`、`decisions/`、`candidates/`、`cost.json` 和 `worker.json`。
+2. 检查：确认状态不是暂停或停止；对比 `decisions/` 与状态文件里的决策条数；找出只有 `spec.json`、没有 `coder_log.jsonl` 的候选目录；核对 `cost.json` 的 `llm_calls` 和 `llm_failures`；看 `worker.json` 里的 pid 是否还在，以及 `/proc/<pid>/stat` 是否为 `Z` 或 `X`。
+3. 恢复：检查通过后，由操作者执行 `python -m react_agent.eeg_research.agentic.cli resume --campaign <id> --root <runs 目录>`。不要在这一步附带训练命令或模型请求。暂停和停止不会被这一检查改写。
+
+已结束的历史 campaign 若要重开，仍然需要新的预算和 `resume --reopen-reason`。原因会写入事件。详见该次运行目录里的 `report.md`。
 
 ## 验收矩阵
 

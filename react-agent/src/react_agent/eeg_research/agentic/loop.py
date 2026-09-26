@@ -94,6 +94,82 @@ def load_state(camp: Path) -> dict[str, Any]:
     return _read(camp / "campaign_state.json")
 
 
+def _decision_number(stem: str) -> int:
+    digits = stem[1:] if stem.startswith("d") else stem
+    return int(digits) if digits.isdigit() else 0
+
+
+def incomplete_candidate_id(camp: Path, state: dict[str, Any]) -> str | None:
+    """Directory with a spec and no coder log that never entered state or evidence."""
+    recorded = {row.get("candidate_id") for row in state.get("candidates") or []}
+    evidenced = {row.get("candidate_id") for row in state.get("evidence") or []}
+    root = camp / "candidates"
+    if not root.is_dir():
+        return None
+    names = []
+    for path in root.iterdir():
+        if not path.is_dir():
+            continue
+        name = path.name
+        if not (name.startswith("c") and name[1:].isdigit()):
+            continue
+        if name in recorded or name in evidenced:
+            continue
+        if (path / "spec.json").is_file() and not (path / "coder_log.jsonl").is_file():
+            names.append(name)
+    if not names:
+        return None
+    return sorted(names, key=lambda name: int(name[1:]))[0]
+
+
+def pending_implement(camp: Path, state: dict[str, Any]) -> dict[str, Any] | None:
+    """Last decision asked for a candidate that was never finished."""
+    decisions = state.get("decisions") or []
+    if not decisions:
+        return None
+    last = decisions[-1]
+    if last.get("action") != "implement_candidate" or not last.get("ok"):
+        return None
+    if incomplete_candidate_id(camp, state) is None:
+        return None
+    return last
+
+
+def align_interrupt(camp: Path) -> dict[str, Any]:
+    """Merge decision files the state does not yet list. Does not call the planner or touch the ledger.
+
+    paused, cancelled, and finished stay as they are. Stop and pause are not rewritten here.
+    """
+    state = load_state(camp)
+    status = state.get("status")
+    known = {row.get("decision_id") for row in state.get("decisions") or []}
+    folder = camp / "decisions"
+    added = False
+    if folder.is_dir():
+        paths = sorted(folder.glob("d*.json"), key=lambda path: _decision_number(path.stem))
+        for path in paths:
+            payload = _read(path)
+            record = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
+            if not record:
+                continue
+            decision_id = str(record.get("decision_id") or path.stem)
+            if decision_id in known:
+                continue
+            row = dict(record)
+            row["decision_id"] = decision_id
+            state.setdefault("decisions", []).append(row)
+            known.add(decision_id)
+            added = True
+    if added:
+        state["status"] = status
+        save_state(camp, state)
+        state = load_state(camp)
+        if status in {"paused", "cancelled", "finished"}:
+            state["status"] = status
+            _write(camp / "campaign_state.json", state)
+    return load_state(camp)
+
+
 def request_control(camp: Path, action: str) -> None:
     """User controls live in their own file so a running worker cannot overwrite them."""
     _write(camp / "control.json", {"action": action, "at": time.time()})
@@ -215,6 +291,14 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         _launch(camp, state, services, candidate_id, fidelity)
         save_state(camp, state)
         return state
+    if pending_implement(camp, state) is not None and services.get("implement") is not None:
+        if state.get("status") not in {"paused", "cancelled"}:
+            state["status"] = "planning"
+            services["implement"](camp, state)
+            if state.get("pause_after_step") and state["status"] not in _TERMINAL and not state.get("live_job"):
+                state["status"] = "paused"
+            save_state(camp, state)
+            return state
     if state.get("llm_calls_left", 1) <= 0:
         state["status"] = "blocked"
         state["detail"] = "budget_exhausted"

@@ -48,6 +48,23 @@ def _process_state(pid: int) -> str | None:
     return fields[0]
 
 
+_RUNNING = {"R", "S", "D"}
+
+
+def worker_disconnected(pid: int) -> bool:
+    """True when the worker pid is a zombie, dead, or gone.
+
+    os.kill(pid, 0) succeeds for a zombie, so a signal check alone is not liveness.
+    R, S, and D stay alive even when the heartbeat is old.
+    """
+    if pid <= 0:
+        return True
+    state = _process_state(pid)
+    if state in _RUNNING:
+        return False
+    return True
+
+
 def _reap(pid: int) -> None:
     """Collect an exited child. A non-child raises ChildProcessError and is left alone."""
     try:

@@ -792,7 +792,7 @@ function clearDiscovery() {
 }
 
 const AGENTIC_STATUS = {
-  created: "已创建", planning: "规划中", implementing: "编写代码", checking: "检查中", training: "训练中",
+  created: "已创建", planning: "规划中", implementing: "编写代码", checking: "检查中", training: "训练中", interrupted: "已中断",
   analyzing: "分析结果", paused: "已暂停", finished: "已结束", blocked: "受阻", cancelled: "已停止",
 };
 
