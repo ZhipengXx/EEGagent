@@ -20,7 +20,8 @@ files, entrypoints, checks actually executed, remaining issues and evidence IDs.
 If the proposal needs protected changes, return requires_framework_extension with
 the specific missing interface instead of editing outside your scope.
 
-Each reply is one JSON tool call: {"tool": <name>, "args": {...}}.
+Each reply is one JSON object only: {"tool": <name>, "args": {...}}.
+Do not append tool-call markup or explanation text.
 Tools:
 - list_project_files {}
 - search_code {"query": str}

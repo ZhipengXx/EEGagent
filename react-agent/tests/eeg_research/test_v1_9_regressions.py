@@ -407,3 +407,54 @@ def test_role_backend_wraps_domain_json(tmp_path: Path, monkeypatch) -> None:
     assert reply["proposed_lessons"] == []
     rows = [json.loads(line) for line in (camp / "llm_calls.jsonl").read_text(encoding="utf-8").splitlines()]
     assert rows[-1]["success"] is True
+
+
+def test_missing_plan_version_is_rejected(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.research_plan import PlanError, apply_update, load_plan
+
+    camp, _protocol = _open_campaign(tmp_path, request_id="plan-version")
+    assert load_plan(camp)["plan_version"] == 1
+    for update in (
+        {"notes_zh": "没有版本"},
+        {"based_on_plan_version": "not-a-number", "notes_zh": "坏版本"},
+        {"based_on_plan_version": "", "notes_zh": "空版本"},
+    ):
+        with pytest.raises(PlanError, match="plan_version_missing"):
+            apply_update(camp, update, known_evidence_ids=set())
+    assert load_plan(camp)["plan_version"] == 1
+
+
+def test_tick_keeps_the_action_when_plan_update_is_bad(tmp_path: Path, monkeypatch) -> None:
+    camp, _protocol = _open_campaign(tmp_path, request_id="plan-tick")
+    state = tick(
+        camp,
+        lambda _obs: {
+            "action": "stop",
+            "reason_zh": "停",
+            "evidence_ids": [],
+            "plan_update": {"notes_zh": "漏了版本号"},
+        },
+    )
+    assert state["status"] == "finished"
+    assert state["stop_reason"] == "blocked"
+    events = [json.loads(line) for line in (camp / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    rejected = [row for row in events if row.get("event") == "plan_update_rejected"]
+    assert rejected
+    assert "plan_version_missing" in rejected[-1]["detail"]
+
+    side = tmp_path / "side"
+    side.mkdir()
+    other, _protocol = _open_campaign(side, request_id="plan-boom")
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("plan_store_down")
+
+    monkeypatch.setattr("react_agent.eeg_research.agentic.loop.apply_update", explode)
+    saved = tick(
+        other,
+        lambda _obs: {"action": "inspect_data", "reason_zh": "看数据", "evidence_ids": [], "plan_update": {"based_on_plan_version": 1}},
+    )
+    assert saved["status"] != "blocked" or saved.get("failure", {}).get("phase") != "planner"
+    assert saved["data_audit"]
+    boom = [json.loads(line) for line in (other / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert any(row.get("event") == "plan_update_rejected" and "plan_store_down" in row.get("detail", "") for row in boom)

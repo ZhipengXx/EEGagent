@@ -16,6 +16,16 @@ class PlanError(ValueError):
     """Raised when a plan update cannot be applied."""
 
 
+def _version_number(value: Any) -> int:
+    """Integer plan version. A missing or non-numeric value is a rejected update."""
+    if isinstance(value, bool) or value is None or value == "":
+        raise PlanError("plan_version_missing")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise PlanError("plan_version_missing") from exc
+
+
 def _write(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -98,7 +108,7 @@ def apply_update(
     based = update.get("based_on_plan_version")
     if based is None:
         based = update.get("plan_version")
-    if int(based) != int(plan["plan_version"]):
+    if _version_number(based) != _version_number(plan.get("plan_version")):
         raise PlanError("plan_version_conflict")
     evidence_ids = update.get("based_on_evidence_ids") or []
     if not isinstance(evidence_ids, list) or not evidence_ids:

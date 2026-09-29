@@ -485,6 +485,13 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
             apply_update(camp, raw_update, known_evidence_ids=known)
         except PlanError as exc:
             event(camp, "plan_update_rejected", detail=str(exc), decision_id=record["decision_id"])
+        except Exception as exc:
+            event(
+                camp,
+                "plan_update_rejected",
+                detail=f"{type(exc).__name__}: {exc}",
+                decision_id=record["decision_id"],
+            )
     mark_consumed(camp, record["decision_id"])
     _apply_action(camp, state, str(decision.get("action") or ""), decision, runner, services, obs)
     _finish_step(camp, state)

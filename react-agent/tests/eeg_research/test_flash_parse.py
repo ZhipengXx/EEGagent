@@ -50,6 +50,38 @@ def test_fenced_json_is_an_object() -> None:
     assert payload["tool"] == "finish_patch"
 
 
+def test_json_followed_by_dsml_keeps_the_tool_call() -> None:
+    text = """{"tool": "list_project_files", "args": {}}
+
+<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="list_project_files">
+<｜｜DSML｜｜ parameter name="args" string="true">{}</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>
+"""
+    payload = parse_json_object(text)
+    assert payload == {"tool": "list_project_files", "args": {}}
+
+
+def test_last_tool_object_wins_when_prose_follows() -> None:
+    text = """{"tool": "list_project_files", "args": {}}
+
+---
+
+{"tool": "search_code", "args": {"query": "positional"}}
+
+Let me continue step by step.
+"""
+    payload = parse_json_object(text)
+    assert payload["tool"] == "search_code"
+    assert payload["args"]["query"] == "positional"
+
+
+def test_prose_without_json_still_fails() -> None:
+    with pytest.raises(json.JSONDecodeError):
+        parse_json_object("Let me inspect the project files first.")
+
+
 def test_complete_json_reads_reasoning_and_fences() -> None:
     backend = DeepSeekBackend(FmriCheckConfig(deepseek_api_key="test-key"))
 

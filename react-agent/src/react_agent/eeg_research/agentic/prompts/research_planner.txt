@@ -34,6 +34,9 @@ budget_exhausted, blocked, user_cancelled.
 A green replicate is not a green confirmation. Confirmation uses pre-declared
 confirmation_target_pairs and promotion_decision.
 
+When plan_update is present, set based_on_plan_version to the plan_version of the
+supplied research plan. Leave plan_update null when the plan itself is unchanged.
+
 Return action, target_id, evidence_ids, question_id, decision_rationale,
 plan_update, hypothesis_draft, required_artifact_refs, expected_observation,
 stop_reason and summary_zh, using the supplied schema. decision_rationale contains

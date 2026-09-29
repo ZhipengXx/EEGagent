@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
@@ -13,6 +14,8 @@ from react_agent.fmri.prompts import DECISION_SCHEMA_TEXT, DECISION_SYSTEM, SUMM
 from react_agent.fmri.schemas import Decision, LMUsage
 
 RAW_EXCERPT_LIMIT = 2048
+_DSML_BLOCK = re.compile(r"<｜｜DSML｜｜[\s\S]*?(?:</｜｜DSML｜｜\s*calls>|$)", re.MULTILINE)
+_PREFERRED_KEYS = ("tool", "action", "schema_version")
 
 
 def message_text(message: Any) -> str:
@@ -42,10 +45,51 @@ def strip_json_fence(text: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _strip_dsml(text: str) -> str:
+    """Drop DeepSeek tool-call markup so a stray {} inside it is not the result."""
+    return _DSML_BLOCK.sub("", text)
+
+
+def _json_objects(text: str) -> list[dict[str, Any]]:
+    decoder = json.JSONDecoder()
+    found: list[dict[str, Any]] = []
+    index = 0
+    while index < len(text):
+        start = text.find("{", index)
+        if start < 0:
+            break
+        try:
+            payload, offset = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        if isinstance(payload, dict):
+            found.append(payload)
+        index = max(offset, start + 1)
+    return found
+
+
+def _choose_object(objects: list[dict[str, Any]]) -> dict[str, Any] | None:
+    preferred = [item for item in objects if any(key in item for key in _PREFERRED_KEYS)]
+    if preferred:
+        return preferred[-1]
+    return objects[-1] if objects else None
+
+
 def parse_json_object(text: str) -> dict[str, Any]:
-    payload = json.loads(strip_json_fence(text))
-    if not isinstance(payload, dict):
-        raise TypeError("json is not an object")
+    """Read one JSON object. A valid object followed by markup or prose still counts."""
+    cleaned = strip_json_fence(text)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        payload = _choose_object(_json_objects(_strip_dsml(cleaned)))
+        if payload is None:
+            raise exc
+    else:
+        if not isinstance(payload, dict):
+            payload = _choose_object(_json_objects(_strip_dsml(cleaned)))
+            if payload is None:
+                raise TypeError("json is not an object")
     return payload
 
 
