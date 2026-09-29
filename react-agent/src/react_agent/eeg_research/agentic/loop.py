@@ -13,8 +13,8 @@ from react_agent.eeg_research.agentic.comparison import compare_runs, matched_co
 from react_agent.eeg_research.agentic.contract import public_contract
 from react_agent.eeg_research.agentic.execution_protocol import load_protocol, next_unused_training_seed
 from react_agent.eeg_research.agentic.llm import LlmUnavailable
-from react_agent.eeg_research.agentic.memory import episode, retrieve
-from react_agent.eeg_research.agentic.planner import available_actions, decide, evidence_count
+from react_agent.eeg_research.agentic.memory import EpisodeStore, episode, retrieve
+from react_agent.eeg_research.agentic.planner import STOP_REASONS, available_actions, decide, evidence_count
 from react_agent.eeg_research.agentic.promotion import promotion_decision
 from react_agent.eeg_research.agentic.research_plan import (
     PlanError,
@@ -28,6 +28,21 @@ from react_agent.eeg_research.agentic.schemas import SCHEMA_VERSION
 
 _TERMINAL = {"paused", "finished", "blocked", "cancelled"}
 DEFAULT_MAX_GPU_SECONDS = 48 * 3600
+
+
+def _planner_goal(goal: dict[str, Any]) -> dict[str, Any]:
+    """Keep research switches. Drop held-out test scores so the planner cannot steer on them."""
+    public: dict[str, Any] = {}
+    for key, value in goal.items():
+        if key == "final_test_enabled":
+            public[key] = value
+            continue
+        if key == "test_result" or key.startswith("test_result"):
+            continue
+        if key.startswith("final_test_"):
+            continue
+        public[key] = value
+    return public
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -277,6 +292,7 @@ def _apply_control(camp: Path, state: dict[str, Any]) -> None:
         state["pause_after_step"] = True
     elif action == "stop":
         state["status"] = "cancelled"
+        state["stop_reason"] = "user_cancelled"
     elif action == "resume":
         state["pause_after_step"] = False
 
@@ -308,8 +324,13 @@ def _dev_row(row: dict[str, Any]) -> dict[str, Any]:
         "training_seed",
         "failures",
         "diagnostic_ref",
+        "diagnostics",
+        "comparison",
         "comparison_status",
         "job_status",
+        "promotion",
+        "local_only",
+        "status",
     )
     return {key: row.get(key) for key in keep if key in row}
 
@@ -328,8 +349,9 @@ def observation(camp: Path) -> dict[str, Any]:
             trainable.append(row["candidate_id"])
     if state.get("candidate_ready") and state.get("candidate_id") and state["candidate_id"] not in trainable:
         trainable.append(state["candidate_id"])
+    latest_job = next((row for row in reversed(state.get("evidence") or []) if row.get("job_dir") or row.get("fidelity")), None)
     return {
-        "goal": {key: value for key, value in _read(camp / "goal.json").items() if "test" not in key},
+        "goal": _planner_goal(_read(camp / "goal.json")),
         "contract": contract,
         "candidate_interface": candidate_interface(protocol),
         "evidence": evidence,
@@ -348,6 +370,8 @@ def observation(camp: Path) -> dict[str, Any]:
         ),
         "recent_decisions": (state.get("decisions") or [])[-4:],
         "last_local_result": state.get("last_local_result"),
+        "latest_comparison": None if latest_job is None else latest_job.get("comparison"),
+        "latest_diagnostics": None if latest_job is None else latest_job.get("diagnostics"),
         "_known_evidence_ids": [row.get("evidence_id") for row in evidence],
     }
 
@@ -488,17 +512,40 @@ def _apply_action(
     state["status"] = "planning"
     raw = decision.get("raw") if isinstance(decision.get("raw"), dict) else _decision_raw(camp, str(decision.get("decision_id") or ""))
     if action == "stop":
+        reason = raw.get("stop_reason") or decision.get("stop_reason")
+        if reason in {None, ""}:
+            reason = "blocked"
+        if reason not in STOP_REASONS:
+            persist_failure(
+                camp,
+                state,
+                phase="stop",
+                error_type="stop_reason_invalid",
+                detail=f"stop_reason_invalid:{reason}",
+                recoverable=True,
+            )
+            return
         state["status"] = "finished"
-        state["stop_reason"] = raw.get("stop_reason") or decision.get("reason_zh")
+        state["stop_reason"] = reason
     elif action == "inspect_data":
         state["data_audit"] = _inspect(camp)
         _append_derived(state, {"evidence_id": f"ev_audit_{len(state['evidence']) + 1}", "kind": "data_audit", "summary": state["data_audit"]})
     elif action == "retrieve_memory":
         state["memory_hits"] = [row.get("candidate_id") for row in obs.get("memory") or []]
+    elif action == "retrieve_methods":
+        _retrieve_methods(camp, state, raw, services)
     elif action == "diagnose_results":
         _append_derived(state, _diagnose(camp, state))
+    elif action == "collect_diagnostics":
+        _collect_diagnostics(camp, state)
+    elif action == "design_experiment":
+        _design_experiment(camp, state, decision, raw, services)
     elif action == "propose_experiment":
         _propose_experiment(camp, state, decision, raw)
+    elif action == "repair_candidate":
+        _repair_candidate(camp, state, services)
+    elif action == "audit_result":
+        _audit_result(camp, state, services)
     elif action == "implement_candidate":
         implementer = services.get("implement")
         if implementer is None:
@@ -533,6 +580,216 @@ def _propose_experiment(camp: Path, state: dict[str, Any], decision: dict[str, A
         _write(path, {"hypothesis": state["hypothesis"], "experiment": state["experiment"]})
     state["candidate_ready"] = False
     state["experiment_failed"] = False
+
+
+def _retrieve_methods(camp: Path, state: dict[str, Any], raw: dict[str, Any], services: Services) -> None:
+    from react_agent.eeg_research.agentic.knowledge import retrieve_methods
+    from react_agent.eeg_research.agentic.llm import LlmUnavailable
+    from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
+    from react_agent.eeg_research.agentic.schemas import ROLE_RESULT_VERSION
+
+    query = str(raw.get("query") or (state.get("hypothesis") or {}).get("mechanism") or "")
+    packed = retrieve_methods(query)
+    packed["local_only"] = True
+    packed["online"] = False
+    inputs = [camp / "goal.json", camp / "evaluation_contract.json"]
+    task = begin_role_task(camp, role="research_librarian", inputs=inputs)
+    payload = {
+        "schema_version": ROLE_RESULT_VERSION,
+        "task_id": task["task_id"],
+        "attempt_id": task["attempt_id"],
+        "input_digest": task["input_digest"],
+        "status": "completed",
+        "search_scope": packed["search_scope"],
+        "local_only": True,
+        "method_cards": packed["hits"],
+        "sources": packed["sources"],
+        "summary_zh": f"本地方法卡 {len(packed['hits'])} 条，未联网检索",
+    }
+    librarian = services.get("librarian")
+    if librarian is not None:
+        try:
+            reply = librarian({**payload, "task_id": task["task_id"], "input_digest": task["input_digest"], "online_retrieval": False})
+            if isinstance(reply, dict):
+                payload["summary_zh"] = str(reply.get("summary_zh") or payload["summary_zh"])
+                payload["payload"] = reply
+            payload["local_only"] = True
+        except LlmUnavailable:
+            payload["status"] = "partial"
+            payload["summary_zh"] = "文献角色不可用，仅返回本地方法卡"
+    path = camp / "knowledge" / "method_hits.json"
+    finish_role_task(camp, task, payload, kind="method_hits", path=path)
+    state["method_hits"] = packed["hits"]
+    _append_derived(
+        state,
+        {
+            "evidence_id": f"ev_methods_{len(state['evidence']) + 1}",
+            "kind": "method_hits",
+            "local_only": True,
+            "summary": {"n": len(packed["hits"]), "local_only": True, "query": query},
+        },
+    )
+
+
+def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, Any], raw: dict[str, Any], services: Services) -> None:
+    from react_agent.eeg_research.agentic.llm import LlmUnavailable
+    from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
+
+    spec = raw.get("experiment_draft") or state.get("experiment") or {"initial_fidelity": "pilot"}
+    if not isinstance(spec, dict):
+        spec = {"initial_fidelity": "pilot"}
+    spec = dict(spec)
+    spec["parent_candidate_id"] = spec.get("parent_candidate_id") or "baseline"
+    spec["hypothesis"] = raw.get("hypothesis_draft") or state.get("hypothesis")
+    designer = services.get("designer")
+    inputs = [camp / "goal.json"]
+    task = begin_role_task(camp, role="experiment_designer", inputs=inputs)
+    payload: dict[str, Any] = {"status": "completed", "experiment_spec": spec, "summary_zh": "已写出 ExperimentSpec"}
+    if designer is not None:
+        try:
+            reply = designer(
+                {
+                    "task_id": task["task_id"],
+                    "attempt_id": task["attempt_id"],
+                    "input_digest": task["input_digest"],
+                    "draft": spec,
+                }
+            )
+            spec_reply = None
+            if isinstance(reply, dict):
+                spec_reply = reply.get("experiment_spec")
+                inner = reply.get("payload")
+                if spec_reply is None and isinstance(inner, dict):
+                    spec_reply = inner.get("experiment_spec")
+                payload["summary_zh"] = str(reply.get("summary_zh") or payload["summary_zh"])
+            if isinstance(spec_reply, dict):
+                spec = {**spec, **spec_reply}
+        except LlmUnavailable:
+            payload["status"] = "partial"
+            payload["summary_zh"] = "设计角色不可用，使用 planner 草稿"
+    path = camp / "experiments" / f"spec_{task['task_id']}.json"
+    finish_role_task(camp, task, payload, kind="experiment_spec", path=path)
+    state["experiment"] = spec
+    state["hypothesis"] = spec.get("hypothesis") or state.get("hypothesis")
+    state["candidate_ready"] = False
+    state["experiment_failed"] = False
+    _write(camp / "hypotheses" / f"h{len(state.get('decisions') or [])}.json", {"hypothesis": state["hypothesis"], "experiment": spec})
+
+
+def _repair_candidate(camp: Path, state: dict[str, Any], services: Services) -> None:
+    repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else None
+    if not repair or int(repair.get("remaining") or 0) <= 0:
+        persist_failure(
+            camp,
+            state,
+            phase="repair_candidate",
+            error_type="no_repair_task",
+            detail="repair_candidate_requires_existing_repair_task",
+            recoverable=True,
+        )
+        return
+    implementer = services.get("implement")
+    if implementer is None:
+        persist_failure(
+            camp,
+            state,
+            phase="repair_candidate",
+            error_type="implementer_missing",
+            detail="repair_uses_existing_implement_path",
+            recoverable=True,
+        )
+        return
+    implementer(camp, state)
+
+
+def _collect_diagnostics(camp: Path, state: dict[str, Any]) -> None:
+    from react_agent.eeg_research.agentic.diagnostics import write_job_bundle
+
+    jobs = [row for row in state.get("evidence") or [] if row.get("job_dir")]
+    if not jobs:
+        _append_derived(
+            state,
+            {
+                "evidence_id": f"ev_diag_bundle_{len(state['evidence']) + 1}",
+                "kind": "diagnostic_bundle",
+                "status": "unavailable",
+                "diagnostic_ref": None,
+                "summary": {"reason": "no_job_dir"},
+            },
+        )
+        return
+    latest = jobs[-1]
+    summary = write_job_bundle(Path(str(latest["job_dir"])))
+    latest["diagnostics"] = summary
+    latest["diagnostic_ref"] = str(Path(str(latest["job_dir"])) / "diagnostic_summary.json")
+    _append_derived(
+        state,
+        {
+            "evidence_id": f"ev_diag_bundle_{len(state['evidence']) + 1}",
+            "kind": "diagnostic_bundle",
+            "status": "ready",
+            "diagnostic_ref": latest["diagnostic_ref"],
+            "summary": summary,
+        },
+    )
+
+
+def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None:
+    from react_agent.eeg_research.agentic.llm import LlmUnavailable
+    from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
+
+    latest = next((row for row in reversed(state.get("evidence") or []) if row.get("comparison") or row.get("job_dir")), None)
+    claims = []
+    verdict = "PASS"
+    if latest is None:
+        verdict = "REVISE"
+        claims.append({"claim": "no_job_result", "status": "unsupported"})
+    else:
+        if latest.get("comparison") and latest["comparison"].get("comparable"):
+            claims.append({"claim": "comparison_comparable", "status": "supported", "ref": latest.get("evidence_id")})
+        else:
+            claims.append({"claim": "comparison_comparable", "status": "unsupported", "ref": latest.get("evidence_id")})
+            verdict = "REVISE"
+        if not latest.get("diagnostics"):
+            claims.append({"claim": "diagnostics_present", "status": "unsupported"})
+            verdict = "REVISE" if verdict != "BLOCK" else verdict
+    payload = {
+        "status": "completed",
+        "verdict": verdict,
+        "claims": claims,
+        "summary_zh": "审计基于已落盘的 comparison/diagnostics，未训练模型",
+    }
+    task = begin_role_task(camp, role="result_auditor", inputs=[camp / "goal.json"])
+    auditor = services.get("auditor")
+    if auditor is not None:
+        try:
+            reply = auditor(
+                {
+                    "task_id": task["task_id"],
+                    "attempt_id": task["attempt_id"],
+                    "input_digest": task["input_digest"],
+                    "latest": latest,
+                    "draft": payload,
+                }
+            )
+            if isinstance(reply, dict):
+                payload["verdict"] = reply.get("verdict") or (
+                    reply.get("payload", {}) or {}
+                ).get("verdict") or payload["verdict"]
+                payload["summary_zh"] = str(reply.get("summary_zh") or payload["summary_zh"])
+        except LlmUnavailable:
+            payload["status"] = "partial"
+            payload["summary_zh"] = "审计角色不可用，保留确定性核查"
+    path = camp / "audits" / f"{task['task_id']}.json"
+    finish_role_task(camp, task, payload, kind="audit", path=path)
+    _append_derived(
+        state,
+        {
+            "evidence_id": f"ev_audit_result_{len(state['evidence']) + 1}",
+            "kind": "audit",
+            "summary": {"verdict": payload["verdict"], "claims": claims},
+        },
+    )
 
 
 def _append_derived(state: dict[str, Any], row: dict[str, Any]) -> None:
@@ -676,32 +933,20 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
     cost["training_jobs"] = int(state.get("training_jobs", 0))
     cost.setdefault("api_usd", None)
     _write(cost_path, cost)
-    if result.get("evaluation_valid"):
-        state["memory"].append(
-            episode(
-                task_hash=str(state.get("goal_id")),
-                candidate_id=str(result.get("candidate_id")),
-                kind="exploratory_result",
-                fidelity=str(result.get("fidelity")),
-                seed=int(record.get("seed") or 0),
-                metric=result.get("fixed_bank_top1"),
-                contract_fingerprint=str(state.get("contract_fingerprint")),
-                artifact=str(Path(result["job_dir"]) / "metrics.json"),
-            )
-        )
-    else:
-        state["memory"].append(
-            episode(
-                task_hash=str(state.get("goal_id")),
-                candidate_id=str(result.get("candidate_id")),
-                kind="implementation_failure",
-                fidelity=str(result.get("fidelity")),
-                seed=int(record.get("seed") or 0),
-                metric=None,
-                contract_fingerprint=str(state.get("contract_fingerprint")),
-                artifact=str(result["job_dir"]),
-            )
-        )
+    store = EpisodeStore(camp)
+    ep = episode(
+        task_hash=str(state.get("goal_id")),
+        candidate_id=str(result.get("candidate_id")),
+        kind="exploratory_result" if result.get("evaluation_valid") else "implementation_failure",
+        fidelity=str(result.get("fidelity")),
+        seed=int(record.get("seed") or 0),
+        metric=result.get("fixed_bank_top1") if result.get("evaluation_valid") else None,
+        contract_fingerprint=str(state.get("contract_fingerprint")),
+        artifact=str(Path(result["job_dir"]) / "metrics.json") if result.get("evaluation_valid") else str(result["job_dir"]),
+        job_id=str(record.get("job_id") or ""),
+    )
+    store.persist_episode(ep)
+    state["memory"].append(ep)
     state["evidence"].append(result)
     protocol = load_protocol(camp)
     control = matched_control(state["evidence"][:-1], result, protocol)
@@ -714,6 +959,11 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
     else:
         result.pop("delta_vs_control_pp", None)
         result.pop("control_id", None)
+    from react_agent.eeg_research.agentic.diagnostics import write_job_bundle
+
+    diagnostics = write_job_bundle(Path(result["job_dir"]))
+    result["diagnostics"] = diagnostics
+    result["diagnostic_ref"] = str(Path(result["job_dir"]) / "diagnostic_summary.json")
     goal = _read(camp / "goal.json")
     paired = [
         float(row["delta_vs_control_pp"])
@@ -723,9 +973,14 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
         and row.get("delta_vs_control_pp") is not None
         and row.get("evaluation_valid")
     ]
-    promo = promotion_decision(comparison=comparison, goal=goal, paired_deltas_pp=paired)
+    promo = promotion_decision(
+        comparison=comparison,
+        goal=goal,
+        paired_deltas_pp=paired,
+        fidelity=str(result.get("fidelity") or ""),
+    )
     result["promotion"] = promo
-    _write(camp / "comparisons" / f"{result['evidence_id']}.json", {"comparison": comparison, "promotion": promo})
+    _write(camp / "comparisons" / f"{result['evidence_id']}.json", {"comparison": comparison, "promotion": promo, "diagnostics": diagnostics})
     event(camp, "job_settled", job_id=record.get("job_id"), status=record.get("status"), valid=result.get("evaluation_valid"))
 
 

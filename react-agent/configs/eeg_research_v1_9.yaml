@@ -1,0 +1,55 @@
+# EEGagent V1.9 research runtime (sample)
+
+# This file documents roles and policies. It does not start a campaign
+# and does not authorize GPU or API spend.
+
+schema_version: eeg_research.v1.9
+sample_only: true
+spawn_worker: false
+roles:
+  research_planner:
+    provider: deepseek
+    profile: fast
+    max_output_tokens: 16384
+    schema_repair_limit: 1
+  research_librarian:
+    provider: deepseek
+    profile: fast
+    max_output_tokens: 16384
+    schema_repair_limit: 1
+  experiment_designer:
+    provider: deepseek
+    profile: fast
+    max_output_tokens: 16384
+    schema_repair_limit: 1
+  candidate_coder:
+    provider: deepseek
+    profile: fast
+    max_output_tokens: 16384
+    schema_repair_limit: 1
+  candidate_reviewer:
+    provider: deepseek
+    profile: fast
+    max_output_tokens: 16384
+    schema_repair_limit: 1
+  result_analyst:
+    provider: deepseek
+    profile: fast
+    max_output_tokens: 16384
+    schema_repair_limit: 1
+  memory_curator:
+    provider: deepseek
+    profile: fast
+    max_output_tokens: 16384
+    schema_repair_limit: 1
+  result_auditor:
+    provider: deepseek
+    profile: fast
+    max_output_tokens: 16384
+    schema_repair_limit: 1
+negative_sampling:
+  baseline: data_parallel_local
+  custom_objective: global_batch
+capabilities:
+  available: [build_encoder, fit_statistics, build_training_transform, build_training_objective, evaluate_only]
+  unavailable: [classification, reconstruction, raw_preprocessing, foundation_model]

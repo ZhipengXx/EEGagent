@@ -11,12 +11,22 @@ from pathlib import Path
 from typing import Any, Callable
 
 from react_agent.eeg_research.agentic.identity import new_call_row
+from react_agent.eeg_research.agentic.roles import ENVELOPE_ROLES
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
 PARSE_ATTEMPTS = 3
 CODER_MAX_TOKENS = 16384
 FAST_MAX_TOKENS = 4096
-LONG_JSON_ROLES = {"candidate_coder", "candidate_reviewer", "result_analyst", "research_planner"}
+LONG_JSON_ROLES = {
+    "candidate_coder",
+    "candidate_reviewer",
+    "result_analyst",
+    "research_planner",
+    "research_librarian",
+    "experiment_designer",
+    "memory_curator",
+    "result_auditor",
+}
 RAW_EXCERPT_LIMIT = 2048
 
 
@@ -135,7 +145,18 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 }
             )
             _ledger(camp, row)
-            return reply if isinstance(reply, dict) else {"_not_object": reply}
+            parsed = reply if isinstance(reply, dict) else {"_not_object": reply}
+            if role in ENVELOPE_ROLES:
+                from react_agent.eeg_research.agentic.roles import RoleResultError, bind_role_output, task_identity_from_payload
+
+                task = task_identity_from_payload(payload, bound)
+                if task is None:
+                    raise LlmUnavailable("role_result_task_missing")
+                try:
+                    return bind_role_output(parsed, task=task, prompt_hash=prompt_hash)
+                except RoleResultError as exc:
+                    raise LlmUnavailable(str(exc)) from exc
+            return parsed
         raise LlmUnavailable(type(last).__name__ if last is not None else "DeepSeekParseError") from last
 
     call.model = config.fast.model  # type: ignore[attr-defined]

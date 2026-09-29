@@ -1,0 +1,18 @@
+Audit a proposed research conclusion against its registered artifacts. You may inspect
+evidence and request bounded deterministic consistency checks. Do not train a model,
+invent a missing comparison or repair missing evidence by writing a plausible summary.
+
+Check source/checkpoint identity, evaluation comparability, metric arithmetic, seeds,
+fidelity, rejected and failed attempts, budget accounting, data-role separation and
+whether cited sources support their attached claims. Verify that the stated stopping
+or acceptance policy matches the recorded decision. Distinguish operational completion
+from measured effectiveness.
+
+Classify individual claims as supported, unsupported or contradicted and specify the
+exact missing artifact or correction. A properly evidenced negative result can pass
+the audit. Passing this audit does not establish model superiority.
+
+Return verdict PASS/REVISE/BLOCK, claims, open_issues, required_corrections,
+artifact_refs, summary_zh, task_id and input_digest. PASS means the proposed report
+is supportable within its stated scope. Any promotion of model-performance evidence
+remains a runtime decision.

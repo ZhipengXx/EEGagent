@@ -73,7 +73,7 @@ def build_loaders(design: Design, data_root: Path, identity: dict | None = None)
     import torch
     from torch.utils.data import DataLoader
 
-    from react_agent.eeg_training.data import RetrievalTrials, collect_records, load_feature_cache
+    from react_agent.eeg_training.data import RetrievalTrials, collate_retrieval, collect_records, load_feature_cache
 
     plan = split_plan(data_root, design)
     forbidden_paths = set(plan.forbidden_files)
@@ -106,8 +106,18 @@ def build_loaders(design: Design, data_root: Path, identity: dict | None = None)
         raise SplitError("train_validation_overlap")
     train_set = RetrievalTrials(train_records, timesteps)
     val_set = RetrievalTrials(val_records, timesteps)
-    train_loader = DataLoader(train_set, batch_size=min(design.batch_size, len(train_set)), shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=min(200, len(val_set)), shuffle=False)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=min(design.batch_size, len(train_set)),
+        shuffle=True,
+        collate_fn=collate_retrieval,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=min(200, len(val_set)),
+        shuffle=False,
+        collate_fn=collate_retrieval,
+    )
     return train_loader, val_loader, train_images, val_images, spec
 
 
@@ -289,7 +299,7 @@ def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, 
         return None
     from torch.utils.data import DataLoader
 
-    from react_agent.eeg_training.data import RetrievalTrials, collect_records, load_feature_cache
+    from react_agent.eeg_training.data import RetrievalTrials, collate_retrieval, collect_records, load_feature_cache
 
     spec = geometry(design.dataset)
     channels = spec["channels"]
@@ -304,7 +314,7 @@ def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, 
     if not records:
         return None
     dataset = RetrievalTrials(records, timesteps)
-    loader = DataLoader(dataset, batch_size=min(200, len(dataset)), shuffle=False)
+    loader = DataLoader(dataset, batch_size=min(200, len(dataset)), shuffle=False, collate_fn=collate_retrieval)
     encoder = _load_encoder(spec, checkpoint, out_dir)
     result = _fixed_bank_pass(encoder, loader, records)
     return {
@@ -382,7 +392,7 @@ def _fixed_bank_pass(encoder, loader, records) -> dict[str, float]:
 
 
 def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
-    """Score an existing checkpoint. The trial's metrics, curve and checkpoint are not rewritten."""
+    """Score an existing checkpoint on frozen validation. Final test is not computed."""
     limit_visible_gpus(design)
     import torch
 
@@ -401,7 +411,8 @@ def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path) -> dict[
         "fixed_bank_top5": validation["fixed_bank_top5"],
         "query_count": validation["query_count"],
         "candidate_count": validation["candidate_count"],
-        "test_result": score_held_out(design, data_root, out_dir),
+        "test_result": None,
+        "evaluate_only": True,
     }
 
 
@@ -432,16 +443,19 @@ def train_channel_statistics(train_loader) -> dict[str, object]:
     }
 
 
-def _build_encoder(spec: dict[str, object], out_dir: Path, train_loader=None):
-    """Build the baseline, or the candidate module named by the job environment."""
+def _instantiate_candidate(spec: dict[str, object], out_dir: Path, train_loader=None):
+    """Build the candidate plugin and encoder. Missing hooks stay None, not invented."""
     module_name = os.environ.get("EEG_CANDIDATE_MODULE", "")
     candidate_path = os.environ.get("EEG_CANDIDATE_PATH", "")
     if candidate_path and candidate_path not in sys.path:
         sys.path.insert(0, candidate_path)
+    used_fit = False
     if not module_name:
-        from react_agent.eeg_training.model import EEGProjectLayer
+        from react_agent.eeg_research.agentic.baseline import EEGCandidate
 
-        return EEGProjectLayer(z_dim=1024, c_num=int(spec["c_num"]), timesteps=list(spec["timesteps"]))
+        candidate = EEGCandidate()
+        encoder = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
+        return encoder, candidate, "react_agent.eeg_research.agentic.baseline", used_fit
     import importlib
 
     from react_agent.eeg_research.agentic.binding import write_binding
@@ -453,8 +467,36 @@ def _build_encoder(spec: dict[str, object], out_dir: Path, train_loader=None):
         stats = train_channel_statistics(train_loader)
         candidate.fit_statistics(encoder, stats)
         (out_dir / "train_statistics.json").write_text(json.dumps(stats), encoding="utf-8")
+        used_fit = True
     write_binding(out_dir, candidate)
+    return encoder, candidate, module_name, used_fit
+
+
+def _build_encoder(spec: dict[str, object], out_dir: Path, train_loader=None):
+    """Build the baseline, or the candidate module named by the job environment."""
+    encoder, _candidate, _module, _used = _instantiate_candidate(spec, out_dir, train_loader)
     return encoder
+
+
+def _logit_scale(encoder, device):
+    import torch
+    from torch.nn import functional as F
+
+    raw = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
+    if hasattr(raw, "logit_scale") and hasattr(raw, "softplus"):
+        return raw.softplus(raw.logit_scale)
+    if hasattr(raw, "logit_scale"):
+        return F.softplus(raw.logit_scale)
+    return torch.ones([], device=device)
+
+
+def _batch_image_ids(batch) -> list[str]:
+    ids = batch.get("image_id") if isinstance(batch, dict) else None
+    if ids is None:
+        return []
+    if isinstance(ids, (list, tuple)):
+        return [str(item) for item in ids]
+    return []
 
 
 def placed_retrieval(encoder, device, n_visible: int):
@@ -475,11 +517,22 @@ def placed_retrieval(encoder, device, n_visible: int):
 
 def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     """Train on validation top-1 and write metrics only after a completed loop."""
+    import hashlib
+
     limit_visible_gpus(design)
     begin_history(out_dir, design.epochs)
     import torch
 
     from react_agent.eeg_training.fixed_bank import FixedBankTally, frozen_bank
+    from react_agent.eeg_training.hooks import (
+        apply_train_transform,
+        capabilities_used_payload,
+        compute_objective,
+        is_custom_objective,
+        note_eval_without_transform,
+        objective_parameters,
+    )
+    from react_agent.eeg_training.model import contrastive_loss, within_batch_accuracy
 
     if not torch.cuda.is_available():
         raise SplitError("cuda_unavailable")
@@ -490,9 +543,40 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         design, data_root, identity=_frozen_identity(out_dir)
     )
     device = torch.device("cuda:0")
-    encoder = _build_encoder(spec, out_dir, train_loader).to(device)
-    model: torch.nn.Module = placed_retrieval(encoder, device, len(design.gpu))
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate(design), weight_decay=design.weight_decay)
+    encoder, candidate, module_name, used_fit = _instantiate_candidate(spec, out_dir, train_loader)
+    encoder = encoder.to(device)
+    transform = candidate.build_training_transform() if hasattr(candidate, "build_training_transform") else None
+    objective = candidate.build_training_objective() if hasattr(candidate, "build_training_objective") else contrastive_loss
+    if isinstance(objective, torch.nn.Module):
+        objective = objective.to(device)
+    counters: dict[str, int] = {
+        "transform_train_calls": 0,
+        "transform_eval_calls": 0,
+        "objective_train_calls": 0,
+    }
+    try:
+        objective._call_counts = counters  # type: ignore[attr-defined]
+    except (AttributeError, TypeError):
+        pass
+    custom = is_custom_objective(objective)
+    negative_policy = "global_batch" if custom else "data_parallel_local"
+    n_visible = len(design.gpu)
+    extra = objective_parameters(objective)
+    model: torch.nn.Module | None = None
+    if custom:
+        wrapped = encoder
+        if n_visible > 1:
+            wrapped = torch.nn.DataParallel(encoder, device_ids=list(range(n_visible)))
+        params = list(encoder.parameters()) + extra
+        optimizer = torch.optim.AdamW(params, lr=learning_rate(design), weight_decay=design.weight_decay)
+    else:
+        model = placed_retrieval(encoder, device, n_visible)
+        optimizer = torch.optim.AdamW(
+            list(model.parameters()) + extra,
+            lr=learning_rate(design),
+            weight_decay=design.weight_decay,
+        )
+        wrapped = None
     bank, bank_labels = frozen_bank(val_loader.dataset.records)
     bank = bank.to(device)
     bank_labels = bank_labels.to(device)
@@ -502,12 +586,31 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     best_within = None
     finished = 0
     early_stop_enabled = design.stop in {"single_early", "chain_early"}
+    duplicate_batches: list[list[str]] = []
     write_status(out_dir, "training", 0, design.epochs)
     for epoch_index in range(design.epochs):
-        model.train()
+        if custom:
+            encoder.train()
+            if isinstance(objective, torch.nn.Module):
+                objective.train()
+        else:
+            assert model is not None
+            model.train()
         losses: list[float] = []
         for batch in train_loader:
-            loss, _top1, _top5 = model(batch["eeg"].to(device), batch["img_features"].to(device))
+            eeg = apply_train_transform(transform, batch["eeg"].to(device), counters)
+            img = batch["img_features"].to(device)
+            ids = _batch_image_ids(batch)
+            if ids:
+                duplicate_batches.append(ids)
+            if custom:
+                assert wrapped is not None
+                eeg_z = wrapped(eeg)
+                scale = _logit_scale(encoder, device)
+                loss = compute_objective(objective, eeg_z, img, scale, ids)
+            else:
+                assert model is not None
+                loss, _top1, _top5 = model(eeg, img)
             loss = loss.mean()
             losses.append(float(loss))
             optimizer.zero_grad(set_to_none=True)
@@ -516,15 +619,31 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         scores_top1: list[float] = []
         scores_top5: list[float] = []
         tally = FixedBankTally(bank, bank_labels)
-        raw = model.module if isinstance(model, torch.nn.DataParallel) else model
-        model.eval()
-        with torch.no_grad():
-            for batch in val_loader:
-                eeg = batch["eeg"].to(device)
-                _loss, top1, top5 = model(eeg, batch["img_features"].to(device))
-                scores_top1.append(float(top1.mean()))
-                scores_top5.append(float(top5.mean()))
-                tally.add(raw.encoder(eeg))
+        if custom:
+            raw_encoder = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
+            encoder.eval()
+            note_eval_without_transform(counters)
+            with torch.no_grad():
+                for batch in val_loader:
+                    eeg = batch["eeg"].to(device)
+                    embedding = raw_encoder(eeg)
+                    tally.add(embedding)
+                    top1, top5 = within_batch_accuracy(embedding, batch["img_features"].to(device))
+                    scores_top1.append(float(top1))
+                    scores_top5.append(float(top5))
+        else:
+            assert model is not None
+            raw = model.module if isinstance(model, torch.nn.DataParallel) else model
+            raw_encoder = raw.encoder
+            model.eval()
+            note_eval_without_transform(counters)
+            with torch.no_grad():
+                for batch in val_loader:
+                    eeg = batch["eeg"].to(device)
+                    _loss, top1, top5 = model(eeg, batch["img_features"].to(device))
+                    scores_top1.append(float(top1.mean()))
+                    scores_top5.append(float(top5.mean()))
+                    tally.add(raw_encoder(eeg))
         finished = epoch_index + 1
         fixed = tally.result()
         val_top1 = sum(scores_top1) / len(scores_top1)
@@ -545,12 +664,37 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             best_top5 = fixed["fixed_bank_top5"]
             best_within = val_top1
             stall = 0
-            torch.save({"state_dict": raw.encoder.state_dict()}, out_dir / "last.ckpt")
+            payload = {"state_dict": raw_encoder.state_dict()}
+            if isinstance(objective, torch.nn.Module):
+                payload["objective_state"] = objective.state_dict()
+            torch.save(payload, out_dir / "last.ckpt")
         else:
             stall += 1
         if early_stop_enabled and stall >= 5:
             break
     write_status(out_dir, "finished", finished, design.epochs)
+    if duplicate_batches:
+        (out_dir / "train_batch_image_ids.jsonl").write_text(
+            "\n".join(json.dumps(row) for row in duplicate_batches[:64]) + "\n",
+            encoding="utf-8",
+        )
+    encoder_params = sum(int(item.numel()) for item in encoder.parameters())
+    objective_params = sum(int(item.numel()) for item in extra)
+    used = capabilities_used_payload(
+        module=module_name,
+        hooks={
+            "build_encoder": True,
+            "fit_statistics": used_fit,
+            "build_training_transform": transform is not None,
+            "build_training_objective": True,
+            "evaluate_only": False,
+        },
+        parameter_counts={"encoder": encoder_params, "objective": objective_params},
+        counters=counters,
+        negative_policy=negative_policy,
+        config_hash=hashlib.sha256(json.dumps({"spec": spec, "seed": design.seed}, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16],
+    )
+    (out_dir / "capabilities_used.json").write_text(json.dumps(used, ensure_ascii=False, indent=2), encoding="utf-8")
     return {
         "primary_metric": best,
         "metric_name": "fixed_bank_top1",
@@ -563,6 +707,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         "validation_image_count": len(set(val_images)),
         "validation_image_ids": sorted(set(val_images)),
         "train_validation_overlap": False,
+        "negative_sampling_policy": negative_policy,
     }
 
 

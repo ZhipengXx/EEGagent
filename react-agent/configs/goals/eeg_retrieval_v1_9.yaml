@@ -1,0 +1,39 @@
+# SAMPLE GoalSpec. Loading this file does not start a worker and is not
+# authorization to spend 12 jobs, 120 LLM calls, or 28800 GPU seconds.
+# Runtime uses a Goal the user actually submits.
+
+schema_version: eeg_research.v1.9
+goal_id: retrieval_development_v19
+task_type: eeg_image_retrieval
+objective: 在冻结协议下改进 EEG 到图像的检索，并留下可复现的候选与负结果
+generalization_target: resolve_from_actual_split
+primary_metric: validation.fixed_gallery_top1
+direction: maximize
+final_test_enabled: false
+allowed_capabilities: resolve_from_verified_registry
+split_seed: 0
+training_seeds: [0, 1, 2]
+max_candidates: 4
+max_training_jobs: 12
+max_llm_calls: 120
+max_gpu_seconds: 28800
+max_concurrent_training_jobs: 1
+min_practical_gain_pp: null
+confirmation_target_pairs: 3
+max_schema_repairs: 1
+max_implementation_repairs: 2
+max_no_progress_decisions: 3
+allowed_changes:
+  - eeg_encoder
+  - temporal_pooling
+  - projection_head
+  - training_loss
+  - training_only_augmentation
+frozen_components:
+  - split_manifest
+  - query_gallery_manifest
+  - evaluator
+  - metric_definition
+  - image_feature_target
+sample_only: true
+spawn_worker: false

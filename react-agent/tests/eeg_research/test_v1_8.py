@@ -547,7 +547,7 @@ def test_coder_must_write_after_two_reads_and_extension_is_answered_once(tmp_pat
     outcome = implement(tmp_path / "ws", {}, backend, python=sys.executable)
     assert outcome["status"] == "ready_for_review"
     log = [json.loads(line) for line in (tmp_path / "ws" / "coder_log.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert log[2]["result"]["error"] == "write_required"
+    assert log[2]["result"]["error"] == "repeated_read"
     assert log[3]["result"]["error"] == "interface_already_available"
 
 

@@ -51,8 +51,21 @@ def read_code(workspace: Path, relative: str, start: int = 1, end: int = 200) ->
         if not _allowed(workspace, target) or not target.is_file():
             return {"ok": False, "error": "read_refused"}
     lines = target.read_text(encoding="utf-8").splitlines()
-    chunk = lines[max(0, start - 1) : end]
-    return {"ok": True, "text": "\n".join(chunk)[:4000]}
+    total = len(lines)
+    start = max(1, int(start))
+    end = int(end)
+    chunk = lines[start - 1 : end]
+    truncated = end < total
+    next_range = {"start": end + 1, "end": min(total, end + max(1, end - start + 1))} if truncated else None
+    return {
+        "ok": True,
+        "text": "\n".join(chunk)[:4000],
+        "truncated": truncated,
+        "next_range": next_range,
+        "total_lines": total,
+        "start": start,
+        "end": min(end, total),
+    }
 
 
 def search_code(workspace: Path, query: str) -> dict[str, Any]:

@@ -141,6 +141,19 @@ class RoleResult(BaseModel):
     summary_zh: str = ""
 
 
+class ExperimentSpec(BaseModel):
+    """Executable experiment. Designer writes this; it is not a new scientific candidate by itself."""
+
+    model_config = ConfigDict(extra="allow")
+
+    parent_candidate_id: str = "baseline"
+    intervention: str = ""
+    initial_fidelity: Literal["pilot", "full"] = "pilot"
+    required_capability_ids: list[str] = Field(default_factory=list)
+    seed_policy: str = "unused_training_seed"
+    confirmation_target_pairs: int | None = None
+
+
 def comparison_key(protocol: dict[str, Any], fidelity: str) -> str:
     """Identity that must match before two full runs can be compared."""
     return "|".join(

@@ -977,28 +977,35 @@ function agenticSwitch(rows) {
 function agenticBody(camp) {
   const budget = camp.budget || {};
   const last = (camp.decisions || []).slice(-1)[0] || {};
-  const best = (camp.experiments || []).filter((row) => row.evaluation_valid && row.candidate_id !== "baseline")
-    .sort((a, b) => (b.delta_vs_control_pp ?? -1e9) - (a.delta_vs_control_pp ?? -1e9))[0];
+  const best = camp.best_full || null;
   const progress = camp.live_progress ? `（epoch ${esc(camp.live_progress.epoch)} / ${esc(camp.live_progress.epochs)}）` : "";
-  const expRows = (camp.experiments || []).map((row) => `<tr><td>${esc(row.candidate_id === "baseline" ? "对照" : row.candidate_id)}</td><td>${esc(row.fidelity === "pilot" ? "试跑" : "完整")}</td><td>${row.fixed_bank_top1 == null ? "未评估" : formatTick(row.fixed_bank_top1)}</td><td>${row.delta_vs_control_pp == null ? "—" : `${row.delta_vs_control_pp > 0 ? "+" : ""}${esc(row.delta_vs_control_pp)} pp`}</td><td>${row.evaluation_valid ? (row.candidate_id === "baseline" ? "对照" : "暂未确认") : `无效：${esc(row.reason || "")}`}</td></tr>`).join("");
+  const rowHtml = (row) => `<tr><td>${esc(row.candidate_id === "baseline" ? "对照" : row.candidate_id)}</td><td>${row.fixed_bank_top1 == null ? "未评估" : formatTick(row.fixed_bank_top1)}</td><td>${row.delta_vs_control_pp == null ? "—" : `${row.delta_vs_control_pp > 0 ? "+" : ""}${esc(row.delta_vs_control_pp)} pp`}</td><td>${row.evaluation_valid ? (row.candidate_id === "baseline" ? "对照" : (row.confirmation || row.promotion_tier || "开发结果")) : `无效：${esc(row.reason || "")}`}</td></tr>`;
+  const pilotRows = (camp.pilot_rows || []).map(rowHtml).join("");
+  const fullRows = (camp.full_rows || []).map(rowHtml).join("");
   const candidates = (camp.candidates || []).map((row) => `<details data-keep="candidate-${esc(camp.campaign_id)}-${esc(row.candidate_id)}"><summary>${esc(row.candidate_id)} · ${esc(row.status)}</summary>${row.review_summary ? `<p class="agentic-prose">${renderProse(row.review_summary)}</p>` : ""}<pre class="agentic-source">${esc(row.source || "没有写出文件")}</pre></details>`).join("");
   const analyses = (camp.analyses || []).filter(Boolean).map((row) => `<p class="agentic-prose">${renderProse(row.summary_zh || "")}</p>`).join("");
   const decisions = (camp.decisions || []).slice().reverse().map(decisionCard).join("");
   const detail = camp.detail ? (AGENTIC_DETAIL[camp.detail] || camp.detail) : "";
-  const gpu = budget.gpu_seconds_used == null ? "未记录" : Math.round(budget.gpu_seconds_used);
+  const gpuUsed = budget.gpu_seconds_used == null ? "未记录" : Math.round(budget.gpu_seconds_used);
+  const gpuReserved = budget.gpu_seconds_reserved == null ? "—" : Math.round(budget.gpu_seconds_reserved);
+  const gpuLeft = budget.gpu_seconds_left == null ? "—" : Math.round(budget.gpu_seconds_left);
   const fee = budget.api_usd == null ? "未记录" : esc(budget.api_usd);
   const brief = firstClause(last.reason_zh || "");
+  const bestLine = best
+    ? `${esc(best.candidate_id)} 相对对照 ${best.delta_vs_control_pp > 0 ? "+" : ""}${esc(best.delta_vs_control_pp)} pp<span class="agentic-sub">完整 · 可比</span>`
+    : "没有可比的完整结果";
   return `<h2>代码级研究 · ${esc(camp.objective || camp.campaign_id)}</h2>
       <p class="muted">${esc(camp.campaign_id || "")}</p>
       <p class="muted">${esc(camp.scope_zh || "")}。验证固定候选集 top1 用于比较，测试集本轮关闭。</p>
       <div class="agentic-summary">
         <div><span class="muted">当前问题</span><p>${esc(hypothesisLine(camp.hypothesis))}</p></div>
         <div><span class="muted">正在做什么</span><p>${esc(AGENTIC_STATUS[camp.status] || camp.status)}${progress}${detail ? `<span class="agentic-sub">${esc(detail)}</span>` : ""}</p></div>
-        <div><span class="muted">最好可比结果</span><p>${best ? `${esc(best.candidate_id)} 相对对照 ${best.delta_vs_control_pp > 0 ? "+" : ""}${esc(best.delta_vs_control_pp)} pp<span class="agentic-sub">${best.fidelity === "pilot" ? "试跑" : "完整"}，暂未确认</span>` : "未评估"}</p></div>
-        <div><span class="muted">剩余预算</span><ul class="agentic-budget"><li>训练 ${esc(budget.training_jobs ?? 0)}/${esc(budget.max_training_jobs ?? "—")}</li><li>模型调用 ${esc(budget.llm_calls ?? 0)}/${esc(budget.max_llm_calls ?? "—")}</li><li>GPU 秒 ${esc(gpu)}</li><li>费用 ${fee}</li></ul></div>
+        <div><span class="muted">最好可比完整结果</span><p>${bestLine}</p></div>
+        <div><span class="muted">剩余预算</span><ul class="agentic-budget"><li>训练 ${esc(budget.training_jobs ?? 0)}/${esc(budget.max_training_jobs ?? "—")}</li><li>模型调用 ${esc(budget.llm_calls ?? 0)}/${esc(budget.max_llm_calls ?? "—")}</li><li>GPU 已用 ${esc(gpuUsed)}</li><li>GPU 预留 ${esc(gpuReserved)}</li><li>GPU 剩余 ${esc(gpuLeft)}</li><li>费用 ${fee}</li></ul></div>
       </div>
       <p class="agentic-note">最近决定：${esc(last.action_zh || "—")}${brief ? `。${esc(brief)}` : ""}</p>
-      <div class="trial-trace"><h3>实验</h3><div class="trial-scroll"><table><thead><tr><th>改动</th><th>阶段</th><th>开发指标</th><th>相对对照</th><th>证据状态</th></tr></thead><tbody>${expRows || `<tr><td colspan="5">还没有训练</td></tr>`}</tbody></table></div></div>
+      <div class="trial-trace"><h3>试跑</h3><div class="trial-scroll"><table><thead><tr><th>改动</th><th>开发指标</th><th>相对对照</th><th>证据状态</th></tr></thead><tbody>${pilotRows || `<tr><td colspan="4">还没有试跑</td></tr>`}</tbody></table></div></div>
+      <div class="trial-trace"><h3>完整训练</h3><div class="trial-scroll"><table><thead><tr><th>改动</th><th>开发指标</th><th>相对对照</th><th>证据状态</th></tr></thead><tbody>${fullRows || `<tr><td colspan="4">还没有完整训练</td></tr>`}</tbody></table></div></div>
       ${analyses ? `<h3>结果分析</h3>${analyses}` : ""}
       ${candidates ? `<h3>候选代码</h3>${candidates}` : ""}
       <details data-keep="decisions-${esc(camp.campaign_id)}"><summary>决策记录</summary><div class="agentic-decisions">${decisions}</div></details>

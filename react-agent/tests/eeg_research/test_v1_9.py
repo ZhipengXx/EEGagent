@@ -237,7 +237,9 @@ def test_method_cards_are_local() -> None:
     from react_agent.eeg_research.agentic.knowledge import retrieve_methods
 
     hits = retrieve_methods("projection scale contrastive")
-    assert hits and hits[0]["id"] == "projection_scale"
+    assert hits["local_only"] is True
+    assert hits["hits"][0]["id"] == "projection_scale"
+    assert hits["hits"][0]["retrieval"] == "local_only"
 
 
 def _goal(**kwargs) -> dict:
@@ -530,3 +532,237 @@ def test_other_subjects_test_does_not_freeze_empty_queries(tmp_path: Path) -> No
     with pytest.raises(ProtocolError):
         build_execution_protocol(design, tmp_path)
     assert not (tmp_path / "execution_protocol.json").exists()
+
+
+def test_unavailable_diagnostics_are_not_empty_fakes(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.diagnostics import CATEGORIES, summarize_bundle
+    from react_agent.eeg_training.diagnostics import UNAVAILABLE, compute_job_diagnostics
+
+    bundle = compute_job_diagnostics(tmp_path / "empty_job")
+    for name in CATEGORIES:
+        assert name in bundle
+        assert bundle[name]["status"] in {"observed", UNAVAILABLE}
+        if bundle[name]["status"] == UNAVAILABLE:
+            assert bundle[name].get("reason")
+            assert bundle[name].get("payload") in (None, {}) or "reason" in bundle[name]
+    summary = summarize_bundle(bundle)
+    assert summary["items"]["retrieval_errors"]["status"] == UNAVAILABLE
+
+
+def test_librarian_is_local_only_and_records_a_task(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.contract import freeze_contract
+    from react_agent.eeg_research.agentic.loop import create_campaign, load_state, tick
+    from react_agent.eeg_research.agentic.task_ledger import latest
+
+    design = _design(tmp_path)
+    contract = freeze_contract(design, tmp_path)
+    create_campaign(tmp_path, goal=_goal(), contract=contract, request_id="lib")
+    camp = tmp_path / "goal"
+    tick(camp, lambda _obs: {"action": "retrieve_methods", "reason_zh": "查方法", "evidence_ids": [], "query": "temporal encoder"})
+    state = load_state(camp)
+    hits = [row for row in state["evidence"] if row.get("kind") == "method_hits"]
+    assert hits
+    assert hits[0]["local_only"] is True
+    payload = json.loads((camp / "knowledge" / "method_hits.json").read_text(encoding="utf-8"))
+    assert payload["local_only"] is True
+    assert payload["schema_version"] == "eeg_research.role_result.v1"
+    assert latest(camp, payload["task_id"])["status"] == "completed"
+
+
+def test_replicate_is_not_confirmation() -> None:
+    from react_agent.eeg_research.agentic.promotion import promotion_decision
+
+    promo = promotion_decision(
+        comparison={"comparable": True, "delta_pp": 1.2, "reason": "matched_control"},
+        goal={"min_practical_gain_pp": None, "confirmation_target_pairs": 3},
+        paired_deltas_pp=[1.2, 0.9],
+        fidelity="full",
+    )
+    assert promo["replicate_status"] == "replicated_seed"
+    assert promo["confirmation"] == "provisional_improvement"
+    assert promo["status"] == "provisional"
+    assert promo["tier"] != "confirmation"
+
+
+def test_lesson_cannot_rewrite_episode(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.memory import EpisodeStore, episode
+
+    store = EpisodeStore(tmp_path)
+    saved = store.persist_episode(
+        episode(
+            task_hash="g",
+            candidate_id="c1",
+            kind="exploratory_result",
+            fidelity="full",
+            seed=0,
+            metric=0.1,
+            contract_fingerprint="fp",
+            artifact="a",
+        )
+    )
+    with pytest.raises(PermissionError, match="episode_immutable"):
+        store.update_episode(saved["episode_id"], primary_metric=0.99)
+    rejected = store.accept_lessons(
+        {
+            "proposed_lessons": [
+                {
+                    "supporting_episode_ids": [saved["episode_id"]],
+                    "evidence_level": "confirmed_result",
+                    "observed_effect": "win",
+                }
+            ]
+        }
+    )
+    assert rejected["rejected"]
+    assert rejected["rejected"][0]["reason"] == "evidence_level_exceeds_runs"
+    assert store.list_episodes()[0]["primary_metric"] == 0.1
+
+
+def test_export_pack_is_evaluate_only(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.cli import main
+    from react_agent.eeg_research.agentic.export import pack_candidate, pack_is_rebuildable
+
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "last.ckpt").write_bytes(b"ckpt")
+    (job / "source_binding.json").write_text(json.dumps({"module": "eeg_candidate"}), encoding="utf-8")
+    (job / "evaluation_identity.json").write_text("{}", encoding="utf-8")
+    dest = tmp_path / "pack"
+    manifest = pack_candidate(job, dest)
+    assert manifest["evaluate_only"] is True
+    assert manifest["final_test"] is False
+    ok, reason = pack_is_rebuildable(dest)
+    assert ok is True
+    assert reason == "ok"
+    code = main(["evaluate-export", "--pack", str(dest)])
+    assert code == 0
+
+
+def test_validate_goal_does_not_spawn() -> None:
+    from react_agent.eeg_research.agentic.cli import load_goal_file, main
+    from react_agent.eeg_research.agentic.planner import decide
+
+    path = Path(__file__).resolve().parents[2] / "configs" / "goals" / "eeg_retrieval_v1_9.yaml"
+    goal = load_goal_file(path)
+    assert goal["max_training_jobs"] == 12
+    assert goal["max_llm_calls"] == 120
+    assert goal["max_gpu_seconds"] == 28800
+    blocked = decide(
+        {"available_actions": ["stop"], "_known_evidence_ids": []},
+        lambda _obs: {"action": "invent", "reason_zh": "x", "evidence_ids": []},
+    )
+    assert blocked["ok"] is False
+    assert "unknown_action" in str(blocked["detail"])
+    code = main(["validate-goal", "--goal", str(path)])
+    assert code == 0
+
+
+def test_view_splits_pilot_and_full(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.contract import freeze_contract
+    from react_agent.eeg_research.agentic.loop import create_campaign, load_state, save_state
+    from react_agent.eeg_research.agentic.view import campaign_view
+
+    design = _design(tmp_path)
+    contract = freeze_contract(design, tmp_path)
+    create_campaign(tmp_path, goal=_goal(), contract=contract, request_id="view")
+    camp = tmp_path / "goal"
+    state = load_state(camp)
+    state["evidence"] = [
+        {
+            "evidence_id": "ev_p",
+            "candidate_id": "c1",
+            "fidelity": "pilot",
+            "evaluation_valid": True,
+            "fixed_bank_top1": 0.4,
+            "delta_vs_control_pp": 5.0,
+            "comparison": {"comparable": True},
+            "comparison_status": "comparable",
+        },
+        {
+            "evidence_id": "ev_f",
+            "candidate_id": "c1",
+            "fidelity": "full",
+            "evaluation_valid": True,
+            "fixed_bank_top1": 0.2,
+            "delta_vs_control_pp": 1.0,
+            "comparison": {"comparable": True},
+            "comparison_status": "comparable",
+            "promotion": {"tier": "full", "confirmation": "provisional_improvement"},
+        },
+    ]
+    save_state(camp, state)
+    view = campaign_view(camp)
+    assert len(view["pilot_rows"]) == 1
+    assert len(view["full_rows"]) == 1
+    assert view["best_full"]["evidence_id"] == "ev_f"
+    assert view["best_full"]["delta_vs_control_pp"] == 1.0
+    assert "gpu_seconds_reserved" in view["budget"]
+    assert view["budget"]["api_usd"] is None
+
+
+def test_comparison_then_diagnostics_reach_observation(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.contract import freeze_contract
+    from react_agent.eeg_research.agentic.loop import _record_job, create_campaign, load_state, observation, save_state
+
+    design = _design(tmp_path)
+    contract = freeze_contract(design, tmp_path)
+    create_campaign(tmp_path, goal=_goal(), contract=contract, request_id="diag")
+    camp = tmp_path / "goal"
+    job = camp / "jobs" / "j1_c1_pilot"
+    job.mkdir(parents=True)
+    (job / "metrics.json").write_text(json.dumps({"fixed_bank_top1": 0.02, "validation_image_count": 2}), encoding="utf-8")
+    (job / "history.jsonl").write_text(json.dumps({"epoch": 1, "loss": 1.2, "fixed_bank_top1": 0.02}) + "\n", encoding="utf-8")
+    state = load_state(camp)
+    _record_job(
+        camp,
+        state,
+        {
+            "job_id": "j1_c1_pilot",
+            "candidate_id": "c1",
+            "seed": 0,
+            "status": "finished",
+            "gpu_seconds": 1,
+            "result": {"evaluation_valid": True, "fidelity": "pilot", "fixed_bank_top1": 0.02},
+        },
+    )
+    save_state(camp, state)
+    row = state["evidence"][-1]
+    assert row["comparison"]
+    assert row["diagnostics"]
+    assert row["diagnostic_ref"]
+    assert (job / "diagnostic_bundle.json").is_file()
+    obs = observation(camp)
+    assert obs["latest_comparison"]
+    assert obs["latest_diagnostics"]
+    assert any("diagnostic_ref" in item for item in obs["evidence"])
+
+
+def test_truncated_read_allows_next_range(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.coder import read_code
+
+    workspace = tmp_path / "ws"
+    (workspace / "extension").mkdir(parents=True)
+    (workspace / "extension" / "eeg_candidate.py").write_text("\n".join(f"line_{i}" for i in range(1, 40)) + "\n", encoding="utf-8")
+    first = read_code(workspace, "extension/eeg_candidate.py", 1, 10)
+    assert first["truncated"] is True
+    assert first["next_range"]["start"] == 11
+    second = read_code(workspace, "extension/eeg_candidate.py", first["next_range"]["start"], first["next_range"]["end"])
+    assert second["ok"] is True
+    assert "line_11" in second["text"]
+
+
+def test_stop_reason_must_be_structured() -> None:
+    from react_agent.eeg_research.agentic.planner import decide
+
+    bad = decide(
+        {"available_actions": ["stop"], "_known_evidence_ids": []},
+        lambda _obs: {"action": "stop", "stop_reason": "feels_done", "reason_zh": "停", "evidence_ids": []},
+    )
+    assert bad["ok"] is False
+    assert "stop_reason_invalid" in str(bad["detail"])
+    good = decide(
+        {"available_actions": ["stop"], "_known_evidence_ids": []},
+        lambda _obs: {"action": "stop", "stop_reason": "no_progress", "reason_zh": "停", "evidence_ids": []},
+    )
+    assert good["ok"] is True
+

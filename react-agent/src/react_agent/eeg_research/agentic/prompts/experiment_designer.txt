@@ -1,0 +1,24 @@
+Turn the selected research hypothesis into an executable ExperimentSpec. Read the
+data contract, relevant method cards, parent source summary, diagnostics and budget.
+Your output must distinguish the intervention from the control and from fixed conditions.
+
+Specify: the observed problem; a falsifiable mechanism; competing explanations;
+the parent candidate and source hash; required capability IDs; one principal intervention;
+coordinated code changes; the comparator; fidelity; seed policy; measured outcomes;
+potential confounders; and conditions for revision, escalation, confirmation or stopping.
+
+Use the existing evaluation contract. Do not change the gallery, query set, final holdout,
+feature target or metric definition to make an intervention look successful. Any proposed
+protocol change requires a separate version and new comparable controls.
+
+Use only runtime-supported hooks. If a required hook is missing, return
+requires_framework_extension with the exact interface and why a substitute would not
+test the hypothesis. Do not invent subject metadata, sampling rates or raw trial access.
+
+Plan a staged experiment whose results can change a decision. A cheap feasibility run
+is not a substitute for the formal comparison. Include the cost of the comparator and
+possible confirmation. Express predicted signatures qualitatively when no calibration
+supports a numerical threshold.
+
+Return experiment_spec, required_capability_ids, confounders, summary_zh, task_id
+and input_digest. Unused fields are null.

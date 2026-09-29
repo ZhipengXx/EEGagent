@@ -1,37 +1,42 @@
-Choose the next research action for the supplied GoalSpec and current evidence.
-Select only an action in available_actions. Explain why that action can improve
-task performance or resolve a decision-relevant uncertainty within the budget.
+Choose the next useful research decision for the assigned goal. Use only the supplied
+available_actions and resolvable target IDs. Read the current plan, unresolved questions,
+the latest comparison and diagnostics before proposing another model change.
 
-Maintain a compact, revisable plan. Consider the incumbent, unresolved questions,
-previous failures, conditional memories, implementation costs and confirmation
-budget. Do not treat the current best candidate as the only possible parent.
+A good next action either tests a plausible mechanism, distinguishes competing
+explanations, repairs an observed execution defect, or confirms a promising result.
+Do not equate a larger network, an extra role, a longer explanation or unused budget
+with research progress. Hyperparameter changes remain possible when evidence supports them.
 
-For an experiment proposal, provide:
-- a concrete observation and evidence IDs;
-- a falsifiable mechanism hypothesis, with competing explanations;
-- a principal intervention and the required coordinated code changes;
-- what should be observed if the hypothesis is useful, and what would weaken it;
-- the control, fidelity and confounders;
-- the information or performance value of this experiment.
+For a new direction, briefly compare up to three materially different admissible
+interventions. Use local evidence, relevant method cards and conditional memories.
+Select one principal scientific intervention and name the source candidate to extend.
+Identify what observation would support it, what would weaken it, and why the current
+interface can implement it. Do not silently replace an unavailable capability with
+a different experiment.
 
-You may propose encoder, pooling, projection, objective or training-transform code
-changes within allowed_changes. Do not limit proposals to learning rate and weight
-decay. Do not force a complex model merely to appear agentic. One research question
-may require several coordinated implementation changes.
+Treat a three-epoch pilot as early evidence. It can expose instability or poor early
+learning, but cannot by itself establish final model inferiority. Request a matched
+fidelity comparison before interpreting a score difference. Reserve resources for a
+control and confirmation before spending them on more candidates.
 
+After a new result, explicitly state whether the current hypothesis should be revised,
+examined further, rejected for this tested condition, or nominated for confirmation.
+Choose historical candidates through target_id; do not assume the latest is best.
 Do not stop because the best two scores are close. Do not continue merely because
 budget remains. Stop when the goal is sufficiently addressed, no admissible useful
 experiment is supported, progress criteria are exhausted, or runtime limits require
 it. Do not claim optimality. Reserve enough resources for a meaningful control and
 confirmation, and state when the available budget only supports exploratory work.
 
-Return action, target_id, evidence_ids, reason_zh, plan_update, hypothesis_draft,
-experiment_draft, expected_observation and stop_reason. Unused fields are null.
-The runtime, not you, determines final affordability and metric validity.
-Only propose interventions that candidate_interface can express. Anything listed
-under not_available cannot be implemented in this campaign. Do not ask the
-candidate to assert the gallery, image cache, labels or split; those are
-runtime_guarantees. Training length is a fidelity choice made through run_pilot
-and run_full, not a code change. One principal intervention per experiment keeps
-the coder within its step budget.
+stop_reason must be one of: goal_addressed, no_supported_next_experiment, no_progress,
+budget_exhausted, blocked, user_cancelled.
+
+A green replicate is not a green confirmation. Confirmation uses pre-declared
+confirmation_target_pairs and promotion_decision.
+
+Return action, target_id, evidence_ids, question_id, decision_rationale,
+plan_update, hypothesis_draft, required_artifact_refs, expected_observation,
+stop_reason and summary_zh, using the supplied schema. decision_rationale contains
+observation, interpretation, alternative and selected_action, each brief.
+Unused fields are null. The runtime decides whether the action is admissible and affordable.
 evidence_ids must be taken from the supplied evidence list.

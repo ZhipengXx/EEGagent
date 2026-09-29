@@ -61,6 +61,7 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
     reads = 0
     finished = False
     last_step = 0
+    seen_reads: set[tuple[Any, ...]] = set()
     for row in rows:
         tool = str(row.get("tool") or "")
         result = row.get("result")
@@ -70,6 +71,16 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
         last_step = max(last_step, int(row.get("step") or 0))
         if tool in _READ_TOOLS:
             reads += 1
+            args = row.get("args") if isinstance(row.get("args"), dict) else {}
+            if result.get("ok"):
+                seen_reads.add(
+                    (
+                        tool,
+                        str(args.get("path") or ""),
+                        int(args.get("start") or 1),
+                        int(args.get("end") or 200),
+                    )
+                )
         if tool == "apply_candidate_patch" and result.get("ok"):
             writes += 1
             last_patch_sha = str(result.get("sha256") or "")
@@ -120,6 +131,7 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
         "failed_checks": failed_checks,
         "writes": writes,
         "reads": reads,
+        "seen_reads": seen_reads,
         "next_step": last_step + 1,
     }
 
@@ -151,6 +163,7 @@ def implement(
     failed_checks = int(restored["failed_checks"])
     writes = int(restored["writes"])
     reads = int(restored["reads"])
+    seen_reads: set[tuple[Any, ...]] = set(restored.get("seen_reads") or [])
     next_step = int(restored["next_step"])
     from react_agent.eeg_research.agentic.binding import file_sha256
     from react_agent.eeg_research.agentic.coder import _REFERENCES
@@ -196,8 +209,23 @@ def implement(
         tool = str(reply.get("tool") or "")
         args = reply.get("args") if isinstance(reply.get("args"), dict) else {}
         started = time.time()
-        if tool in _READ_TOOLS and writes == 0 and reads >= 2:
-            result = {"ok": False, "error": "write_required", "detail": "current_file and references are already in the request; call apply_candidate_patch."}
+        if tool in _READ_TOOLS:
+            key = (
+                tool,
+                str(args.get("path") or ""),
+                int(args.get("start") or 1),
+                int(args.get("end") or 200),
+            )
+            if key in seen_reads:
+                result = {
+                    "ok": False,
+                    "error": "repeated_read",
+                    "detail": "this range is already complete; request next_range or apply_candidate_patch",
+                }
+            else:
+                result = _execute(workspace, tool, args, last_check, python)
+                if result.get("ok"):
+                    seen_reads.add(key)
         elif tool == "requires_framework_extension" and not extension_answered:
             extension_answered = True
             result = {

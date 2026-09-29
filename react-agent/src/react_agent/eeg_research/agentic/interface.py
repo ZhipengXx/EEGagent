@@ -17,8 +17,17 @@ CANDIDATE_INTERFACE = {
         "mean and std computed over the training files only; store them as registered buffers, "
         "not parameters; validation reuses them"
     ),
+    "build_training_transform": (
+        "optional build_training_transform(self, transform_config=None); train-only EEG transform; "
+        "validation and evaluate-only must not call a stochastic transform"
+    ),
+    "build_training_objective": (
+        "optional build_training_objective(self, objective_config=None); receives EEG embedding, "
+        "frozen image embedding and runtime positive relations; learnable parameters enter AdamW"
+    ),
     "not_available": [
         "subject id or any per-subject metadata as model input",
+        "image id as encoder input",
         "per-subject statistics",
         "validation or test data before evaluation",
         "changes to the loss target, evaluator, gallery, split or image features",
@@ -29,6 +38,7 @@ CANDIDATE_INTERFACE = {
         "train, validation and held-out files are assigned by the frozen split manifest",
         "the trainer imports only extension/eeg_candidate.py and records its hash",
         "training length and fidelity (pilot 3 epochs, full per goal) are set by the runtime, not by the candidate",
+        "custom objectives use global-batch after encoder gather; baseline default is data_parallel_local",
     ],
 }
 

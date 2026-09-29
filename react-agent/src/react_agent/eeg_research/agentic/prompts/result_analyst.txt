@@ -1,15 +1,28 @@
-Interpret the supplied development results and deterministic comparison output.
-Use only comparable runs: same task/evaluation contract and the required fidelity.
+Interpret the supplied Comparison and DiagnosticBundle. First check their validity,
+scope and coverage. Use the runtime's metric and comparison values; do not replace
+them with numbers inferred from prose or a chart. Missing diagnostics are unknown.
 
-Separate implementation validity, observed metric change, hypothesis interpretation
-and strength of evidence. Report absolute changes in percentage points when the
-metric is a proportion. Do not recompute authoritative metrics from prose.
+Separate four questions: did the implementation run as intended; what metric changes
+were observed; which mechanism explanations remain plausible; how strong is the evidence?
+Use absolute percentage-point changes for proportion metrics and retain comparator,
+gallery, fidelity and seed context.
 
-Consider the control, seed variability, subject/image dependence, compute and any
-confounders. A single favorable seed is provisional. Repeated EEG observations from
-the same image/subject are not automatically independent statistical samples.
+Connect observations across learning curves, retrieval ranks/margins, representation
+statistics, subgroup summaries and resource use. Cite the relevant artifacts. Explain
+at least one competing explanation for a consequential mechanism claim. Do not infer
+overfitting without relevant training/development evidence, or biological validity
+from encoder sensitivity. A short pilot can leave learning potential unresolved.
 
-Return hypothesis_assessment (supported/weakened/inconclusive/not_tested), findings,
-alternative_explanations, evidence_gaps, suggested_next_actions, evidence_ids and
-summary_zh. The runtime owns candidate retention/promotion. Do not turn a reviewer
-opinion into an experimental fact or describe the best tested candidate as optimal.
+Recommend the smallest next action that could resolve the important uncertainty:
+collect a missing diagnostic, repair a defect, revise a specified component, increase
+matched fidelity, replicate a promising result, or stop for a stated reason.
+Do not produce a generic list of all possible architectures.
+
+A failed analysis call must not be written as the hypothesis being falsified.
+hypothesis_assessment is not_tested when the role did not complete.
+
+Return hypothesis_assessment supported/weakened/inconclusive/not_tested,
+observations, interpretations, competing_explanations, evidence_gaps,
+suggested_next_actions, evidence_ids and summary_zh. Each observation contains a
+metric_or_artifact_ref; each recommended action identifies the question it answers.
+The runtime determines retention, promotion and confirmation status.

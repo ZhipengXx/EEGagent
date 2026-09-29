@@ -7,13 +7,27 @@ from typing import Any, Callable
 ACTIONS = (
     "inspect_data",
     "retrieve_memory",
+    "retrieve_methods",
     "diagnose_results",
+    "collect_diagnostics",
+    "design_experiment",
     "propose_experiment",
     "implement_candidate",
+    "repair_candidate",
     "run_pilot",
     "run_full",
     "replicate",
+    "audit_result",
     "stop",
+)
+
+STOP_REASONS = (
+    "goal_addressed",
+    "no_supported_next_experiment",
+    "no_progress",
+    "budget_exhausted",
+    "blocked",
+    "user_cancelled",
 )
 
 Backend = Callable[[dict[str, Any]], dict[str, Any]]
@@ -26,7 +40,16 @@ def _has(evidence: list[dict[str, Any]], candidate_id: Any, fidelity: str) -> bo
     )
 
 
-_LOCAL = {"inspect_data", "retrieve_memory", "diagnose_results", "propose_experiment"}
+_LOCAL = {
+    "inspect_data",
+    "retrieve_memory",
+    "retrieve_methods",
+    "diagnose_results",
+    "collect_diagnostics",
+    "design_experiment",
+    "propose_experiment",
+    "audit_result",
+}
 IMPLEMENT_CALLS = 8 + 2 + 1
 """Coder steps, reviewer with one repair, and the planner call that asks for the pilot."""
 
@@ -62,16 +85,20 @@ def available_actions(state: dict[str, Any]) -> list[str]:
     if state.get("gpu_seconds_left", 1) <= 0 and state.get("llm_calls_left", 1) <= 0:
         return ["stop"]
     evidence = state.get("evidence") or []
-    actions = ["inspect_data", "retrieve_memory", "stop"]
+    actions = ["inspect_data", "retrieve_memory", "retrieve_methods", "stop"]
     pending_experiment = bool(state.get("experiment")) and not state.get("candidate_ready") and not state.get("experiment_failed")
     if not pending_experiment:
         actions.append("propose_experiment")
+        actions.append("design_experiment")
     if any(row.get("job_dir") or row.get("fidelity") for row in evidence):
         actions.append("diagnose_results")
+        actions.append("collect_diagnostics")
+        actions.append("audit_result")
     calls_left = int(state.get("llm_calls_left", 1_000))
     if state.get("repair_task") and int((state.get("repair_task") or {}).get("remaining") or 0) > 0:
         if calls_left >= IMPLEMENT_CALLS:
             actions.append("implement_candidate")
+            actions.append("repair_candidate")
     elif (
         pending_experiment
         and submitted_candidates(state) < int(state.get("max_candidates", 4))
@@ -128,6 +155,10 @@ def _parse(reply: Any, allowed: list[str], known: set[str], trainable: set[str] 
         return {"ok": False, "detail": "unknown_evidence"}
     if action == "propose_experiment" and not isinstance(reply.get("hypothesis_draft"), dict):
         return {"ok": False, "detail": "hypothesis_draft_missing"}
+    if action == "stop":
+        reason = reply.get("stop_reason")
+        if reason not in {None, ""} and reason not in STOP_REASONS:
+            return {"ok": False, "detail": f"stop_reason_invalid:{reason}"}
     if action in {"run_pilot", "run_full", "replicate"}:
         target = reply.get("target_id")
         allowed_targets = trainable or set()

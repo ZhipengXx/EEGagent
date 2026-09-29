@@ -78,15 +78,31 @@ class RetrievalTrials(Dataset):
         """Return the number of kept images."""
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        """Return one window and its cached image embedding."""
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        """Return one window, its cached image embedding, and the image id for duplicate stats.
+
+        image_id is runtime metadata. It must not be concatenated into the encoder input.
+        """
         row = self.records[index]
         start, end = self.timesteps
         eeg = row["eeg"]
         assert isinstance(eeg, torch.Tensor)
         features = row["img_features"]
         assert isinstance(features, torch.Tensor)
-        return {"eeg": eeg[:, start:end].float(), "img_features": features.float()}
+        return {
+            "eeg": eeg[:, start:end].float(),
+            "img_features": features.float(),
+            "image_id": str(row.get("img") or ""),
+        }
+
+
+def collate_retrieval(batch: list[dict[str, torch.Tensor | str]]) -> dict[str, torch.Tensor | list[str]]:
+    """Keep image_id as strings so default_collate never tensorizes them into the encoder."""
+    return {
+        "eeg": torch.stack([row["eeg"] for row in batch]),  # type: ignore[arg-type]
+        "img_features": torch.stack([row["img_features"] for row in batch]),  # type: ignore[arg-type]
+        "image_id": [str(row.get("image_id") or "") for row in batch],
+    }
 
 
 def _subject_from_path(path: Path) -> str:

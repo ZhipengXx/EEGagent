@@ -6,17 +6,23 @@ import json
 from pathlib import Path
 from typing import Any
 
+from react_agent.eeg_research.agentic.budget import snapshot as budget_snapshot
 from react_agent.eeg_research.agentic.cli import DEFAULT_ROOT, status_view
 
 ACTION_ZH = {
     "inspect_data": "核对数据",
     "retrieve_memory": "检索经验",
+    "retrieve_methods": "检索方法卡",
     "diagnose_results": "诊断结果",
+    "collect_diagnostics": "收集诊断包",
+    "design_experiment": "设计实验",
     "propose_experiment": "提出实验",
     "implement_candidate": "编写候选代码",
+    "repair_candidate": "修复候选",
     "run_pilot": "小规模试跑",
     "run_full": "完整训练",
     "replicate": "重复 seed",
+    "audit_result": "审计结果",
     "stop": "停止",
 }
 
@@ -75,6 +81,7 @@ def campaign_view(camp: Path) -> dict[str, Any]:
     for item in state.get("evidence") or []:
         if item.get("fidelity") is None:
             continue
+        comparable = bool((item.get("comparison") or {}).get("comparable")) or item.get("comparison_status") == "comparable"
         rows.append(
             {
                 "evidence_id": item.get("evidence_id"),
@@ -83,10 +90,22 @@ def campaign_view(camp: Path) -> dict[str, Any]:
                 "fixed_bank_top1": item.get("fixed_bank_top1"),
                 "delta_vs_control_pp": item.get("delta_vs_control_pp"),
                 "evaluation_valid": item.get("evaluation_valid"),
+                "comparable": comparable,
                 "reason": item.get("reason"),
                 "seed": item.get("seed"),
+                "promotion_tier": (item.get("promotion") or {}).get("tier"),
+                "confirmation": (item.get("promotion") or {}).get("confirmation"),
             }
         )
+    pilot_rows = [row for row in rows if row.get("fidelity") == "pilot"]
+    full_rows = [row for row in rows if row.get("fidelity") == "full"]
+    ranked_full = [
+        row
+        for row in full_rows
+        if row.get("evaluation_valid") and row.get("comparable") and row.get("candidate_id") != "baseline"
+    ]
+    ranked_full.sort(key=lambda row: (row.get("delta_vs_control_pp") is not None, row.get("delta_vs_control_pp") or -1e9), reverse=True)
+    best_full = ranked_full[0] if ranked_full else None
     analyses = [
         item.get("summary") for item in state.get("evidence") or [] if item.get("kind") == "analysis"
     ]
@@ -96,6 +115,7 @@ def campaign_view(camp: Path) -> dict[str, Any]:
     ]
     live = state.get("live_job")
     live_status = _read(camp / "jobs" / str(live) / "status.json") if live else None
+    budget = budget_snapshot(camp, state)
     return {
         "campaign_id": camp.name,
         "created_at": _created_at(camp),
@@ -106,6 +126,7 @@ def campaign_view(camp: Path) -> dict[str, Any]:
         "allowed_changes": goal.get("allowed_changes"),
         "status": view["status"],
         "detail": view.get("detail"),
+        "stop_reason": state.get("stop_reason"),
         "pause_after_step": state.get("pause_after_step"),
         "hypothesis": state.get("hypothesis"),
         "live_job": live,
@@ -113,14 +134,18 @@ def campaign_view(camp: Path) -> dict[str, Any]:
         "decisions": decisions,
         "candidates": candidates,
         "experiments": rows,
+        "pilot_rows": pilot_rows,
+        "full_rows": full_rows,
+        "best_full": best_full,
         "analyses": analyses,
         "budget": {
-            "training_jobs": state.get("training_jobs"),
-            "max_training_jobs": state.get("max_training_jobs"),
-            "llm_calls": cost.get("llm_calls"),
-            "max_llm_calls": state.get("max_llm_calls"),
-            "gpu_seconds_used": cost.get("gpu_seconds_used"),
-            "gpu_seconds_left": state.get("gpu_seconds_left"),
+            "training_jobs": budget.get("training_jobs_used"),
+            "max_training_jobs": budget.get("training_jobs_limit"),
+            "llm_calls": budget.get("llm_calls_used"),
+            "max_llm_calls": budget.get("llm_calls_limit"),
+            "gpu_seconds_used": budget.get("gpu_seconds_used"),
+            "gpu_seconds_reserved": budget.get("gpu_seconds_reserved"),
+            "gpu_seconds_left": budget.get("gpu_seconds_left"),
             "api_usd": cost.get("api_usd"),
         },
     }

@@ -17,6 +17,7 @@ from react_agent.eeg_research.agentic.interface import candidate_interface
 from react_agent.eeg_research.agentic.lineage import LineageError, materialize
 from react_agent.eeg_research.agentic.llm import LlmUnavailable, role_backend
 from react_agent.eeg_research.agentic.loop import (
+    _sync_ledger,
     align_interrupt,
     event,
     incomplete_candidate_id,
@@ -31,6 +32,16 @@ from react_agent.eeg_training.protocol import data_root
 _TERMINAL = {"paused", "finished", "blocked", "cancelled"}
 CODER_STEPS = 8
 IMPLEMENT_ATTEMPTS = 3
+
+
+def _lesson_proposal(reply: Any) -> dict[str, Any]:
+    """Read lessons from a RoleResult envelope or a bare curator object."""
+    if not isinstance(reply, dict):
+        return {}
+    inner = reply.get("payload")
+    if isinstance(inner, dict) and ("proposed_lessons" in inner or "summary_zh" in inner):
+        return inner
+    return reply
 
 
 def worker_lock_held(camp: Path) -> bool:
@@ -377,10 +388,14 @@ def build_services(camp: Path) -> dict[str, Any]:
 
     def analyze(camp_dir: Path, state: dict[str, Any]) -> None:
         latest = state["evidence"][-1]
+        comparison = latest.get("comparison")
+        diagnostics = latest.get("diagnostics")
         if not latest.get("evaluation_valid") or latest.get("candidate_id") == "baseline":
             return
         payload = {
             "latest": {key: latest.get(key) for key in ("evidence_id", "candidate_id", "fidelity", "fixed_bank_top1", "gallery_size", "delta_vs_control_pp", "control_id", "seed")},
+            "comparison": comparison,
+            "diagnostics": diagnostics,
             "hypothesis": state.get("hypothesis"),
             "controls": [
                 {key: row.get(key) for key in ("evidence_id", "candidate_id", "fidelity", "fixed_bank_top1", "seed")}
@@ -388,15 +403,19 @@ def build_services(camp: Path) -> dict[str, Any]:
                 if row.get("candidate_id") == "baseline" and row.get("evaluation_valid")
             ],
         }
+        billed = 0
         try:
             reply = analyst(payload)
+            billed += 1
         except LlmUnavailable as exc:
+            billed += 1
             reply = {"hypothesis_assessment": "not_tested", "summary_zh": f"分析未完成：{exc}"}
-        state["llm_calls"] = int(state.get("llm_calls", 0)) + 1
-        state["llm_calls_left"] = int(state.get("llm_calls_left", 0)) - 1
         target = camp_dir / "analyses" / f"{latest['evidence_id']}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(reply, ensure_ascii=False, indent=2), encoding="utf-8")
+        target.write_text(
+            json.dumps({"reply": reply, "comparison": comparison, "diagnostics": diagnostics}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         state["evidence"].append(
             {
                 "evidence_id": f"ev_analysis_{latest['evidence_id']}",
@@ -405,8 +424,59 @@ def build_services(camp: Path) -> dict[str, Any]:
                 "summary": {key: reply.get(key) for key in ("hypothesis_assessment", "summary_zh", "suggested_next_actions")},
             }
         )
+        from react_agent.eeg_research.agentic.memory import EpisodeStore
+        from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
 
-    return {"launch": launch, "settle": settle, "implement": do_implement, "analyze": analyze}
+        store = EpisodeStore(camp_dir)
+        try:
+            curator = role_backend(camp, "memory_curator")
+            task = begin_role_task(camp_dir, role="memory_curator", inputs=[camp_dir / "goal.json"])
+            try:
+                proposal = curator(
+                    {
+                        "episodes": store.list_episodes(),
+                        "task_id": task["task_id"],
+                        "attempt_id": task["attempt_id"],
+                        "input_digest": task["input_digest"],
+                    }
+                )
+                billed += 1
+            except LlmUnavailable:
+                billed += 1
+                store.mark_pending_curation("curator_unavailable")
+            else:
+                accepted = store.accept_lessons(_lesson_proposal(proposal))
+                finish_role_task(
+                    camp_dir,
+                    task,
+                    {"status": "completed", "summary_zh": "已提议条件化经验", "accepted": accepted},
+                    kind="lessons",
+                    path=camp_dir / "memory" / f"lessons_{task['task_id']}.json",
+                )
+        except LlmUnavailable:
+            store.mark_pending_curation("curator_unavailable")
+        except Exception:
+            store.mark_pending_curation("curator_failed")
+        _sync_ledger(camp_dir, state)
+        if not (camp_dir / "cost.json").is_file():
+            state["llm_calls"] = int(state.get("llm_calls", 0)) + billed
+            state["llm_calls_left"] = int(state.get("llm_calls_left", 0)) - billed
+
+    def _lazy(role: str):
+        def call(payload: dict[str, Any]) -> dict[str, Any]:
+            return role_backend(camp, role)(payload)
+
+        return call
+
+    return {
+        "launch": launch,
+        "settle": settle,
+        "implement": do_implement,
+        "analyze": analyze,
+        "librarian": _lazy("research_librarian"),
+        "designer": _lazy("experiment_designer"),
+        "auditor": _lazy("result_auditor"),
+    }
 
 
 def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) -> dict[str, Any]:

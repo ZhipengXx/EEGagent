@@ -20,20 +20,39 @@ from react_agent.eeg_research.agentic.loop import (
     request_control,
     save_state,
 )
+from react_agent.eeg_research.agentic.schemas import GoalSpec
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[4] / "runs" / "eeg_research_v18"
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m react_agent.eeg_research.agentic.cli")
-    parser.add_argument("command", choices=["create", "start", "run", "status", "pause", "resume", "stop"])
+    parser.add_argument(
+        "command",
+        choices=["create", "start", "run", "status", "pause", "resume", "stop", "validate-goal", "evaluate-export"],
+    )
     parser.add_argument("--campaign", default="eeg_retrieval_research_v1")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--request-id", default="")
     parser.add_argument("--gpu", default="0", help="Comma-separated GPU indices for training jobs")
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--reopen-reason", default="", help="Reopen a finished campaign after a framework fix; the reason is logged")
+    parser.add_argument("--goal", type=Path, default=None, help="GoalSpec YAML. validate-goal prints it and does not start a worker.")
+    parser.add_argument("--pack", type=Path, default=None, help="Candidate pack directory for evaluate-export")
+    parser.add_argument("--data-root", type=Path, default=None)
+    parser.add_argument("--out", type=Path, default=None)
     return parser
+
+
+def load_goal_file(path: Path) -> dict:
+    """Validate a GoalSpec YAML or JSON file. Sample 12/120/28800 values are not a run authorization."""
+    import yaml
+
+    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("goal_not_object")
+    spec = GoalSpec.model_validate(raw)
+    return spec.model_dump()
 
 
 def goal(campaign: str, design=None) -> dict:
@@ -152,6 +171,61 @@ def status_view(camp: Path) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "validate-goal":
+        if args.goal is None:
+            print(json.dumps({"error": "goal_missing"}, ensure_ascii=False))
+            return 2
+        try:
+            payload = load_goal_file(args.goal)
+        except Exception as exc:  # noqa: BLE001
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
+        from react_agent.eeg_research.agentic.capabilities import capability_manifest
+
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "spawn_worker": False,
+                    "note": "sample YAML is not a run authorization",
+                    "goal": payload,
+                    "capabilities": capability_manifest(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+    if args.command == "evaluate-export":
+        from react_agent.eeg_research.agentic.export import evaluate_only_argv, pack_is_rebuildable
+
+        pack = args.pack
+        if pack is None:
+            print(json.dumps({"error": "pack_missing"}))
+            return 2
+        ok, reason = pack_is_rebuildable(pack)
+        if not ok:
+            print(json.dumps({"error": reason}, ensure_ascii=False))
+            return 2
+        out = args.out or (pack / "eval_only")
+        argv_train = evaluate_only_argv(pack, out=out, data_root=args.data_root)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "evaluate_only": True,
+                    "final_test": False,
+                    "pack": str(pack),
+                    "out": str(out),
+                    "rebuild_encoder": True,
+                    "argv": argv_train,
+                    "note": "prints train_entry argv; does not spawn training. uses rebuild_encoder; does not fall back to EEGProjectLayer for candidate modules",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
     root = args.root.resolve()
     camp = root / args.campaign
     if args.command == "create":
@@ -168,16 +242,32 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         contract = freeze_contract(design, base)
         contract["execution_fingerprint"] = protocol["fingerprint"]
+        submitted = goal(args.campaign, design)
+        if args.goal is not None:
+            submitted = {**submitted, **load_goal_file(args.goal)}
+            submitted["goal_id"] = args.campaign
         state = create_campaign(
             root,
-            goal=goal(args.campaign, design),
+            goal=submitted,
             contract=contract,
             request_id=args.request_id or args.campaign,
             protocol=protocol,
         )
         state["gpu"] = [int(item) for item in args.gpu.split(",") if item.strip()]
         save_state(camp, state)
-        print(json.dumps({"status": state["status"], "fingerprint": state["contract_fingerprint"]}, ensure_ascii=False))
+        print(
+            json.dumps(
+                {
+                    "status": state["status"],
+                    "fingerprint": state["contract_fingerprint"],
+                    "spawn_worker": False,
+                    "max_training_jobs": state.get("max_training_jobs"),
+                    "max_llm_calls": state.get("max_llm_calls"),
+                    "max_gpu_seconds": state.get("max_gpu_seconds"),
+                },
+                ensure_ascii=False,
+            )
+        )
         return 0
     if not (camp / "campaign_state.json").is_file():
         print(json.dumps({"error": "campaign_missing"}))
