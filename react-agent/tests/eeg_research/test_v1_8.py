@@ -134,7 +134,7 @@ def test_code_candidate_then_new_evidence_changes_the_next_action(tmp_path: Path
     create_campaign(tmp_path, goal=goal, contract=contract, request_id="req")
     camp = tmp_path / "goal"
     script = [
-        {"action": "propose_experiment", "reason_zh": "先提出投影改动", "evidence_ids": [], "experiment_draft": {"initial_fidelity": "pilot"}, "hypothesis_draft": {"mechanism": "投影尺度"}},
+        {"action": "propose_experiment", "reason_zh": "先提出投影改动", "evidence_ids": [], "experiment_draft": {"initial_fidelity": "pilot", "intervention": "projection_scale"}, "hypothesis_draft": {"mechanism": "投影尺度"}},
         {"action": "implement_candidate", "reason_zh": "写入候选", "evidence_ids": [], "relative": "extension/eeg_candidate.py", "content": _CANDIDATE, "expected_base_hash": ""},
         {"action": "run_pilot", "reason_zh": "小规模训练", "evidence_ids": [], "target_id": "c1"},
     ]
@@ -312,6 +312,14 @@ def test_repeated_local_action_needs_new_evidence() -> None:
     assert "diagnose_results" in available_actions(state)
     state["experiment"] = {"initial_fidelity": "pilot"}
     assert "propose_experiment" not in available_actions(state)
+    assert "implement_candidate" not in available_actions(state)
+    state["experiment"] = {
+        "status": "approved",
+        "parent_candidate_id": "baseline",
+        "intervention": "pooling",
+        "initial_fidelity": "pilot",
+        "hypothesis": {"mechanism": "池化"},
+    }
     assert "implement_candidate" in available_actions(state)
     state["experiment_failed"] = True
     assert "propose_experiment" in available_actions(state)
@@ -507,7 +515,17 @@ def test_coder_stops_before_the_budget_and_planner_reserves_calls(tmp_path: Path
     outcome = implement(tmp_path / "ws", {}, backend, calls_left=lambda: left["n"], reserve=2)
     assert outcome["detail"] == "budget_exhausted"
     assert left["n"] == 2
-    state = {"experiment": {"initial_fidelity": "pilot"}, "llm_calls_left": 5, "gpu_seconds_left": 10}
+    state = {
+        "experiment": {
+            "status": "approved",
+            "parent_candidate_id": "baseline",
+            "intervention": "pooling",
+            "initial_fidelity": "pilot",
+            "hypothesis": {"mechanism": "池化"},
+        },
+        "llm_calls_left": 5,
+        "gpu_seconds_left": 10,
+    }
     assert "implement_candidate" not in available_actions(state)
     state["llm_calls_left"] = 20
     assert "implement_candidate" in available_actions(state)

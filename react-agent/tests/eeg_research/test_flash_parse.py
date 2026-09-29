@@ -50,7 +50,8 @@ def test_fenced_json_is_an_object() -> None:
     assert payload["tool"] == "finish_patch"
 
 
-def test_json_followed_by_dsml_keeps_the_tool_call() -> None:
+def test_json_followed_by_dsml_is_refused() -> None:
+    """Trailing tool markup is another command. The earlier salvage executed it anyway."""
     text = """{"tool": "list_project_files", "args": {}}
 
 <｜｜DSML｜｜ calls>
@@ -59,22 +60,18 @@ def test_json_followed_by_dsml_keeps_the_tool_call() -> None:
 </｜｜DSML｜｜ invoke>
 </｜｜DSML｜｜ calls>
 """
-    payload = parse_json_object(text)
-    assert payload == {"tool": "list_project_files", "args": {}}
+    with pytest.raises(json.JSONDecodeError):
+        parse_json_object(text)
 
 
-def test_last_tool_object_wins_when_prose_follows() -> None:
+def test_two_tool_objects_are_refused() -> None:
+    """Two JSON objects disagree. Picking the last one would hide the conflict."""
     text = """{"tool": "list_project_files", "args": {}}
 
----
-
 {"tool": "search_code", "args": {"query": "positional"}}
-
-Let me continue step by step.
 """
-    payload = parse_json_object(text)
-    assert payload["tool"] == "search_code"
-    assert payload["args"]["query"] == "positional"
+    with pytest.raises(json.JSONDecodeError):
+        parse_json_object(text)
 
 
 def test_prose_without_json_still_fails() -> None:

@@ -257,6 +257,10 @@ def stop_job(job_dir: Path) -> dict[str, Any]:
             os.killpg(int(record["pid"]), signal.SIGTERM)
         except OSError:
             pass
+        record["cancel_requested"] = True
+        if _alive(record):
+            path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+            return record
         record["status"] = "cancelled"
         record["ended_at"] = time.time()
         elapsed = float(record["ended_at"]) - float(record["started_at"])

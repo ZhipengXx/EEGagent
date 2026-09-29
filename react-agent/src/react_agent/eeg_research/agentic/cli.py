@@ -29,7 +29,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m react_agent.eeg_research.agentic.cli")
     parser.add_argument(
         "command",
-        choices=["create", "start", "run", "status", "pause", "resume", "stop", "validate-goal", "evaluate-export"],
+        choices=["create", "start", "run", "status", "pause", "resume", "stop", "validate-goal", "evaluate-export", "evaluate-pack"],
     )
     parser.add_argument("--campaign", default="eeg_retrieval_research_v1")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
@@ -196,7 +196,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0
-    if args.command == "evaluate-export":
+    if args.command in {"evaluate-export", "evaluate-pack"}:
         from react_agent.eeg_research.agentic.export import evaluate_only_argv, pack_is_rebuildable
 
         pack = args.pack

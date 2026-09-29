@@ -90,7 +90,7 @@ def accept_job(
         return {"evaluation_valid": False, "reason": "score_out_of_range", "fidelity": fidelity, "execution_succeeded": True}
     if manifest is None:
         return {"evaluation_valid": False, "reason": "manifest_missing", "fidelity": fidelity}
-    if protocol is not None and not (job_dir / "last.ckpt").is_file() and not payload.get("checkpoint_optional"):
+    if protocol is not None and not (job_dir / "last.ckpt").is_file():
         return {"evaluation_valid": False, "reason": "checkpoint_missing", "fidelity": fidelity, "execution_succeeded": True}
     expected_gallery = protocol.get("validation_image_ids") if protocol else None
     gallery = payload.get("validation_image_count")

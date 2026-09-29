@@ -40,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--test-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
+    parser.add_argument("--checkpoint", default=None, help="Checkpoint path, separate from the output directory")
     parser.add_argument("--negative-policy", default="data_parallel_local")
     return parser
 
@@ -391,14 +392,14 @@ def _fixed_bank_pass(encoder, loader, records) -> dict[str, float]:
     return tally.result()
 
 
-def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
+def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path, checkpoint: Path | None = None) -> dict[str, object]:
     """Score an existing checkpoint on frozen validation. Final test is not computed."""
     limit_visible_gpus(design)
     import torch
 
     if not torch.cuda.is_available():
         raise SplitError("cuda_unavailable")
-    checkpoint = out_dir / "last.ckpt"
+    checkpoint = Path(checkpoint) if checkpoint is not None else out_dir / "last.ckpt"
     if not checkpoint.is_file():
         raise SplitError("checkpoint_missing")
     _train_loader, val_loader, _train_images, _val_images, spec = build_loaders(
@@ -443,6 +444,41 @@ def train_channel_statistics(train_loader) -> dict[str, object]:
     }
 
 
+def _hook_section(out_dir: Path, name: str) -> dict:
+    path = out_dir / "hook_config.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    section = payload.get(name) if isinstance(payload, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _build_hook(candidate, method: str, geometry: dict, config: dict):
+    """Call a hook with geometry plus approved config. Unknown config is an error."""
+    from react_agent.eeg_training.hooks import HookConfigError, call_configured
+
+    builder = getattr(candidate, method)
+    accepted = getattr(builder, "accepted_config_keys", None)
+    if accepted is not None:
+        return call_configured(lambda payload: builder(geometry, payload), {**geometry, **config}, kind=method)
+    if method == "build_encoder":
+        try:
+            return builder(geometry, config or None)
+        except TypeError:
+            if config:
+                raise HookConfigError("encoder_rejected_config") from None
+            return builder(geometry)
+    try:
+        return builder(config or None)
+    except TypeError:
+        if config:
+            raise HookConfigError(f"{method}_rejected_config") from None
+        return builder()
+
+
 def _instantiate_candidate(spec: dict[str, object], out_dir: Path, train_loader=None):
     """Build the candidate plugin and encoder. Missing hooks stay None, not invented."""
     module_name = os.environ.get("EEG_CANDIDATE_MODULE", "")
@@ -454,7 +490,7 @@ def _instantiate_candidate(spec: dict[str, object], out_dir: Path, train_loader=
         from react_agent.eeg_research.agentic.baseline import EEGCandidate
 
         candidate = EEGCandidate()
-        encoder = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
+        encoder = _build_hook(candidate, "build_encoder", {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}, _hook_section(out_dir, "model"))
         return encoder, candidate, "react_agent.eeg_research.agentic.baseline", used_fit
     import importlib
 
@@ -462,7 +498,7 @@ def _instantiate_candidate(spec: dict[str, object], out_dir: Path, train_loader=
 
     module = importlib.import_module(module_name)
     candidate = module.EEGCandidate()
-    encoder = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
+    encoder = _build_hook(candidate, "build_encoder", {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}, _hook_section(out_dir, "model"))
     if hasattr(candidate, "fit_statistics") and train_loader is not None:
         stats = train_channel_statistics(train_loader)
         candidate.fit_statistics(encoder, stats)
@@ -499,7 +535,7 @@ def _batch_image_ids(batch) -> list[str]:
     return []
 
 
-def placed_retrieval(encoder, device, n_visible: int):
+def placed_retrieval(encoder, device, n_visible: int, objective=None):
     """Move wrapper parameters with the encoder, then replicate.
 
     LocalRetrieval may allocate logit_scale on CPU when the encoder has none.
@@ -509,7 +545,7 @@ def placed_retrieval(encoder, device, n_visible: int):
 
     from react_agent.eeg_training.model import LocalRetrieval
 
-    model = LocalRetrieval(encoder).to(device)
+    model = LocalRetrieval(encoder, objective=objective).to(device)
     if n_visible > 1:
         model = torch.nn.DataParallel(model, device_ids=list(range(n_visible)))
     return model
@@ -531,6 +567,8 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         is_custom_objective,
         note_eval_without_transform,
         objective_parameters,
+        resolve_negative_policy,
+        scalar_loss,
     )
     from react_agent.eeg_training.model import contrastive_loss, within_batch_accuracy
 
@@ -545,8 +583,8 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     device = torch.device("cuda:0")
     encoder, candidate, module_name, used_fit = _instantiate_candidate(spec, out_dir, train_loader)
     encoder = encoder.to(device)
-    transform = candidate.build_training_transform() if hasattr(candidate, "build_training_transform") else None
-    objective = candidate.build_training_objective() if hasattr(candidate, "build_training_objective") else contrastive_loss
+    transform = _build_hook(candidate, "build_training_transform", {}, _hook_section(out_dir, "transform")) if hasattr(candidate, "build_training_transform") else None
+    objective = _build_hook(candidate, "build_training_objective", {}, _hook_section(out_dir, "objective")) if hasattr(candidate, "build_training_objective") else contrastive_loss
     if isinstance(objective, torch.nn.Module):
         objective = objective.to(device)
     counters: dict[str, int] = {
@@ -559,18 +597,19 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     except (AttributeError, TypeError):
         pass
     custom = is_custom_objective(objective)
-    negative_policy = "global_batch" if custom else "data_parallel_local"
+    negative_policy = resolve_negative_policy(candidate, objective)
+    use_global = negative_policy == "global_batch"
     n_visible = len(design.gpu)
     extra = objective_parameters(objective)
     model: torch.nn.Module | None = None
-    if custom:
+    if use_global:
         wrapped = encoder
         if n_visible > 1:
             wrapped = torch.nn.DataParallel(encoder, device_ids=list(range(n_visible)))
         params = list(encoder.parameters()) + extra
         optimizer = torch.optim.AdamW(params, lr=learning_rate(design), weight_decay=design.weight_decay)
     else:
-        model = placed_retrieval(encoder, device, n_visible)
+        model = placed_retrieval(encoder, device, n_visible, objective=objective if custom else None)
         optimizer = torch.optim.AdamW(
             list(model.parameters()) + extra,
             lr=learning_rate(design),
@@ -589,7 +628,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     duplicate_batches: list[list[str]] = []
     write_status(out_dir, "training", 0, design.epochs)
     for epoch_index in range(design.epochs):
-        if custom:
+        if use_global:
             encoder.train()
             if isinstance(objective, torch.nn.Module):
                 objective.train()
@@ -601,17 +640,17 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             eeg = apply_train_transform(transform, batch["eeg"].to(device), counters)
             img = batch["img_features"].to(device)
             ids = _batch_image_ids(batch)
-            if ids:
+            if ids and len(duplicate_batches) < 64:
                 duplicate_batches.append(ids)
-            if custom:
+            if use_global:
                 assert wrapped is not None
                 eeg_z = wrapped(eeg)
                 scale = _logit_scale(encoder, device)
-                loss = compute_objective(objective, eeg_z, img, scale, ids)
+                loss = scalar_loss(compute_objective(objective, eeg_z, img, scale, ids))
             else:
                 assert model is not None
                 loss, _top1, _top5 = model(eeg, img)
-            loss = loss.mean()
+                loss = scalar_loss(loss)
             losses.append(float(loss))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -619,7 +658,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         scores_top1: list[float] = []
         scores_top5: list[float] = []
         tally = FixedBankTally(bank, bank_labels)
-        if custom:
+        if use_global:
             raw_encoder = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
             encoder.eval()
             note_eval_without_transform(counters)
@@ -675,7 +714,18 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     write_status(out_dir, "finished", finished, design.epochs)
     if duplicate_batches:
         (out_dir / "train_batch_image_ids.jsonl").write_text(
-            "\n".join(json.dumps(row) for row in duplicate_batches[:64]) + "\n",
+            "\n".join(json.dumps(row) for row in duplicate_batches) + "\n",
+            encoding="utf-8",
+        )
+        (out_dir / "duplicate_sampling.json").write_text(
+            json.dumps(
+                {
+                    "sampling_policy": "first_64_batches",
+                    "recorded_batches": len(duplicate_batches),
+                    "limit": 64,
+                    "seed": design.seed,
+                }
+            ),
             encoding="utf-8",
         )
     encoder_params = sum(int(item.numel()) for item in encoder.parameters())
@@ -733,7 +783,8 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics = out_dir / "metrics.json"
     if args.evaluate_only:
-        return _evaluate_main(design, args.data_root, out_dir)
+        checkpoint = Path(args.checkpoint) if args.checkpoint else None
+        return _evaluate_main(design, args.data_root, out_dir, checkpoint=checkpoint)
     try:
         validate_design(design)
         limit_visible_gpus(design)
@@ -759,12 +810,12 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _evaluate_main(design: Design, data_root: Path, out_dir: Path) -> int:
+def _evaluate_main(design: Design, data_root: Path, out_dir: Path, checkpoint: Path | None = None) -> int:
     """Write eval_scores.json only. status.json and metrics.json keep the finished trial."""
     target = out_dir / "eval_scores.json"
     try:
         validate_design(design)
-        payload = evaluate_checkpoint(design, data_root, out_dir)
+        payload = evaluate_checkpoint(design, data_root, out_dir, checkpoint=checkpoint)
     except (SplitError, OSError, RuntimeError, ValueError) as exc:
         target.write_text(json.dumps({"error": str(exc)}), encoding="utf-8")
         return 2

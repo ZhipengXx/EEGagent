@@ -390,13 +390,22 @@ def build_services(camp: Path) -> dict[str, Any]:
         latest = state["evidence"][-1]
         comparison = latest.get("comparison")
         diagnostics = latest.get("diagnostics")
-        if not latest.get("evaluation_valid") or latest.get("candidate_id") == "baseline":
+        if not latest.get("evaluation_valid"):
             return
+        bound_hypothesis = latest.get("hypothesis")
+        bound_experiment = latest.get("experiment")
+        if bound_hypothesis is None:
+            for row in state.get("candidates") or []:
+                if row.get("candidate_id") == latest.get("candidate_id") and row.get("hypothesis"):
+                    bound_hypothesis = row.get("hypothesis")
+                    bound_experiment = row.get("experiment")
         payload = {
             "latest": {key: latest.get(key) for key in ("evidence_id", "candidate_id", "fidelity", "fixed_bank_top1", "gallery_size", "delta_vs_control_pp", "control_id", "seed")},
             "comparison": comparison,
             "diagnostics": diagnostics,
-            "hypothesis": state.get("hypothesis"),
+            "hypothesis": bound_hypothesis,
+            "experiment": bound_experiment,
+            "hypothesis_binding_missing": bound_hypothesis is None,
             "controls": [
                 {key: row.get(key) for key in ("evidence_id", "candidate_id", "fidelity", "fixed_bank_top1", "seed")}
                 for row in state["evidence"]
@@ -409,7 +418,7 @@ def build_services(camp: Path) -> dict[str, Any]:
             billed += 1
         except LlmUnavailable as exc:
             billed += 1
-            reply = {"hypothesis_assessment": "not_tested", "summary_zh": f"分析未完成：{exc}"}
+            reply = {"status": "failed", "role_failed": True, "hypothesis_assessment": None, "summary_zh": f"分析未完成：{exc}"}
         target = camp_dir / "analyses" / f"{latest['evidence_id']}.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(

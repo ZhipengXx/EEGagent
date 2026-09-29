@@ -198,7 +198,13 @@ def test_target_id_is_required_for_training() -> None:
 
 def test_baseline_does_not_consume_candidate_slots() -> None:
     state = {
-        "experiment": {"initial_fidelity": "pilot"},
+        "experiment": {
+            "status": "approved",
+            "parent_candidate_id": "baseline",
+            "intervention": "pooling",
+            "initial_fidelity": "pilot",
+            "hypothesis": {"mechanism": "池化"},
+        },
         "llm_calls_left": 40,
         "gpu_seconds_left": 10,
         "max_candidates": 1,
@@ -563,7 +569,7 @@ def test_librarian_is_local_only_and_records_a_task(tmp_path: Path) -> None:
     hits = [row for row in state["evidence"] if row.get("kind") == "method_hits"]
     assert hits
     assert hits[0]["local_only"] is True
-    payload = json.loads((camp / "knowledge" / "method_hits.json").read_text(encoding="utf-8"))
+    payload = json.loads(next((camp / "knowledge" / "method_hits").glob("*.json")).read_text(encoding="utf-8"))
     assert payload["local_only"] is True
     assert payload["schema_version"] == "eeg_research.role_result.v1"
     assert latest(camp, payload["task_id"])["status"] == "completed"

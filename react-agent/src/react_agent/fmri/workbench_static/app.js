@@ -999,7 +999,7 @@ function agenticBody(camp) {
       <p class="muted">${esc(camp.scope_zh || "")}。验证固定候选集 top1 用于比较，测试集本轮关闭。</p>
       <div class="agentic-summary">
         <div><span class="muted">当前问题</span><p>${esc(hypothesisLine(camp.hypothesis))}</p></div>
-        <div><span class="muted">正在做什么</span><p>${esc(AGENTIC_STATUS[camp.status] || camp.status)}${progress}${detail ? `<span class="agentic-sub">${esc(detail)}</span>` : ""}</p></div>
+        <div><span class="muted">正在做什么</span><p>${esc(AGENTIC_STATUS[camp.status] || camp.status)}${progress}${detail ? `<span class="agentic-sub">${esc(detail)}</span>` : ""}</p><p class="agentic-sub">结论 ${esc(camp.research_outcome || "not_evaluated")} · 审计 ${esc(camp.audit_status || "pending")}</p></div>
         <div><span class="muted">最好可比完整结果</span><p>${bestLine}</p></div>
         <div><span class="muted">剩余预算</span><ul class="agentic-budget"><li>训练 ${esc(budget.training_jobs ?? 0)}/${esc(budget.max_training_jobs ?? "—")}</li><li>模型调用 ${esc(budget.llm_calls ?? 0)}/${esc(budget.max_llm_calls ?? "—")}</li><li>GPU 已用 ${esc(gpuUsed)}</li><li>GPU 预留 ${esc(gpuReserved)}</li><li>GPU 剩余 ${esc(gpuLeft)}</li><li>费用 ${fee}</li></ul></div>
       </div>

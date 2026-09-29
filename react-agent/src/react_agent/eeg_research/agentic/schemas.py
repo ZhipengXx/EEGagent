@@ -8,6 +8,24 @@ from pydantic import BaseModel, ConfigDict, Field
 
 SCHEMA_VERSION = "eeg_research.v1.9"
 ROLE_RESULT_VERSION = "eeg_research.role_result.v1"
+
+ROLE_OUTPUT_SCHEMAS = {
+    "research_planner": "PlannerDecision: action, target_id, question_id, evidence_refs, decision_rationale, expected_information, required_artifact_refs, hypothesis_draft, plan_update, action_depends_on_plan_update, stop_reason, summary_zh",
+    "research_librarian": "MethodEvidencePacket: question, search_scope, sources, method_cards, competing_hypotheses, applicability_limits, knowledge_gaps, local_only, summary_zh",
+    "experiment_designer": "ExperimentDesignResult: status, experiment_spec, missing_inputs, required_capability_ids, confounders, required_corrections, evidence_refs, summary_zh",
+    "candidate_coder": "One tool request: tool, args. The runtime builds PatchResult.",
+    "candidate_reviewer": "ImplementationReview: status, intervention_coverage, issues, verified_invariants_with_refs, unverified_invariants, review_limits, summary_zh",
+    "result_analyst": "ResultAnalysis: execution_assessment, hypothesis_assessment, observations, interpretations, competing_explanations, evidence_gaps, suggested_next_actions, evidence_refs, summary_zh",
+    "memory_curator": "LessonProposal: proposed_lessons with statement, conditions, invalidation_conditions, supporting_episode_ids, contradicting_episode_ids, comparison_refs, observed_effect_refs, requested_evidence_level, uncertainty",
+    "result_auditor": "AuditReport: verdict, audited_report_ref, claims, open_issues, required_corrections, review_limits, summary_zh",
+}
+
+
+def role_output_schema(role: str) -> str:
+    """Field list injected with the prompt. Roles do not keep a second handwritten schema."""
+    return ROLE_OUTPUT_SCHEMAS.get(role, "role-specific JSON object")
+
+
 PLAN_VERSION_NAME = "eeg_research.research_plan.v1"
 
 
@@ -172,6 +190,9 @@ def protocol_is_comparable(protocol: dict[str, Any] | None) -> tuple[bool, str |
         return False, "protocol_missing"
     if not protocol.get("split_seed") and protocol.get("split_seed") != 0:
         return False, "split_seed_missing"
+    gallery = protocol.get("gallery_image_ids") or protocol.get("validation_image_ids")
+    if not gallery:
+        return False, "gallery_identity_missing"
     if protocol.get("val_mode") != "other_subjects_test" and not protocol.get("validation_image_ids"):
         return False, "validation_identity_missing"
     if protocol.get("schema_version") != SCHEMA_VERSION and not protocol.get("train_query_ids") and not protocol.get(

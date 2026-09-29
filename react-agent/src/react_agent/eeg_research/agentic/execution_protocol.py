@@ -122,15 +122,21 @@ def build_execution_protocol(
         missing = [path for path in plan.val_files if not path.is_file()]
         if missing:
             raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{missing[0]}")
-        train_ids: list[str] = []
-        validation_ids: list[str] = []
         validation_files = [str(path) for path in plan.val_files]
-        identity = identity_digest(validation_files)
         train_rows = read_query_rows(plan.train_files, channels, subject_fallback)
         val_rows = read_query_rows(plan.val_files, channels, subject_fallback)
         train_query_ids = [qid for qid, _img in train_rows]
         validation_query_ids = [qid for qid, _img in val_rows]
         positive_map = {qid: img for qid, img in [*train_rows, *val_rows]}
+        train_ids = list(dict.fromkeys(img for _qid, img in train_rows))
+        validation_ids = list(dict.fromkeys(img for _qid, img in val_rows))
+        if not validation_ids or not validation_query_ids:
+            raise ProtocolError("缺少样本文件，不能冻结空的执行协议")
+        gallery_ids = set(validation_ids)
+        missing_positive = [qid for qid in validation_query_ids if positive_map.get(qid) not in gallery_ids]
+        if missing_positive:
+            raise ProtocolError("positive_not_in_gallery")
+        identity = identity_digest(validation_ids)
     else:
         if train_image_ids is None:
             train_rows = read_query_rows(plan.train_files, channels, subject_fallback)

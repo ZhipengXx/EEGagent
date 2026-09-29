@@ -77,19 +77,19 @@ def _choose_object(objects: list[dict[str, Any]]) -> dict[str, Any] | None:
 
 
 def parse_json_object(text: str) -> dict[str, Any]:
-    """Read one JSON object. A valid object followed by markup or prose still counts."""
-    cleaned = strip_json_fence(text)
+    """Read one JSON object. Fences are ignored. A second object or tool markup is refused.
+
+    Scanning for any later object would execute a different command than the first one.
+    """
+    cleaned = strip_json_fence(text).strip()
+    if _DSML_BLOCK.search(cleaned):
+        raise json.JSONDecodeError("trailing_tool_markup", cleaned, 0)
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        payload = _choose_object(_json_objects(_strip_dsml(cleaned)))
-        if payload is None:
-            raise exc
-    else:
-        if not isinstance(payload, dict):
-            payload = _choose_object(_json_objects(_strip_dsml(cleaned)))
-            if payload is None:
-                raise TypeError("json is not an object")
+        raise exc
+    if not isinstance(payload, dict):
+        raise TypeError("json is not an object")
     return payload
 
 

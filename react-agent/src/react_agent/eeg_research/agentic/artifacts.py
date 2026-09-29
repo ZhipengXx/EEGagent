@@ -30,6 +30,11 @@ def input_digest(paths: list[Path]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def allocate_artifact_id() -> str:
+    """Reserve an id before the bytes are written. Registration must not rewrite them."""
+    return f"art_{uuid.uuid4().hex[:12]}"
+
+
 def register(
     camp: Path,
     path: Path,
@@ -37,11 +42,12 @@ def register(
     kind: str,
     producer_task_id: str | None = None,
     candidate_id: str | None = None,
+    artifact_id: str | None = None,
 ) -> dict[str, Any]:
     """Record one on-disk artifact. The hash is taken from the file at registration time."""
     digest = file_digest(path)
     row = {
-        "artifact_id": f"art_{uuid.uuid4().hex[:12]}",
+        "artifact_id": artifact_id or allocate_artifact_id(),
         "kind": kind,
         "path": str(path.resolve()),
         "relative": str(path.resolve().relative_to(camp.resolve())) if _under(path, camp) else None,
@@ -80,6 +86,34 @@ def verify(camp: Path, artifact_id: str) -> tuple[bool, str]:
     if file_digest(path) != row.get("sha256"):
         return False, "artifact_hash_mismatch"
     return True, "ok"
+
+
+def resolve_verified_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
+    """Return a registry row only after the bytes still match. A path alone is not a read."""
+    ok, reason = verify(camp, artifact_id)
+    if not ok:
+        raise FileNotFoundError(reason)
+    row = lookup(camp, artifact_id)
+    if row is None:
+        raise FileNotFoundError("artifact_unknown")
+    return row
+
+
+def read_verified_range(camp: Path, artifact_id: str, *, start: int = 0, end: int | None = None) -> dict[str, Any]:
+    """Read a bounded slice of one registered artifact. Unknown ids are refused."""
+    row = resolve_verified_artifact(camp, artifact_id)
+    text = Path(str(row["path"])).read_text(encoding="utf-8")
+    stop = len(text) if end is None else max(start, end)
+    chunk = text[start:stop]
+    return {
+        "artifact_id": artifact_id,
+        "sha256": row.get("sha256"),
+        "start": start,
+        "end": start + len(chunk),
+        "truncated": start + len(chunk) < len(text),
+        "next_range": None if start + len(chunk) >= len(text) else [start + len(chunk), len(text)],
+        "text": chunk,
+    }
 
 
 def _under(path: Path, camp: Path) -> bool:

@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from react_agent.eeg_research.agentic.artifacts import input_digest, register
+from react_agent.eeg_research.agentic.artifacts import allocate_artifact_id, input_digest, register, verify
 from react_agent.eeg_research.agentic.schemas import ROLE_RESULT_VERSION, RoleResult
 from react_agent.eeg_research.agentic.task_ledger import create_task, mark, reusable
 
@@ -142,22 +142,43 @@ def task_identity_from_payload(payload: Any, bound: dict[str, Any] | None = None
     }
 
 
+def _claimed(reply: dict[str, Any], field: str) -> str | None:
+    value = reply.get(field)
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
 def bind_role_output(reply: Any, *, task: dict[str, Any], prompt_hash: str = "") -> dict[str, Any]:
     """Validate a claimed envelope or wrap a domain object.
 
-    A different task_id is not reused. A schema_version with missing or partial identity is wrapped.
+    Any explicit identity field must match this attempt. A mismatch is not stripped and rebound.
+    A business payload with no identity is wrapped by the runtime.
     """
     if not isinstance(reply, dict):
         raise RoleResultError("role_result_not_object")
     reply = _coerce_role_fields(reply)
-    claimed = reply.get("task_id")
-    if reply.get("schema_version") == ROLE_RESULT_VERSION and claimed and claimed != task["task_id"]:
+    claimed_task = _claimed(reply, "task_id")
+    claimed_attempt = _claimed(reply, "attempt_id")
+    claimed_digest = _claimed(reply, "input_digest")
+    claimed_candidate = _claimed(reply, "candidate_id")
+    if claimed_task is not None and claimed_task != str(task["task_id"]):
+        raise RoleResultError("role_result_identity_mismatch")
+    if claimed_attempt is not None and claimed_attempt != str(task["attempt_id"]):
+        raise RoleResultError("role_result_identity_mismatch")
+    if claimed_digest is not None and claimed_digest != str(task["input_digest"]):
+        raise RoleResultError("role_result_identity_mismatch")
+    expected_candidate = task.get("candidate_id")
+    if claimed_candidate is not None and expected_candidate not in (None, "") and claimed_candidate != str(expected_candidate):
+        raise RoleResultError("role_result_identity_mismatch")
+    explicit = (claimed_task, claimed_attempt, claimed_digest)
+    if any(item is not None for item in explicit) and not all(item is not None for item in explicit):
         raise RoleResultError("role_result_identity_mismatch")
     matched = (
         reply.get("schema_version") == ROLE_RESULT_VERSION
-        and claimed == task["task_id"]
-        and str(reply.get("attempt_id") or "") == str(task["attempt_id"])
-        and str(reply.get("input_digest") or "") == str(task["input_digest"])
+        and claimed_task == str(task["task_id"])
+        and claimed_attempt == str(task["attempt_id"])
+        and claimed_digest == str(task["input_digest"])
     )
     if matched:
         try:
@@ -203,12 +224,25 @@ def finish_role_task(
     path: Path,
     candidate_id: str | None = None,
 ) -> dict[str, Any]:
-    """Write the envelope, register the artifact, and mark the task completed."""
+    """Write the final envelope once, then register those exact bytes."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_id = allocate_artifact_id()
     envelope = wrap_role_result(payload, task=task)
+    refs = list(envelope.get("artifact_refs") or [])
+    if artifact_id not in refs:
+        refs.append(artifact_id)
+    envelope["artifact_refs"] = refs
     path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
-    artifact = register(camp, path, kind=kind, producer_task_id=task["task_id"], candidate_id=candidate_id)
-    envelope.setdefault("artifact_refs", []).append(artifact["artifact_id"])
-    path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+    artifact = register(
+        camp,
+        path,
+        kind=kind,
+        producer_task_id=task["task_id"],
+        candidate_id=candidate_id,
+        artifact_id=artifact_id,
+    )
+    ok, reason = verify(camp, artifact["artifact_id"])
+    if not ok:
+        raise RoleResultError(reason)
     mark(camp, task["task_id"], "completed", artifact_id=artifact["artifact_id"], path=str(path))
     return envelope

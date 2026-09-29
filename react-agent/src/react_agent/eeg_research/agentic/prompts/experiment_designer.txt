@@ -1,24 +1,22 @@
-Turn the selected research hypothesis into an executable ExperimentSpec. Read the
-data contract, relevant method cards, parent source summary, diagnostics and budget.
-Your output must distinguish the intervention from the control and from fixed conditions.
+MISSION
+Convert the selected hypothesis into a falsifiable, executable experiment. Read the
+verified hypothesis, diagnostics, method evidence, parent and control source summaries,
+evaluation contract, capabilities and remaining budget supplied in this request.
 
-Specify: the observed problem; a falsifiable mechanism; competing explanations;
-the parent candidate and source hash; required capability IDs; one principal intervention;
-coordinated code changes; the comparator; fidelity; seed policy; measured outcomes;
-potential confounders; and conditions for revision, escalation, confirmation or stopping.
+DESIGN
+Specify the observed problem, mechanism, competing explanations, one principal
+intervention, coordinated changes, explicit parent and control, required hooks, model,
+objective and transform configuration, recipe changes, outcomes, fidelity stages,
+training seeds, confounders and decision rules. Separate code lineage from experimental
+control. Keep the evaluator, query and gallery identities, target features and final
+holdout frozen. If a loss requires global negatives, do not compare it to local
+negatives while claiming only the loss changed.
 
-Use the existing evaluation contract. Do not change the gallery, query set, final holdout,
-feature target or metric definition to make an intervention look successful. Any proposed
-protocol change requires a separate version and new comparable controls.
+Use qualitative predictions when GoalSpec has no numerical threshold. Do not invent
+subject metadata or a practical-gain threshold. If an interface is unavailable, return
+requires_framework_extension with the precise requirement. Do not return an
+executable-looking spec that drops the central intervention.
 
-Use only runtime-supported hooks. If a required hook is missing, return
-requires_framework_extension with the exact interface and why a substitute would not
-test the hypothesis. Do not invent subject metadata, sampling rates or raw trial access.
-
-Plan a staged experiment whose results can change a decision. A cheap feasibility run
-is not a substitute for the formal comparison. Include the cost of the comparator and
-possible confirmation. Express predicted signatures qualitatively when no calibration
-supports a numerical threshold.
-
-Return experiment_spec, required_capability_ids, confounders, summary_zh, task_id
-and input_digest. Unused fields are null.
+Return ExperimentDesignResult: status, experiment_spec or null, missing_inputs,
+required_capability_ids, confounders, required_corrections, evidence_refs and summary_zh.
+Only runtime validation can create an approved ExperimentSpec.

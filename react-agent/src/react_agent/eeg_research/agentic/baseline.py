@@ -15,6 +15,9 @@ class EEGCandidate:
     def build_encoder(self, input_spec: dict[str, Any], model_config: dict[str, Any] | None = None) -> EEGProjectLayer:
         """Project EEG [batch, channels, time] to the image feature size."""
         config = model_config or {}
+        unknown = sorted(set(config) - {"z_dim", "drop_proj"})
+        if unknown:
+            raise ValueError("unknown_model_config:" + ",".join(unknown))
         return EEGProjectLayer(
             z_dim=int(config.get("z_dim", 1024)),
             c_num=int(input_spec["c_num"]),
@@ -24,10 +27,12 @@ class EEGCandidate:
 
     def build_training_objective(self, objective_config: dict[str, Any] | None = None) -> Any:
         """Return the symmetric contrastive loss. The image target stays the frozen cache."""
-        del objective_config
+        if objective_config:
+            raise ValueError("baseline_objective_rejects_config")
         return contrastive_loss
 
     def build_training_transform(self, transform_config: dict[str, Any] | None = None) -> Any:
         """Baseline applies no extra train-only transform."""
-        del transform_config
+        if transform_config:
+            raise ValueError("baseline_transform_rejects_config")
         return None

@@ -35,8 +35,11 @@ class LlmUnavailable(RuntimeError):
 
 
 def system_prompt(role: str) -> str:
+    from react_agent.eeg_research.agentic.schemas import role_output_schema
+
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
-    return shared + "\n\n" + (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
+    mission = (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
+    return shared + "\n\n" + mission + "\n\nOUTPUT_SCHEMA\n" + role_output_schema(role) + "\nReturn one JSON object only.\n"
 
 
 def _ledger(camp: Path, row: dict[str, Any]) -> None:
@@ -109,6 +112,22 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
         last: DeepSeekParseError | None = None
         for _attempt in range(PARSE_ATTEMPTS):
+            goal_path = camp / "goal.json"
+            if goal_path.is_file():
+                try:
+                    goal = json.loads(goal_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    goal = {}
+                limit = goal.get("max_llm_calls")
+                cost_path = camp / "cost.json"
+                used = 0
+                if cost_path.is_file():
+                    try:
+                        used = int(json.loads(cost_path.read_text(encoding="utf-8")).get("llm_calls") or 0)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        used = 0
+                if isinstance(limit, int) and used >= limit:
+                    raise LlmUnavailable("budget_exhausted")
             started = time.time()
             row = new_call_row(
                 role=role,

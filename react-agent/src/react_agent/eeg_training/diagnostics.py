@@ -30,14 +30,19 @@ def training_dynamics(job_dir: Path) -> dict[str, Any]:
     if not rows:
         return _item(UNAVAILABLE, reason="history_empty")
     last = rows[-1]
+    best = max(rows, key=lambda item: float(item.get("fixed_bank_top1") or 0.0))
     return _item(
         "observed",
         {
             "epochs": len(rows),
+            "best_epoch": best.get("epoch"),
             "last_loss": last.get("train_loss") or last.get("loss"),
             "last_fixed_bank_top1": last.get("fixed_bank_top1"),
             "last_fixed_bank_top5": last.get("fixed_bank_top5"),
+            "train_loss": [row.get("train_loss") or row.get("loss") for row in rows],
+            "fixed_bank_top1": [row.get("fixed_bank_top1") for row in rows],
             "sample_count": len(rows),
+            "definition": "epoch_series_from_history",
         },
     )
 
@@ -75,6 +80,110 @@ def _load_duplicate_batches(job_dir: Path) -> list[list[str]]:
     return rows
 
 
+def retrieval_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Positive rank and margin from one frozen validation pass. Ranks are 1-based."""
+    if not rows:
+        return _item(UNAVAILABLE, reason="query_ranks_not_exported")
+    margins = []
+    hits = 0
+    parsed = []
+    for row in rows:
+        rank = row.get("positive_rank")
+        positive = row.get("positive_score")
+        negative = row.get("best_negative_score")
+        if rank is None or positive is None or negative is None:
+            return _item(UNAVAILABLE, reason="retrieval_row_incomplete")
+        margin = float(positive) - float(negative)
+        margins.append(margin)
+        if int(rank) <= int(row.get("k") or 1):
+            hits += 1
+        parsed.append(
+            {
+                "query_id": row.get("query_id"),
+                "positive_rank": int(rank),
+                "positive_score": float(positive),
+                "best_negative_score": float(negative),
+                "margin": margin,
+            }
+        )
+    return _item(
+        "observed",
+        {
+            "sample_count": len(parsed),
+            "mean_margin": sum(margins) / len(margins),
+            "hit_rate": hits / len(parsed),
+            "rows": parsed,
+            "definition": "positive_score_minus_best_negative",
+            "scope": "frozen_validation",
+        },
+    )
+
+
+def representation_from_vectors(vectors: list[list[float]]) -> dict[str, Any]:
+    """Norm, per-dimension variance, and participation-ratio effective rank."""
+    if not vectors or not vectors[0]:
+        return _item(UNAVAILABLE, reason="embeddings_not_exported")
+    width = len(vectors[0])
+    if any(len(row) != width for row in vectors):
+        return _item(UNAVAILABLE, reason="embedding_width_mismatch")
+    count = len(vectors)
+    norms = []
+    for row in vectors:
+        norms.append(sum(value * value for value in row) ** 0.5)
+    means = [sum(row[index] for row in vectors) / count for index in range(width)]
+    variances = [
+        sum((row[index] - means[index]) ** 2 for row in vectors) / count
+        for index in range(width)
+    ]
+    total = sum(variances)
+    squares = sum(value * value for value in variances)
+    effective = None if squares == 0 else (total * total) / squares
+    return _item(
+        "observed",
+        {
+            "sample_count": count,
+            "width": width,
+            "mean_norm": sum(norms) / count,
+            "mean_dimension_variance": total / width,
+            "effective_rank": effective,
+            "effective_rank_definition": "participation_ratio_of_dimension_variance",
+            "scope": "supplied_embeddings",
+        },
+    )
+
+
+def _load_jsonl(path: Path) -> list[Any]:
+    if not path.is_file():
+        return []
+    rows = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _load_embedding_matrix(job_dir: Path) -> list[list[float]]:
+    path = job_dir / "embeddings.json"
+    if not path.is_file():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    rows = payload.get("vectors") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        return []
+    matrix: list[list[float]] = []
+    for row in rows:
+        if isinstance(row, list):
+            matrix.append([float(value) for value in row])
+    return matrix
+
+
 def compute_job_diagnostics(job_dir: Path, *, batches: list[list[str]] | None = None) -> dict[str, Any]:
     """Fill every DiagnosticBundle category. Absent files stay unavailable."""
     job_dir = Path(job_dir)
@@ -104,9 +213,11 @@ def compute_job_diagnostics(job_dir: Path, *, batches: list[list[str]] | None = 
             },
         ),
         "training_dynamics": training_dynamics(job_dir),
-        "retrieval_errors": _item(UNAVAILABLE, reason="query_ranks_not_exported"),
-        "representation": _item(UNAVAILABLE, reason="embeddings_not_exported"),
-        "group_results": _item(UNAVAILABLE, reason="subject_metadata_not_trusted"),
+        "retrieval_errors": retrieval_from_rows([row for row in _load_jsonl(job_dir / "retrieval_queries.jsonl") if isinstance(row, dict)]),
+        "representation": representation_from_vectors(_load_embedding_matrix(job_dir)),
+        "group_results": _item(UNAVAILABLE, reason="subject_metadata_not_trusted")
+        if not (job_dir / "subject_groups.json").is_file()
+        else _item("observed", json.loads((job_dir / "subject_groups.json").read_text(encoding="utf-8"))),
         "intervention_probe": _item(UNAVAILABLE, reason="occlusion_not_requested"),
         "integrity_cost": _item(
             "observed" if binding.is_file() else UNAVAILABLE,

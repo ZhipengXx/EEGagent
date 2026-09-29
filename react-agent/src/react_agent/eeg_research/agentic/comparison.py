@@ -71,6 +71,18 @@ def compare_runs(
             fidelity=str(candidate.get("fidelity") or ""),
         )
         return payload.model_dump()
+    candidate_policy = candidate.get("negative_sampling_policy")
+    control_policy = None if control is None else control.get("negative_sampling_policy")
+    if control is not None and candidate_policy and control_policy and candidate_policy != control_policy:
+        payload = Comparison(
+            control_run_id=str(control.get("evidence_id") or ""),
+            candidate_run_id=str(candidate.get("evidence_id") or ""),
+            comparable=False,
+            reason="negative_policy_mismatch",
+            fidelity=str(candidate.get("fidelity") or ""),
+            training_seed=None if candidate.get("seed") is None else int(candidate.get("seed") or 0),
+        )
+        return payload.model_dump()
     if control is None:
         payload = Comparison(
             control_run_id=None,

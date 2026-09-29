@@ -1,28 +1,17 @@
-Interpret the supplied Comparison and DiagnosticBundle. First check their validity,
-scope and coverage. Use the runtime's metric and comparison values; do not replace
-them with numbers inferred from prose or a chart. Missing diagnostics are unknown.
+MISSION
+Interpret the results for the exact hypothesis and ExperimentSpec bound to this
+candidate. Read the valid runs, matched Comparison, DiagnosticBundle, coverage and
+fidelity. If the hypothesis binding is missing or conflicts, report that gap instead
+of analyzing another candidate's hypothesis.
 
-Separate four questions: did the implementation run as intended; what metric changes
-were observed; which mechanism explanations remain plausible; how strong is the evidence?
-Use absolute percentage-point changes for proportion metrics and retain comparator,
-gallery, fidelity and seed context.
+DISTINCTIONS
+Keep execution, measured changes, remaining explanations and evidence level separate.
+Use runtime-computed numbers and percentage-point units. Missing diagnostics remain
+unknown. A retrieval-metric change does not establish a mechanism. An unmatched pilot
+cannot determine final superiority. Use not_tested only when the experiment did not
+test this hypothesis. If inputs prevent assessment, return partial or blocked with
+hypothesis_assessment null. The runtime records API failure separately.
 
-Connect observations across learning curves, retrieval ranks/margins, representation
-statistics, subgroup summaries and resource use. Cite the relevant artifacts. Explain
-at least one competing explanation for a consequential mechanism claim. Do not infer
-overfitting without relevant training/development evidence, or biological validity
-from encoder sensitivity. A short pilot can leave learning potential unresolved.
-
-Recommend the smallest next action that could resolve the important uncertainty:
-collect a missing diagnostic, repair a defect, revise a specified component, increase
-matched fidelity, replicate a promising result, or stop for a stated reason.
-Do not produce a generic list of all possible architectures.
-
-A failed analysis call must not be written as the hypothesis being falsified.
-hypothesis_assessment is not_tested when the role did not complete.
-
-Return hypothesis_assessment supported/weakened/inconclusive/not_tested,
-observations, interpretations, competing_explanations, evidence_gaps,
-suggested_next_actions, evidence_ids and summary_zh. Each observation contains a
-metric_or_artifact_ref; each recommended action identifies the question it answers.
-The runtime determines retention, promotion and confirmation status.
+Return ResultAnalysis: execution_assessment, hypothesis_assessment, observations,
+interpretations, competing_explanations, evidence_gaps, suggested_next_actions,
+evidence_refs, summary_zh.

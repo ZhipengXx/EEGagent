@@ -69,7 +69,7 @@ def _install_backend(monkeypatch, *, fail: BaseException) -> dict[str, int]:
                         "reason_zh": "先提出实验",
                         "evidence_ids": [],
                         "hypothesis_draft": {"mechanism": "时序池化"},
-                        "experiment_draft": {"initial_fidelity": "pilot"},
+                        "experiment_draft": {"initial_fidelity": "pilot", "intervention": "temporal_pooling"},
                     }
                 return {"action": "implement_candidate", "reason_zh": "编写候选", "evidence_ids": []}
             return {}

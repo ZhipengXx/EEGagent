@@ -55,17 +55,46 @@ def note_eval_without_transform(counters: dict[str, int]) -> None:
     counters["transform_eval_calls"] = int(counters.get("transform_eval_calls") or 0)
 
 
+class HookConfigError(ValueError):
+    """A hook was given a configuration key it does not accept."""
+
+
+def resolve_negative_policy(candidate: Any, objective: Any | None = None) -> str:
+    """Custom loss does not silently switch the negative set. Declaration is required."""
+    del objective
+    declared = getattr(candidate, "negative_sampling_policy", None)
+    if declared in {"data_parallel_local", "global_batch"}:
+        return str(declared)
+    return "data_parallel_local"
+
+
+def call_configured(builder: Any, config: dict[str, Any] | None, *, kind: str) -> Any:
+    """Pass approved config. Unknown keys are rejected instead of dropped."""
+    payload = dict(config or {})
+    accepted = getattr(builder, "accepted_config_keys", None)
+    if accepted is not None:
+        unknown = sorted(set(payload) - set(accepted))
+        if unknown:
+            raise HookConfigError(f"unknown_{kind}_config:{','.join(unknown)}")
+    return builder(payload)
+
+
+def scalar_loss(loss: Any) -> Any:
+    """Refuse a non-scalar loss. Mean must not hide a shape error."""
+    ndim = getattr(loss, "ndim", 0)
+    if ndim not in (0, None) and int(ndim) != 0:
+        raise RuntimeError("loss_not_scalar")
+    return loss
+
+
 def compute_objective(objective: Any, eeg_z, img_z, scale, positives: list[str] | None = None):
-    """Return a finite scalar loss. Baseline contrastive ignores extra positives."""
+    """Return a finite scalar loss. An internal TypeError is not retried without positives."""
     counters = getattr(objective, "_call_counts", None)
     if isinstance(counters, dict):
         counters["objective_train_calls"] = int(counters.get("objective_train_calls") or 0) + 1
     if not is_custom_objective(objective):
         return contrastive_loss(eeg_z, img_z, scale)
-    try:
-        return objective(eeg_z, img_z, scale, positives)
-    except TypeError:
-        return objective(eeg_z, img_z, scale)
+    return objective(eeg_z, img_z, scale, positives)
 
 
 def capabilities_used_payload(

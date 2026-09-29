@@ -43,6 +43,13 @@ def pack_candidate(job_dir: Path, dest: Path, *, workspace: Path | None = None) 
             shutil.copy2(entry, target / "eeg_candidate.py")
             source = "extension/eeg_candidate.py"
             copied.append(source)
+    binding_path = dest / "source_binding.json"
+    entry = dest / "extension" / "eeg_candidate.py"
+    if binding_path.is_file() and entry.is_file():
+        binding = _read_json(binding_path)
+        binding["class_file"] = str(entry.resolve())
+        binding["workspace"] = str(dest.resolve())
+        binding_path.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = {
         "schema_version": "eeg_research.candidate_pack.v1",
         "job_dir": str(job_dir),
@@ -50,6 +57,7 @@ def pack_candidate(job_dir: Path, dest: Path, *, workspace: Path | None = None) 
         "missing": missing,
         "evaluate_only": True,
         "final_test": False,
+        "checkpoint": str((dest / "last.ckpt").resolve()) if (dest / "last.ckpt").is_file() else None,
     }
     (dest / "pack_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
@@ -142,6 +150,8 @@ def evaluate_only_argv(pack: Path, *, out: Path | None = None, data_root: Path |
         "--out",
         str(dest),
         "--evaluate-only",
+        "--checkpoint",
+        str(pack / "last.ckpt"),
     ]
     train_dir = str(job.get("train_dir") or identity.get("train_dir") or "")
     test_dir = str(job.get("test_dir") or identity.get("test_dir") or "")

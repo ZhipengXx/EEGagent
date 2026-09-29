@@ -19,22 +19,57 @@ def _tier(fidelity: str | None, confirmation_level: str | None) -> str:
     return fidelity or "observed"
 
 
+def _paired_rows(
+    paired_deltas_pp: list[float] | None,
+    paired_records: list[dict[str, Any]] | None,
+    fidelity: str | None,
+) -> list[dict[str, Any]]:
+    if paired_records:
+        return [dict(row) for row in paired_records if isinstance(row, dict)]
+    return [{"delta_pp": float(value), "fidelity": fidelity, "legacy_float": True} for value in (paired_deltas_pp or [])]
+
+
+def _confirmation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Full runs only. The same run, seed, or checkpoint is one observation."""
+    kept: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for row in rows:
+        if str(row.get("fidelity") or "") == "pilot":
+            continue
+        if row.get("evaluation_valid") is False:
+            continue
+        token = (row.get("run_id") or row.get("job_id"), row.get("seed"), row.get("checkpoint_id"))
+        if any(token) and token in seen:
+            continue
+        if any(token):
+            seen.add(token)
+        kept.append(row)
+    return kept
+
+
 def promotion_decision(
     *,
     comparison: dict[str, Any],
     goal: dict[str, Any],
     paired_deltas_pp: list[float] | None = None,
     fidelity: str | None = None,
+    paired_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Return a code-level promotion record. LLM must not invent a numeric bar.
 
-    A green replicate is not a green confirmation. confirmation_target_pairs is the
-    pre-declared paired-seed policy; fewer pairs stay provisional.
+    Pilot runs and bare float lists never become confirmation. The paired set, not the
+    last delta, decides the aggregate. Percentage points are compared as percentage points.
     """
     bar = goal.get("min_practical_gain_pp")
-    target_pairs = int(goal.get("confirmation_target_pairs") or 3)
-    paired = list(paired_deltas_pp or [])
-    replicate_n = len(paired)
+    target_pairs = int(goal.get("confirmation_target_pairs") or 0)
+    has_rule = goal.get("confirmation_target_pairs") is not None
+    rows = _confirmation_rows(_paired_rows(paired_deltas_pp, paired_records, fidelity))
+    deltas = [float(row["delta_pp"]) for row in rows if row.get("delta_pp") is not None]
+    replicate_n = len(deltas)
+    identity_ready = bool(rows) and all(
+        not row.get("legacy_float") and row.get("run_id") and row.get("control_run_id") and row.get("seed") is not None
+        for row in rows
+    )
     if not comparison.get("comparable"):
         return {
             "status": "not_compared",
@@ -47,7 +82,30 @@ def promotion_decision(
             "paired_n": replicate_n,
         }
     delta_pp = comparison.get("delta_pp")
-    if bar is not None and delta_pp is not None and float(delta_pp) < float(bar):
+    if deltas and has_rule and target_pairs > 0:
+        margin = 0.0 if bar is None else float(bar)
+        level = confirmation(deltas, target=target_pairs, margin_pp=margin)
+        confirmed = (
+            level == "replicated_improvement"
+            and fidelity == "full"
+            and identity_ready
+            and bar is not None
+        )
+        status = "confirmed" if confirmed else "provisional"
+        if bar is not None and level == "no_confirmed_improvement":
+            status = "below_threshold"
+        return {
+            "status": status,
+            "reason": level,
+            "min_practical_gain_pp": bar,
+            "delta_pp": delta_pp,
+            "confirmation": level,
+            "tier": "confirmation" if confirmed else _tier(fidelity, None),
+            "replicate_status": "replicated_seed" if replicate_n > 1 else "single_seed",
+            "confirmation_target_pairs": target_pairs,
+            "paired_n": replicate_n,
+        }
+    if not deltas and bar is not None and delta_pp is not None and float(delta_pp) < float(bar):
         return {
             "status": "below_threshold",
             "reason": "min_practical_gain_not_met",
@@ -55,32 +113,18 @@ def promotion_decision(
             "delta_pp": delta_pp,
             "confirmation": None,
             "tier": _tier(fidelity, None),
-            "replicate_status": "recorded" if replicate_n > 1 else "single_or_none",
+            "replicate_status": "single_or_none",
             "confirmation_target_pairs": target_pairs,
-            "paired_n": replicate_n,
-        }
-    if paired:
-        level = confirmation(paired, target=target_pairs, margin_pp=float(bar or 0.0))
-        confirmed = level == "replicated_improvement"
-        return {
-            "status": "confirmed" if confirmed else "provisional",
-            "reason": level,
-            "min_practical_gain_pp": bar,
-            "delta_pp": delta_pp,
-            "confirmation": level,
-            "tier": _tier(fidelity, level),
-            "replicate_status": "replicated_seed" if replicate_n > 1 else "single_seed",
-            "confirmation_target_pairs": target_pairs,
-            "paired_n": replicate_n,
+            "paired_n": 0,
         }
     return {
         "status": "observed",
-        "reason": "single_seed",
+        "reason": "single_seed" if not deltas else "confirmation_rule_missing",
         "min_practical_gain_pp": bar,
         "delta_pp": delta_pp,
         "confirmation": None,
         "tier": _tier(fidelity, None),
-        "replicate_status": "single_seed",
+        "replicate_status": "replicated_seed" if replicate_n > 1 else "single_seed",
         "confirmation_target_pairs": target_pairs,
-        "paired_n": 0,
+        "paired_n": replicate_n,
     }

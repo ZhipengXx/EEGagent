@@ -15,16 +15,25 @@ def capability_manifest(protocol: dict[str, Any] | None = None) -> dict[str, Any
         "schema_version": "eeg_research.capabilities.v1",
         "task_type": "eeg_image_retrieval",
         "hooks": {
-            "build_encoder": {"status": "available", "verified": True},
-            "fit_statistics": {"status": "available", "verified": True},
-            "build_training_transform": {"status": "available", "verified": True},
-            "build_training_objective": {"status": "available", "verified": True},
-            "evaluate_only": {"status": "available", "verified": True},
+            name: {
+                "status": "available",
+                "verified": False,
+                "interface_version": "eeg_candidate.hooks.v1",
+                "verification_artifact": None,
+                "reason": "no_verification_artifact",
+            }
+            for name in (
+                "build_encoder",
+                "fit_statistics",
+                "build_training_transform",
+                "build_training_objective",
+                "evaluate_only",
+            )
         },
         "task_adapters": {name: {"status": "unavailable"} for name in UNAVAILABLE_TASKS},
         "negative_sampling_policies": {
             "data_parallel_local": {"status": "available", "default": True},
-            "global_batch": {"status": "available", "when": "custom_objective"},
+            "global_batch": {"status": "available", "when": "declared_by_experiment"},
         },
         "input_spec": candidate_interface(protocol),
     }

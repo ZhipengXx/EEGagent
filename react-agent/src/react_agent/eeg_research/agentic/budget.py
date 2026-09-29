@@ -62,16 +62,22 @@ def release_gpu(state: dict[str, Any], seconds: float) -> None:
     state["gpu_seconds_reserved"] = max(0.0, float(state.get("gpu_seconds_reserved") or 0.0) - seconds)
 
 
-def charge_gpu(camp: Path, state: dict[str, Any], seconds: float) -> None:
-    """Move spent seconds from reservation into the used ledger."""
+def charge_gpu(camp: Path, state: dict[str, Any], seconds: float, *, job_id: str | None = None) -> bool:
+    """Move spent seconds from reservation into the used ledger. One job settles once."""
+    cost = _read(camp / COST)
+    settled = [str(item) for item in cost.get("settled_job_ids") or []]
+    if job_id and job_id in settled:
+        return False
     used = max(0.0, float(seconds))
     release_gpu(state, used)
     state["gpu_seconds_left"] = float(state.get("gpu_seconds_left") or 0.0) - used
-    cost = _read(camp / COST)
     cost["gpu_seconds_used"] = float(cost.get("gpu_seconds_used") or 0.0) + used
     cost["training_jobs"] = int(state.get("training_jobs") or 0)
+    if job_id:
+        cost["settled_job_ids"] = settled + [job_id]
     cost.setdefault("api_usd", None)
     _write(camp / COST, cost)
+    return True
 
 
 def wall_deadline(gpu_seconds_left: float, n_gpu: int, *, now: float) -> float | None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 from torch import nn
@@ -52,9 +54,10 @@ class EEGProjectLayer(nn.Module):
 class LocalRetrieval(nn.Module):
     """Contrastive step on one replica. DataParallel keeps each card's own batch."""
 
-    def __init__(self, encoder: nn.Module) -> None:
+    def __init__(self, encoder: nn.Module, objective: Any | None = None) -> None:
         super().__init__()
         self.encoder = encoder
+        self.objective = objective
         if not hasattr(encoder, "logit_scale"):
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
             self.softplus = nn.Softplus()
@@ -66,7 +69,10 @@ class LocalRetrieval(nn.Module):
             scale = self.encoder.softplus(self.encoder.logit_scale)
         else:
             scale = self.softplus(self.logit_scale)
-        loss = contrastive_loss(embedding, image, scale)
+        if self.objective is None:
+            loss = contrastive_loss(embedding, image, scale)
+        else:
+            loss = self.objective(embedding, image, scale)
         eeg_n = embedding / embedding.norm(dim=-1, keepdim=True)
         image_n = image / image.norm(dim=-1, keepdim=True)
         similarity = eeg_n @ image_n.T

@@ -1,18 +1,22 @@
-Propose reusable lessons from the supplied immutable development episodes. Preserve
-their task conditions, intervention, control, fidelity, seeds, costs and evidence level.
-Look for counterexamples as well as favorable observations.
+MISSION
+Propose narrow, reusable lessons from immutable development episodes and their linked
+experiments, comparisons and analyses. This task does not edit run facts, compute
+missing results or promote evidence.
 
-Distinguish implementation failures, short-run observations, single-seed full results
-and paired confirmation. A failure to execute is not evidence that the architecture
-is ineffective. A pilot loss is not proof of final inferiority. Repeated references
-to the same run do not create independent support.
+LESSON QUALITY
+A useful lesson specifies the task, data and evaluation conditions, intervention and
+control, fidelity, seed treatment, observed result, uncertainty, applicability and
+invalidation conditions. Preserve the difference between an implementation failure, a
+pilot observation, a single-seed full result and a matched confirmation. Repeated
+references to the same job do not add independent support. Evidence from a different
+protocol is analogy, not a directly comparable gain.
 
-Write narrow, conditional lessons: when the recorded conditions hold, this intervention
-produced this observed result under this evaluation. State when the lesson should not
-be reused and which contradictory episodes exist. Do not generalize to other tasks,
-subjects or feature targets without compatible evidence.
+Every supporting and contradicting episode ID must exist in the supplied evidence.
+Link each numeric effect to a runtime Comparison reference. Do not fill required
+conditions with null or generic placeholders. If no useful generalization is supported,
+return an empty lesson list.
 
-Return proposed_lessons, supporting_episode_ids, contradicting_episode_ids,
-conditions, invalidation_conditions, evidence_level_requested and summary_zh.
-You cannot edit episode values or promote evidence levels. The runtime validates
-compatibility, deduplication and the maximum level supported by the referenced runs.
+Return LessonProposal containing proposed_lessons. Each lesson has statement,
+conditions, invalidation_conditions, supporting_episode_ids, contradicting_episode_ids,
+comparison_refs, observed_effect_refs, requested_evidence_level and uncertainty.
+The runtime validates compatibility, numerical references and evidence level.
