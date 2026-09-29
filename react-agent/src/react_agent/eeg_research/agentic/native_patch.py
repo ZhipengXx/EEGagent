@@ -48,7 +48,7 @@ def _load_coder_rows(log_path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _restore_coder(workspace: Path) -> dict[str, Any]:
+def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str, Any]:
     """Replay complete log rows without executing their tools again."""
     from react_agent.eeg_research.agentic.binding import file_sha256
 
@@ -84,6 +84,8 @@ def _restore_coder(workspace: Path) -> dict[str, Any]:
                 failed_checks += 1
         if tool == "finish_patch" and result.get("ok"):
             finished = True
+    if ignore_finish:
+        finished = False
     checks_path = workspace / "checks.json"
     if checks_path.is_file():
         try:
@@ -98,7 +100,7 @@ def _restore_coder(workspace: Path) -> dict[str, Any]:
         current = file_sha256(entry)
         if not last_patch_sha or current != last_patch_sha:
             raise RecoveryBlocked("unlogged_code_change")
-    if (workspace / "source_manifest.json").is_file() and not finished:
+    if (workspace / "source_manifest.json").is_file() and not finished and not ignore_finish:
         raise RecoveryBlocked("unlogged_finish")
     if finished:
         manifest_path = workspace / "source_manifest.json"
@@ -132,14 +134,15 @@ def implement(
     python: str | None = None,
     calls_left: Callable[[], int] | None = None,
     reserve: int = 2,
+    resume_repair: bool = False,
 ) -> dict[str, Any]:
     """Run the coder loop. finish_patch is refused until a check has passed.
 
     A complete coder log is replayed in memory. Tools already in that log are not executed again.
     """
     (workspace / "extension").mkdir(parents=True, exist_ok=True)
-    restored = _restore_coder(workspace)
-    if restored.get("done"):
+    restored = _restore_coder(workspace, ignore_finish=resume_repair)
+    if restored.get("done") and not resume_repair:
         return restored["done"]
     log_path = workspace / "coder_log.jsonl"
     history: list[dict[str, Any]] = list(restored["history"])
@@ -151,17 +154,17 @@ def implement(
     next_step = int(restored["next_step"])
     from react_agent.eeg_research.agentic.binding import file_sha256
     from react_agent.eeg_research.agentic.coder import _REFERENCES
+    from react_agent.eeg_research.agentic.interface import candidate_interface
 
-    from react_agent.eeg_research.agentic.interface import CANDIDATE_INTERFACE
-    from react_agent.eeg_training.protocol import geometry
-
-    shape = geometry("eeg")
-    input_spec = {
-        "c_num": int(shape["c_num"]),
-        "timesteps": list(shape["timesteps"]),
-        **CANDIDATE_INTERFACE,
-    }
+    spec_path = workspace / "input_spec.json"
+    if spec_path.is_file():
+        input_spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    else:
+        input_spec = candidate_interface(None)
     references = {name: path.read_text(encoding="utf-8")[:6000] for name, path in _REFERENCES.items()}
+    parent = workspace / "reference" / "parent.py"
+    if parent.is_file():
+        references["reference/parent.py"] = parent.read_text(encoding="utf-8")[:6000]
     entry = workspace / "extension" / "eeg_candidate.py"
     extension_answered = False
     for step in range(next_step, max_steps + 1):
@@ -313,54 +316,64 @@ def _review_valid(reply: Any) -> bool:
     )
 
 
-_RUNTIME_BLOCK_MARKERS = (
-    "训练预算",
-    "训练时长",
-    "训练长度",
-    "training length",
-    "training budget",
-    "epoch",
-    "gallery",
-    "图库",
-    "特征缓存",
-    "feature cache",
-    "划分",
-    "split manifest",
-    "接口断言",
-    "运行时保证",
-    "runtime guarantee",
-    "runtime_guarantees",
-    "自己断言",
-)
+_RUNTIME_INVARIANTS = {
+    "training_length_runtime_owned",
+    "gallery_runtime_owned",
+    "feature_cache_runtime_owned",
+    "split_runtime_owned",
+    "validation_identity_matches",
+    "candidate_interface_check_passed",
+}
 
 
-def _issue_text(issue: dict[str, Any]) -> str:
-    parts = (issue.get("title"), issue.get("evidence"), issue.get("impact"), issue.get("repair"))
-    return " ".join(str(part or "") for part in parts).lower()
+def satisfied_invariants(workspace: Path, contract_summary: dict[str, Any] | None = None) -> set[str]:
+    """Invariants the runtime has evidence for. Keyword matches are not evidence."""
+    found: set[str] = set()
+    checks_path = workspace / "checks.json"
+    if checks_path.is_file():
+        try:
+            checks = json.loads(checks_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            checks = {}
+        if isinstance(checks, dict) and checks.get("ok"):
+            found.add("candidate_interface_check_passed")
+    protocol = workspace / "input_spec.json"
+    if protocol.is_file() or (contract_summary or {}).get("fingerprint"):
+        found.add("training_length_runtime_owned")
+        found.add("gallery_runtime_owned")
+        found.add("feature_cache_runtime_owned")
+        found.add("split_runtime_owned")
+        found.add("validation_identity_matches")
+    return found
 
 
-def filter_runtime_blocking(issues: list[Any]) -> list[dict[str, Any]]:
-    """Training length, gallery, cache, split and runtime assertions are not candidate defects."""
+def filter_runtime_blocking(
+    issues: list[Any],
+    *,
+    satisfied: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Keep blocking issues unless a named invariant is already satisfied with evidence."""
+    known = set(satisfied or ())
     filtered: list[dict[str, Any]] = []
     for issue in issues:
         row = dict(issue) if isinstance(issue, dict) else {"title": str(issue), "severity": "blocking"}
-        text = _issue_text(row)
-        if row.get("severity") == "blocking" and any(marker in text for marker in _RUNTIME_BLOCK_MARKERS):
+        invariant = str(row.get("invariant_id") or "")
+        if row.get("severity") == "blocking" and invariant and invariant in known and invariant in _RUNTIME_INVARIANTS:
             row["severity"] = "non_blocking"
-            row["downgraded_from"] = "blocking"
-            row["downgrade_reason"] = "runtime_owned"
+            row["already_satisfied"] = True
+            row["downgrade_reason"] = "already_satisfied"
         filtered.append(row)
     return filtered
 
 
-def apply_review_filter(result: dict[str, Any]) -> dict[str, Any]:
-    """Recompute review status after runtime-owned blocking issues are downgraded."""
-    issues = filter_runtime_blocking(list(result.get("issues") or []))
+def apply_review_filter(result: dict[str, Any], *, satisfied: set[str] | None = None) -> dict[str, Any]:
+    """Recompute review status after already-satisfied invariants are marked."""
+    issues = filter_runtime_blocking(list(result.get("issues") or []), satisfied=satisfied)
     blocking = [row for row in issues if row.get("severity") == "blocking"]
     updated = dict(result)
     updated["issues"] = issues
     updated["model_status"] = result.get("model_status") or result.get("status")
-    updated["runtime_issues_downgraded"] = sum(1 for row in issues if row.get("downgrade_reason") == "runtime_owned")
+    updated["runtime_issues_downgraded"] = sum(1 for row in issues if row.get("already_satisfied"))
     if result.get("format_failed"):
         updated["status"] = "blocked"
     elif not blocking:
@@ -379,16 +392,18 @@ def review(
 ) -> dict[str, Any]:
     """Reviewer sees spec, code and checks. It returns blocking issues, not a score."""
     entry = workspace / "extension" / "eeg_candidate.py"
-    from react_agent.eeg_research.agentic.interface import CANDIDATE_INTERFACE
+    from react_agent.eeg_research.agentic.interface import candidate_interface
 
     checks = json.loads((workspace / "checks.json").read_text(encoding="utf-8")) if (workspace / "checks.json").is_file() else None
+    spec_path = workspace / "input_spec.json"
+    interface = json.loads(spec_path.read_text(encoding="utf-8")) if spec_path.is_file() else candidate_interface(None)
     payload = {
         "experiment_spec": spec,
         "candidate_source": entry.read_text(encoding="utf-8") if entry.is_file() else None,
         "checks": checks,
         "evaluation_contract": contract_summary,
-        "candidate_interface": CANDIDATE_INTERFACE,
-        "runtime_guarantees": CANDIDATE_INTERFACE["runtime_guarantees"],
+        "candidate_interface": interface,
+        "runtime_guarantees": interface.get("runtime_guarantees"),
         "reviewer_model": model,
         "executor_model": model,
     }
@@ -416,7 +431,8 @@ def review(
             "calls": 2 if repaired else 1,
             "reviewer_model": model,
             "same_family_as_executor": True,
-        }
+        },
+        satisfied=satisfied_invariants(workspace, contract_summary),
     )
     if identity:
         for key in ("candidate_id", "attempt_id", "phase", "operation_id"):

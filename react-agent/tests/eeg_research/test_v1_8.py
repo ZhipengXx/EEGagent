@@ -136,7 +136,7 @@ def test_code_candidate_then_new_evidence_changes_the_next_action(tmp_path: Path
     script = [
         {"action": "propose_experiment", "reason_zh": "先提出投影改动", "evidence_ids": [], "experiment_draft": {"initial_fidelity": "pilot"}, "hypothesis_draft": {"mechanism": "投影尺度"}},
         {"action": "implement_candidate", "reason_zh": "写入候选", "evidence_ids": [], "relative": "extension/eeg_candidate.py", "content": _CANDIDATE, "expected_base_hash": ""},
-        {"action": "run_pilot", "reason_zh": "小规模训练", "evidence_ids": []},
+        {"action": "run_pilot", "reason_zh": "小规模训练", "evidence_ids": [], "target_id": "c1"},
     ]
 
     def backend(obs):
@@ -260,7 +260,7 @@ def test_live_job_is_reconciled_without_a_planner_call(tmp_path: Path) -> None:
 
     def planner(obs):
         calls.append("plan")
-        return {"action": "run_pilot", "reason_zh": "试跑", "evidence_ids": []}
+        return {"action": "run_pilot", "reason_zh": "试跑", "evidence_ids": [], "target_id": "c1"}
 
     def launch(_camp, _state, job_id, candidate_id, fidelity):
         launched.append(candidate_id)
@@ -292,7 +292,8 @@ def test_live_job_is_reconciled_without_a_planner_call(tmp_path: Path) -> None:
     state = tick(camp, planner, services=services)
     assert calls == ["plan"]
     rows = [row for row in state["evidence"] if row.get("candidate_id") == "c1"]
-    assert rows[0]["delta_vs_control_pp"] == -0.1
+    assert "delta_vs_control_pp" not in rows[0]
+    assert rows[0]["comparison_status"] == "protocol_missing"
     assert "run_pilot" not in available_actions(state)
     assert any(row["kind"] == "implementation_failure" or row["kind"] == "exploratory_result" for row in state["memory"])
 
@@ -519,6 +520,8 @@ def test_coder_stops_before_the_budget_and_planner_reserves_calls(tmp_path: Path
     ]
     assert "implement_candidate" in available_actions(state)
     state["candidates"].append({"candidate_id": "c8", "status": "ready"})
+    assert "implement_candidate" in available_actions(state)
+    state["candidates"].append({"candidate_id": "c9", "status": "ready"})
     assert "implement_candidate" not in available_actions(state)
 
 
@@ -598,7 +601,7 @@ def test_retrieval_owns_scale_when_encoder_has_none() -> None:
     assert torch.isfinite(base_loss)
 
 
-def test_c10_runtime_opinions_do_not_block_training(tmp_path: Path) -> None:
+def test_c10_runtime_opinions_need_invariant_ids(tmp_path: Path) -> None:
     from react_agent.eeg_research.agentic.native_patch import review
 
     training_budget = {
@@ -615,27 +618,42 @@ def test_c10_runtime_opinions_do_not_block_training(tmp_path: Path) -> None:
     }
     workspace = tmp_path / "c10"
     apply_candidate_patch(workspace, "extension/eeg_candidate.py", _CANDIDATE, "")
-    (workspace / "checks.json").write_text("{}", encoding="utf-8")
+    (workspace / "checks.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
 
     def backend(_payload):
         return {
             "status": "needs_fix",
             "issues": [training_budget, interface_assert],
-            "summary_zh": "两条阻塞意见都在运行时职责内。",
+            "summary_zh": "两条阻塞意见都没有 invariant_id。",
         }
 
     result = review(workspace, {"hypothesis": {}}, {"fingerprint": "p"}, backend, "m")
-    assert result["status"] == "ready"
-    assert result["model_status"] == "needs_fix"
-    assert result["blocking_remaining"] == 0
-    assert result["runtime_issues_downgraded"] == 2
-    assert all(row["severity"] == "non_blocking" for row in result["issues"])
+    assert result["status"] == "needs_fix"
+    assert result["blocking_remaining"] == 2
+    assert result["runtime_issues_downgraded"] == 0
+
+    def with_invariants(_payload):
+        return {
+            "status": "needs_fix",
+            "issues": [
+                {**training_budget, "invariant_id": "training_length_runtime_owned"},
+                {**interface_assert, "invariant_id": "candidate_interface_check_passed"},
+            ],
+            "summary_zh": "运行时已经满足这些 invariant。",
+        }
+
+    marked = review(workspace, {"hypothesis": {}}, {"fingerprint": "p"}, with_invariants, "m")
+    assert marked["status"] == "ready"
+    assert marked["model_status"] == "needs_fix"
+    assert marked["blocking_remaining"] == 0
+    assert marked["runtime_issues_downgraded"] == 2
+    assert all(row.get("already_satisfied") for row in marked["issues"])
 
     def still_blocked(_payload):
         return {
             "status": "needs_fix",
             "issues": [
-                training_budget,
+                {**training_budget, "invariant_id": "training_length_runtime_owned"},
                 {
                     "severity": "blocking",
                     "title": "输出维度写成 512，与契约 1024 不符",
@@ -647,7 +665,8 @@ def test_c10_runtime_opinions_do_not_block_training(tmp_path: Path) -> None:
         }
 
     (tmp_path / "bad").mkdir()
-    kept = review(tmp_path / "bad", {"hypothesis": {}}, {}, still_blocked, "m")
+    (tmp_path / "bad" / "checks.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
+    kept = review(tmp_path / "bad", {"hypothesis": {}}, {"fingerprint": "p"}, still_blocked, "m")
     assert kept["status"] == "needs_fix"
     assert kept["blocking_remaining"] == 1
     assert kept["issues"][1]["severity"] == "blocking"
@@ -773,3 +792,45 @@ def test_new_planner_does_not_stop_on_a_small_gap() -> None:
     text = prompt.read_text(encoding="utf-8")
     assert "0.005" not in text
     assert "Do not stop because the best two scores are close" in text
+
+
+def test_studio_graph_reads_a_finished_campaign_without_training(tmp_path: Path, monkeypatch) -> None:
+    from react_agent.eeg_research.agentic.loop import load_state, save_state
+    from react_agent.eeg_research.agentic.studio_graph import apply_studio_defaults, graph
+
+    design = _design(tmp_path)
+    contract = freeze_contract(design, tmp_path)
+    create_campaign(
+        tmp_path,
+        goal={"goal_id": "done", "max_training_jobs": 4, "max_llm_calls": 8, "max_gpu_seconds": 100},
+        contract=contract,
+        request_id="studio",
+    )
+    camp = tmp_path / "done"
+    state = load_state(camp)
+    state["status"] = "finished"
+    state["decisions"] = [{"decision_id": "d1", "action": "stop", "ok": True, "evidence_count": 0}]
+    save_state(camp, state)
+    before = (camp / "campaign_state.json").read_bytes()
+    decisions = len(state["decisions"])
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("planner called")
+
+    monkeypatch.setattr("react_agent.eeg_research.agentic.studio_graph.role_backend", boom)
+    monkeypatch.setattr("react_agent.eeg_research.agentic.studio_graph.build_services", boom)
+    result = graph.invoke({"root": str(tmp_path), "campaign": "done"})
+    summary = result["studio_summary"]
+    assert summary["status"] == "finished"
+    assert summary["last_decision"] == "stop"
+    assert summary["max_ticks"] == 1
+    assert summary["ticks_run"] == 0
+    assert apply_studio_defaults({})["max_ticks"] == 1
+    assert len(json.loads((camp / "campaign_state.json").read_text(encoding="utf-8"))["decisions"]) == decisions
+    assert (camp / "campaign_state.json").read_bytes() == before
+    assert not (camp / "jobs").exists()
+    registered = json.loads((Path(__file__).resolve().parents[2] / "langgraph.json").read_text(encoding="utf-8"))
+    assert "eeg_research" in registered["graphs"]
+    assert graph.name == "EEG Research"
+    edges = {(edge.source, edge.target) for edge in graph.get_graph().edges}
+    assert {("load", "step"), ("load", "summarize"), ("step", "summarize")} <= edges

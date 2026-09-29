@@ -173,6 +173,7 @@ def test_mismatch_is_not_comparable(tmp_path: Path, monkeypatch) -> None:
         json.dumps({"fixed_bank_top1": 0.2, "validation_image_count": 1, "validation_identity": protocol["validation_identity"]}),
         encoding="utf-8",
     )
+    (job / "last.ckpt").write_bytes(b"ckpt")
     (job / "job.json").write_text(
         json.dumps({"command": command, "execution_fingerprint": protocol["fingerprint"], "fidelity": "full"}),
         encoding="utf-8",
@@ -186,6 +187,7 @@ def test_mismatch_is_not_comparable(tmp_path: Path, monkeypatch) -> None:
         json.dumps({"fixed_bank_top1": 0.2, "validation_identity": "nope"}),
         encoding="utf-8",
     )
+    (bad_job / "last.ckpt").write_bytes(b"ckpt")
     (bad_job / "job.json").write_text(
         json.dumps({"command": ["python", "--dataset", "eeg"], "execution_fingerprint": protocol["fingerprint"]}),
         encoding="utf-8",

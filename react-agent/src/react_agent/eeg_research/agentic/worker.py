@@ -11,8 +11,10 @@ from typing import Any
 
 from react_agent.eeg_research.agentic import jobs
 from react_agent.eeg_research.agentic.contract import public_contract
-from react_agent.eeg_research.agentic.execution_protocol import resolve_worker_design
-from react_agent.eeg_research.agentic.identity import ensure_attempt, operation_id, result_matches, source_hash
+from react_agent.eeg_research.agentic.execution_protocol import load_protocol, resolve_worker_design
+from react_agent.eeg_research.agentic.identity import ensure_attempt, operation_id, result_matches, rotate_attempt, source_hash
+from react_agent.eeg_research.agentic.interface import candidate_interface
+from react_agent.eeg_research.agentic.lineage import LineageError, materialize
 from react_agent.eeg_research.agentic.llm import LlmUnavailable, role_backend
 from react_agent.eeg_research.agentic.loop import (
     align_interrupt,
@@ -177,13 +179,14 @@ def build_services(camp: Path) -> dict[str, Any]:
             save_state(camp_dir, state)
             return {"job_id": job_id, "status": "blocked", "detail": state.get("detail")}
         extension = None if candidate_id == "baseline" else camp_dir / "candidates" / candidate_id / "extension"
+        root = Path(design.data_root) if design.data_root else data_root()
         return jobs.start_job(
             camp_dir / "jobs" / job_id,
             design,
             candidate_id=candidate_id,
             extension=extension,
             fidelity=fidelity,
-            root=data_root(),
+            root=root,
             protocol_path=camp_dir / "execution_protocol.json",
         )
 
@@ -193,7 +196,13 @@ def build_services(camp: Path) -> dict[str, Any]:
     def do_implement(camp_dir: Path, state: dict[str, Any]) -> None:
         if state.get("status") in {"paused", "cancelled"}:
             return
-        candidate_id = incomplete_candidate_id(camp_dir, state)
+        repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else None
+        repairing = bool(repair and int(repair.get("remaining") or 0) > 0 and repair.get("candidate_id"))
+        candidate_id = None
+        if repairing:
+            candidate_id = str(repair["candidate_id"])
+        if candidate_id is None:
+            candidate_id = incomplete_candidate_id(camp_dir, state)
         if candidate_id is None:
             index = len(state.get("candidates") or []) + 1
             while (camp_dir / "candidates" / f"c{index}").exists():
@@ -201,10 +210,29 @@ def build_services(camp: Path) -> dict[str, Any]:
             candidate_id = f"c{index}"
         workspace = camp_dir / "candidates" / candidate_id
         spec = {"hypothesis": state.get("hypothesis"), "experiment": state.get("experiment")}
+        if repairing:
+            spec["repair_issues"] = repair.get("issues") or []
         workspace.mkdir(parents=True, exist_ok=True)
         (workspace / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+        protocol = load_protocol(camp_dir)
+        (workspace / "input_spec.json").write_text(
+            json.dumps(candidate_interface(protocol), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            materialize(camp_dir, workspace, state.get("experiment") or {})
+        except LineageError as exc:
+            _block_phase(
+                camp_dir,
+                state,
+                phase="implement_candidate",
+                error_type="LineageError",
+                detail=str(exc),
+                recoverable=False,
+            )
+            return
         evidence_id = f"ev_impl_{candidate_id}"
-        if any(row.get("evidence_id") == evidence_id for row in state.get("evidence") or []):
+        if not repairing and any(row.get("evidence_id") == evidence_id for row in state.get("evidence") or []):
             return
         max_calls = int(state.get("max_llm_calls", 100))
 
@@ -214,7 +242,10 @@ def build_services(camp: Path) -> dict[str, Any]:
             return max_calls - int(used)
 
         impl_path = workspace / "implementation.json"
-        attempt = ensure_attempt(workspace, candidate_id)
+        if repairing:
+            attempt = rotate_attempt(workspace, candidate_id)
+        else:
+            attempt = ensure_attempt(workspace, candidate_id)
         _attach(
             coder,
             candidate_id=candidate_id,
@@ -224,13 +255,21 @@ def build_services(camp: Path) -> dict[str, Any]:
             input_hash=source_hash(workspace),
         )
         outcome: dict[str, Any] | None = None
-        if impl_path.is_file():
+        if impl_path.is_file() and not repairing:
             outcome = json.loads(impl_path.read_text(encoding="utf-8"))
         else:
             last_llm: LlmUnavailable | None = None
             for _attempt in range(IMPLEMENT_ATTEMPTS):
                 try:
-                    outcome = implement(workspace, spec, coder, max_steps=CODER_STEPS, calls_left=calls_left, reserve=2)
+                    outcome = implement(
+                        workspace,
+                        spec,
+                        coder,
+                        max_steps=CODER_STEPS,
+                        calls_left=calls_left,
+                        reserve=2,
+                        resume_repair=repairing,
+                    )
                     break
                 except RecoveryBlocked as exc:
                     _block_phase(
@@ -286,20 +325,54 @@ def build_services(camp: Path) -> dict[str, Any]:
             if verdict["status"] == "ready":
                 state["candidate_ready"] = True
                 state["candidate_id"] = candidate_id
+                state["repair_task"] = None
                 row["status"] = "ready"
+            elif verdict["status"] == "needs_fix":
+                used = int((repair or {}).get("used") or 0)
+                limit = int(state.get("max_repairs_per_candidate", 2))
+                if used < limit:
+                    state["repair_task"] = {
+                        "candidate_id": candidate_id,
+                        "issues": verdict.get("issues") or [],
+                        "remaining": 1,
+                        "used": used + 1,
+                    }
+                else:
+                    state["repair_task"] = None
+                    state["experiment_failed"] = True
+                row["status"] = "review_needs_fix"
             else:
+                state["repair_task"] = None
                 row["status"] = f"review_{verdict['status']}"
         if row["status"] != "ready":
-            state["experiment_failed"] = True
-        state.setdefault("candidates", []).append(row)
-        state["evidence"].append(
-            {
-                "evidence_id": evidence_id,
-                "kind": "implementation",
-                "candidate_id": candidate_id,
-                "summary": row,
-            }
+            repairing_now = bool(
+                isinstance(state.get("repair_task"), dict)
+                and int((state.get("repair_task") or {}).get("remaining") or 0) > 0
+            )
+            if not repairing_now:
+                state["experiment_failed"] = True
+        existing = next(
+            (index for index, item in enumerate(state.get("candidates") or []) if item.get("candidate_id") == candidate_id),
+            None,
         )
+        if existing is None:
+            state.setdefault("candidates", []).append(row)
+        else:
+            state["candidates"][existing] = row
+        evidence_row = {
+            "evidence_id": evidence_id,
+            "kind": "implementation",
+            "candidate_id": candidate_id,
+            "summary": row,
+        }
+        replaced = False
+        for index, item in enumerate(state.get("evidence") or []):
+            if item.get("evidence_id") == evidence_id:
+                state["evidence"][index] = evidence_row
+                replaced = True
+                break
+        if not replaced:
+            state["evidence"].append(evidence_row)
         event(camp_dir, "implemented", **row)
 
     def analyze(camp_dir: Path, state: dict[str, Any]) -> None:
@@ -364,11 +437,22 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
             state["detail"] = str(exc)
             save_state(camp, state)
         return state
-    for _ in range(max_ticks):
+    for tick_index in range(max_ticks):
         state = tick(camp, planner, services=services)
-        (camp / "worker.json").write_text(json.dumps({"pid": os.getpid(), "heartbeat": time.time()}), encoding="utf-8")
+        (camp / "worker.json").write_text(
+            json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "tick": tick_index, "resumable": bool(state.get("live_job"))}),
+            encoding="utf-8",
+        )
         if state.get("status") in _TERMINAL:
             break
         if state.get("status") == "training":
             time.sleep(poll_seconds)
+    else:
+        state = load_state(camp)
+        if state.get("live_job"):
+            (camp / "worker.json").write_text(
+                json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "resumable": True, "detail": "worker_tick_limit"}),
+                encoding="utf-8",
+            )
+            event(camp, "worker_suspended", reason="tick_limit", live_job=state.get("live_job"))
     return state

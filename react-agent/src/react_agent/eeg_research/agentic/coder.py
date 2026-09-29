@@ -42,6 +42,10 @@ _REFERENCES = {
 def read_code(workspace: Path, relative: str, start: int = 1, end: int = 200) -> dict[str, Any]:
     if relative in _REFERENCES:
         target = _REFERENCES[relative]
+    elif relative == "reference/parent.py":
+        target = workspace / "reference" / "parent.py"
+        if not target.is_file():
+            return {"ok": False, "error": "read_refused"}
     else:
         target = (workspace / relative).resolve()
         if not _allowed(workspace, target) or not target.is_file():
@@ -94,9 +98,11 @@ def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: f
     env = research_env(extension)
     env.pop("EEG_CANDIDATE_MODULE", None)
     env["CUDA_VISIBLE_DEVICES"] = ""
+    spec_path = workspace / "input_spec.json"
+    dataset_arg = str(spec_path.resolve()) if spec_path.is_file() else "eeg"
     try:
         completed = subprocess.run(  # noqa: S603
-            [interpreter, "-m", "react_agent.eeg_research.agentic.check_entry", "eeg"],
+            [interpreter, "-m", "react_agent.eeg_research.agentic.check_entry", dataset_arg],
             cwd=str(extension),
             env=env,
             capture_output=True,
@@ -114,9 +120,16 @@ def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: f
     except ValueError:
         return {"ok": False, "error": "check_bad_output", "detail": lines[-1][:500]}
     payload["returncode"] = completed.returncode
-    payload["loaded_from_workspace"] = str(payload.get("file", "")).startswith(str(extension))
-    if not payload["loaded_from_workspace"]:
+    loaded = str(payload.get("file") or "")
+    try:
+        Path(loaded).resolve().relative_to(extension)
+        payload["loaded_from_workspace"] = True
+    except (ValueError, OSError):
+        payload["loaded_from_workspace"] = False
         payload["ok"] = False
+    if completed.returncode != 0:
+        payload["ok"] = False
+        payload.setdefault("error", "check_nonzero_returncode")
     return payload
 
 

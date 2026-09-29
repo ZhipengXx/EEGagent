@@ -40,6 +40,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--test-only", action="store_true")
     parser.add_argument("--evaluate-only", action="store_true")
+    parser.add_argument("--negative-policy", default="data_parallel_local")
     return parser
 
 
@@ -55,7 +56,19 @@ def _image_ids(files: tuple[Path, ...], channels: list[str] | None) -> list[str]
     return found
 
 
-def build_loaders(design: Design, data_root: Path):
+def _frozen_identity(out_dir: Path | None = None) -> dict | None:
+    env = os.environ.get("EEG_EVALUATION_IDENTITY")
+    path = Path(env) if env else None
+    if path is None and out_dir is not None:
+        candidate = out_dir / "evaluation_identity.json"
+        path = candidate if candidate.is_file() else None
+    if path is None or not path.is_file():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else None
+
+
+def build_loaders(design: Design, data_root: Path, identity: dict | None = None):
     """Create train and validation loaders. Test files are not opened as a loader."""
     import torch
     from torch.utils.data import DataLoader
@@ -71,6 +84,7 @@ def build_loaders(design: Design, data_root: Path):
     assert channels is None or isinstance(channels, list)
     timesteps = spec["timesteps"]
     assert isinstance(timesteps, list)
+    identity = identity or _frozen_identity()
     if plan.val_mode == "other_subjects_test":
         train_features = load_feature_cache(plan.feature_caches[0])
         val_features = load_feature_cache(plan.feature_caches[1])
@@ -78,9 +92,14 @@ def build_loaders(design: Design, data_root: Path):
         val_records, val_images = collect_records(plan.val_files, val_features, channels, None)
     else:
         features = load_feature_cache(plan.feature_caches[0])
-        train_ids = sorted(set(_image_ids(plan.train_files, channels)))
-        test_ids = sorted(set(_image_ids(plan.forbidden_files, channels)))
-        kept, validation = holdout_image_ids(train_ids, test_ids, design.seed)
+        frozen_train = list((identity or {}).get("train_image_ids") or [])
+        frozen_val = list((identity or {}).get("validation_image_ids") or [])
+        if frozen_train and frozen_val:
+            kept, validation = frozen_train, frozen_val
+        else:
+            train_ids = sorted(set(_image_ids(plan.train_files, channels)))
+            test_ids = sorted(set(_image_ids(plan.forbidden_files, channels)))
+            kept, validation = holdout_image_ids(train_ids, test_ids, design.seed)
         train_records, train_images = collect_records(plan.train_files, features, channels, set(kept))
         val_records, val_images = collect_records(plan.val_files, features, channels, set(validation))
     if set(train_images) & set(val_images):
@@ -286,7 +305,7 @@ def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, 
         return None
     dataset = RetrievalTrials(records, timesteps)
     loader = DataLoader(dataset, batch_size=min(200, len(dataset)), shuffle=False)
-    encoder = _load_encoder(spec, checkpoint)
+    encoder = _load_encoder(spec, checkpoint, out_dir)
     result = _fixed_bank_pass(encoder, loader, records)
     return {
         "top1": result["fixed_bank_top1"],
@@ -297,19 +316,53 @@ def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, 
     }
 
 
-def _load_encoder(spec: dict[str, object], checkpoint: Path):
+def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
+    """Rebuild the trained encoder in a new object. Candidate modules never fall back to EEGProjectLayer."""
+    import importlib
+
     import torch
 
-    from react_agent.eeg_training.model import EEGProjectLayer
+    module_name = os.environ.get("EEG_CANDIDATE_MODULE", "")
+    candidate_path = os.environ.get("EEG_CANDIDATE_PATH", "")
+    binding_path = out_dir / "source_binding.json"
+    if binding_path.is_file():
+        binding = json.loads(binding_path.read_text(encoding="utf-8"))
+        module_name = str(binding.get("module") or module_name)
+        class_file = binding.get("class_file")
+        if class_file:
+            parent = str(Path(class_file).resolve().parent)
+            if parent not in sys.path:
+                sys.path.insert(0, parent)
+    if candidate_path and candidate_path not in sys.path:
+        sys.path.insert(0, candidate_path)
+    baseline = module_name in {
+        "",
+        "react_agent.eeg_research.agentic.baseline",
+        "react_agent.eeg_training.model",
+    }
+    if baseline:
+        from react_agent.eeg_training.model import EEGProjectLayer
 
-    encoder = EEGProjectLayer(
-        z_dim=1024,
-        c_num=int(spec["c_num"]),  # type: ignore[arg-type]
-        timesteps=list(spec["timesteps"]),  # type: ignore[arg-type]
-    )
+        encoder = EEGProjectLayer(
+            z_dim=1024,
+            c_num=int(spec["c_num"]),  # type: ignore[arg-type]
+            timesteps=list(spec["timesteps"]),  # type: ignore[arg-type]
+        )
+    else:
+        try:
+            module = importlib.import_module(module_name)
+            candidate = module.EEGCandidate()
+            encoder = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
+        except Exception as exc:  # noqa: BLE001
+            raise SplitError(f"candidate_reload_failed:{type(exc).__name__}") from exc
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     encoder.load_state_dict(saved["state_dict"])
     return encoder.to(torch.device("cuda:0"))
+
+
+def _load_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path | None = None):
+    directory = out_dir if out_dir is not None else checkpoint.parent
+    return rebuild_encoder(spec, checkpoint, directory)
 
 
 def _fixed_bank_pass(encoder, loader, records) -> dict[str, float]:
@@ -338,8 +391,10 @@ def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path) -> dict[
     checkpoint = out_dir / "last.ckpt"
     if not checkpoint.is_file():
         raise SplitError("checkpoint_missing")
-    _train_loader, val_loader, _train_images, _val_images, spec = build_loaders(design, data_root)
-    encoder = _load_encoder(spec, checkpoint)
+    _train_loader, val_loader, _train_images, _val_images, spec = build_loaders(
+        design, data_root, identity=_frozen_identity(out_dir)
+    )
+    encoder = _load_encoder(spec, checkpoint, out_dir)
     validation = _fixed_bank_pass(encoder, val_loader, val_loader.dataset.records)
     return {
         "fixed_bank_top1": validation["fixed_bank_top1"],
@@ -431,7 +486,9 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     random.seed(design.seed)
     torch.manual_seed(design.seed)
     torch.cuda.manual_seed_all(design.seed)
-    train_loader, val_loader, train_images, val_images, spec = build_loaders(design, data_root)
+    train_loader, val_loader, train_images, val_images, spec = build_loaders(
+        design, data_root, identity=_frozen_identity(out_dir)
+    )
     device = torch.device("cuda:0")
     encoder = _build_encoder(spec, out_dir, train_loader).to(device)
     model: torch.nn.Module = placed_retrieval(encoder, device, len(design.gpu))

@@ -1,0 +1,90 @@
+"""Artifact registry. Role handoff uses files and hashes, not in-memory dicts."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+
+REGISTRY = "artifact_registry.jsonl"
+
+
+def file_digest(path: Path) -> str:
+    """Return the sha256 of a file. Missing files are an error."""
+    if not path.is_file():
+        raise FileNotFoundError(str(path))
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def input_digest(paths: list[Path]) -> str:
+    """Stable digest of input artifacts. Order is normalized by path."""
+    rows = []
+    for path in sorted(paths, key=lambda item: str(item)):
+        rows.append({"path": str(path), "sha256": file_digest(path) if path.is_file() else None, "missing": not path.is_file()})
+    encoded = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def register(
+    camp: Path,
+    path: Path,
+    *,
+    kind: str,
+    producer_task_id: str | None = None,
+    candidate_id: str | None = None,
+) -> dict[str, Any]:
+    """Record one on-disk artifact. The hash is taken from the file at registration time."""
+    digest = file_digest(path)
+    row = {
+        "artifact_id": f"art_{uuid.uuid4().hex[:12]}",
+        "kind": kind,
+        "path": str(path.resolve()),
+        "relative": str(path.resolve().relative_to(camp.resolve())) if _under(path, camp) else None,
+        "sha256": digest,
+        "producer_task_id": producer_task_id,
+        "candidate_id": candidate_id,
+        "at": time.time(),
+    }
+    with (camp / REGISTRY).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return row
+
+
+def lookup(camp: Path, artifact_id: str) -> dict[str, Any] | None:
+    """Return the registered row. A missing registry is empty, not an error."""
+    path = camp / REGISTRY
+    if not path.is_file():
+        return None
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("artifact_id") == artifact_id:
+            return row
+    return None
+
+
+def verify(camp: Path, artifact_id: str) -> tuple[bool, str]:
+    """True when the file still matches the registered hash."""
+    row = lookup(camp, artifact_id)
+    if row is None:
+        return False, "artifact_unknown"
+    path = Path(str(row["path"]))
+    if not path.is_file():
+        return False, "artifact_missing"
+    if file_digest(path) != row.get("sha256"):
+        return False, "artifact_hash_mismatch"
+    return True, "ok"
+
+
+def _under(path: Path, camp: Path) -> bool:
+    try:
+        path.resolve().relative_to(camp.resolve())
+    except ValueError:
+        return False
+    return True

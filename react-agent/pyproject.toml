@@ -46,6 +46,7 @@ packages = ["langgraph.templates.react_agent", "react_agent"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
+"react_agent.eeg_research.agentic" = ["prompts/*.txt", "method_cards.json"]
 
 [tool.ruff]
 lint.select = [

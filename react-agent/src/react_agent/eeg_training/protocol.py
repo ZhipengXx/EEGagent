@@ -550,6 +550,8 @@ def train_command(design: Design, out_dir: Path, root: Path | None = None) -> li
         command.extend(["--train-dir", design.train_dir, "--test-dir", design.test_dir])
     if design.gpu:
         command.extend(["--gpu", ",".join(str(index) for index in design.gpu)])
+    if design.policy == "agentic":
+        command.extend(["--negative-policy", "data_parallel_local"])
     return command
 
 

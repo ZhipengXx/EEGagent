@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -59,7 +60,8 @@ def _protocol_mismatch(job_dir: Path, fidelity: str, protocol: dict[str, Any] | 
     from react_agent.eeg_research.agentic.execution_protocol import command_matches
 
     command = record.get("command") or []
-    if not command_matches([str(part) for part in command], protocol, fidelity):
+    seed = record.get("training_seed", record.get("seed"))
+    if not command_matches([str(part) for part in command], protocol, fidelity, training_seed=None if seed is None else int(seed)):
         return True
     if payload.get("validation_identity") != protocol.get("validation_identity"):
         return True
@@ -80,10 +82,24 @@ def accept_job(
         return {"evaluation_valid": False, "reason": "metrics_missing", "fidelity": fidelity}
     payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     score = payload.get("fixed_bank_top1")
-    if not isinstance(score, (int, float)):
+    if isinstance(score, bool) or not isinstance(score, (int, float)):
         return {"evaluation_valid": False, "reason": "score_missing", "fidelity": fidelity, "execution_succeeded": True}
+    if not math.isfinite(float(score)):
+        return {"evaluation_valid": False, "reason": "score_not_finite", "fidelity": fidelity, "execution_succeeded": True}
+    if not 0.0 <= float(score) <= 1.0:
+        return {"evaluation_valid": False, "reason": "score_out_of_range", "fidelity": fidelity, "execution_succeeded": True}
     if manifest is None:
         return {"evaluation_valid": False, "reason": "manifest_missing", "fidelity": fidelity}
+    if protocol is not None and not (job_dir / "last.ckpt").is_file() and not payload.get("checkpoint_optional"):
+        return {"evaluation_valid": False, "reason": "checkpoint_missing", "fidelity": fidelity, "execution_succeeded": True}
+    expected_gallery = protocol.get("validation_image_ids") if protocol else None
+    gallery = payload.get("validation_image_count")
+    if expected_gallery is not None and gallery is not None and int(gallery) != len(expected_gallery):
+        return {"evaluation_valid": False, "reason": "gallery_count_mismatch", "fidelity": fidelity, "execution_succeeded": True}
+    query_count = payload.get("query_count")
+    expected_queries = protocol.get("validation_query_ids") if protocol else None
+    if expected_queries and query_count is not None and int(query_count) != len(expected_queries):
+        return {"evaluation_valid": False, "reason": "query_count_mismatch", "fidelity": fidelity, "execution_succeeded": True}
     if _protocol_mismatch(job_dir, fidelity, protocol, payload):
         return {
             "evaluation_valid": False,
@@ -98,7 +114,8 @@ def accept_job(
         "reason": reason,
         "fidelity": fidelity,
         "fixed_bank_top1": float(score) if ok else None,
-        "gallery_size": payload.get("validation_image_count"),
+        "gallery_size": gallery,
+        "query_count": query_count,
         "execution_succeeded": True,
         "implementation_failure": False,
         "execution_fingerprint": None if protocol is None else protocol.get("fingerprint"),

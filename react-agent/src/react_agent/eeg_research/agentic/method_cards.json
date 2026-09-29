@@ -1,0 +1,23 @@
+[
+  {
+    "id": "temporal_pooling",
+    "title": "调整时间聚合",
+    "mechanism": "EEG 时间窗上的均值或注意力池化改变表示",
+    "tags": ["pooling", "temporal", "encoder"],
+    "when": "学习曲线上升但检索 margin 很小"
+  },
+  {
+    "id": "projection_scale",
+    "title": "调整投影尺度或温度",
+    "mechanism": "对比学习的 logit scale / 投影范数影响 top1",
+    "tags": ["projection", "contrastive", "scale"],
+    "when": "train loss 下降而 fixed-gallery top1 不变"
+  },
+  {
+    "id": "train_only_norm",
+    "title": "仅用训练统计量做通道标准化",
+    "mechanism": "fit_statistics 写入 buffer，验证复用，不读验证集",
+    "tags": ["normalization", "leakage"],
+    "when": "通道幅度差异大且验证曲线抖动"
+  }
+]

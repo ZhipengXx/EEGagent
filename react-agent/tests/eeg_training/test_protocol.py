@@ -132,7 +132,7 @@ def test_workbench_form_dry_run_stays_in_research_root(tmp_path: Path, monkeypat
     assert "subject-checks" in script
     assert "data-subject" not in script
     assert "GPU 秒数上限" in script
-    assert "28800" in script
+    assert "172800" in script
     assert "progress-track" in script
     assert "检查数据" in script
     assert ">输出<" in script or "输出" in script

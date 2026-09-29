@@ -7,12 +7,24 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from react_agent.eeg_research.agentic.budget import charge_gpu, snapshot as budget_snapshot
 from react_agent.eeg_research.agentic.coder import apply_candidate_patch, finish_patch, run_candidate_check
+from react_agent.eeg_research.agentic.comparison import compare_runs, matched_control
 from react_agent.eeg_research.agentic.contract import public_contract
+from react_agent.eeg_research.agentic.execution_protocol import load_protocol, next_unused_training_seed
 from react_agent.eeg_research.agentic.llm import LlmUnavailable
 from react_agent.eeg_research.agentic.memory import episode, retrieve
 from react_agent.eeg_research.agentic.planner import available_actions, decide, evidence_count
+from react_agent.eeg_research.agentic.promotion import promotion_decision
+from react_agent.eeg_research.agentic.research_plan import (
+    PlanError,
+    apply_update,
+    consume_for_planner,
+    init_plan,
+    mark_consumed,
+)
 from react_agent.eeg_research.agentic.runner import accept_job, comparable
+from react_agent.eeg_research.agentic.schemas import SCHEMA_VERSION
 
 _TERMINAL = {"paused", "finished", "blocked", "cancelled"}
 DEFAULT_MAX_GPU_SECONDS = 48 * 3600
@@ -69,8 +81,14 @@ def create_campaign(
         "max_training_jobs": int(goal.get("max_training_jobs", 20)),
         "max_llm_calls": int(goal.get("max_llm_calls", 300)),
         "max_candidates": int(goal.get("max_candidates", 4)),
+        "max_gpu_seconds": float(goal.get("max_gpu_seconds", DEFAULT_MAX_GPU_SECONDS)),
         "gpu_seconds_left": float(goal.get("max_gpu_seconds", DEFAULT_MAX_GPU_SECONDS)),
+        "gpu_seconds_reserved": 0.0,
         "llm_calls_left": int(goal.get("max_llm_calls", 300)),
+        "max_repairs_per_candidate": int(goal.get("max_repairs_per_candidate", 2)),
+        "training_seeds": list(goal.get("training_seeds") or (protocol or {}).get("training_seeds") or []),
+        "schema_version": SCHEMA_VERSION,
+        "baseline_jobs": 0,
         "hypothesis": None,
         "experiment": None,
         "candidate_ready": False,
@@ -89,6 +107,7 @@ def create_campaign(
     known[request_id] = str(camp)
     _write(index, known)
     event(camp, "created", fingerprint=contract["fingerprint"])
+    init_plan(camp, goal, protocol=protocol)
     return state
 
 
@@ -186,6 +205,18 @@ def _mark_executed(state: dict[str, Any]) -> None:
         decisions[-1]["executed"] = True
 
 
+def pending_repair(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Same-candidate repair with remaining attempts. This is not a new scientific candidate."""
+    task = state.get("repair_task")
+    if not isinstance(task, dict):
+        return None
+    if int(task.get("remaining") or 0) <= 0:
+        return None
+    if not task.get("candidate_id"):
+        return None
+    return task
+
+
 def pending_implement(camp: Path, state: dict[str, Any]) -> dict[str, Any] | None:
     """Last decision asked for a candidate that was never finished."""
     decisions = state.get("decisions") or []
@@ -274,6 +305,11 @@ def _dev_row(row: dict[str, Any]) -> dict[str, Any]:
         "summary",
         "kind",
         "seed",
+        "training_seed",
+        "failures",
+        "diagnostic_ref",
+        "comparison_status",
+        "job_status",
     )
     return {key: row.get(key) for key in keep if key in row}
 
@@ -283,23 +319,28 @@ def observation(camp: Path) -> dict[str, Any]:
     contract = public_contract(_read(camp / "evaluation_contract.json"))
     actions = available_actions(state)
     evidence = [_dev_row(row) for row in state.get("evidence") or []]
-    from react_agent.eeg_research.agentic.interface import CANDIDATE_INTERFACE
+    from react_agent.eeg_research.agentic.interface import candidate_interface
 
+    protocol = load_protocol(camp)
+    trainable = ["baseline"]
+    for row in state.get("candidates") or []:
+        if row.get("status") == "ready" and row.get("candidate_id") and row["candidate_id"] not in trainable:
+            trainable.append(row["candidate_id"])
+    if state.get("candidate_ready") and state.get("candidate_id") and state["candidate_id"] not in trainable:
+        trainable.append(state["candidate_id"])
     return {
         "goal": {key: value for key, value in _read(camp / "goal.json").items() if "test" not in key},
         "contract": contract,
-        "candidate_interface": CANDIDATE_INTERFACE,
+        "candidate_interface": candidate_interface(protocol),
         "evidence": evidence,
         "candidates": state.get("candidates") or [],
         "hypothesis": state.get("hypothesis"),
         "experiment": state.get("experiment"),
         "candidate_ready": state.get("candidate_ready"),
         "available_actions": actions,
-        "budget": {
-            "training_jobs_left": int(state.get("max_training_jobs", 0)) - int(state.get("training_jobs", 0)),
-            "gpu_seconds_left": state.get("gpu_seconds_left"),
-            "llm_calls_left": state.get("llm_calls_left"),
-        },
+        "trainable_ids": trainable,
+        "budget": budget_snapshot(camp, state),
+        "research_plan": consume_for_planner(camp, state),
         "memory": retrieve(
             state.get("memory") or [],
             task_hash=str(state.get("goal_id")),
@@ -347,9 +388,11 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     _sync_ledger(camp, state)
     queued = state.get("queued") or []
     if queued and services.get("launch") is not None:
-        candidate_id, fidelity = queued.pop(0)
+        item = queued.pop(0)
+        candidate_id, fidelity = item[0], item[1]
+        training_seed = item[2] if len(item) > 2 else None
         state["queued"] = queued
-        _launch(camp, state, services, candidate_id, fidelity)
+        _launch(camp, state, services, candidate_id, fidelity, training_seed=training_seed)
         _finish_step(camp, state)
         return state
     pending = _unexecuted_decision(state)
@@ -411,6 +454,14 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         }
         save_state(camp, state)
         return state
+    raw_update = (decision.get("raw") or {}).get("plan_update") if isinstance(decision.get("raw"), dict) else None
+    if isinstance(raw_update, dict):
+        known = {str(row.get("evidence_id")) for row in state.get("evidence") or [] if row.get("evidence_id")}
+        try:
+            apply_update(camp, raw_update, known_evidence_ids=known)
+        except PlanError as exc:
+            event(camp, "plan_update_rejected", detail=str(exc), decision_id=record["decision_id"])
+    mark_consumed(camp, record["decision_id"])
     _apply_action(camp, state, str(decision.get("action") or ""), decision, runner, services, obs)
     _finish_step(camp, state)
     return state
@@ -455,7 +506,7 @@ def _apply_action(
         else:
             implementer(camp, state)
     elif action in {"run_pilot", "run_full", "replicate"}:
-        _train(camp, state, action, runner, services)
+        _train(camp, state, action, runner, services, raw)
 
 
 def _propose_experiment(camp: Path, state: dict[str, Any], decision: dict[str, Any], raw: dict[str, Any]) -> None:
@@ -579,6 +630,9 @@ def _diagnose(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
 
 def _implement_inline(camp: Path, state: dict[str, Any], decision: dict[str, Any]) -> None:
     """Direct patch from one reply. Used by synthetic tests; the worker uses NativePatch."""
+    from react_agent.eeg_research.agentic.interface import candidate_interface
+    from react_agent.eeg_research.agentic.lineage import materialize
+
     candidate_id = f"c{len(state.get('candidates') or []) + 1}"
     workspace = camp / "candidates" / candidate_id
     raw = decision.get("raw") or {}
@@ -586,6 +640,10 @@ def _implement_inline(camp: Path, state: dict[str, Any], decision: dict[str, Any
     if not content:
         state["detail"] = "implementation_failed"
         return
+    workspace.mkdir(parents=True, exist_ok=True)
+    materialize(camp, workspace, state.get("experiment") or {})
+    protocol = load_protocol(camp)
+    (workspace / "input_spec.json").write_text(json.dumps(candidate_interface(protocol), ensure_ascii=False, indent=2), encoding="utf-8")
     applied = apply_candidate_patch(workspace, raw.get("relative") or "extension/eeg_candidate.py", content, raw.get("expected_base_hash") or "")
     if not applied.get("ok"):
         state["detail"] = applied.get("error")
@@ -608,29 +666,17 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
     result["candidate_id"] = record.get("candidate_id")
     result["job_dir"] = str(camp / "jobs" / str(record.get("job_id")))
     result["seed"] = record.get("seed")
+    result["training_seed"] = record.get("seed")
     result["job_status"] = record.get("status")
     if result.get("evaluation_valid"):
         result["contract_fingerprint"] = result.get("execution_fingerprint") or state.get("contract_fingerprint")
-    state["gpu_seconds_left"] = float(state.get("gpu_seconds_left", 0)) - float(record.get("gpu_seconds") or 0)
+    charge_gpu(camp, state, float(record.get("gpu_seconds") or 0))
     cost_path = camp / "cost.json"
     cost = _read(cost_path)
-    cost["gpu_seconds_used"] = float(cost.get("gpu_seconds_used", 0.0)) + float(record.get("gpu_seconds") or 0)
     cost["training_jobs"] = int(state.get("training_jobs", 0))
     cost.setdefault("api_usd", None)
     _write(cost_path, cost)
     if result.get("evaluation_valid"):
-        controls = [
-            row
-            for row in state["evidence"]
-            if row.get("candidate_id") == "baseline"
-            and row.get("fidelity") == result.get("fidelity")
-            and row.get("evaluation_valid")
-            and row.get("gallery_size") == result.get("gallery_size")
-            and row.get("seed") == result.get("seed")
-        ]
-        if controls and result.get("candidate_id") != "baseline":
-            result["control_id"] = controls[-1]["evidence_id"]
-            result["delta_vs_control_pp"] = round(100 * (result["fixed_bank_top1"] - controls[-1]["fixed_bank_top1"]), 4)
         state["memory"].append(
             episode(
                 task_hash=str(state.get("goal_id")),
@@ -657,10 +703,41 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
             )
         )
     state["evidence"].append(result)
+    protocol = load_protocol(camp)
+    control = matched_control(state["evidence"][:-1], result, protocol)
+    comparison = compare_runs(candidate=result, control=control, protocol=protocol)
+    result["comparison_status"] = "comparable" if comparison.get("comparable") else comparison.get("reason")
+    result["comparison"] = comparison
+    if comparison.get("comparable") and comparison.get("delta_pp") is not None:
+        result["delta_vs_control_pp"] = comparison["delta_pp"]
+        result["control_id"] = comparison.get("control_run_id")
+    else:
+        result.pop("delta_vs_control_pp", None)
+        result.pop("control_id", None)
+    goal = _read(camp / "goal.json")
+    paired = [
+        float(row["delta_vs_control_pp"])
+        for row in state["evidence"]
+        if row.get("candidate_id") == result.get("candidate_id")
+        and row.get("fidelity") == result.get("fidelity")
+        and row.get("delta_vs_control_pp") is not None
+        and row.get("evaluation_valid")
+    ]
+    promo = promotion_decision(comparison=comparison, goal=goal, paired_deltas_pp=paired)
+    result["promotion"] = promo
+    _write(camp / "comparisons" / f"{result['evidence_id']}.json", {"comparison": comparison, "promotion": promo})
     event(camp, "job_settled", job_id=record.get("job_id"), status=record.get("status"), valid=result.get("evaluation_valid"))
 
 
-def _launch(camp: Path, state: dict[str, Any], services: Services, candidate_id: str, fidelity: str) -> None:
+def _launch(
+    camp: Path,
+    state: dict[str, Any],
+    services: Services,
+    candidate_id: str,
+    fidelity: str,
+    *,
+    training_seed: int | None = None,
+) -> None:
     """Start one job, or adopt a job.json already on disk. Never start a second process for the same id."""
     job_index = int(state["training_jobs"]) + 1
     job_id = f"j{job_index}_{candidate_id}_{fidelity}"
@@ -688,24 +765,109 @@ def _launch(camp: Path, state: dict[str, Any], services: Services, candidate_id:
                 recoverable=False,
             )
             return
+        if (record.get("status") or "running") != "running":
+            persist_failure(
+                camp,
+                state,
+                phase="train",
+                error_type=str(record.get("detail") or record.get("status") or "job_not_running"),
+                detail=str(record.get("detail") or record.get("status") or "job_not_running"),
+                recoverable=False,
+            )
+            return
         state["training_jobs"] = job_index
         state["live_job"] = job_id
         state["status"] = "training"
         return
+    if training_seed is not None:
+        state["pending_training_seed"] = training_seed
     record = services["launch"](camp, state, job_id, candidate_id, fidelity)
+    state.pop("pending_training_seed", None)
+    if (record.get("status") or "running") != "running":
+        persist_failure(
+            camp,
+            state,
+            phase="train",
+            error_type=str(record.get("detail") or record.get("status") or "launch_blocked"),
+            detail=str(record.get("detail") or record.get("status") or "launch_blocked"),
+            recoverable=False,
+        )
+        return
+    if candidate_id == "baseline":
+        state["baseline_jobs"] = int(state.get("baseline_jobs") or 0) + 1
     state["training_jobs"] = job_index
     state["live_job"] = record["job_id"]
     state["status"] = "training"
-    event(camp, "job_started", job_id=record["job_id"], candidate_id=candidate_id, fidelity=fidelity)
+    event(camp, "job_started", job_id=record["job_id"], candidate_id=candidate_id, fidelity=fidelity, seed=training_seed)
 
 
-def _train(camp: Path, state: dict[str, Any], action: str, runner: Any, services: Services) -> None:
+def _reviewed_ids(state: dict[str, Any]) -> set[str]:
+    names = {"baseline"}
+    for row in state.get("candidates") or []:
+        if row.get("status") == "ready" and row.get("candidate_id"):
+            names.add(str(row["candidate_id"]))
+    if state.get("candidate_ready") and state.get("candidate_id"):
+        names.add(str(state["candidate_id"]))
+    return names
+
+
+def _train(
+    camp: Path,
+    state: dict[str, Any],
+    action: str,
+    runner: Any,
+    services: Services,
+    raw: dict[str, Any] | None = None,
+) -> None:
     if state.get("gpu_seconds_left", 0) <= 0 or state["training_jobs"] >= state["max_training_jobs"]:
         state["status"] = "blocked"
         state["detail"] = "budget_exhausted"
         return
     fidelity = "pilot" if action == "run_pilot" else "full"
-    candidate_id = state.get("candidate_id") or "c1"
+    raw = raw or {}
+    reviewed = _reviewed_ids(state)
+    requested = raw.get("target_id")
+    candidate_id = requested or state.get("candidate_id")
+    if requested and requested not in reviewed:
+        persist_failure(
+            camp,
+            state,
+            phase="train",
+            error_type="unknown_target",
+            detail=f"unknown_target:{requested}",
+            recoverable=False,
+        )
+        return
+    if not candidate_id:
+        persist_failure(
+            camp,
+            state,
+            phase="train",
+            error_type="target_id_missing",
+            detail="target_id_missing",
+            recoverable=False,
+        )
+        return
+    protocol = load_protocol(camp) or {}
+    used = {
+        int(row.get("seed") or 0)
+        for row in state.get("evidence") or []
+        if row.get("candidate_id") == candidate_id and row.get("fidelity") == fidelity and row.get("evaluation_valid")
+    }
+    if action == "replicate":
+        training_seed = next_unused_training_seed(protocol, used)
+        if training_seed is None:
+            persist_failure(
+                camp,
+                state,
+                phase="train",
+                error_type="no_unused_training_seed",
+                detail="no_unused_training_seed",
+                recoverable=False,
+            )
+            return
+    else:
+        training_seed = int(protocol.get("training_seed", protocol.get("seed") or 0))
     job_index = state["training_jobs"] + 1
     job_dir = camp / "jobs" / f"j{job_index}"
     if job_dir.exists() and not (job_dir / "job.json").is_file() and not (job_dir / "metrics.json").is_file():
@@ -720,14 +882,29 @@ def _train(camp: Path, state: dict[str, Any], action: str, runner: Any, services
         return
     if services.get("launch") is not None:
         has_control = any(
-            row.get("candidate_id") == "baseline" and row.get("fidelity") == fidelity and row.get("evaluation_valid")
+            row.get("candidate_id") == "baseline"
+            and row.get("fidelity") == fidelity
+            and row.get("evaluation_valid")
+            and int(row.get("seed") or 0) == int(training_seed)
             for row in state.get("evidence") or []
         )
-        if not has_control and state["training_jobs"] + 2 <= state["max_training_jobs"]:
-            state["queued"] = [[candidate_id, fidelity]]
-            _launch(camp, state, services, "baseline", fidelity)
+        if candidate_id != "baseline" and not has_control:
+            if state["training_jobs"] + 2 > state["max_training_jobs"]:
+                persist_failure(
+                    camp,
+                    state,
+                    phase="train",
+                    error_type="unmatched_control",
+                    detail="unmatched_control",
+                    recoverable=True,
+                )
+                return
+            queued = list(state.get("queued") or [])
+            queued.append([candidate_id, fidelity, training_seed])
+            state["queued"] = queued
+            _launch(camp, state, services, "baseline", fidelity, training_seed=training_seed)
         else:
-            _launch(camp, state, services, candidate_id, fidelity)
+            _launch(camp, state, services, candidate_id, fidelity, training_seed=training_seed)
         return
     job = camp / "jobs" / f"j{job_index}"
     job.mkdir(parents=True, exist_ok=True)
@@ -738,14 +915,14 @@ def _train(camp: Path, state: dict[str, Any], action: str, runner: Any, services
         return
     result = runner(job, manifest, fidelity)
     state["training_jobs"] = job_index
-    accepted = accept_job(job, manifest, fidelity)
+    accepted = accept_job(job, manifest, fidelity, protocol=load_protocol(camp))
     _record_job(
         camp,
         state,
         {
             "job_id": job.name,
             "candidate_id": candidate_id,
-            "seed": result.get("seed", 0),
+            "seed": result.get("seed", training_seed),
             "status": "finished" if accepted.get("evaluation_valid") else "invalid",
             "gpu_seconds": result.get("gpu_seconds", 0),
             "result": accepted,

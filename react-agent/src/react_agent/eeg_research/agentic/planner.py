@@ -35,9 +35,13 @@ _DERIVED = {"data_audit", "learning_profile"}
 
 
 def submitted_candidates(state: dict[str, Any]) -> int:
-    """Candidates that produced a patch. An attempt that never wrote code is not a candidate."""
+    """Scientific candidates that produced a patch. Baseline is counted separately."""
     unwritten = {"implementation_failed", "requires_framework_extension"}
-    return sum(1 for row in state.get("candidates") or [] if row.get("status") not in unwritten)
+    return sum(
+        1
+        for row in state.get("candidates") or []
+        if row.get("status") not in unwritten and row.get("candidate_id") != "baseline"
+    )
 
 
 def evidence_count(state: dict[str, Any]) -> int:
@@ -65,9 +69,12 @@ def available_actions(state: dict[str, Any]) -> list[str]:
     if any(row.get("job_dir") or row.get("fidelity") for row in evidence):
         actions.append("diagnose_results")
     calls_left = int(state.get("llm_calls_left", 1_000))
-    if (
+    if state.get("repair_task") and int((state.get("repair_task") or {}).get("remaining") or 0) > 0:
+        if calls_left >= IMPLEMENT_CALLS:
+            actions.append("implement_candidate")
+    elif (
         pending_experiment
-        and submitted_candidates(state) < int(state.get("max_candidates", 4)) - 1
+        and submitted_candidates(state) < int(state.get("max_candidates", 4))
         and calls_left >= IMPLEMENT_CALLS
     ):
         actions.append("implement_candidate")
@@ -80,7 +87,14 @@ def available_actions(state: dict[str, Any]) -> list[str]:
         elif not _has(evidence, current, "full"):
             actions.append("run_full")
     if room and current and _has(evidence, current, "full"):
-        actions.append("replicate")
+        used = {
+            int(row.get("seed") or 0)
+            for row in evidence
+            if row.get("candidate_id") == current and row.get("fidelity") == "full" and row.get("evaluation_valid")
+        }
+        declared = [int(item) for item in state.get("training_seeds") or []]
+        if declared and any(seed not in used for seed in declared):
+            actions.append("replicate")
     return actions
 
 
@@ -88,21 +102,22 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
     """Ask once. One schema repair is allowed. A second failure blocks."""
     allowed = observation.get("available_actions") or []
     known = set(observation.get("_known_evidence_ids") or [])
+    trainable = set(observation.get("trainable_ids") or ["baseline"])
     reply = backend(observation)
-    parsed = _parse(reply, allowed, known)
+    parsed = _parse(reply, allowed, known, trainable)
     if parsed.get("ok"):
         return parsed
     if repairs >= 1:
         return {"ok": False, "status": "blocked", "detail": parsed.get("detail")}
     repaired = backend({"schema_error": parsed.get("detail"), "previous": reply, "available_actions": allowed})
-    second = _parse(repaired, allowed, known)
+    second = _parse(repaired, allowed, known, trainable)
     if second.get("ok"):
         second["repairs"] = 1
         return second
     return {"ok": False, "status": "blocked", "detail": second.get("detail"), "repairs": 1}
 
 
-def _parse(reply: Any, allowed: list[str], known: set[str]) -> dict[str, Any]:
+def _parse(reply: Any, allowed: list[str], known: set[str], trainable: set[str] | None = None) -> dict[str, Any]:
     if not isinstance(reply, dict):
         return {"ok": False, "detail": "not_json"}
     action = reply.get("action")
@@ -113,4 +128,11 @@ def _parse(reply: Any, allowed: list[str], known: set[str]) -> dict[str, Any]:
         return {"ok": False, "detail": "unknown_evidence"}
     if action == "propose_experiment" and not isinstance(reply.get("hypothesis_draft"), dict):
         return {"ok": False, "detail": "hypothesis_draft_missing"}
+    if action in {"run_pilot", "run_full", "replicate"}:
+        target = reply.get("target_id")
+        allowed_targets = trainable or set()
+        if not isinstance(target, str) or not target:
+            return {"ok": False, "detail": "target_id_missing"}
+        if allowed_targets and target not in allowed_targets:
+            return {"ok": False, "detail": f"unknown_target:{target}"}
     return {"ok": True, "action": action, "reason_zh": reply.get("reason_zh") or "", "raw": reply}

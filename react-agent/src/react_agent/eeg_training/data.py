@@ -89,13 +89,23 @@ class RetrievalTrials(Dataset):
         return {"eeg": eeg[:, start:end].float(), "img_features": features.float()}
 
 
+def _subject_from_path(path: Path) -> str:
+    name = path.parent.name
+    if name.startswith("sub-"):
+        return name
+    return name or "custom"
+
+
 def collect_records(
     files: tuple[Path, ...],
     features: dict[str, torch.Tensor],
     channels: list[str] | None,
     allowed: set[str] | None,
 ) -> tuple[list[dict[str, torch.Tensor | str]], list[str]]:
-    """Join trial files to cached features. allowed=None keeps every image in the files."""
+    """Join trial files to cached features. allowed=None keeps every image in the files.
+
+    Query identity is subject plus image. Subject is metadata for the evaluator, not model input.
+    """
     records: list[dict[str, torch.Tensor | str]] = []
     image_ids: list[str] = []
     for path in files:
@@ -104,11 +114,20 @@ def collect_records(
         eeg = trials["eeg"]
         assert isinstance(images, list)
         assert isinstance(eeg, torch.Tensor)
+        subject = _subject_from_path(path)
         for index, image_id in enumerate(images):
             if allowed is not None and image_id not in allowed:
                 continue
             if image_id not in features:
                 raise SplitError(f"feature_missing:{image_id}")
-            records.append({"eeg": eeg[index], "img": image_id, "img_features": features[image_id]})
+            records.append(
+                {
+                    "eeg": eeg[index],
+                    "img": image_id,
+                    "img_features": features[image_id],
+                    "subject": subject,
+                    "query_id": f"{subject}::{image_id}",
+                }
+            )
             image_ids.append(image_id)
     return records, image_ids

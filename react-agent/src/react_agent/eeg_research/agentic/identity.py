@@ -40,6 +40,29 @@ def ensure_attempt(workspace: Path, candidate_id: str) -> dict[str, Any]:
     return data
 
 
+def rotate_attempt(workspace: Path, candidate_id: str) -> dict[str, Any]:
+    """Start a new implementation attempt. Prior review artifacts must not be reused."""
+    previous = {}
+    path = workspace / "attempt.json"
+    if path.is_file():
+        try:
+            previous = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous = {}
+    data = {
+        "attempt_id": uuid.uuid4().hex[:12],
+        "candidate_id": candidate_id,
+        "operations": {},
+        "supersedes_attempt_id": previous.get("attempt_id"),
+    }
+    _atomic(path, data)
+    for name in ("review.json", "implementation.json"):
+        stale = workspace / name
+        if stale.is_file():
+            stale.rename(workspace / f"{name}.{previous.get('attempt_id') or 'old'}")
+    return data
+
+
 def operation_id(workspace: Path, candidate_id: str, phase: str) -> str:
     """Stable id for one phase inside the current attempt."""
     data = ensure_attempt(workspace, candidate_id)

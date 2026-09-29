@@ -182,7 +182,10 @@ def test_review_file_is_reused_and_a_real_rejection_is_recorded_once(tmp_path: P
     assert len(state["candidates"]) == 1
     assert state["candidates"][0]["candidate_id"] == "c1"
     assert state["candidates"][0]["status"] == "review_needs_fix"
-    assert state["experiment_failed"] is True
+    assert state.get("repair_task")
+    assert state["repair_task"]["candidate_id"] == "c1"
+    assert int(state["repair_task"]["remaining"] or 0) > 0
+    assert state.get("experiment_failed") is not True
     assert [row["evidence_id"] for row in state["evidence"]] == ["ev_impl_c1"]
     assert not state.get("failure")
     saved = load_state(camp)

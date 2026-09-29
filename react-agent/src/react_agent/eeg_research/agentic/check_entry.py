@@ -11,12 +11,21 @@ import traceback
 from pathlib import Path
 
 
+def _spec(dataset_or_path: str) -> dict[str, object]:
+    path = Path(dataset_or_path)
+    if path.suffix == ".json" and path.is_file():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and payload.get("c_num") is not None:
+            return payload
+    from react_agent.eeg_training.protocol import geometry
+
+    return geometry(dataset_or_path)
+
+
 def run(dataset: str = "eeg") -> dict[str, object]:
     import torch
 
-    from react_agent.eeg_training.protocol import geometry
-
-    spec = geometry(dataset)
+    spec = _spec(dataset)
     module = importlib.import_module("eeg_candidate")
     candidate = module.EEGCandidate()
     encoder = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
@@ -56,9 +65,11 @@ def run(dataset: str = "eeg") -> dict[str, object]:
     buffer = io.BytesIO()
     torch.save(encoder.state_dict(), buffer)
     buffer.seek(0)
-    encoder.load_state_dict(torch.load(buffer))
+    rebuilt = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
+    rebuilt.load_state_dict(torch.load(buffer))
+    rebuilt.eval()
     with torch.no_grad():
-        second = encoder(batch)
+        second = rebuilt(batch)
     round_trip = bool(torch.allclose(first, second))
     loaded = str(Path(inspect.getfile(type(candidate))).resolve())
     ok = finite and out.shape == (4, 1024) and with_grad > 0 and round_trip
