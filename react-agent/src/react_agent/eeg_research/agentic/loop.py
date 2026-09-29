@@ -15,6 +15,7 @@ from react_agent.eeg_research.agentic.planner import available_actions, decide, 
 from react_agent.eeg_research.agentic.runner import accept_job, comparable
 
 _TERMINAL = {"paused", "finished", "blocked", "cancelled"}
+DEFAULT_MAX_GPU_SECONDS = 48 * 3600
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -65,11 +66,11 @@ def create_campaign(
         "memory": [],
         "training_jobs": 0,
         "llm_calls": 0,
-        "max_training_jobs": int(goal.get("max_training_jobs", 10)),
-        "max_llm_calls": int(goal.get("max_llm_calls", 100)),
+        "max_training_jobs": int(goal.get("max_training_jobs", 20)),
+        "max_llm_calls": int(goal.get("max_llm_calls", 300)),
         "max_candidates": int(goal.get("max_candidates", 4)),
-        "gpu_seconds_left": float(goal.get("max_gpu_seconds", 28800)),
-        "llm_calls_left": int(goal.get("max_llm_calls", 100)),
+        "gpu_seconds_left": float(goal.get("max_gpu_seconds", DEFAULT_MAX_GPU_SECONDS)),
+        "llm_calls_left": int(goal.get("max_llm_calls", 300)),
         "hypothesis": None,
         "experiment": None,
         "candidate_ready": False,
@@ -513,34 +514,67 @@ def _inspect(camp: Path) -> dict[str, Any]:
     }
 
 
+def _train_log_tail(path: Path, *, limit: int = 4000) -> str:
+    """Last characters of a job log. Missing files are empty, not an error."""
+    if not path.is_file():
+        return ""
+    text = path.read_text(encoding="utf-8", errors="replace").strip()
+    if len(text) > limit:
+        return text[-limit:]
+    return text
+
+
 def _diagnose(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
-    """Curve summary from history files. No checkpoint means unavailable."""
+    """Curve summary from history files, plus the tail of jobs that never wrote one."""
     curves = []
+    failures = []
     for row in state.get("evidence") or []:
         job = row.get("job_dir")
         if not job:
             continue
-        history = Path(job) / "history.jsonl"
-        if not history.is_file():
+        job_path = Path(job)
+        history = job_path / "history.jsonl"
+        points: list[dict[str, Any]] = []
+        if history.is_file():
+            points = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if points:
+            best = max(points, key=lambda item: float(item.get("fixed_bank_top1") or 0.0))
+            curves.append(
+                {
+                    "candidate_id": row.get("candidate_id"),
+                    "fidelity": row.get("fidelity"),
+                    "epochs": len(points),
+                    "best_epoch": best.get("epoch"),
+                    "best_fixed_bank_top1": best.get("fixed_bank_top1"),
+                    "first_train_loss": points[0].get("train_loss"),
+                    "last_train_loss": points[-1].get("train_loss"),
+                    "fixed_bank_trend": [round(float(item.get("fixed_bank_top1") or 0.0), 5) for item in points],
+                }
+            )
             continue
-        points = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if not points:
+        tail = _train_log_tail(job_path / "train.log")
+        failed = row.get("evaluation_valid") is False or row.get("job_status") in {"failed", "invalid"}
+        if not failed and not tail:
             continue
-        best = max(points, key=lambda item: float(item.get("fixed_bank_top1") or 0.0))
-        curves.append(
+        failures.append(
             {
                 "candidate_id": row.get("candidate_id"),
                 "fidelity": row.get("fidelity"),
-                "epochs": len(points),
-                "best_epoch": best.get("epoch"),
-                "best_fixed_bank_top1": best.get("fixed_bank_top1"),
-                "first_train_loss": points[0].get("train_loss"),
-                "last_train_loss": points[-1].get("train_loss"),
-                "fixed_bank_trend": [round(float(item.get("fixed_bank_top1") or 0.0), 5) for item in points],
+                "reason": row.get("reason"),
+                "job_status": row.get("job_status"),
+                "train_log_tail": tail,
             }
         )
-    status = "ready" if curves else "unavailable"
-    return {"evidence_id": f"ev_diag_{len(state['evidence']) + 1}", "kind": "learning_profile", "status": status, "curve": curves}
+    status = "ready" if curves or failures else "unavailable"
+    payload: dict[str, Any] = {
+        "evidence_id": f"ev_diag_{len(state['evidence']) + 1}",
+        "kind": "learning_profile",
+        "status": status,
+        "curve": curves,
+    }
+    if failures:
+        payload["failures"] = failures
+    return payload
 
 
 def _implement_inline(camp: Path, state: dict[str, Any], decision: dict[str, Any]) -> None:

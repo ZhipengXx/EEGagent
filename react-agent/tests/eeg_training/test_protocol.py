@@ -32,6 +32,7 @@ from react_agent.eeg_training.train_entry import (
     append_history,
     begin_history,
     limit_visible_gpus,
+    placed_retrieval,
     read_train_status,
     score_held_out,
     write_status,
@@ -403,3 +404,29 @@ def test_stop_condition_chooses_the_chain_without_starting(tmp_path: Path) -> No
     stored = json.loads((out / "metrics.json").read_text(encoding="utf-8"))
     assert stored["test_result"] is None
     assert stored["primary_metric"] == 0.36
+
+
+def test_placed_retrieval_moves_wrapper_temperature() -> None:
+    import inspect
+
+    import torch
+    from torch import nn
+
+    from react_agent.eeg_training import train_entry
+
+    class Enc(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.proj = nn.Linear(4, 4)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.proj(x)
+
+    device = torch.device("cpu")
+    encoder = Enc().to(device)
+    model = placed_retrieval(encoder, device, n_visible=1)
+    assert hasattr(model, "logit_scale")
+    assert model.logit_scale.device == encoder.proj.weight.device
+    source = inspect.getsource(train_entry.placed_retrieval)
+    assert ".to(device)" in source
+    assert source.index("LocalRetrieval") < source.index("DataParallel")

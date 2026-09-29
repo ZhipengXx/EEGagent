@@ -387,6 +387,11 @@ select:disabled { opacity: 0.6; cursor: not-allowed; }
 .trial-trace { background: var(--bg-subtle); border-radius: var(--radius-control); padding: 12px; margin-bottom: calc(var(--space) * 1.5); }
 .trial-trace h3 { margin: 0 0 4px; font-size: 12px; font-weight: 600; color: var(--text-secondary); }
 .trial-scroll { overflow-x: auto; }
+.agentic-switch { display: flex; flex-wrap: wrap; gap: var(--space); margin-bottom: calc(var(--space) * 1.5); }
+.agentic-switch button { height: auto; min-height: 40px; text-align: left; padding: 8px 12px; display: flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.agentic-switch button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.agentic-switch-meta { font-size: 12px; line-height: 1.4; color: var(--text-secondary); }
+.agentic-switch button.active .agentic-switch-meta { color: inherit; }
 .agentic-card h3 { margin: calc(var(--space) * 1.5) 0 var(--space); font-size: 13px; }
 .agentic-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: calc(var(--space) * 1.5); margin: var(--space) 0 calc(var(--space) * 1.5); }
 .agentic-summary > div { background: var(--bg-subtle); border-radius: var(--radius-control); padding: 12px; }
@@ -425,7 +430,8 @@ circle[data-index] { fill: var(--accent); cursor: pointer; }
 @media (hover: hover) and (pointer: fine) {
   button:hover { background: var(--bg-subtle); }
   button.primary:hover, #start-check:hover, #open-drawer:hover,
-  .research-actions button.primary:hover, .segment button.active:hover { background: var(--accent-hover); color: #fff; }
+  .research-actions button.primary:hover, .segment button.active:hover,
+  .agentic-switch button.active:hover { background: var(--accent-hover); color: #fff; }
   .mode-switch button:hover, .tabs button:hover { background: transparent; color: var(--text-primary); }
   .tabs button.active:hover { color: var(--accent); }
   .run-item:hover, tr.metric:hover, .recent-row:hover { background: var(--bg-subtle); }

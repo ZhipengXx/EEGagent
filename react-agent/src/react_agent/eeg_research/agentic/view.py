@@ -27,6 +27,31 @@ def _read(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _created_at(camp: Path) -> float:
+    events = camp / "events.jsonl"
+    if events.is_file():
+        with events.open(encoding="utf-8") as handle:
+            line = handle.readline().strip()
+        if line:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                row = None
+            if isinstance(row, dict) and row.get("at") is not None:
+                return float(row["at"])
+    state = camp / "campaign_state.json"
+    if state.is_file():
+        return state.stat().st_mtime
+    return 0.0
+
+
+def _updated_at(camp: Path) -> float:
+    state = camp / "campaign_state.json"
+    if state.is_file():
+        return state.stat().st_mtime
+    return 0.0
+
+
 def campaign_view(camp: Path) -> dict[str, Any]:
     view = status_view(camp)
     goal = _read(camp / "goal.json") or {}
@@ -73,6 +98,8 @@ def campaign_view(camp: Path) -> dict[str, Any]:
     live_status = _read(camp / "jobs" / str(live) / "status.json") if live else None
     return {
         "campaign_id": camp.name,
+        "created_at": _created_at(camp),
+        "updated_at": _updated_at(camp),
         "objective": goal.get("objective"),
         "research_scope": contract.get("research_scope"),
         "scope_zh": "多被试合训 · 图像留出验证（不是未见被试）" if contract.get("research_scope") == "pooled_subject_retrieval" else contract.get("research_scope"),
@@ -104,7 +131,9 @@ def agentic_status(root: Path | None = None, campaign: str = "") -> dict[str, An
     if not base.is_dir():
         return {"campaigns": []}
     names = [campaign] if campaign else sorted(path.name for path in base.iterdir() if (path / "campaign_state.json").is_file())
-    return {"campaigns": [campaign_view(base / name) for name in names if (base / name / "campaign_state.json").is_file()]}
+    rows = [campaign_view(base / name) for name in names if (base / name / "campaign_state.json").is_file()]
+    rows.sort(key=lambda row: float(row.get("updated_at") or 0), reverse=True)
+    return {"campaigns": rows}
 
 
 def control(action: str, campaign: str, root: Path | None = None) -> dict[str, Any]:

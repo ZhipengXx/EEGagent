@@ -402,6 +402,22 @@ def _build_encoder(spec: dict[str, object], out_dir: Path, train_loader=None):
     return encoder
 
 
+def placed_retrieval(encoder, device, n_visible: int):
+    """Move wrapper parameters with the encoder, then replicate.
+
+    LocalRetrieval may allocate logit_scale on CPU when the encoder has none.
+    DataParallel requires every parameter to already sit on cuda:0.
+    """
+    import torch
+
+    from react_agent.eeg_training.model import LocalRetrieval
+
+    model = LocalRetrieval(encoder).to(device)
+    if n_visible > 1:
+        model = torch.nn.DataParallel(model, device_ids=list(range(n_visible)))
+    return model
+
+
 def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     """Train on validation top-1 and write metrics only after a completed loop."""
     limit_visible_gpus(design)
@@ -409,7 +425,6 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     import torch
 
     from react_agent.eeg_training.fixed_bank import FixedBankTally, frozen_bank
-    from react_agent.eeg_training.model import LocalRetrieval
 
     if not torch.cuda.is_available():
         raise SplitError("cuda_unavailable")
@@ -419,9 +434,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     train_loader, val_loader, train_images, val_images, spec = build_loaders(design, data_root)
     device = torch.device("cuda:0")
     encoder = _build_encoder(spec, out_dir, train_loader).to(device)
-    model: torch.nn.Module = LocalRetrieval(encoder)
-    if len(design.gpu) > 1:
-        model = torch.nn.DataParallel(model, device_ids=list(range(len(design.gpu))))
+    model: torch.nn.Module = placed_retrieval(encoder, device, len(design.gpu))
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate(design), weight_decay=design.weight_decay)
     bank, bank_labels = frozen_bank(val_loader.dataset.records)
     bank = bank.to(device)

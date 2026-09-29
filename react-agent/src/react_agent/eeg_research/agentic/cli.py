@@ -11,7 +11,15 @@ from pathlib import Path
 from react_agent.eeg_research.agentic.contract import freeze_contract, research_scope
 from react_agent.eeg_research.agentic.execution_protocol import ProtocolError, build_execution_protocol
 from react_agent.eeg_research.agentic.jobs import worker_disconnected
-from react_agent.eeg_research.agentic.loop import align_interrupt, create_campaign, event, load_state, request_control, save_state
+from react_agent.eeg_research.agentic.loop import (
+    DEFAULT_MAX_GPU_SECONDS,
+    align_interrupt,
+    create_campaign,
+    event,
+    load_state,
+    request_control,
+    save_state,
+)
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[4] / "runs" / "eeg_research_v18"
 
@@ -30,6 +38,10 @@ def _parser() -> argparse.ArgumentParser:
 
 def goal(campaign: str, design=None) -> dict:
     scope = "pooled_subject_retrieval" if design is None else research_scope(design)
+    gpu = DEFAULT_MAX_GPU_SECONDS
+    chosen = None if design is None else getattr(design, "gpu_seconds", None)
+    if chosen is not None:
+        gpu = float(chosen)
     return {
         "goal_id": campaign,
         "objective": "改进指定数据与协议下的 EEG 到图像检索",
@@ -40,9 +52,9 @@ def goal(campaign: str, design=None) -> dict:
         "min_practical_gain_pp": None,
         "final_test_enabled": False,
         "max_candidates": 4,
-        "max_training_jobs": 10,
-        "max_llm_calls": 100,
-        "max_gpu_seconds": 28800,
+        "max_training_jobs": 20,
+        "max_llm_calls": 300,
+        "max_gpu_seconds": gpu,
         "max_concurrent_training_jobs": 1,
         "max_api_usd": None,
         "allowed_changes": ["eeg_encoder", "temporal_pooling", "projection_head", "training_loss", "training_only_augmentation"],

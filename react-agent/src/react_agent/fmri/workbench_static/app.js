@@ -28,7 +28,7 @@ const state = {
     seed: "0",
     batch_size: "1024",
     lr: "",
-    gpu_seconds: "28800",
+    gpu_seconds: "172800",
     gpu: "",
     data_root: "",
     train_dir: "",
@@ -50,6 +50,8 @@ const state = {
   refused: false,
   trainStatus: null,
   trainPoll: null,
+  agenticFocus: "",
+  agenticKnown: [],
 };
 
 const main = document.getElementById("main");
@@ -930,24 +932,64 @@ function decisionCard(row) {
   return `<article class="decision-card"><h4>${esc(title)}</h4><p class="agentic-prose">${renderProse(lead.body)}</p>${rest ? `<div class="decision-fields">${rest}</div>` : ""}</article>`;
 }
 
-function agenticCard() {
-  const rows = (state.agentic && state.agentic.campaigns) || [];
-  if (!rows.length) return `<h2>代码级研究</h2><p class="muted">还没有代码级研究。用命令行 create 后在这里查看。</p>`;
-  return rows.map((camp) => {
-    const budget = camp.budget || {};
-    const last = (camp.decisions || []).slice(-1)[0] || {};
-    const best = (camp.experiments || []).filter((row) => row.evaluation_valid && row.candidate_id !== "baseline")
-      .sort((a, b) => (b.delta_vs_control_pp ?? -1e9) - (a.delta_vs_control_pp ?? -1e9))[0];
-    const progress = camp.live_progress ? `（epoch ${esc(camp.live_progress.epoch)} / ${esc(camp.live_progress.epochs)}）` : "";
-    const expRows = (camp.experiments || []).map((row) => `<tr><td>${esc(row.candidate_id === "baseline" ? "对照" : row.candidate_id)}</td><td>${esc(row.fidelity === "pilot" ? "试跑" : "完整")}</td><td>${row.fixed_bank_top1 == null ? "未评估" : formatTick(row.fixed_bank_top1)}</td><td>${row.delta_vs_control_pp == null ? "—" : `${row.delta_vs_control_pp > 0 ? "+" : ""}${esc(row.delta_vs_control_pp)} pp`}</td><td>${row.evaluation_valid ? (row.candidate_id === "baseline" ? "对照" : "暂未确认") : `无效：${esc(row.reason || "")}`}</td></tr>`).join("");
-    const candidates = (camp.candidates || []).map((row) => `<details data-keep="candidate-${esc(camp.campaign_id)}-${esc(row.candidate_id)}"><summary>${esc(row.candidate_id)} · ${esc(row.status)}</summary>${row.review_summary ? `<p class="agentic-prose">${renderProse(row.review_summary)}</p>` : ""}<pre class="agentic-source">${esc(row.source || "没有写出文件")}</pre></details>`).join("");
-    const analyses = (camp.analyses || []).filter(Boolean).map((row) => `<p class="agentic-prose">${renderProse(row.summary_zh || "")}</p>`).join("");
-    const decisions = (camp.decisions || []).slice().reverse().map(decisionCard).join("");
-    const detail = camp.detail ? (AGENTIC_DETAIL[camp.detail] || camp.detail) : "";
-    const gpu = budget.gpu_seconds_used == null ? "未记录" : Math.round(budget.gpu_seconds_used);
-    const fee = budget.api_usd == null ? "未记录" : esc(budget.api_usd);
-    const brief = firstClause(last.reason_zh || "");
-    return `<h2>代码级研究 · ${esc(camp.objective || camp.campaign_id)}</h2>
+function agenticWhen(stamp) {
+  const n = Number(stamp);
+  if (!n) return "";
+  const date = new Date(n * 1000);
+  const pad = (value) => String(value).padStart(2, "0");
+  return `${date.getMonth() + 1}/${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function agenticOrdinals(rows) {
+  const order = rows.slice().sort((a, b) => (Number(a.created_at) || 0) - (Number(b.created_at) || 0) || String(a.campaign_id).localeCompare(String(b.campaign_id)));
+  const map = {};
+  order.forEach((row, index) => { map[row.campaign_id] = index + 1; });
+  return map;
+}
+
+function chooseAgentic(rows) {
+  const ids = rows.map((row) => row.campaign_id);
+  const known = state.agenticKnown || [];
+  const fresh = ids.filter((id) => known.indexOf(id) < 0);
+  let focus = state.agenticFocus;
+  if (!known.length) focus = ids[0] || "";
+  else if (fresh.length) focus = fresh[0];
+  else if (ids.indexOf(focus) < 0) focus = ids[0] || "";
+  state.agenticFocus = focus;
+  state.agenticKnown = ids;
+  return focus;
+}
+
+function agenticSwitch(rows) {
+  const ordinals = agenticOrdinals(rows);
+  const latest = rows[0] && rows[0].campaign_id;
+  return `<div class="agentic-switch">${rows.map((camp) => {
+    const when = agenticWhen(camp.updated_at);
+    const tail = String(camp.campaign_id || "").slice(-6);
+    const status = AGENTIC_STATUS[camp.status] || camp.status || "";
+    const meta = [status, when, tail].filter(Boolean).join(" · ");
+    const title = `${camp.campaign_id === latest ? "最新 · " : ""}第 ${ordinals[camp.campaign_id] || "?"} 次`;
+    const active = camp.campaign_id === state.agenticFocus ? " active" : "";
+    return `<button type="button" class="agentic-pick${active}" data-agentic-select="${esc(camp.campaign_id)}" aria-pressed="${camp.campaign_id === state.agenticFocus ? "true" : "false"}"><span>${esc(title)}</span><span class="agentic-switch-meta">${esc(meta)}</span></button>`;
+  }).join("")}</div>`;
+}
+
+function agenticBody(camp) {
+  const budget = camp.budget || {};
+  const last = (camp.decisions || []).slice(-1)[0] || {};
+  const best = (camp.experiments || []).filter((row) => row.evaluation_valid && row.candidate_id !== "baseline")
+    .sort((a, b) => (b.delta_vs_control_pp ?? -1e9) - (a.delta_vs_control_pp ?? -1e9))[0];
+  const progress = camp.live_progress ? `（epoch ${esc(camp.live_progress.epoch)} / ${esc(camp.live_progress.epochs)}）` : "";
+  const expRows = (camp.experiments || []).map((row) => `<tr><td>${esc(row.candidate_id === "baseline" ? "对照" : row.candidate_id)}</td><td>${esc(row.fidelity === "pilot" ? "试跑" : "完整")}</td><td>${row.fixed_bank_top1 == null ? "未评估" : formatTick(row.fixed_bank_top1)}</td><td>${row.delta_vs_control_pp == null ? "—" : `${row.delta_vs_control_pp > 0 ? "+" : ""}${esc(row.delta_vs_control_pp)} pp`}</td><td>${row.evaluation_valid ? (row.candidate_id === "baseline" ? "对照" : "暂未确认") : `无效：${esc(row.reason || "")}`}</td></tr>`).join("");
+  const candidates = (camp.candidates || []).map((row) => `<details data-keep="candidate-${esc(camp.campaign_id)}-${esc(row.candidate_id)}"><summary>${esc(row.candidate_id)} · ${esc(row.status)}</summary>${row.review_summary ? `<p class="agentic-prose">${renderProse(row.review_summary)}</p>` : ""}<pre class="agentic-source">${esc(row.source || "没有写出文件")}</pre></details>`).join("");
+  const analyses = (camp.analyses || []).filter(Boolean).map((row) => `<p class="agentic-prose">${renderProse(row.summary_zh || "")}</p>`).join("");
+  const decisions = (camp.decisions || []).slice().reverse().map(decisionCard).join("");
+  const detail = camp.detail ? (AGENTIC_DETAIL[camp.detail] || camp.detail) : "";
+  const gpu = budget.gpu_seconds_used == null ? "未记录" : Math.round(budget.gpu_seconds_used);
+  const fee = budget.api_usd == null ? "未记录" : esc(budget.api_usd);
+  const brief = firstClause(last.reason_zh || "");
+  return `<h2>代码级研究 · ${esc(camp.objective || camp.campaign_id)}</h2>
+      <p class="muted">${esc(camp.campaign_id || "")}</p>
       <p class="muted">${esc(camp.scope_zh || "")}。验证固定候选集 top1 用于比较，测试集本轮关闭。</p>
       <div class="agentic-summary">
         <div><span class="muted">当前问题</span><p>${esc(hypothesisLine(camp.hypothesis))}</p></div>
@@ -965,7 +1007,25 @@ function agenticCard() {
         <button type="button" data-agentic-action="pause" data-campaign="${esc(camp.campaign_id)}">本轮后暂停</button>
         <button type="button" data-agentic-action="stop" data-campaign="${esc(camp.campaign_id)}">停止当前作业</button>
       </div>`;
-  }).join("");
+}
+
+function agenticCard() {
+  const rows = (state.agentic && state.agentic.campaigns) || [];
+  if (!rows.length) return `<h2>代码级研究</h2><p class="muted">还没有代码级研究。用命令行 create 后在这里查看。</p>`;
+  const focus = chooseAgentic(rows);
+  const camp = rows.find((row) => row.campaign_id === focus) || rows[0];
+  return `${agenticSwitch(rows)}${agenticBody(camp)}`;
+}
+
+function paintAgentic(box) {
+  const open = new Set();
+  box.querySelectorAll("details[open][data-keep]").forEach((el) => open.add(el.dataset.keep));
+  box.innerHTML = agenticCard();
+  box.dataset.snapshot = JSON.stringify(state.agentic || {});
+  box.querySelectorAll("details[data-keep]").forEach((el) => {
+    if (open.has(el.dataset.keep)) el.open = true;
+  });
+  bindAgentic();
 }
 
 async function refreshAgentic() {
@@ -979,17 +1039,19 @@ async function refreshAgentic() {
   if (!box) return;
   const next = JSON.stringify(state.agentic);
   if (next === box.dataset.snapshot) return;
-  const open = new Set();
-  box.querySelectorAll("details[open][data-keep]").forEach((el) => open.add(el.dataset.keep));
-  box.innerHTML = agenticCard();
-  box.dataset.snapshot = next;
-  box.querySelectorAll("details[data-keep]").forEach((el) => {
-    if (open.has(el.dataset.keep)) el.open = true;
-  });
-  bindAgentic();
+  paintAgentic(box);
 }
 
 function bindAgentic() {
+  document.querySelectorAll("[data-agentic-select]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const id = button.getAttribute("data-agentic-select") || "";
+      if (!id || id === state.agenticFocus) return;
+      state.agenticFocus = id;
+      const box = document.getElementById("agentic-card");
+      if (box) paintAgentic(box);
+    });
+  });
   document.querySelectorAll("[data-agentic-action]").forEach((button) => {
     button.addEventListener("click", async () => {
       const action = button.getAttribute("data-agentic-action");
@@ -1133,7 +1195,7 @@ function paintRetrieval(payload) {
           <label class="choice">seed<input id="retrieval-seed" inputmode="numeric" value="${esc(state.retrieval.seed)}"></label>
           <label class="choice">batch size<input id="retrieval-batch" inputmode="numeric" value="${esc(state.retrieval.batch_size)}"></label>
           <label class="choice">learning rate<input id="retrieval-lr" inputmode="decimal" value="${esc(state.retrieval.lr)}" placeholder="${esc(lrPlaceholder)}"></label>
-          <label class="choice">GPU 秒数上限<input id="retrieval-gpu-seconds" inputmode="numeric" value="${esc(state.retrieval.gpu_seconds)}" placeholder="28800"></label>
+          <label class="choice">GPU 秒数上限<input id="retrieval-gpu-seconds" inputmode="numeric" value="${esc(state.retrieval.gpu_seconds)}" placeholder="172800"></label>
         </div>
         <label class="choice">训练方式<select id="retrieval-strategy">
           <option value="pooled_subjects"${state.retrieval.training_strategy === "pooled_subjects" ? " selected" : ""}>多被试合训</option>

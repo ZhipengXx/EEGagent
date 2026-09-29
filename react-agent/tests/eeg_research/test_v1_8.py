@@ -108,6 +108,15 @@ def test_pilot_and_other_galleries_are_not_ranked() -> None:
     assert comparable(full, dict(full)) is True
 
 
+def test_goal_default_gpu_seconds_is_48_hours() -> None:
+    from react_agent.eeg_research.agentic.cli import goal
+
+    assert goal("x")["max_gpu_seconds"] == 48 * 3600
+    assert goal("x")["max_training_jobs"] == 20
+    assert goal("x")["max_llm_calls"] == 300
+    assert goal("x", Design("eeg", "inter-subject", "all", gpu_seconds=120))["max_gpu_seconds"] == 120
+
+
 def test_repeat_request_does_not_open_a_second_campaign(tmp_path: Path) -> None:
     design = _design(tmp_path)
     contract = freeze_contract(design, tmp_path)
@@ -373,6 +382,44 @@ def test_repeated_diagnosis_adds_no_evidence(tmp_path: Path) -> None:
     assert "diagnose_results" not in available_actions(first)
 
 
+def test_diagnosis_includes_failed_job_train_log(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.loop import _diagnose, load_state, save_state
+
+    design = _design(tmp_path)
+    contract = freeze_contract(design, tmp_path)
+    create_campaign(tmp_path, goal={"goal_id": "goal", "max_llm_calls": 10}, contract=contract, request_id="fail-log")
+    camp = tmp_path / "goal"
+    job = tmp_path / "j2_c1_pilot"
+    job.mkdir()
+    (job / "train.log").write_text(
+        "RuntimeError: module must have its parameters and buffers on device cuda:0 "
+        "(device_ids[0]) but found one of them on device: cpu\n",
+        encoding="utf-8",
+    )
+    state = load_state(camp)
+    state["evidence"].append(
+        {
+            "evidence_id": "ev_j2",
+            "candidate_id": "c1",
+            "fidelity": "pilot",
+            "evaluation_valid": False,
+            "reason": "metrics_missing",
+            "job_status": "failed",
+            "job_dir": str(job),
+        }
+    )
+    save_state(camp, state)
+    row = _diagnose(camp, state)
+    assert row["status"] == "ready"
+    assert row["curve"] == []
+    assert "cuda:0" in row["failures"][0]["train_log_tail"]
+    backend = lambda _obs: {"action": "diagnose_results", "reason_zh": "看失败日志", "evidence_ids": []}  # noqa: E731
+    first = tick(camp, backend)
+    profile = [item for item in first["evidence"] if item.get("kind") == "learning_profile"][0]
+    assert "cpu" in profile["failures"][0]["train_log_tail"]
+    assert "diagnose_results" not in available_actions(first)
+
+
 _STATS_CANDIDATE = '''
 import torch
 from torch import nn
@@ -499,6 +546,34 @@ def test_coder_must_write_after_two_reads_and_extension_is_answered_once(tmp_pat
     log = [json.loads(line) for line in (tmp_path / "ws" / "coder_log.jsonl").read_text(encoding="utf-8").splitlines()]
     assert log[2]["result"]["error"] == "write_required"
     assert log[3]["result"]["error"] == "interface_already_available"
+
+
+def test_short_keeps_a_dict_when_text_is_long() -> None:
+    from react_agent.eeg_research.agentic.native_patch import _short
+
+    payload = {"ok": True, "text": "x" * 5000}
+    shortened = _short(payload)
+    assert isinstance(shortened, dict)
+    assert shortened["ok"] is True
+    assert json.dumps(shortened, ensure_ascii=False).find("{") == 0
+    assert len(json.dumps(shortened, ensure_ascii=False)) <= 3000
+
+
+def test_restore_accepts_shortened_read_result(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.native_patch import _restore_coder, _short
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    row = {
+        "step": 6,
+        "tool": "read_code",
+        "result": _short({"ok": True, "text": "class LocalRetrieval:\n" + (" " * 80 + "top5\n") * 80}),
+    }
+    (workspace / "coder_log.jsonl").write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    restored = _restore_coder(workspace)
+    assert restored["next_step"] == 7
+    assert isinstance(restored["history"][0]["result"], dict)
+    assert restored["history"][0]["result"]["ok"] is True
 
 
 def test_retrieval_owns_scale_when_encoder_has_none() -> None:
@@ -698,4 +773,3 @@ def test_new_planner_does_not_stop_on_a_small_gap() -> None:
     text = prompt.read_text(encoding="utf-8")
     assert "0.005" not in text
     assert "Do not stop because the best two scores are close" in text
-

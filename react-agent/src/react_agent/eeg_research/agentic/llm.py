@@ -13,6 +13,11 @@ from typing import Any, Callable
 from react_agent.eeg_research.agentic.identity import new_call_row
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
+PARSE_ATTEMPTS = 3
+CODER_MAX_TOKENS = 16384
+FAST_MAX_TOKENS = 4096
+LONG_JSON_ROLES = {"candidate_coder", "candidate_reviewer", "result_analyst", "research_planner"}
+RAW_EXCERPT_LIMIT = 2048
 
 
 class LlmUnavailable(RuntimeError):
@@ -43,6 +48,25 @@ def _ledger(camp: Path, row: dict[str, Any]) -> None:
     cost_path.write_text(json.dumps(cost, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _fail_row(row: dict[str, Any], exc: BaseException, started: float) -> dict[str, Any]:
+    row.update({"success": False, "error": type(exc).__name__, "cost_status": "uncertain", "elapsed_seconds": round(time.time() - started, 3)})
+    usage = getattr(exc, "usage", None)
+    if usage is not None:
+        row.update(
+            {
+                "response_model": usage.response_model,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "reasoning_tokens": usage.reasoning_tokens,
+                "finish_reason": usage.finish_reason,
+            }
+        )
+    raw = getattr(exc, "raw", None)
+    if isinstance(raw, str):
+        row["raw_excerpt"] = raw[:RAW_EXCERPT_LIMIT]
+    return row
+
+
 def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
     """Return a callable that sends one structured input to DeepSeek for this role."""
     from dotenv import load_dotenv
@@ -52,7 +76,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
     if not key:
         raise LlmUnavailable("DEEPSEEK_API_KEY missing")
     from react_agent.fmri.config import FmriCheckConfig
-    from react_agent.fmri.llm.deepseek import DeepSeekBackend
+    from react_agent.fmri.llm.deepseek import DeepSeekBackend, DeepSeekParseError
 
     config = FmriCheckConfig(
         deepseek_api_key=key,
@@ -60,7 +84,8 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
     )
     if os.environ.get("DEEPSEEK_FAST_MODEL"):
         config.fast.model = os.environ["DEEPSEEK_FAST_MODEL"]
-    config.fast.max_tokens = max(int(config.fast.max_tokens or 0), 4096)
+    floor = CODER_MAX_TOKENS if role in LONG_JSON_ROLES else FAST_MAX_TOKENS
+    config.fast.max_tokens = max(int(config.fast.max_tokens or 0), floor)
     system = system_prompt(role)
     prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
     loop = asyncio.new_event_loop()
@@ -72,39 +97,46 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
         bound.update({key: value for key, value in fields.items() if value is not None})
 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
-        started = time.time()
-        row = new_call_row(
-            role=role,
-            prompt_hash=prompt_hash,
-            requested_model=config.fast.model,
-            started_at=started,
-            **bound,
-        )
-        try:
-            reply, usage = loop.run_until_complete(
-                client.complete_json(
-                    system=system,
-                    user=json.dumps(payload, ensure_ascii=False, default=str),
-                    profile="fast",
-                    role=role,
-                )
+        last: DeepSeekParseError | None = None
+        for _attempt in range(PARSE_ATTEMPTS):
+            started = time.time()
+            row = new_call_row(
+                role=role,
+                prompt_hash=prompt_hash,
+                requested_model=config.fast.model,
+                started_at=started,
+                **bound,
             )
-        except Exception as exc:  # noqa: BLE001
-            row.update({"success": False, "error": type(exc).__name__, "cost_status": "uncertain"})
+            try:
+                reply, usage = loop.run_until_complete(
+                    client.complete_json(
+                        system=system,
+                        user=json.dumps(payload, ensure_ascii=False, default=str),
+                        profile="fast",
+                        role=role,
+                    )
+                )
+            except DeepSeekParseError as exc:
+                last = exc
+                _ledger(camp, _fail_row(row, exc, started))
+                continue
+            except Exception as exc:  # noqa: BLE001
+                _ledger(camp, _fail_row(row, exc, started))
+                raise LlmUnavailable(type(exc).__name__) from exc
+            row.update(
+                {
+                    "success": True,
+                    "response_model": usage.response_model,
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "reasoning_tokens": usage.reasoning_tokens,
+                    "finish_reason": usage.finish_reason,
+                    "elapsed_seconds": round(time.time() - started, 3),
+                }
+            )
             _ledger(camp, row)
-            raise LlmUnavailable(type(exc).__name__) from exc
-        row.update(
-            {
-                "success": True,
-                "response_model": usage.response_model,
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "reasoning_tokens": usage.reasoning_tokens,
-                "elapsed_seconds": round(time.time() - started, 3),
-            }
-        )
-        _ledger(camp, row)
-        return reply if isinstance(reply, dict) else {"_not_object": reply}
+            return reply if isinstance(reply, dict) else {"_not_object": reply}
+        raise LlmUnavailable(type(last).__name__ if last is not None else "DeepSeekParseError") from last
 
     call.model = config.fast.model  # type: ignore[attr-defined]
     call.bind = bind  # type: ignore[attr-defined]

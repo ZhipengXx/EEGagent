@@ -278,11 +278,30 @@ def _execute(workspace: Path, tool: str, args: dict[str, Any], last_check: Any, 
     return {"ok": False, "error": f"unknown_tool:{tool}"}
 
 
-def _short(value: Any) -> Any:
-    text = json.dumps(value, ensure_ascii=False, default=str)
-    if len(text) <= 3000:
+_SHORT_LIMIT = 3000
+_SHORT_STRING_KEYS = ("text", "content", "summary", "detail")
+
+
+def _short(value: Any, *, limit: int = _SHORT_LIMIT) -> Any:
+    """Keep JSON small without turning a dict result into a truncated string."""
+    encoded = json.dumps(value, ensure_ascii=False, default=str)
+    if len(encoded) <= limit:
         return value
-    return text[:3000]
+    if isinstance(value, dict):
+        shortened = dict(value)
+        for key in _SHORT_STRING_KEYS:
+            field = shortened.get(key)
+            if isinstance(field, str) and len(field) > 400:
+                shortened[key] = field[:400] + "…"
+        if len(json.dumps(shortened, ensure_ascii=False, default=str)) <= limit:
+            return shortened
+        compact = {key: shortened[key] for key in ("ok", "error", "path", "sha256") if key in shortened}
+        compact["truncated"] = True
+        compact["keys"] = sorted(shortened)
+        return compact
+    if isinstance(value, str):
+        return value[:limit]
+    return {"truncated": True}
 
 
 def _review_valid(reply: Any) -> bool:

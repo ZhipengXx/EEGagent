@@ -12,6 +12,46 @@ from react_agent.fmri.config import FmriCheckConfig, LmProfile
 from react_agent.fmri.prompts import DECISION_SCHEMA_TEXT, DECISION_SYSTEM, SUMMARY_SYSTEM
 from react_agent.fmri.schemas import Decision, LMUsage
 
+RAW_EXCERPT_LIMIT = 2048
+
+
+def message_text(message: Any) -> str:
+    """Prefer content. Flash sometimes leaves the object in reasoning_content."""
+    content = getattr(message, "content", None)
+    if content is None and isinstance(message, dict):
+        content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    reasoning = getattr(message, "reasoning_content", None)
+    if reasoning is None and isinstance(message, dict):
+        reasoning = message.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        return reasoning
+    return content if isinstance(content, str) else ""
+
+
+def strip_json_fence(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw.startswith("```"):
+        return raw
+    lines = raw.splitlines()
+    if lines and lines[0].startswith("```"):
+        lines = lines[1:]
+    if lines and lines[-1].strip() == "```":
+        lines = lines[:-1]
+    return "\n".join(lines).strip()
+
+
+def parse_json_object(text: str) -> dict[str, Any]:
+    payload = json.loads(strip_json_fence(text))
+    if not isinstance(payload, dict):
+        raise TypeError("json is not an object")
+    return payload
+
+
+def raw_excerpt(text: str, limit: int = RAW_EXCERPT_LIMIT) -> str:
+    return (text or "")[:limit]
+
 
 class DeepSeekConfigError(RuntimeError):
     """Raised when DeepSeek is requested without credentials."""
@@ -77,7 +117,8 @@ class DeepSeekBackend:
             )
             raise DeepSeekCallError(usage) from exc
 
-        content = response.choices[0].message.content or ""
+        choice = response.choices[0]
+        content = message_text(choice.message)
         raw_usage = getattr(response, "usage", None)
         usage = LMUsage(
             provider="deepseek",
@@ -91,6 +132,7 @@ class DeepSeekBackend:
             cache_hit_tokens=_nested(raw_usage, "prompt_tokens_details", "cached_tokens"),
             elapsed_seconds=time.perf_counter() - started,
             success=True,
+            finish_reason=getattr(choice, "finish_reason", None),
         )
         return content, usage
 
@@ -116,14 +158,12 @@ class DeepSeekBackend:
         usage.role = role
         usage.status = "succeeded" if usage.success else "failed"
         try:
-            payload = json.loads(text)
-            if not isinstance(payload, dict):
-                raise TypeError("json is not an object")
+            payload = parse_json_object(text)
         except (json.JSONDecodeError, TypeError) as exc:
             usage.error = f"invalid_json:{type(exc).__name__}"
             usage.success = False
             usage.status = "failed"
-            raise DeepSeekParseError(text, usage) from exc
+            raise DeepSeekParseError(raw_excerpt(text), usage) from exc
         return payload, usage
 
     async def decide(
@@ -148,14 +188,14 @@ class DeepSeekBackend:
             profile=profile,
         )
         try:
-            payload = json.loads(text)
+            payload = parse_json_object(text)
             decision = Decision.model_validate(
                 {**payload, "source": "hybrid", "profile": profile}
             )
         except (json.JSONDecodeError, ValidationError, TypeError) as exc:
             usage.error = f"invalid_json_decision:{type(exc).__name__}"
             usage.success = False
-            raise DeepSeekParseError(text, usage) from exc
+            raise DeepSeekParseError(raw_excerpt(text), usage) from exc
         return decision, usage
 
     async def summarize(
@@ -179,13 +219,11 @@ class DeepSeekBackend:
             profile="fast",
         )
         try:
-            payload = json.loads(text)
-            if not isinstance(payload, dict):
-                raise TypeError("summary is not an object")
+            payload = parse_json_object(text)
         except (json.JSONDecodeError, TypeError) as exc:
             usage.error = f"invalid_json_summary:{type(exc).__name__}"
             usage.success = False
-            raise DeepSeekParseError(text, usage) from exc
+            raise DeepSeekParseError(raw_excerpt(text), usage) from exc
         return payload, usage
 
 
