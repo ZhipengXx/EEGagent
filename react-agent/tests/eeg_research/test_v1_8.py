@@ -215,7 +215,7 @@ def test_ui_agentic_run_writes_a_new_campaign(tmp_path: Path) -> None:
     from react_agent.eeg_research.agentic.cli import open_agentic_run
 
     v1 = Path(__file__).resolve().parents[2] / "runs/eeg_research_v18/eeg_retrieval_research_v1/campaign_state.json"
-    before = v1.read_bytes()
+    before = v1.read_bytes() if v1.is_file() else None
     design = _design(tmp_path)
     (Path(design.train_dir) / "train.pt").write_text(json.dumps(["img-a", "img-b", "img-c", "img-d"]), encoding="utf-8")
     (Path(design.test_dir) / "test.pt").write_text(json.dumps(["img-z"]), encoding="utf-8")
@@ -240,7 +240,8 @@ def test_ui_agentic_run_writes_a_new_campaign(tmp_path: Path) -> None:
     blocked = open_agentic_run(design, {"ok": False, "started": False, "blockers": ["missing"], "log": []}, request_id="click-2", root=root, spawn=spawn)
     assert blocked["started"] is False
     assert spawned == [first["campaign_id"]]
-    assert v1.read_bytes() == before
+    if before is not None:
+        assert v1.read_bytes() == before
 
 
 def test_live_job_is_reconciled_without_a_planner_call(tmp_path: Path) -> None:
@@ -252,7 +253,22 @@ def test_live_job_is_reconciled_without_a_planner_call(tmp_path: Path) -> None:
     from react_agent.eeg_research.agentic.loop import load_state, save_state
 
     state = load_state(camp)
-    state.update({"candidate_ready": True, "candidate_id": "c1", "experiment": {"initial_fidelity": "pilot"}})
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
+    state.update(
+        {
+            "candidate_ready": True,
+            "candidate_id": "c1",
+            "experiment": approve_experiment(
+                {
+                    "intervention": "pooling",
+                    "hypothesis": {"mechanism": "池化"},
+                    "parent_candidate_id": "baseline",
+                    "initial_fidelity": "pilot",
+                }
+            ),
+        }
+    )
     save_state(camp, state)
     calls: list[str] = []
     launched: list[str] = []
@@ -313,13 +329,16 @@ def test_repeated_local_action_needs_new_evidence() -> None:
     state["experiment"] = {"initial_fidelity": "pilot"}
     assert "propose_experiment" not in available_actions(state)
     assert "implement_candidate" not in available_actions(state)
-    state["experiment"] = {
-        "status": "approved",
-        "parent_candidate_id": "baseline",
-        "intervention": "pooling",
-        "initial_fidelity": "pilot",
-        "hypothesis": {"mechanism": "池化"},
-    }
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
+    state["experiment"] = approve_experiment(
+        {
+            "parent_candidate_id": "baseline",
+            "intervention": "pooling",
+            "initial_fidelity": "pilot",
+            "hypothesis": {"mechanism": "池化"},
+        }
+    )
     assert "implement_candidate" in available_actions(state)
     state["experiment_failed"] = True
     assert "propose_experiment" in available_actions(state)
@@ -515,14 +534,17 @@ def test_coder_stops_before_the_budget_and_planner_reserves_calls(tmp_path: Path
     outcome = implement(tmp_path / "ws", {}, backend, calls_left=lambda: left["n"], reserve=2)
     assert outcome["detail"] == "budget_exhausted"
     assert left["n"] == 2
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
     state = {
-        "experiment": {
-            "status": "approved",
-            "parent_candidate_id": "baseline",
-            "intervention": "pooling",
-            "initial_fidelity": "pilot",
-            "hypothesis": {"mechanism": "池化"},
-        },
+        "experiment": approve_experiment(
+            {
+                "parent_candidate_id": "baseline",
+                "intervention": "pooling",
+                "initial_fidelity": "pilot",
+                "hypothesis": {"mechanism": "池化"},
+            }
+        ),
         "llm_calls_left": 5,
         "gpu_seconds_left": 10,
     }

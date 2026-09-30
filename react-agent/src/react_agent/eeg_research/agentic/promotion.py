@@ -29,8 +29,25 @@ def _paired_rows(
     return [{"delta_pp": float(value), "fidelity": fidelity, "legacy_float": True} for value in (paired_deltas_pp or [])]
 
 
-def _confirmation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+_IDENTITY_FIELDS = ("run_id", "control_run_id", "seed", "checkpoint_id", "source_hash", "config_hash", "approval_ref")
+
+
+def declared_training_seeds(goal: dict[str, Any] | None) -> set[int] | None:
+    """Seeds must be declared on the goal or protocol. Undeclared seeds cannot confirm."""
+    if not isinstance(goal, dict):
+        return None
+    seeds = goal.get("training_seeds") or goal.get("declared_training_seeds")
+    protocol = goal.get("protocol") if isinstance(goal.get("protocol"), dict) else {}
+    if seeds is None:
+        seeds = protocol.get("training_seeds")
+    if seeds is None:
+        return None
+    return {int(item) for item in seeds}
+
+
+def _confirmation_rows(rows: list[dict[str, Any]], goal: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     """Full runs only. One predeclared training seed is one independent pair."""
+    declared = declared_training_seeds(goal)
     kept: list[dict[str, Any]] = []
     seen_tokens: set[tuple[Any, ...]] = set()
     seen_seeds: set[Any] = set()
@@ -44,6 +61,9 @@ def _confirmation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if row.get("evaluation_valid") is False:
             continue
         seed = row.get("seed")
+        if declared is not None:
+            if seed is None or int(seed) not in declared:
+                continue
         if seed is not None and seed in seen_seeds:
             continue
         checkpoint = row.get("checkpoint_id")
@@ -59,6 +79,11 @@ def _confirmation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if checkpoint not in (None, ""):
             seen_checkpoints.add(checkpoint)
         kept.append(row)
+    if kept:
+        keys = ("source_hash", "config_hash", "approval_ref")
+        first = kept[0]
+        if all(first.get(key) not in (None, "") for key in keys):
+            kept = [row for row in kept if all(row.get(key) == first.get(key) for key in keys)]
     return kept
 
 
@@ -78,12 +103,16 @@ def promotion_decision(
     bar = goal.get("min_practical_gain_pp")
     target_pairs = int(goal.get("confirmation_target_pairs") or 0)
     has_rule = goal.get("confirmation_target_pairs") is not None
-    rows = _confirmation_rows(_paired_rows(paired_deltas_pp, paired_records, fidelity))
+    rows = _confirmation_rows(_paired_rows(paired_deltas_pp, paired_records, fidelity), goal)
     deltas = [float(row["delta_pp"]) for row in rows if row.get("delta_pp") is not None]
     replicate_n = len(deltas)
-    identity_ready = bool(rows) and all(
-        not row.get("legacy_float") and row.get("run_id") and row.get("control_run_id") and row.get("seed") is not None
-        for row in rows
+    identity_ready = (
+        bool(rows)
+        and declared_training_seeds(goal) is not None
+        and all(
+            not row.get("legacy_float") and all(row.get(field) not in (None, "") for field in _IDENTITY_FIELDS)
+            for row in rows
+        )
     )
     if not comparison.get("comparable"):
         return {

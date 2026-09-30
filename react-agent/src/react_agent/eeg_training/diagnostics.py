@@ -265,6 +265,31 @@ def _load_embedding_matrix(job_dir: Path) -> list[list[float]]:
     return matrix
 
 
+def write_validation_artifacts(
+    job_dir: Path,
+    queries: list[tuple[str, list[float]]],
+    bank: list[tuple[str, list[float]]],
+    positives: dict[str, set[str]],
+    *,
+    limit: int = 32,
+) -> dict[str, Any]:
+    """Write retrieval_queries.jsonl and a bounded embeddings.json from a real evaluator pass."""
+    job_dir = Path(job_dir)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    bounded = queries[:limit]
+    rows = retrieval_rows_from_scores(bounded, bank, positives)
+    (job_dir / "retrieval_queries.jsonl").write_text(
+        ("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n") if rows else "",
+        encoding="utf-8",
+    )
+    vectors = [vector for _query_id, vector in bounded[:16]]
+    (job_dir / "embeddings.json").write_text(
+        json.dumps({"vectors": vectors, "sample_count": len(vectors), "source": "validation_encoder"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    return {"query_rows": len(rows), "embedding_sample": len(vectors)}
+
+
 def compute_job_diagnostics(job_dir: Path, *, batches: list[list[str]] | None = None) -> dict[str, Any]:
     """Fill every DiagnosticBundle category. Absent files stay unavailable."""
     job_dir = Path(job_dir)

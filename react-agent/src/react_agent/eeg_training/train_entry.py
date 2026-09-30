@@ -539,6 +539,33 @@ def _batch_image_ids(batch) -> list[str]:
     return []
 
 
+def _query_rows(batch, embedding) -> list[tuple[str, list[float]]]:
+    ids = _batch_image_ids(batch)
+    vectors = embedding.detach().cpu().tolist()
+    if vectors and not isinstance(vectors[0], list):
+        vectors = [vectors]
+    rows: list[tuple[str, list[float]]] = []
+    for index, vector in enumerate(vectors):
+        query_id = ids[index] if index < len(ids) else f"q{index}"
+        rows.append((query_id, [float(value) for value in vector]))
+    return rows
+
+
+def unique_trainable_parameters(params):
+    """Deduplicate learnable tensors by object identity. Custom objectives must not be counted twice."""
+    seen: set[int] = set()
+    unique = []
+    for param in params:
+        if not getattr(param, "requires_grad", False):
+            continue
+        key = id(param)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(param)
+    return unique
+
+
 def placed_retrieval(encoder, device, n_visible: int, objective=None):
     """Move wrapper parameters with the encoder, then replicate.
 
@@ -610,12 +637,12 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         wrapped = encoder
         if n_visible > 1:
             wrapped = torch.nn.DataParallel(encoder, device_ids=list(range(n_visible)))
-        params = list(encoder.parameters()) + extra
+        params = unique_trainable_parameters(list(encoder.parameters()) + extra)
         optimizer = torch.optim.AdamW(params, lr=learning_rate(design), weight_decay=design.weight_decay)
     else:
         model = placed_retrieval(encoder, device, n_visible, objective=objective if custom else None)
         optimizer = torch.optim.AdamW(
-            list(model.parameters()) + extra,
+            unique_trainable_parameters(list(model.parameters()) + extra),
             lr=learning_rate(design),
             weight_decay=design.weight_decay,
         )
@@ -630,6 +657,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     finished = 0
     early_stop_enabled = design.stop in {"single_early", "chain_early"}
     duplicate_batches: list[list[str]] = []
+    last_queries: list[tuple[str, list[float]]] = []
     write_status(out_dir, "training", 0, design.epochs)
     for epoch_index in range(design.epochs):
         if use_global:
@@ -670,6 +698,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             raw_encoder = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
             encoder.eval()
             note_eval_without_transform(counters)
+            last_queries = []
             with torch.no_grad():
                 for batch in val_loader:
                     eeg = batch["eeg"].to(device)
@@ -678,19 +707,23 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                     top1, top5 = within_batch_accuracy(embedding, batch["img_features"].to(device))
                     scores_top1.append(float(top1))
                     scores_top5.append(float(top5))
+                    last_queries.extend(_query_rows(batch, embedding))
         else:
             assert model is not None
             raw = model.module if isinstance(model, torch.nn.DataParallel) else model
             raw_encoder = raw.encoder
-            model.eval()
+            raw_encoder.eval()
             note_eval_without_transform(counters)
+            last_queries = []
             with torch.no_grad():
                 for batch in val_loader:
                     eeg = batch["eeg"].to(device)
-                    _loss, top1, top5 = model(eeg, batch["img_features"].to(device))
-                    scores_top1.append(float(top1.mean()))
-                    scores_top5.append(float(top5.mean()))
-                    tally.add(raw_encoder(eeg))
+                    embedding = raw_encoder(eeg)
+                    tally.add(embedding)
+                    top1, top5 = within_batch_accuracy(embedding, batch["img_features"].to(device))
+                    scores_top1.append(float(top1))
+                    scores_top5.append(float(top5))
+                    last_queries.extend(_query_rows(batch, embedding))
         finished = epoch_index + 1
         fixed = tally.result()
         val_top1 = sum(scores_top1) / len(scores_top1)
@@ -736,8 +769,33 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             ),
             encoding="utf-8",
         )
+    if last_queries:
+        from react_agent.eeg_training.diagnostics import write_validation_artifacts
+
+        seen: dict[str, int] = {}
+        for row in val_loader.dataset.records:
+            image_id = str(row["img"])
+            if image_id not in seen:
+                seen[image_id] = len(seen)
+        vectors = bank.detach().cpu().tolist()
+        bank_pairs = [
+            (image_id, [float(value) for value in vectors[index]])
+            for image_id, index in seen.items()
+            if index < len(vectors)
+        ]
+        write_validation_artifacts(out_dir, last_queries, bank_pairs, {query_id: {query_id} for query_id, _vector in last_queries})
     encoder_params = sum(int(item.numel()) for item in encoder.parameters())
     objective_params = sum(int(item.numel()) for item in extra)
+    hook = {}
+    hook_path = out_dir / "hook_config.json"
+    if hook_path.is_file():
+        try:
+            hook = json.loads(hook_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            hook = {}
+    config_hash = hook.get("config_hash") or hashlib.sha256(
+        json.dumps({"spec": spec, "seed": design.seed}, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
     used = capabilities_used_payload(
         module=module_name,
         hooks={
@@ -750,7 +808,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         parameter_counts={"encoder": encoder_params, "objective": objective_params},
         counters=counters,
         negative_policy=negative_policy,
-        config_hash=hashlib.sha256(json.dumps({"spec": spec, "seed": design.seed}, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16],
+        config_hash=config_hash,
     )
     (out_dir / "capabilities_used.json").write_text(json.dumps(used, ensure_ascii=False, indent=2), encoding="utf-8")
     return {

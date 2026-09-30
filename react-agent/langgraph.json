@@ -4,7 +4,8 @@
   "graphs": {
     "agent": "./src/react_agent/graph.py:graph",
     "fmri_check": "./src/react_agent/fmri/graph.py:graph",
-    "fmri_pipeline": "./src/react_agent/fmri/pipeline_graph.py:graph"
+    "fmri_pipeline": "./src/react_agent/fmri/pipeline_graph.py:graph",
+    "eeg_research": "./src/react_agent/eeg_research/agentic/studio_graph.py:graph"
   },
   "env": ".env"
 }

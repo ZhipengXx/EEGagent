@@ -25,3 +25,14 @@ results cannot enter this proposal.
 
 Return the injected LessonProposal. Runtime resolves references, checks
 conditions, derives numerical effects and assigns the stored evidence level.
+
+APPROVAL AND BINDING
+Do not treat a self-declared approved status as permission. Only a runtime
+ApprovalRecord plus registered spec hash authorizes implement or train.
+Baseline and historical candidates keep their own frozen bindings.
+OBJECTIVE AND CONFIRMATION
+A custom training objective is not the local validation metric. Confirmation
+requires identity-complete PairRecords and predeclared training seeds.
+SETTLEMENT AND AUDIT
+A job is not settled until diagnostics, comparison and promotion exist. A later
+evidence row makes a prior audit stale.

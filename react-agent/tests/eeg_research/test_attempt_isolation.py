@@ -93,8 +93,17 @@ def _ready(camp: Path, candidate_id: str, *, implementation: bool = True) -> Pat
 def _open_implement(camp: Path, candidate_id: str = "c3") -> None:
     state = load_state(camp)
     state["status"] = "planning"
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
     state["hypothesis"] = {"mechanism": "池化"}
-    state["experiment"] = {"initial_fidelity": "pilot"}
+    state["experiment"] = approve_experiment(
+        {
+            "intervention": "pooling",
+            "hypothesis": {"mechanism": "池化"},
+            "parent_candidate_id": "baseline",
+            "initial_fidelity": "pilot",
+        }
+    )
     state["candidates"] = [
         {"candidate_id": "c1", "status": "implementation_failed"},
         {"candidate_id": "c2", "status": "review_needs_fix"},
@@ -296,9 +305,19 @@ def test_matching_review_is_committed_once_and_a_mismatch_is_redone(tmp_path: Pa
 def test_job_identity_mismatch_does_not_start_training(tmp_path: Path, monkeypatch) -> None:
     camp = _campaign(tmp_path)
     state = load_state(camp)
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
     state["status"] = "planning"
     state["candidate_ready"] = True
     state["candidate_id"] = "c1"
+    state["experiment"] = approve_experiment(
+        {
+            "intervention": "pooling",
+            "hypothesis": {"mechanism": "池化"},
+            "parent_candidate_id": "baseline",
+            "initial_fidelity": "pilot",
+        }
+    )
     state["decisions"] = [{"decision_id": "d1", "action": "run_pilot", "ok": True, "executed": False}]
     save_state(camp, state)
     job = camp / "jobs" / "j1_baseline_pilot"

@@ -84,8 +84,17 @@ def _ready_candidate(camp: Path, *, review: dict | None = None, implementation: 
         (workspace / "review.json").write_text(json.dumps(review), encoding="utf-8")
     state = load_state(camp)
     state["status"] = "planning"
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
     state["hypothesis"] = {"mechanism": "池化"}
-    state["experiment"] = {"initial_fidelity": "pilot"}
+    state["experiment"] = approve_experiment(
+        {
+            "intervention": "pooling",
+            "hypothesis": {"mechanism": "池化"},
+            "parent_candidate_id": "baseline",
+            "initial_fidelity": "pilot",
+        }
+    )
     state["decisions"] = [
         {"decision_id": "d1", "action": "implement_candidate", "ok": True, "executed": False, "reason_zh": "编写"}
     ]
@@ -342,9 +351,20 @@ def test_unexecuted_decision_is_replayed_once(tmp_path: Path, monkeypatch) -> No
 def test_training_job_json_is_adopted_and_a_bare_directory_blocks(tmp_path: Path, monkeypatch) -> None:
     camp = _campaign(tmp_path)
     state = load_state(camp)
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
+    approved = approve_experiment(
+        {
+            "intervention": "pooling",
+            "hypothesis": {"mechanism": "池化"},
+            "parent_candidate_id": "baseline",
+            "initial_fidelity": "pilot",
+        }
+    )
     state["status"] = "planning"
     state["candidate_ready"] = True
     state["candidate_id"] = "c1"
+    state["experiment"] = approved
     state["decisions"] = [{"decision_id": "d1", "action": "run_pilot", "ok": True, "executed": False}]
     save_state(camp, state)
     job = camp / "jobs" / "j1_baseline_pilot"
@@ -369,6 +389,7 @@ def test_training_job_json_is_adopted_and_a_bare_directory_blocks(tmp_path: Path
     state2 = load_state(camp2)
     state2["status"] = "planning"
     state2["candidate_id"] = "c1"
+    state2["experiment"] = approved
     state2["decisions"] = [{"decision_id": "d1", "action": "run_pilot", "ok": True, "executed": False}]
     save_state(camp2, state2)
     (camp2 / "jobs" / "j1_baseline_pilot").mkdir(parents=True)

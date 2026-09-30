@@ -137,8 +137,10 @@ def start_job(
         write_evaluation_identity(job_dir, protocol)
         env["EEG_EVALUATION_IDENTITY"] = str((job_dir / "evaluation_identity.json").resolve())
     from react_agent.eeg_research.agentic.hook_config import write_hook_config
+    from react_agent.eeg_research.agentic.run_context import resolve_run_context
 
-    write_hook_config(job_dir, state.get("experiment") if isinstance(state.get("experiment"), dict) else {}, spec_ref=state.get("experiment_ref"))
+    run_context = resolve_run_context(camp, candidate_id, state, fidelity=fidelity, seed=run_design.seed)
+    write_hook_config(job_dir, run_context["hook_spec"], spec_ref=run_context.get("spec_ref"))
     log = (job_dir / "train.log").open("wb")
     proc = subprocess.Popen(  # noqa: S603
         command,

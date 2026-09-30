@@ -338,6 +338,10 @@ def build_services(camp: Path) -> dict[str, Any]:
                 state["candidate_id"] = candidate_id
                 state["repair_task"] = None
                 row["status"] = "ready"
+                if isinstance(state.get("experiment"), dict):
+                    from react_agent.eeg_research.agentic.run_context import persist_approved_binding
+
+                    persist_approved_binding(camp_dir, candidate_id, state["experiment"], spec_ref=state.get("experiment_ref"))
             elif verdict["status"] == "needs_fix":
                 used = int((repair or {}).get("used") or 0)
                 limit = int(state.get("max_repairs_per_candidate", 2))

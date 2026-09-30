@@ -197,14 +197,17 @@ def test_target_id_is_required_for_training() -> None:
 
 
 def test_baseline_does_not_consume_candidate_slots() -> None:
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
     state = {
-        "experiment": {
-            "status": "approved",
-            "parent_candidate_id": "baseline",
-            "intervention": "pooling",
-            "initial_fidelity": "pilot",
-            "hypothesis": {"mechanism": "池化"},
-        },
+        "experiment": approve_experiment(
+            {
+                "parent_candidate_id": "baseline",
+                "intervention": "pooling",
+                "initial_fidelity": "pilot",
+                "hypothesis": {"mechanism": "池化"},
+            }
+        ),
         "llm_calls_left": 40,
         "gpu_seconds_left": 10,
         "max_candidates": 1,
@@ -271,12 +274,21 @@ def _open_campaign(tmp_path: Path, *, with_protocol: bool = False, request_id: s
 
 
 def _ready(camp: Path, candidate_id: str = "c1") -> None:
+    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+
     state = load_state(camp)
     state.update(
         {
             "candidate_ready": True,
             "candidate_id": candidate_id,
-            "experiment": {"initial_fidelity": "pilot"},
+            "experiment": approve_experiment(
+                {
+                    "intervention": "pooling",
+                    "hypothesis": {"mechanism": "池化"},
+                    "parent_candidate_id": "baseline",
+                    "initial_fidelity": "pilot",
+                }
+            ),
             "candidates": [{"candidate_id": candidate_id, "status": "ready"}],
         }
     )

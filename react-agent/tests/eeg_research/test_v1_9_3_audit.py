@@ -189,13 +189,16 @@ def test_full_identity_pairs_can_confirm() -> None:
             "run_id": f"run_{seed}",
             "control_run_id": f"base_{seed}",
             "checkpoint_id": f"ckpt_{seed}",
+            "source_hash": "src",
+            "config_hash": "cfg",
+            "approval_ref": "art_exp",
             "evaluation_valid": True,
         }
         for seed in (0, 1, 2)
     ]
     promo = promotion_decision(
         comparison={"comparable": True, "delta_pp": 1.4, "reason": "matched_control"},
-        goal={"min_practical_gain_pp": 1.0, "confirmation_target_pairs": 3},
+        goal={"min_practical_gain_pp": 1.0, "confirmation_target_pairs": 3, "training_seeds": [0, 1, 2]},
         paired_records=records,
         fidelity="full",
     )
@@ -441,7 +444,8 @@ def test_evaluate_pack_checkpoint_is_not_the_output_directory(tmp_path: Path) ->
     dest = tmp_path / "pack"
     pack_candidate(job, dest, workspace=tmp_path / "ws")
     binding = json.loads((dest / "source_binding.json").read_text(encoding="utf-8"))
-    assert binding["class_file"].startswith(str(dest.resolve()))
+    assert binding["class_file"] == "extension/eeg_candidate.py"
+    assert binding["workspace"] == "."
     argv = evaluate_only_argv(dest, out=tmp_path / "fresh")
     assert str(tmp_path / "fresh") in argv
     assert str(dest / "last.ckpt") in argv
@@ -549,13 +553,16 @@ def test_duplicate_pairs_count_once_and_a_null_bar_cannot_confirm() -> None:
             "run_id": run,
             "control_run_id": "base",
             "checkpoint_id": f"ckpt-{run}",
+            "source_hash": "src",
+            "config_hash": "cfg",
+            "approval_ref": "art_exp",
             "evaluation_valid": True,
         }
 
     records = [row(0, "a"), row(1, "b"), row(2, "c"), row(0, "a")]
     counted = promotion_decision(
         comparison={"comparable": True, "delta_pp": 2.0},
-        goal={"min_practical_gain_pp": 1.0, "confirmation_target_pairs": 3},
+        goal={"min_practical_gain_pp": 1.0, "confirmation_target_pairs": 3, "training_seeds": [0, 1, 2]},
         fidelity="full",
         paired_records=records,
     )

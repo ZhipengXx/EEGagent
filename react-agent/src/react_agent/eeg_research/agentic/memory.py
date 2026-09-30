@@ -17,6 +17,19 @@ LEVEL_ORDER = (
 )
 
 
+def _usable_comparison(path: Path) -> bool:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not data:
+        return False
+    comparison = data.get("comparison") if isinstance(data, dict) else None
+    if comparison is None and isinstance(data, dict) and data.get("comparable") is not None:
+        comparison = data
+    return isinstance(comparison, dict) and bool(comparison)
+
+
 def evidence_level(kind: str) -> str:
     if kind == "implementation_failure":
         return "implementation_failure"
@@ -318,7 +331,14 @@ class EpisodeStore:
                 comparison_refs = [str(item) for item in lesson.get("comparison_refs") or lesson.get("observed_effect_refs") or []]
                 if effect not in (None, "") and not comparison_refs:
                     reasons.append("forged_effect")
-                fake_refs = [item for item in comparison_refs if not (self.camp / "comparisons" / f"{item}.json").is_file() and item not in {row.get("evidence_id") for row in self.list_episodes()}]
+                fake_refs = []
+                for item in comparison_refs:
+                    path = self.camp / "comparisons" / f"{item}.json"
+                    if path.is_file():
+                        if not _usable_comparison(path):
+                            fake_refs.append(item)
+                    elif item not in {row.get("evidence_id") for row in self.list_episodes()}:
+                        fake_refs.append(item)
                 if comparison_refs and fake_refs:
                     reasons.append("comparison_ref_missing")
                 if requested in {"confirmed_result"} and not any(
@@ -332,6 +352,9 @@ class EpisodeStore:
                     continue
                 stored = {
                     "lesson_id": f"les_{uuid.uuid4().hex[:12]}",
+                    "statement": lesson.get("statement") or proposal.get("statement") or "",
+                    "uncertainty": lesson.get("uncertainty") if "uncertainty" in lesson else proposal.get("uncertainty"),
+                    "requested_evidence_level": requested,
                     "evidence_level": LEVEL_ORDER[group_level] if cited else requested,
                     "supporting_episode_ids": supporting,
                     "contradicting_episode_ids": contradicting,

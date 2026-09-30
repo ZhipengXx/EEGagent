@@ -116,6 +116,10 @@ def campaign_view(camp: Path) -> dict[str, Any]:
     live = state.get("live_job")
     live_status = _read(camp / "jobs" / str(live) / "status.json") if live else None
     budget = budget_snapshot(camp, state)
+    from react_agent.eeg_research.agentic.loop import refresh_audit_freshness
+
+    refresh_audit_freshness(state)
+    audit_status = state.get("audit_status") or "pending"
     return {
         "campaign_id": camp.name,
         "created_at": _created_at(camp),
@@ -128,7 +132,7 @@ def campaign_view(camp: Path) -> dict[str, Any]:
         "detail": view.get("detail"),
         "execution_status": state.get("execution_status") or view["status"],
         "research_outcome": state.get("research_outcome") or "not_evaluated",
-        "audit_status": state.get("audit_status") or "pending",
+        "audit_status": audit_status,
         "termination_reason": state.get("termination_reason") or state.get("stop_reason"),
         "stop_reason": state.get("stop_reason"),
         "pause_after_step": state.get("pause_after_step"),

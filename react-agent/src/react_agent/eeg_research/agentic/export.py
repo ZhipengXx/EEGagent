@@ -49,8 +49,8 @@ def pack_candidate(job_dir: Path, dest: Path, *, workspace: Path | None = None) 
     entry = dest / "extension" / "eeg_candidate.py"
     if binding_path.is_file() and entry.is_file():
         binding = _read_json(binding_path)
-        binding["class_file"] = str(entry.resolve())
-        binding["workspace"] = str(dest.resolve())
+        binding["class_file"] = "extension/eeg_candidate.py"
+        binding["workspace"] = "."
         binding_path.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
     manifest = {
         "schema_version": "eeg_research.candidate_pack.v1",
@@ -59,7 +59,7 @@ def pack_candidate(job_dir: Path, dest: Path, *, workspace: Path | None = None) 
         "missing": missing,
         "evaluate_only": True,
         "final_test": False,
-        "checkpoint": str((dest / "last.ckpt").resolve()) if (dest / "last.ckpt").is_file() else None,
+        "checkpoint": "last.ckpt" if (dest / "last.ckpt").is_file() else None,
     }
     (dest / "pack_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
@@ -91,7 +91,13 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _rewrite_evaluate_command(command: list[Any], *, out: Path, data_root: Path | None) -> list[str]:
+def _rewrite_evaluate_command(
+    command: list[Any],
+    *,
+    out: Path,
+    data_root: Path | None,
+    checkpoint: Path | None = None,
+) -> list[str]:
     argv = [str(item) for item in command if str(item) != "--test-only"]
     if "--out" in argv:
         index = argv.index("--out")
@@ -110,6 +116,15 @@ def _rewrite_evaluate_command(command: list[Any], *, out: Path, data_root: Path 
                 argv.insert(index + 1, str(data_root))
         else:
             argv.extend(["--data-root", str(data_root)])
+    ckpt = str(checkpoint) if checkpoint is not None else str(Path(out) / "last.ckpt")
+    if "--checkpoint" in argv:
+        index = argv.index("--checkpoint")
+        if index + 1 < len(argv) and not str(argv[index + 1]).startswith("-"):
+            argv[index + 1] = ckpt
+        else:
+            argv.insert(index + 1, ckpt)
+    else:
+        argv.extend(["--checkpoint", ckpt])
     if "--evaluate-only" not in argv:
         argv.append("--evaluate-only")
     return argv
@@ -128,7 +143,7 @@ def evaluate_only_argv(pack: Path, *, out: Path | None = None, data_root: Path |
     root = Path(data_root) if data_root is not None else default_root()
     command = job.get("command")
     if isinstance(command, list) and command:
-        return _rewrite_evaluate_command(command, out=dest, data_root=root)
+        return _rewrite_evaluate_command(command, out=dest, data_root=root, checkpoint=pack / "last.ckpt")
     python = torch_python() or sys.executable
     dataset = str(job.get("dataset") or identity.get("dataset") or "eeg")
     exp_setting = str(job.get("exp_setting") or identity.get("exp_setting") or "inter-subject")

@@ -179,6 +179,7 @@ def test_t18_t19_record_job_builds_pair_records_and_dedupes_seed(tmp_path: Path)
     goal = json.loads((camp / "goal.json").read_text(encoding="utf-8"))
     goal["min_practical_gain_pp"] = 1.0
     goal["confirmation_target_pairs"] = 3
+    goal["training_seeds"] = [0, 1, 2]
     (camp / "goal.json").write_text(json.dumps(goal), encoding="utf-8")
     state = load_state(camp)
     state["contract_fingerprint"] = "fp"
@@ -186,11 +187,14 @@ def test_t18_t19_record_job_builds_pair_records_and_dedupes_seed(tmp_path: Path)
     state["experiment"] = approve_experiment(
         {"intervention": "projection_scale", "hypothesis": "h", "parent_candidate_id": "baseline", "initial_fidelity": "full"}
     )
+    state["experiment_ref"] = "art_exp"
 
     def settle(job_id: str, candidate: str, seed: int, score: float) -> None:
         job = camp / "jobs" / job_id
         job.mkdir(parents=True, exist_ok=True)
         (job / "metrics.json").write_text(json.dumps({"fixed_bank_top1": score}), encoding="utf-8")
+        (job / "hook_config.json").write_text(json.dumps({"config_hash": "cfg1"}), encoding="utf-8")
+        (job / "last.ckpt").write_bytes(job_id.encode("utf-8"))
         _record_job(
             camp,
             state,
@@ -199,6 +203,7 @@ def test_t18_t19_record_job_builds_pair_records_and_dedupes_seed(tmp_path: Path)
                 "candidate_id": candidate,
                 "seed": seed,
                 "status": "finished",
+                "source_hash": "src1",
                 "gpu_seconds": 1,
                 "result": {"evaluation_valid": True, "fidelity": "full", "fixed_bank_top1": score, "execution_fingerprint": "fp"},
             },
