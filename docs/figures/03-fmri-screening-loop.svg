@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1238" viewBox="0 0 1440 1238" role="img" aria-labelledby="title desc">
+<title id="title">How fMRI screening closes the loop</title><desc id="desc">An image can be converted to a stimulus video and predicted fMRI by an external TRIBE worker with matched gray control, or an existing series can be ingested directly. Required checks run before the evidence ledger. A rule policy or LLM planner selects an action, deterministic validation checks resource and budget constraints, and a registered tool executes. Evidence returns to the planner until finalization. A report is written and an episode stored; an optional curator can propose lessons for future planning. The claim scope is numeric consistency only.</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#8292A8"/></marker>
+<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#7354CF"/></marker>
+</defs>
+<rect width="1440" height="1238" rx="26" fill="#FFFFFF"/>
+<rect x="1" y="1" width="1438" height="1236" rx="25" fill="none" stroke="#E1E7F0"/>
+<g font-family="DejaVu Sans, Arial, sans-serif">
+<text x="48" y="52" font-size="16" fill="#62728A" font-weight="700" text-anchor="start">EEGagent  /  RESEARCH WORKFLOWS</text>
+<text x="1392" y="52" font-size="18" fill="#7354CF" font-weight="700" text-anchor="end">03</text>
+<text x="48" y="108" font-size="38" fill="#17263D" font-weight="700" text-anchor="start">How fMRI screening closes the loop</text>
+<text x="48" y="144" font-size="19" fill="#62728A" font-weight="400" text-anchor="start">Planning selects checks; deterministic tools produce evidence and the runtime enforces the screening scope.</text>
+<rect x="48" y="191" width="390" height="119" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 209 V292" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="217" font-size="13" fill="#138582" font-weight="700" text-anchor="start">OPTIONAL GENERATION</text>
+<text x="84" y="243" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Image stimulus</text>
+<text x="84" y="269" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Video timing + matched gray control</text>
+<text x="84" y="291" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">External TRIBE worker, when configured</text>
+<rect x="525" y="191" width="390" height="119" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M545 209 V292" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
+<text x="561" y="217" font-size="13" fill="#60718A" font-weight="700" text-anchor="start">DIRECT INPUT</text>
+<text x="561" y="243" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Existing fMRI series</text>
+<text x="561" y="269" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Load prediction / sample metadata</text>
+<text x="561" y="291" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">No generation step required</text>
+<rect x="1002" y="191" width="390" height="119" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M1022 209 V292" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
+<text x="1038" y="217" font-size="13" fill="#60718A" font-weight="700" text-anchor="start">PERSISTENT MEMORY</text>
+<text x="1038" y="243" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Episodes + prior lessons</text>
+<text x="1038" y="269" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Retrieve scoped experience</text>
+<text x="1038" y="291" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Memory augments the planning context</text>
+<rect x="48" y="383" width="420" height="116" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 401 V481" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="422" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Ingest + required checks</text>
+<text x="84" y="448" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Validate input; run mandatory checks</text>
+<text x="84" y="470" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Record evidence and unavailable resources</text>
+<path d="M243 310 V383" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M720 310 V346 H258 V383" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="510" y="383" width="420" height="116" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M530 401 V481" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
+<text x="546" y="422" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Evidence + question ledger</text>
+<text x="546" y="448" font-size="17" fill="#62728A" font-weight="400" text-anchor="start">Track answered and unresolved questions</text>
+<text x="546" y="470" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Update coverage, issues and stop conditions</text>
+<path d="M468 441 H510" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="972" y="383" width="420" height="116" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M992 401 V481" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="1008" y="422" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Planner / rule policy</text>
+<text x="1008" y="448" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Choose a next check or stop</text>
+<text x="1008" y="470" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Revise the plan when evidence changes</text>
+<path d="M930 441 H972" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M1197 310 V383" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<rect x="972" y="593" width="420" height="116" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M992 611 V691" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="1008" y="632" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Action validator</text>
+<text x="1008" y="658" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Check registered tool + prerequisites</text>
+<text x="1008" y="680" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Enforce resources, budget and policy</text>
+<path d="M1182 499 V593" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="1105.25" y="539" width="153.5" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="1182" y="553" font-size="15" fill="#62728A" font-weight="500" text-anchor="middle">proposed action</text>
+<rect x="510" y="593" width="420" height="116" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M530 611 V691" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="546" y="632" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Screening tools</text>
+<text x="546" y="658" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Execute one available check</text>
+<text x="546" y="680" font-size="17" fill="#62728A" font-weight="400" text-anchor="start">Return measured evidence + artifact refs</text>
+<path d="M972 650 H930" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="923.85" y="621" width="54.3" height="21" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="951" y="633" font-size="13" fill="#62728A" font-weight="500" text-anchor="middle">valid</text>
+<path d="M720 593 V499" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="657.2" y="535" width="125.6" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="720" y="549" font-size="15" fill="#62728A" font-weight="500" text-anchor="middle">new evidence</text>
+<rect x="48" y="574" width="420" height="209" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 592 V765" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="600" font-size="13" fill="#138582" font-weight="700" text-anchor="start">TOOL REGISTRY  /  RESOURCE-DEPENDENT</text>
+<text x="84" y="626" font-size="19" fill="#17263D" font-weight="700" text-anchor="start">Checks available by configuration</text>
+<text x="84" y="652" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Numeric + temporal diagnostics</text>
+<text x="84" y="674" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Gray contrast + stimulus timing</text>
+<text x="84" y="696" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Surface / ROI + cross-image specificity</text>
+<text x="84" y="718" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Reference + semantic / CortexMAE</text>
+<path d="M468 650 H510" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<rect x="48" y="860" width="645" height="121" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 878 V963" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="886" font-size="13" fill="#60718A" font-weight="700" text-anchor="start">DETERMINISTIC FINALIZATION</text>
+<text x="84" y="912" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Final screening report</text>
+<text x="84" y="938" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">verdict  /  screening_decision  /  stop_reason</text>
+<text x="84" y="960" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Diagnostic configurations can emit next-step tickets</text>
+<rect x="747" y="860" width="645" height="121" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M767 878 V963" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="783" y="886" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">MEMORY WRITE  /  CURATION IS OPTIONAL</text>
+<text x="783" y="912" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Episode writer + optional Curator</text>
+<text x="783" y="938" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Store the observed outcome</text>
+<text x="783" y="960" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Propose evidence-linked lessons when enabled</text>
+<path d="M1392 441 H1414 V818 H370 V860" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="988.85" y="803" width="302.3" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="1140" y="817" font-size="15" fill="#62728A" font-weight="500" text-anchor="middle">stop / coverage or budget limit</text>
+<path d="M693 920 H747" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M1392 920 H1430 V170 H1197 V191" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<rect x="1093.15" y="1026" width="283.7" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="1235" y="1040" font-size="15" fill="#62728A" font-weight="500" text-anchor="middle">experience for future samples</text>
+<rect x="48" y="1030" width="760" height="81" rx="14" fill="#EAF6F4" stroke="#D4EDE8"/>
+<text x="75" y="1067" font-size="23" fill="#138582" font-weight="700" text-anchor="start">claim_scope = numeric_consistency_only</text>
+<text x="75" y="1096" font-size="17" fill="#62728A" font-weight="400" text-anchor="start">Checks support screening claims within the recorded evidence and resources.</text>
+<path d="M48 1129 H1392" fill="none" stroke="#D6DFEB" stroke-width="1" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="48" y="1146" width="12" height="12" rx="3" fill="#7354CF" stroke="#7354CF"/>
+<text x="70" y="1157" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">LLM role</text>
+<rect x="283" y="1146" width="12" height="12" rx="3" fill="#138582" stroke="#138582"/>
+<text x="305" y="1157" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Runtime / tool</text>
+<rect x="518" y="1146" width="12" height="12" rx="3" fill="#60718A" stroke="#60718A"/>
+<text x="540" y="1157" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Stored artifact</text>
+<path d="M753 1152 h35" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7"/>
+<text x="798" y="1157" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Conditional / memory handoff</text>
+<text x="48" y="1193" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Required checks come first. Optional models and LLM planning depend on configured resources.</text>
+</g></svg>

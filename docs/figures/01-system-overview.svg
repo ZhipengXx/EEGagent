@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1110" viewBox="0 0 1440 1110" role="img" aria-labelledby="title desc">
+<title id="title">One workbench. Two research loops.</title><desc id="desc">A local workbench and CLI expose two independent loops. fMRI uses a planner, screening tools, reports and episode memory. EEG uses eight LLM roles coordinated by a campaign runtime, training tools and evidence records. The separate ReAct chat entry is not a third research loop. No automatic screening-to-training connection is shown.</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#8292A8"/></marker>
+<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#7354CF"/></marker>
+</defs>
+<rect width="1440" height="1110" rx="26" fill="#FFFFFF"/>
+<rect x="1" y="1" width="1438" height="1108" rx="25" fill="none" stroke="#E1E7F0"/>
+<g font-family="DejaVu Sans, Arial, sans-serif">
+<text x="48" y="52" font-size="16" fill="#62728A" font-weight="700" text-anchor="start">EEGagent  /  RESEARCH WORKFLOWS</text>
+<text x="1392" y="52" font-size="18" fill="#7354CF" font-weight="700" text-anchor="end">01</text>
+<text x="48" y="108" font-size="38" fill="#17263D" font-weight="700" text-anchor="start">One workbench. Two research loops.</text>
+<text x="48" y="144" font-size="19" fill="#62728A" font-weight="400" text-anchor="start">Screen predicted fMRI responses and investigate EEG-to-image retrieval under explicit protocols.</text>
+<rect x="48" y="185" width="1344" height="92" rx="17" fill="#17263D" stroke="#17263D"/>
+<text x="76" y="224" font-size="26" fill="#FFFFFF" font-weight="700" text-anchor="start">Local workbench + CLI</text>
+<text x="76" y="254" font-size="18" fill="#CAD5E5" font-weight="400" text-anchor="start">Goals, input data, protocol choices, budgets and run controls</text>
+<text x="1362" y="224" font-size="21" fill="#FFFFFF" font-weight="500" text-anchor="end">127.0.0.1:8765</text>
+<text x="1362" y="254" font-size="17" fill="#CAD5E5" font-weight="400" text-anchor="end">Optional LangGraph Studio views</text>
+<path d="M720 277 V299 H373 V327" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M720 299 H1067 V327" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="48" y="327" width="650" height="548" rx="20" fill="#F8FAFD" stroke="#E3E9F2"/>
+<text x="75" y="369" font-size="28" fill="#138582" font-weight="700" text-anchor="start">fMRI screening</text>
+<text x="75" y="399" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Image or existing prediction series</text>
+<rect x="742" y="327" width="650" height="548" rx="20" fill="#F8FAFD" stroke="#E3E9F2"/>
+<text x="769" y="369" font-size="28" fill="#7354CF" font-weight="700" text-anchor="start">EEG / MEG retrieval research</text>
+<text x="769" y="399" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Frozen evaluation + code-level experiments</text>
+<rect x="73" y="425" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M93 443 V499" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="109" y="464" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Materialize the stimulus</text>
+<text x="109" y="490" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Optional TRIBE worker + matched gray control</text>
+<rect x="73" y="539" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M93 557 V613" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="109" y="578" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Plan, validate and execute checks</text>
+<text x="109" y="604" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">LLM planning or rule policy; numeric tool registry</text>
+<rect x="73" y="653" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M93 671 V727" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="109" y="692" font-size="22" fill="#17263D" font-weight="700" text-anchor="start">Update evidence and decide when to stop</text>
+<text x="109" y="718" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Question coverage, resources and diagnostic gates</text>
+<rect x="73" y="767" width="600" height="82" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M93 785 V831" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
+<text x="109" y="806" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Screening report + episode memory</text>
+<text x="109" y="832" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Scope: numeric_consistency_only</text>
+<path d="M373 517 V539" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M373 631 V653" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M373 745 V767" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="767" y="425" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M787 443 V499" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="803" y="464" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Plan and design an experiment</text>
+<text x="803" y="490" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Planner, Librarian and Experiment Designer</text>
+<rect x="767" y="539" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M787 557 V613" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="803" y="578" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Approve, implement and review</text>
+<text x="803" y="604" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Runtime approval; Candidate Coder + Reviewer</text>
+<rect x="767" y="653" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M787 671 V727" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="803" y="692" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Train, compare and analyze</text>
+<text x="803" y="718" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Training tools + Result Analyst; matched controls</text>
+<rect x="767" y="767" width="600" height="82" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M787 785 V831" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="803" y="806" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Audit results and curate memory</text>
+<text x="803" y="832" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Result Auditor + Memory Curator; scoped evidence</text>
+<path d="M1067 517 V539" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M1067 631 V653" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M1067 745 V767" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="48" y="903" width="1344" height="78" rx="14" fill="#F2F5F9" stroke="#E3E9F2"/>
+<text x="76" y="936" font-size="20" fill="#17263D" font-weight="700" text-anchor="start">Separate chat entry</text>
+<text x="76" y="963" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">graph.py provides a ReAct conversation graph; it does not orchestrate either research loop.</text>
+<path d="M48 1003 H1392" fill="none" stroke="#D6DFEB" stroke-width="1" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="48" y="1020" width="12" height="12" rx="3" fill="#7354CF" stroke="#7354CF"/>
+<text x="70" y="1031" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">LLM role</text>
+<rect x="283" y="1020" width="12" height="12" rx="3" fill="#138582" stroke="#138582"/>
+<text x="305" y="1031" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Runtime / tool</text>
+<rect x="518" y="1020" width="12" height="12" rx="3" fill="#60718A" stroke="#60718A"/>
+<text x="540" y="1031" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Stored artifact</text>
+<path d="M753 1026 h35" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7"/>
+<text x="798" y="1031" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Conditional / memory handoff</text>
+<text x="48" y="1067" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Shared interface; separate workflow state and memory. No automatic fMRI-to-EEG training handoff.</text>
+</g></svg>

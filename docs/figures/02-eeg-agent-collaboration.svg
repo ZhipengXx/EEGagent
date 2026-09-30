@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1405" viewBox="0 0 1440 1405" role="img" aria-labelledby="title desc">
+<title id="title">How the EEG research roles collaborate</title><desc id="desc">The Research Planner uses state, data diagnostics and evidence. The Research Librarian returns local method cards. The Experiment Designer proposes a draft that deterministic runtime validation must approve. The Candidate Coder and Candidate Reviewer iterate on an isolated extension. Training and evaluation produce comparable evidence; the Result Analyst feeds findings back to planning. The Result Auditor receives a claim draft and latest result summary; runtime code tracks audit freshness from campaign evidence. The Memory Curator proposes conditional lessons. All handoffs are mediated by campaign records, task identity and artifact hashes; this is not a fixed chain or free-form agent chat.</desc>
+<defs>
+<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#8292A8"/></marker>
+<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#7354CF"/></marker>
+</defs>
+<rect width="1440" height="1405" rx="26" fill="#FFFFFF"/>
+<rect x="1" y="1" width="1438" height="1403" rx="25" fill="none" stroke="#E1E7F0"/>
+<g font-family="DejaVu Sans, Arial, sans-serif">
+<text x="48" y="52" font-size="16" fill="#62728A" font-weight="700" text-anchor="start">EEGagent  /  RESEARCH WORKFLOWS</text>
+<text x="1392" y="52" font-size="18" fill="#7354CF" font-weight="700" text-anchor="end">02</text>
+<text x="48" y="108" font-size="38" fill="#17263D" font-weight="700" text-anchor="start">How the EEG research roles collaborate</text>
+<text x="48" y="144" font-size="19" fill="#62728A" font-weight="400" text-anchor="start">A representative path through a state-driven campaign; the runtime chooses which role or tool to invoke next.</text>
+<rect x="48" y="190" width="350" height="116" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 208 V288" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="216" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">LLM ROLE  /  LOCAL RETRIEVAL</text>
+<text x="84" y="242" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Research Librarian</text>
+<text x="84" y="268" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Retrieve local method cards</text>
+<text x="84" y="290" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Return source + applicability</text>
+<rect x="458" y="190" width="524" height="116" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M478 208 V288" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="494" y="216" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">LLM ROLE  /  ORCHESTRATION</text>
+<text x="494" y="242" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Research Planner</text>
+<text x="494" y="268" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Read goal, plan, evidence and budget</text>
+<text x="494" y="290" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Choose an available next action</text>
+<rect x="1042" y="190" width="350" height="116" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M1062 208 V288" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
+<text x="1078" y="216" font-size="13" fill="#60718A" font-weight="700" text-anchor="start">CAMPAIGN INPUT</text>
+<text x="1078" y="242" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Goal + frozen protocol</text>
+<text x="1078" y="268" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Split, gallery, targets, metric</text>
+<text x="1078" y="290" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Budget + confirmation policy</text>
+<path d="M398 247 H458" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M1042 247 H982" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="391.79" y="220" width="70.42" height="21" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="427" y="232" font-size="13" fill="#62728A" font-weight="500" text-anchor="middle">methods</text>
+<rect x="48" y="386" width="420" height="132" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 404 V500" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="412" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">LLM ROLE  /  EXPERIMENT DRAFT</text>
+<text x="84" y="438" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Experiment Designer</text>
+<text x="84" y="464" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Draft mechanism + competing explanation</text>
+<text x="84" y="486" font-size="17" fill="#62728A" font-weight="400" text-anchor="start">Specify intervention and matched control</text>
+<text x="84" y="508" font-size="17" fill="#62728A" font-weight="400" text-anchor="start">Define predicted / disconfirming evidence</text>
+<rect x="510" y="386" width="420" height="132" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M530 404 V500" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="546" y="412" font-size="13" fill="#138582" font-weight="700" text-anchor="start">DETERMINISTIC GATE</text>
+<text x="546" y="438" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Experiment approval</text>
+<text x="546" y="464" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Validate draft, capability and context</text>
+<text x="546" y="486" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Bind spec + context hashes</text>
+<text x="546" y="508" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Issue runtime ApprovalRecord</text>
+<rect x="972" y="386" width="420" height="132" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M992 404 V500" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="1008" y="412" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">LLM ROLE  /  IMPLEMENTATION</text>
+<text x="1008" y="438" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Candidate Coder</text>
+<text x="1008" y="464" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Write isolated candidate extension</text>
+<text x="1008" y="486" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Run controlled implementation checks</text>
+<text x="1008" y="508" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Bind source to the current attempt</text>
+<path d="M720 306 V345 H258 V386" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="339.5" y="330" width="293.0" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="486" y="344" font-size="15" fill="#62728A" font-weight="500" text-anchor="middle">hypothesis + selected evidence</text>
+<path d="M468 453 H510" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<path d="M930 453 H972" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="972" y="609" width="420" height="119" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M992 627 V710" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="1008" y="635" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">LLM ROLE  /  CODE REVIEW</text>
+<text x="1008" y="661" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Candidate Reviewer</text>
+<text x="1008" y="687" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Identify blocking implementation issues</text>
+<text x="1008" y="709" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Return ready / needs-fix / blocked</text>
+<path d="M1182 518 V609" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="1109.9" y="556" width="144.2" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="1182" y="570" font-size="15" fill="#62728A" font-weight="500" text-anchor="middle">checked source</text>
+<path d="M1392 668 H1412 V451 H1392" fill="none" stroke="#7354CF" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow-violet)"/>
+<rect x="1220.88" y="539" width="170.24" height="22" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="1306" y="552" font-size="14" fill="#7354CF" font-weight="500" text-anchor="middle">repair when needed</text>
+<rect x="510" y="609" width="420" height="119" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M530 627 V710" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="546" y="635" font-size="13" fill="#138582" font-weight="700" text-anchor="start">WORKER + TOOLS  /  CONDITIONAL FIDELITY</text>
+<text x="546" y="661" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Training + evaluation</text>
+<text x="546" y="687" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Baseline, pilot, full or replicate jobs</text>
+<text x="546" y="709" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Fixed validation gallery; holdout policy</text>
+<path d="M972 668 H930" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="923.85" y="639" width="54.3" height="21" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="951" y="651" font-size="13" fill="#62728A" font-weight="500" text-anchor="middle">ready</text>
+<rect x="48" y="609" width="420" height="119" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 627 V710" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="635" font-size="13" fill="#138582" font-weight="700" text-anchor="start">DETERMINISTIC EVIDENCE CHECKS</text>
+<text x="84" y="661" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Evidence settlement</text>
+<text x="84" y="687" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Verify run, source and config identities</text>
+<text x="84" y="709" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Commit diagnostics + matched comparison</text>
+<path d="M510 668 H468" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="48" y="818" width="420" height="115" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 836 V915" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="844" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">LLM ROLE  /  INTERPRETATION</text>
+<text x="84" y="870" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Result Analyst</text>
+<text x="84" y="896" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Assess the tested hypothesis</text>
+<text x="84" y="918" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Suggest the next discriminating action</text>
+<path d="M258 728 V818" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
+<rect x="111.5" y="767" width="293.0" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="258" y="781" font-size="15" fill="#62728A" font-weight="500" text-anchor="middle">valid comparison + diagnostics</text>
+<path d="M48 876 H24 V163 H720 V190" fill="none" stroke="#7354CF" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow-violet)"/>
+<rect x="203.45" y="160" width="265.1" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="336" y="174" font-size="15" fill="#7354CF" font-weight="500" text-anchor="middle">findings feed the next plan</text>
+<rect x="510" y="818" width="420" height="115" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M530 836 V915" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="546" y="844" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">LLM ROLE  /  MEMORY</text>
+<text x="546" y="870" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Memory Curator</text>
+<text x="546" y="896" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Propose conditional, evidence-linked lessons</text>
+<text x="546" y="918" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Runtime validates lesson acceptance</text>
+<path d="M468 876 H510" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<rect x="972" y="818" width="420" height="115" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M992 836 V915" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
+<text x="1008" y="844" font-size="13" fill="#7354CF" font-weight="700" text-anchor="start">LLM ROLE  /  CLAIM AUDIT</text>
+<text x="1008" y="870" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Result Auditor</text>
+<text x="1008" y="896" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Check draft claims + latest result summary</text>
+<text x="1008" y="918" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Runtime tracks evidence freshness</text>
+<path d="M400 728 V786 H1182 V818" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<rect x="743.25" y="770" width="339.5" height="23" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="913" y="784" font-size="15" fill="#62728A" font-weight="500" text-anchor="middle">claim draft + latest settled result</text>
+<rect x="48" y="1003" width="1344" height="91" rx="16" fill="#17263D" stroke="#17263D"/>
+<text x="76" y="1040" font-size="25" fill="#FFFFFF" font-weight="700" text-anchor="start">Campaign records mediate every handoff</text>
+<text x="76" y="1074" font-size="18" fill="#CAD5E5" font-weight="400" text-anchor="start">Versioned plan  /  task + attempt identity  /  artifact references + hashes  /  cost and job ledgers</text>
+<path d="M720 933 V1003" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<path d="M1182 933 V1003" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<rect x="48" y="1134" width="645" height="126" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M68 1152 V1242" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
+<text x="84" y="1173" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Persistent episodes + scoped lessons</text>
+<text x="84" y="1199" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Pilot evidence remains pilot-level</text>
+<text x="84" y="1221" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Lessons retain conditions, evidence refs and limits</text>
+<rect x="735" y="1134" width="657" height="126" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
+<path d="M755 1152 V1242" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
+<text x="771" y="1173" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Audit records + candidate packs</text>
+<text x="771" y="1199" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Audit verdicts retain the evaluated claim scope</text>
+<text x="771" y="1221" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Reuse is tested by running evaluate-only reconstruction</text>
+<path d="M370 1094 V1134" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<path d="M1064 1094 V1134" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<path d="M48 1197 H12 V324 H430 V273 H458" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7" marker-end="url(#arrow)"/>
+<rect x="108.80000000000001" y="310" width="274.4" height="22" rx="4" fill="#FFFFFF" stroke="#FFFFFF"/>
+<text x="246" y="323" font-size="14" fill="#62728A" font-weight="500" text-anchor="middle">retrieve compatible experience</text>
+<path d="M48 1284 H1392" fill="none" stroke="#D6DFEB" stroke-width="1" stroke-linejoin="round" stroke-linecap="round"/>
+<rect x="48" y="1301" width="12" height="12" rx="3" fill="#7354CF" stroke="#7354CF"/>
+<text x="70" y="1312" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">LLM role</text>
+<rect x="283" y="1301" width="12" height="12" rx="3" fill="#138582" stroke="#138582"/>
+<text x="305" y="1312" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Runtime / tool</text>
+<rect x="518" y="1301" width="12" height="12" rx="3" fill="#60718A" stroke="#60718A"/>
+<text x="540" y="1312" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Stored artifact</text>
+<path d="M753 1307 h35" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7"/>
+<text x="798" y="1312" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Conditional / memory handoff</text>
+<text x="48" y="1348" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Eight LLM roles; training, approval, settlement and promotion are implemented by the runtime.</text>
+</g></svg>
