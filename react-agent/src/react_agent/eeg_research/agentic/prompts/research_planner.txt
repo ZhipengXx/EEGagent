@@ -11,40 +11,28 @@ Request a permitted read or diagnostic when required evidence is unavailable.
 An unavailable diagnostic is not evidence of normality or failure.
 
 RESEARCH CHOICE
-For a new direction, compare a small set of materially different admissible
-options when evidence supports alternatives. State the observed problem, a
-plausible competing explanation, the selected principal intervention and a
-prediction that would help distinguish them. Name the parent and comparator.
-Hyperparameter tuning is allowed when it addresses an evidenced optimization
-question; it is not the default substitute for scientific diagnosis.
+For each proposed plan step state: the observed gap, exact target/control,
+evidence refs, question or competing explanation to distinguish, prerequisites,
+expected information, resource cost and interpretation of possible outcomes.
+Choose only currently legal actions and respect the frozen ConfirmationPolicy.
+Use engineering repair for failed execution and scientific experiments for
+tested-but-unresolved mechanisms. Do not substitute a convenient lr/wd change
+for an unavailable central capability. Do not repeat a local action unless its
+inputs or unanswered question have changed; name the changed input digest.
 
-FEEDBACK
-Use the result and analysis bound to that candidate's exact experiment. Choose
-among resolving an evidence gap, repairing execution, revising a hypothesis,
-designing an intervention, increasing matched fidelity, rejecting or retaining
-a direction, nominating confirmation, or stopping. Do not treat a failed role
-or implementation as a negative scientific result. Nominate confirmation only
-through runtime-eligible independent paired runs.
+After every new settled RunRecord or failure, update the plan from that evidence.
+Retain or discard a candidate only at the supported fidelity and scope. A pilot
+is a routing signal; confirmation is a runtime record, not your judgment. No
+improvement is a valid outcome. Stop for a concrete satisfied goal, unresolved
+prerequisite, exhausted authorized budget or lack of a worthwhile executable
+question, not because a fixed number of trials has elapsed or scores are close.
+Do not stop because the best two scores are close.
 
 PLAN AND STOPPING
 Update only affected questions, citing new evidence and the current plan version.
-Declare whether the action depends on the update. Do not repeat derivations of
-unchanged evidence as progress. There is no fixed trial count, score-gap stopping
-rule, or requirement to spend remaining budget. Stop with a supplied reason when
-no supported useful action is executable. Budget exhaustion does not prove that
-the scientific goal was met.
-Do not stop because the best two scores are close.
+plan_update.based_on_evidence_ids must copy the on-disk evidence ids already
+cited in this decision. An empty list cannot authorize a dependent action.
+Declare whether the action depends on the update.
 
 Return the injected PlannerDecision, including a concise decision rationale,
 expected information, required evidence references and scope limitations.
-
-APPROVAL AND BINDING
-Do not treat a self-declared approved status as permission. Only a runtime
-ApprovalRecord plus registered spec hash authorizes implement or train.
-Baseline and historical candidates keep their own frozen bindings.
-OBJECTIVE AND CONFIRMATION
-A custom training objective is not the local validation metric. Confirmation
-requires identity-complete PairRecords and predeclared training seeds.
-SETTLEMENT AND AUDIT
-A job is not settled until diagnostics, comparison and promotion exist. A later
-evidence row makes a prior audit stale.

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ PACK_FILES = (
     "diagnostic_bundle.json",
     "diagnostic_summary.json",
     "hook_config.json",
+    "frozen_run_spec.json",
     "job.json",
 )
 
@@ -52,22 +55,48 @@ def pack_candidate(job_dir: Path, dest: Path, *, workspace: Path | None = None) 
         binding["class_file"] = "extension/eeg_candidate.py"
         binding["workspace"] = "."
         binding_path.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
+    hashes: dict[str, str] = {}
+    for name in copied:
+        path = dest / name
+        if path.is_file():
+            hashes[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     manifest = {
-        "schema_version": "eeg_research.candidate_pack.v1",
+        "schema_version": "eeg_research.candidate_pack.v2",
         "job_dir": str(job_dir),
         "copied": copied,
         "missing": missing,
+        "content_hashes": hashes,
         "evaluate_only": True,
         "final_test": False,
         "checkpoint": "last.ckpt" if (dest / "last.ckpt").is_file() else None,
+        "context_root": ".",
     }
     (dest / "pack_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 
 
+def verify_pack_hashes(dest: Path) -> tuple[bool, str]:
+    dest = Path(dest)
+    manifest = _read_json(dest / "pack_manifest.json")
+    hashes = manifest.get("content_hashes") if isinstance(manifest, dict) else None
+    if not hashes:
+        return True, "ok"
+    for relative, expected in hashes.items():
+        path = dest / str(relative)
+        if not path.is_file():
+            return False, f"dependency_missing:{relative}"
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            return False, f"hash_mismatch:{relative}"
+    return True, "ok"
+
+
 def pack_is_rebuildable(dest: Path) -> tuple[bool, str]:
     """True when encoder identity and checkpoint exist for evaluate-only."""
     dest = Path(dest)
+    ok, reason = verify_pack_hashes(dest)
+    if not ok:
+        return False, reason
     if not (dest / "last.ckpt").is_file():
         return False, "checkpoint_missing"
     binding = dest / "source_binding.json"
@@ -143,7 +172,16 @@ def evaluate_only_argv(pack: Path, *, out: Path | None = None, data_root: Path |
     root = Path(data_root) if data_root is not None else default_root()
     command = job.get("command")
     if isinstance(command, list) and command:
-        return _rewrite_evaluate_command(command, out=dest, data_root=root, checkpoint=pack / "last.ckpt")
+        argv = _rewrite_evaluate_command(command, out=dest, data_root=root, checkpoint=pack / "last.ckpt")
+    else:
+        argv = _fallback_evaluate_argv(job, identity, dest, root, pack, torch_python, sys)
+    device = os.environ.get("EEG_TRAIN_DEVICE", "").strip().lower()
+    if device in {"cpu", "cuda"} and "--device" not in argv:
+        argv.extend(["--device", device])
+    return argv
+
+
+def _fallback_evaluate_argv(job, identity, dest, root, pack, torch_python, sys):
     python = torch_python() or sys.executable
     dataset = str(job.get("dataset") or identity.get("dataset") or "eeg")
     exp_setting = str(job.get("exp_setting") or identity.get("exp_setting") or "inter-subject")

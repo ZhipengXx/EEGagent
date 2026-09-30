@@ -84,12 +84,15 @@ def test_getitem_keeps_image_id_out_of_encoder_keys() -> None:
         [0, 250],
     )
     row = dataset[0]
-    assert set(row) == {"eeg", "img_features", "image_id"}
+    assert {"eeg", "img_features", "image_id"} <= set(row)
     assert row["image_id"] == "img_a"
+    assert "query_id" in row
+    assert "subject" in row
     assert row["eeg"].shape == (17, 250)
     batched = collate_retrieval([row, row])
     assert batched["image_id"] == ["img_a", "img_a"]
-    assert "image_id" not in {"eeg"}
+    assert "query_id" in batched
+    assert batched["eeg"].shape[1:] == (17, 250)
     encoder = EEGProjectLayer(1024, 17, [0, 250])
     encoded = encoder(batched["eeg"])
     assert encoded.shape[0] == 2

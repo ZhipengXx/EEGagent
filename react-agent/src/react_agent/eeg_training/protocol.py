@@ -552,6 +552,9 @@ def train_command(design: Design, out_dir: Path, root: Path | None = None) -> li
         command.extend(["--gpu", ",".join(str(index) for index in design.gpu)])
     if design.policy == "agentic":
         command.extend(["--negative-policy", "data_parallel_local"])
+    device = os.environ.get("EEG_TRAIN_DEVICE", "").strip().lower()
+    if device in {"cpu", "cuda"}:
+        command.extend(["--device", device])
     return command
 
 

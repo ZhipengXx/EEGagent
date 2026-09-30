@@ -137,10 +137,27 @@ def start_job(
         write_evaluation_identity(job_dir, protocol)
         env["EEG_EVALUATION_IDENTITY"] = str((job_dir / "evaluation_identity.json").resolve())
     from react_agent.eeg_research.agentic.hook_config import write_hook_config
-    from react_agent.eeg_research.agentic.run_context import resolve_run_context
+    from react_agent.eeg_research.agentic.run_context import persist_frozen_run_spec, resolve_run_context
 
-    run_context = resolve_run_context(camp, candidate_id, state, fidelity=fidelity, seed=run_design.seed)
-    write_hook_config(job_dir, run_context["hook_spec"], spec_ref=run_context.get("spec_ref"))
+    run_context = resolve_run_context(
+        camp,
+        candidate_id,
+        state,
+        fidelity=fidelity,
+        seed=run_design.seed,
+        protocol=protocol,
+    )
+    frozen = run_context.get("frozen_run_spec")
+    write_hook_config(
+        job_dir,
+        frozen or run_context["hook_spec"],
+        spec_ref=run_context.get("spec_ref"),
+        spec_hash=run_context.get("spec_hash"),
+        seed=run_design.seed,
+        fidelity=fidelity,
+    )
+    if frozen:
+        persist_frozen_run_spec(job_dir, frozen)
     log = (job_dir / "train.log").open("wb")
     proc = subprocess.Popen(  # noqa: S603
         command,

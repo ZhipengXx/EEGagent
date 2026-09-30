@@ -30,6 +30,28 @@ def _usable_comparison(path: Path) -> bool:
     return isinstance(comparison, dict) and bool(comparison)
 
 
+_LESSON_ALIASES = {
+    "claim": "statement",
+    "text": "statement",
+    "confidence": "uncertainty",
+    "evidence_level_requested": "requested_evidence_level",
+    "requested_level": "requested_evidence_level",
+    "support_refs": "supporting_episode_ids",
+    "supporting_refs": "supporting_episode_ids",
+    "contradict_refs": "contradicting_episode_ids",
+    "effect_refs": "observed_effect_refs",
+}
+
+
+def canonicalize_lesson_proposal(lesson: dict[str, Any]) -> dict[str, Any]:
+    """Explicit alias migration. Requested and stored evidence levels stay distinct."""
+    copied = dict(lesson)
+    for old, new in _LESSON_ALIASES.items():
+        if old in copied and new not in copied:
+            copied[new] = copied[old]
+    return copied
+
+
 def evidence_level(kind: str) -> str:
     if kind == "implementation_failure":
         return "implementation_failure"
@@ -305,6 +327,7 @@ class EpisodeStore:
                 if not isinstance(lesson, dict):
                     rejected.append({"reason": "lesson_not_object"})
                     continue
+                lesson = canonicalize_lesson_proposal(lesson)
                 supporting = [str(item) for item in lesson.get("supporting_episode_ids") or proposal.get("supporting_episode_ids") or []]
                 contradicting = [str(item) for item in lesson.get("contradicting_episode_ids") or []]
                 reasons: list[str] = []
@@ -318,7 +341,12 @@ class EpisodeStore:
                 if any("test" in json_keys(item) for item in cited):
                     reasons.append("final_test_derived")
                 group_level = min((_rank(item.get("evidence_level")) for item in cited), default=0)
-                requested = str(lesson.get("evidence_level") or proposal.get("evidence_level_requested") or "exploratory_result")
+                requested = str(
+                    lesson.get("requested_evidence_level")
+                    or lesson.get("evidence_level")
+                    or proposal.get("evidence_level_requested")
+                    or "exploratory_result"
+                )
                 if cited and _rank(requested) > group_level:
                     reasons.append("evidence_level_exceeds_runs")
                 job_ids = [str(item.get("job_id") or item.get("artifact")) for item in cited]
@@ -329,6 +357,7 @@ class EpisodeStore:
                     reasons.append("conditions_missing")
                 effect = lesson.get("observed_effect")
                 comparison_refs = [str(item) for item in lesson.get("comparison_refs") or lesson.get("observed_effect_refs") or []]
+                confirmation_refs = [str(item) for item in lesson.get("confirmation_refs") or []]
                 if effect not in (None, "") and not comparison_refs:
                     reasons.append("forged_effect")
                 fake_refs = []
@@ -341,10 +370,15 @@ class EpisodeStore:
                         fake_refs.append(item)
                 if comparison_refs and fake_refs:
                     reasons.append("comparison_ref_missing")
-                if requested in {"confirmed_result"} and not any(
-                    (self.camp / "comparisons" / f"{item}.json").is_file() for item in comparison_refs
-                ):
-                    reasons.append("confirmation_missing")
+                if requested in {"confirmed_result"}:
+                    confirmed = False
+                    for item in confirmation_refs or comparison_refs:
+                        path = self.camp / "confirmations" / f"{item}.json"
+                        alt = self.camp / "comparisons" / f"{item}.json"
+                        if path.is_file() or (alt.is_file() and _usable_comparison(alt)):
+                            confirmed = True
+                    if not confirmed:
+                        reasons.append("confirmation_missing")
                 if requested in {"confirmed_result"} and not supporting:
                     reasons.append("confirmation_missing")
                 if reasons:
@@ -363,6 +397,7 @@ class EpisodeStore:
                     "observed_effect": None,
                     "observed_effect_refs": comparison_refs,
                     "comparison_refs": comparison_refs,
+                    "confirmation_refs": confirmation_refs,
                     "summary_zh": lesson.get("summary_zh") or proposal.get("summary_zh") or "",
                 }
                 conn.execute(

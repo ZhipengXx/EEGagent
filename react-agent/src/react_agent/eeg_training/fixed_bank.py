@@ -6,12 +6,63 @@ import math
 
 
 def _cosine(left: list[float], right: list[float]) -> float:
+    if any(not math.isfinite(value) for value in left) or any(not math.isfinite(value) for value in right):
+        return float("nan")
     dot = sum(a * b for a, b in zip(left, right))
     left_norm = math.sqrt(sum(a * a for a in left))
     right_norm = math.sqrt(sum(b * b for b in right))
     if left_norm == 0 or right_norm == 0:
         return 0.0
     return dot / (left_norm * right_norm)
+
+
+def _norm(vector: list[float]) -> float:
+    return math.sqrt(sum(value * value for value in vector))
+
+
+def score_query(
+    vector: list[float],
+    bank: list[tuple[str, list[float]]],
+    allowed: set[str],
+    *,
+    k: int = 1,
+) -> dict:
+    """Shared ranking used by the main evaluator and diagnostics."""
+    non_finite = any(not math.isfinite(value) for value in vector) or any(
+        any(not math.isfinite(value) for value in candidate) for _image, candidate in bank
+    )
+    zero_norm_query = _norm(vector) == 0
+    scored = [(image_id, _cosine(vector, candidate)) for image_id, candidate in bank]
+    finite_scores = [score for _image, score in scored if math.isfinite(score)]
+    all_ties = bool(finite_scores) and max(finite_scores) == min(finite_scores)
+    ranked = sorted(scored, key=lambda item: (item[1] if math.isfinite(item[1]) else float("-inf")), reverse=True)
+    pos = [(image_id, score) for image_id, score in ranked if image_id in allowed]
+    if not pos:
+        return {"skip": True}
+    best_pos = max(score for _image, score in pos)
+    best_neg = max((score for image_id, score in ranked if image_id not in allowed), default=float("-inf"))
+    min_rank = 1 + sum(1 for _image, score in ranked if math.isfinite(score) and math.isfinite(best_pos) and score > best_pos)
+    max_rank = 1 + sum(1 for _image, score in ranked if math.isfinite(score) and math.isfinite(best_pos) and score >= best_pos) - 1
+    max_rank = max(min_rank, max_rank)
+    collapsed = non_finite or zero_norm_query or all_ties
+    actual_top1 = bool(ranked and ranked[0][0] in allowed) and not collapsed
+    actual_topk = any(image_id in allowed for image_id, _score in ranked[:k]) and not collapsed
+    return {
+        "skip": False,
+        "positive_identity": [image_id for image_id, _score in pos],
+        "positive_count": len(pos),
+        "positive_score": best_pos if math.isfinite(best_pos) else None,
+        "best_negative_score": None if best_neg == float("-inf") or not math.isfinite(best_neg) else best_neg,
+        "margin": None if best_neg == float("-inf") or not math.isfinite(best_pos) or not math.isfinite(best_neg) else best_pos - best_neg,
+        "min_rank": min_rank,
+        "max_rank": max_rank,
+        "rank_interval": [min_rank, max_rank],
+        "top_k_hit": actual_top1 if k == 1 else actual_topk,
+        "all_ties": all_ties,
+        "zero_norm_query": zero_norm_query,
+        "non_finite": non_finite,
+        "collapsed": collapsed,
+    }
 
 
 def fixed_bank_accuracy(
@@ -32,15 +83,11 @@ def fixed_bank_accuracy(
             allowed = positives.get(query_id) or set()
             if not allowed:
                 raise ValueError(f"missing_positive:{query_id}")
-            ranked = sorted(
-                ((image_id, _cosine(vector, candidate)) for image_id, candidate in bank),
-                key=lambda item: item[1],
-                reverse=True,
-            )
-            top = [image_id for image_id, _score in ranked[:5]]
-            if top and top[0] in allowed:
+            top1 = score_query(vector, bank, allowed, k=1)
+            top5 = score_query(vector, bank, allowed, k=5)
+            if top1.get("top_k_hit"):
                 hits1 += 1
-            if any(image_id in allowed for image_id in top):
+            if top5.get("top_k_hit"):
                 hits5 += 1
     total = len(queries)
     return {

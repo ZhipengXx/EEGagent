@@ -253,20 +253,23 @@ def test_live_job_is_reconciled_without_a_planner_call(tmp_path: Path) -> None:
     from react_agent.eeg_research.agentic.loop import load_state, save_state
 
     state = load_state(camp)
-    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+    from react_agent.eeg_research.agentic.experiment_gate import install_approved_experiment
 
+    install_approved_experiment(
+        camp,
+        state,
+        {
+            "intervention": "pooling",
+            "hypothesis": {"mechanism": "池化"},
+            "parent_candidate_id": "baseline",
+            "initial_fidelity": "pilot",
+        },
+        target_id="c1",
+    )
     state.update(
         {
             "candidate_ready": True,
             "candidate_id": "c1",
-            "experiment": approve_experiment(
-                {
-                    "intervention": "pooling",
-                    "hypothesis": {"mechanism": "池化"},
-                    "parent_candidate_id": "baseline",
-                    "initial_fidelity": "pilot",
-                }
-            ),
         }
     )
     save_state(camp, state)

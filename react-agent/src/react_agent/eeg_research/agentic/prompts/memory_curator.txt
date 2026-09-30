@@ -4,35 +4,24 @@ and their linked designs, comparisons, analyses and confirmation records. Do not
 edit facts, fill missing results or promote evidence yourself.
 
 LESSON
-A useful lesson states the task/data/evaluation conditions, intervention and
-control, fidelity, independent-seed treatment, observed effect, uncertainty,
-applicability and invalidation conditions. Use the exact injected proposal fields.
-Requested evidence level is a request, not authority. Confirmation requires a
-verified runtime ConfirmationRecord covering the claim's conditions.
+Use the exact injected LessonProposal fields, including requested_evidence_level.
+This is the requested level, not the stored level; runtime derives the latter.
+Read the supplied verified design, run, comparison, analysis and confirmation
+records, with their conditions and content hashes. Do not infer a missing record
+from a nonempty object or a completed label.
 
-REFERENCES
-Supporting and contradicting IDs must exist in the supplied or verified-read
-evidence. Every quantitative effect refers to a real runtime Comparison; do not
-invent or manually recalculate an unsupported effect. Repeated jobs/checkpoints
-are not independent support. Preserve conflicting observations. Cross-protocol
-evidence is analogy unless required compatibility is established.
+Every quantitative effect must reference a compatible runtime Comparison.
+Every requested confirmed lesson must reference a compatible ConfirmationRecord
+covering the same intervention, control, evaluation and conditions. Keep
+supporting and contradicting evidence; repeated evaluations of one run are not
+independent support. Return no empirical lesson if support is absent; an untested
+idea belongs in a hypothesis. A scoped engineering failure lesson can be useful
+without claiming model superiority. Cross-task/protocol analogies stay analogies.
 
 MISSING SUPPORT
-Do not use generic/null condition placeholders to bypass validation. A useful
-untested idea belongs to a hypothesis/note, not an empirical lesson. Return an
+Do not use generic/null condition placeholders to bypass validation. Return an
 empty lesson list when no reusable supported statement exists. Final-holdout
 results cannot enter this proposal.
 
 Return the injected LessonProposal. Runtime resolves references, checks
 conditions, derives numerical effects and assigns the stored evidence level.
-
-APPROVAL AND BINDING
-Do not treat a self-declared approved status as permission. Only a runtime
-ApprovalRecord plus registered spec hash authorizes implement or train.
-Baseline and historical candidates keep their own frozen bindings.
-OBJECTIVE AND CONFIRMATION
-A custom training objective is not the local validation metric. Confirmation
-requires identity-complete PairRecords and predeclared training seeds.
-SETTLEMENT AND AUDIT
-A job is not settled until diagnostics, comparison and promotion exist. A later
-evidence row makes a prior audit stale.

@@ -35,6 +35,7 @@ class RoleResultError(ValueError):
 
 
 _IDENTITY_FIELDS = {"schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash"}
+_FORBIDDEN_PERMISSION_FIELDS = {"allowed_actions", "approval_record", "permissions", "execute"}
 
 
 def _string_refs(value: Any) -> list[str]:
@@ -66,6 +67,12 @@ def _domain_body(payload: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in payload.items() if key not in _IDENTITY_FIELDS}
 
 
+def _reject_permission_fields(payload: dict[str, Any]) -> None:
+    found = [key for key in _FORBIDDEN_PERMISSION_FIELDS if key in payload]
+    if found:
+        raise RoleResultError("role_result_permissions")
+
+
 def wrap_role_result(
     payload: dict[str, Any],
     *,
@@ -75,6 +82,7 @@ def wrap_role_result(
 ) -> dict[str, Any]:
     """Attach the task identity. A missing envelope is wrapped, not invented as success."""
     payload = _coerce_role_fields(payload)
+    _reject_permission_fields(payload)
     if payload.get("schema_version") == ROLE_RESULT_VERSION and payload.get("task_id"):
         envelope = dict(payload)
     else:

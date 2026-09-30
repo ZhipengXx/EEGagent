@@ -89,10 +89,17 @@ class RetrievalTrials(Dataset):
         assert isinstance(eeg, torch.Tensor)
         features = row["img_features"]
         assert isinstance(features, torch.Tensor)
+        image_id = str(row.get("img") or "")
+        subject = str(row.get("subject") or "")
+        query_id = str(row.get("query_id") or "")
+        if not query_id:
+            query_id = f"{subject}::{image_id}" if subject else image_id
         return {
             "eeg": eeg[:, start:end].float(),
             "img_features": features.float(),
-            "image_id": str(row.get("img") or ""),
+            "image_id": image_id,
+            "query_id": query_id,
+            "subject": subject,
         }
 
 
@@ -102,6 +109,8 @@ def collate_retrieval(batch: list[dict[str, torch.Tensor | str]]) -> dict[str, t
         "eeg": torch.stack([row["eeg"] for row in batch]),  # type: ignore[arg-type]
         "img_features": torch.stack([row["img_features"] for row in batch]),  # type: ignore[arg-type]
         "image_id": [str(row.get("image_id") or "") for row in batch],
+        "query_id": [str(row.get("query_id") or "") for row in batch],
+        "subject": [str(row.get("subject") or "") for row in batch],
     }
 
 

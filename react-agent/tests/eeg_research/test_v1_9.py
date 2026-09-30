@@ -274,21 +274,24 @@ def _open_campaign(tmp_path: Path, *, with_protocol: bool = False, request_id: s
 
 
 def _ready(camp: Path, candidate_id: str = "c1") -> None:
-    from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
+    from react_agent.eeg_research.agentic.experiment_gate import install_approved_experiment
 
     state = load_state(camp)
+    install_approved_experiment(
+        camp,
+        state,
+        {
+            "intervention": "pooling",
+            "hypothesis": {"mechanism": "池化"},
+            "parent_candidate_id": "baseline",
+            "initial_fidelity": "pilot",
+        },
+        target_id=candidate_id,
+    )
     state.update(
         {
             "candidate_ready": True,
             "candidate_id": candidate_id,
-            "experiment": approve_experiment(
-                {
-                    "intervention": "pooling",
-                    "hypothesis": {"mechanism": "池化"},
-                    "parent_candidate_id": "baseline",
-                    "initial_fidelity": "pilot",
-                }
-            ),
             "candidates": [{"candidate_id": candidate_id, "status": "ready"}],
         }
     )
@@ -470,7 +473,7 @@ def test_inline_runner_respects_protocol_checkpoint(tmp_path: Path) -> None:
     camp, _protocol = _open_campaign(tmp_path, with_protocol=True, request_id="inline-ckpt")
     _ready(camp)
     workspace = camp / "candidates" / "c1"
-    workspace.mkdir(parents=True)
+    workspace.mkdir(parents=True, exist_ok=True)
     (workspace / "source_manifest.json").write_text(
         json.dumps({"module": "eeg_candidate", "entry_sha256": "abc"}),
         encoding="utf-8",

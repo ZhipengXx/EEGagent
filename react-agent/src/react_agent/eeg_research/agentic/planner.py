@@ -96,7 +96,12 @@ def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
     targets: dict[str, list[str]] = {"run_pilot": [], "run_full": [], "replicate": []}
     if not room:
         return targets
-    declared = [int(item) for item in state.get("training_seeds") or []]
+    from react_agent.eeg_research.agentic.confirmation_policy import policy_training_seeds
+
+    policy = state.get("confirmation_policy") if isinstance(state.get("confirmation_policy"), dict) else None
+    declared = policy_training_seeds(policy)
+    if declared is None:
+        declared = [int(item) for item in state.get("training_seeds") or []]
     for name in dict.fromkeys(names):
         if not _has(evidence, name, "pilot"):
             targets["run_pilot"].append(name)
@@ -164,6 +169,71 @@ def available_actions(state: dict[str, Any]) -> list[str]:
     return actions
 
 
+def _hook_execution_status(observation: dict[str, Any]) -> str:
+    diagnostics = observation.get("latest_diagnostics")
+    items = diagnostics.get("items") if isinstance(diagnostics, dict) else None
+    hook = items.get("hook_consumption") if isinstance(items, dict) else None
+    if isinstance(hook, dict) and hook.get("execution_status"):
+        return str(hook["execution_status"])
+    payload = hook.get("payload") if isinstance(hook, dict) else None
+    if isinstance(payload, dict) and payload.get("execution_status"):
+        return str(payload["execution_status"])
+    return "unknown"
+
+
+def _mechanism_unresolved(observation: dict[str, Any]) -> bool:
+    comparison = observation.get("latest_comparison")
+    if not isinstance(comparison, dict) or not comparison:
+        return True
+    if comparison.get("comparable") is not True:
+        return True
+    delta = comparison.get("delta_pp")
+    if delta is None:
+        return True
+    try:
+        return abs(float(delta)) < 1e-12
+    except (TypeError, ValueError):
+        return True
+
+
+def route_next_research_action(observation: dict[str, Any]) -> dict[str, Any]:
+    """Schema-constrained offline scheduler. This is not live LM reasoning."""
+    actions = list(observation.get("available_actions") or [])
+    eligible = observation.get("eligible_targets") if isinstance(observation.get("eligible_targets"), dict) else {}
+    hook = _hook_execution_status(observation)
+    if hook == "not_applied" and "repair_candidate" in actions:
+        return {
+            "action": "repair_candidate",
+            "reason_zh": "批准配置未到达训练 hook，先做工程修复",
+            "observed_gap": "hook_not_consumed",
+            "evidence_ids": [],
+        }
+    if hook in {"applied", "unknown"} and _mechanism_unresolved(observation):
+        for name in ("replicate", "run_full", "collect_diagnostics", "diagnose_results"):
+            if name not in actions:
+                continue
+            targets = list(eligible.get(name) or [])
+            payload = {
+                "action": name,
+                "reason_zh": "执行有效但机制尚未区分，需要对照、重复或测量，而不是改学习率",
+                "observed_gap": "mechanism_unresolved",
+                "evidence_ids": [],
+            }
+            if name in {"replicate", "run_full", "run_pilot"}:
+                if not targets:
+                    continue
+                payload["target_id"] = targets[0]
+            return payload
+    if "stop" in actions:
+        return {
+            "action": "stop",
+            "stop_reason": "no_supported_next_experiment",
+            "reason_zh": "没有值得执行的下一问",
+            "evidence_ids": [],
+        }
+    return {"action": actions[0] if actions else "stop", "reason_zh": "fallback", "evidence_ids": [], "stop_reason": "blocked"}
+
+
 def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -> dict[str, Any]:
     """Ask once. One schema repair is allowed. A second failure blocks."""
     allowed = observation.get("available_actions") or []
@@ -196,9 +266,11 @@ def _parse(
     action = reply.get("action")
     if action not in ACTIONS or (allowed and action not in allowed):
         return {"ok": False, "detail": f"unknown_action:{action}"}
-    evidence_ids = reply.get("evidence_ids") or []
+    evidence_ids = reply.get("evidence_ids") if isinstance(reply.get("evidence_ids"), list) and reply.get("evidence_ids") else reply.get("evidence_refs") or []
     if not isinstance(evidence_ids, list) or any(item not in known for item in evidence_ids):
         return {"ok": False, "detail": "unknown_evidence"}
+    if not reply.get("evidence_ids"):
+        reply["evidence_ids"] = list(evidence_ids)
     if action == "propose_experiment" and not isinstance(reply.get("hypothesis_draft"), dict):
         return {"ok": False, "detail": "hypothesis_draft_missing"}
     if action == "stop":

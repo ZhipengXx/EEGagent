@@ -323,6 +323,68 @@ def test_d12_designer_digest_includes_budget(tmp_path: Path) -> None:
     assert first["input_digest"] != second["input_digest"]
 
 
+def test_cited_evidence_refs_fill_plan_update_and_design_runs(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.research_plan import load_plan
+
+    camp = _camp(tmp_path, "plan-alias")
+    tick(camp, lambda _obs: {"action": "inspect_data", "reason_zh": "看数据", "evidence_ids": []})
+    state = tick(
+        camp,
+        lambda _obs: {
+            "action": "design_experiment",
+            "reason_zh": "设计基线",
+            "evidence_refs": ["ev_audit_1"],
+            "question_id": "q1",
+            "action_depends_on_plan_update": True,
+            "hypothesis_draft": {"mechanism": "基线参考"},
+            "experiment_draft": {
+                "intervention": "baseline_reference",
+                "parent_candidate_id": "baseline",
+                "initial_fidelity": "pilot",
+                "hypothesis": {"mechanism": "基线参考"},
+            },
+            "plan_update": {
+                "based_on_plan_version": 1,
+                "updated_questions": [
+                    {
+                        "question_id": "q1",
+                        "status": "open",
+                        "note_zh": "先建立固定画廊基线",
+                        "evidence_refs": [],
+                    }
+                ],
+            },
+        },
+    )
+    assert state.get("detail") != "plan_update_blocks_action"
+    assert state.get("failure", {}).get("error_type") != "plan_update_rejected"
+    assert load_plan(camp)["plan_version"] == 2
+    assert load_plan(camp)["accepted_evidence_ids"] == ["ev_audit_1"]
+    assert isinstance(state.get("experiment"), dict)
+
+
+def test_plan_update_without_cited_evidence_still_blocks(tmp_path: Path) -> None:
+    from react_agent.eeg_research.agentic.research_plan import PlanError, apply_update, init_plan, normalize_plan_update
+
+    camp = tmp_path / "empty-plan"
+    camp.mkdir()
+    init_plan(camp, {"goal_id": "g", "objective": "改进检索"})
+    empty = normalize_plan_update(
+        {"based_on_plan_version": 1, "affected_question_ids": ["q1"]},
+        {},
+        known_evidence_ids={"ev_1"},
+    )
+    with pytest.raises(PlanError, match="plan_update_needs_evidence"):
+        apply_update(camp, empty, known_evidence_ids={"ev_1"})
+    unknown = normalize_plan_update(
+        {"based_on_plan_version": 1, "affected_question_ids": ["q1"]},
+        {"evidence_refs": ["ev_fake"]},
+        known_evidence_ids={"ev_1"},
+    )
+    with pytest.raises(PlanError, match="plan_update_unknown_evidence"):
+        apply_update(camp, unknown, known_evidence_ids={"ev_1"})
+
+
 def test_already_started_candidates_do_not_bypass_approval(tmp_path: Path) -> None:
     camp = _camp(tmp_path, "started")
     (camp / "candidates" / "c1").mkdir(parents=True)

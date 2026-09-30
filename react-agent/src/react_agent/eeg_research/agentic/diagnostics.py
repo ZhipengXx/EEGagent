@@ -15,6 +15,7 @@ CATEGORIES = (
     "representation",
     "group_results",
     "intervention_probe",
+    "hook_consumption",
     "integrity_cost",
     "image_id_duplicates",
 )
@@ -45,6 +46,8 @@ def summarize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
                 "mean_duplicate_rate",
                 "query_count",
                 "gallery_size",
+                "execution_status",
+                "mismatches",
             ):
                 if key in payload:
                     summary["items"][name][key] = payload[key]

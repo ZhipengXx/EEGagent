@@ -32,11 +32,16 @@ def _paired_rows(
 _IDENTITY_FIELDS = ("run_id", "control_run_id", "seed", "checkpoint_id", "source_hash", "config_hash", "approval_ref")
 
 
-def declared_training_seeds(goal: dict[str, Any] | None) -> set[int] | None:
-    """Seeds must be declared on the goal or protocol. Undeclared seeds cannot confirm."""
+def declared_training_seeds(
+    goal: dict[str, Any] | None,
+    policy: dict[str, Any] | None = None,
+) -> set[int] | None:
+    """Seeds must be declared on the frozen ConfirmationPolicy. Undeclared seeds cannot confirm."""
+    if isinstance(policy, dict) and policy.get("seeds_declared"):
+        return {int(item) for item in policy.get("training_seeds") or []}
     if not isinstance(goal, dict):
         return None
-    seeds = goal.get("training_seeds") or goal.get("declared_training_seeds")
+    seeds = goal.get("training_seeds") if "training_seeds" in goal else goal.get("declared_training_seeds")
     protocol = goal.get("protocol") if isinstance(goal.get("protocol"), dict) else {}
     if seeds is None:
         seeds = protocol.get("training_seeds")
@@ -45,9 +50,13 @@ def declared_training_seeds(goal: dict[str, Any] | None) -> set[int] | None:
     return {int(item) for item in seeds}
 
 
-def _confirmation_rows(rows: list[dict[str, Any]], goal: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def _confirmation_rows(
+    rows: list[dict[str, Any]],
+    goal: dict[str, Any] | None = None,
+    policy: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Full runs only. One predeclared training seed is one independent pair."""
-    declared = declared_training_seeds(goal)
+    declared = declared_training_seeds(goal, policy)
     kept: list[dict[str, Any]] = []
     seen_tokens: set[tuple[Any, ...]] = set()
     seen_seeds: set[Any] = set()
@@ -94,21 +103,32 @@ def promotion_decision(
     paired_deltas_pp: list[float] | None = None,
     fidelity: str | None = None,
     paired_records: list[dict[str, Any]] | None = None,
+    policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a code-level promotion record. LLM must not invent a numeric bar.
 
     Pilot runs and bare float lists never become confirmation. The paired set, not the
     last delta, decides the aggregate. Percentage points are compared as percentage points.
     """
-    bar = goal.get("min_practical_gain_pp")
-    target_pairs = int(goal.get("confirmation_target_pairs") or 0)
-    has_rule = goal.get("confirmation_target_pairs") is not None
-    rows = _confirmation_rows(_paired_rows(paired_deltas_pp, paired_records, fidelity), goal)
+    if isinstance(policy, dict):
+        bar = policy.get("min_practical_gain_pp")
+        if bar is None:
+            bar = goal.get("min_practical_gain_pp")
+        target_pairs = policy.get("target_pairs")
+        if target_pairs is None:
+            target_pairs = goal.get("confirmation_target_pairs")
+        target_pairs = int(target_pairs or 0)
+        has_rule = policy.get("target_pairs") is not None or goal.get("confirmation_target_pairs") is not None
+    else:
+        bar = goal.get("min_practical_gain_pp")
+        target_pairs = int(goal.get("confirmation_target_pairs") or 0)
+        has_rule = goal.get("confirmation_target_pairs") is not None
+    rows = _confirmation_rows(_paired_rows(paired_deltas_pp, paired_records, fidelity), goal, policy)
     deltas = [float(row["delta_pp"]) for row in rows if row.get("delta_pp") is not None]
     replicate_n = len(deltas)
     identity_ready = (
         bool(rows)
-        and declared_training_seeds(goal) is not None
+        and declared_training_seeds(goal, policy) is not None
         and all(
             not row.get("legacy_float") and all(row.get(field) not in (None, "") for field in _IDENTITY_FIELDS)
             for row in rows

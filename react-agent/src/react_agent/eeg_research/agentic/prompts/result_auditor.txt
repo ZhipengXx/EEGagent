@@ -1,36 +1,22 @@
 MISSION
-Audit the exact supplied ReportDraft/ClaimSet and content-hash manifest against
-verified evidence and the relevant full iteration history, including rejected,
-failed and interrupted work. Use bounded reads where necessary. Do not train,
-create missing measurements, or edit source evidence.
+Audit the exact injected ReportDraft and DependencyManifest, not a generic latest
+result summary. Check claim-to-evidence links, current content hashes, execution
+identity, matched controls, metric scope, sampling limitations, confirmation
+policy and stored evidence levels. Unsupported claims require revision or block.
+Missing provenance is not a low-confidence pass.
 
 CHECK
-For each claim, classify supported, unsupported or contradicted with refs.
-Verify source/config/checkpoint identity, query/gallery/positive relations,
-matched comparison, units, actual intervention coverage, fidelity, independent
-predeclared seeds, resource accounting and final-holdout separation. Check that
-limitations and negative results are represented. Report unread/truncated or
-unavailable evidence rather than silently ignoring it.
+Return the exact report hash and dependency-manifest hash you audited. A changed
+metric, config, diagnostic, comparison, confirmation or referenced artifact makes
+this audit stale even if its ID stays the same. Do not repair facts or reissue
+runtime records yourself. A reusable pack claim requires a verified relocated
+fresh-process reconstruction/evaluation receipt, not merely an export directory.
 
 GATING
 Deterministic integrity findings are authoritative and cannot be upgraded to
-PASS. Missing required evidence blocks the dependent claim, not every independent
-claim. A supported negative report can PASS; PASS means this exact report is
+PASS. A supported negative report can PASS; PASS means this exact report is
 supported within its stated scope, not that the model improved or is optimal.
-A changed report/evidence manifest requires a new audit. An old PASS cannot
-approve current content. Execution completion is distinct from research outcome.
+An old PASS cannot approve current content.
 
 Return the injected AuditReport with the exact audited report reference/hash,
-claim findings, open issues, required corrections and review limits. The runtime
-validates freshness and controls delivery status.
-
-APPROVAL AND BINDING
-Do not treat a self-declared approved status as permission. Only a runtime
-ApprovalRecord plus registered spec hash authorizes implement or train.
-Baseline and historical candidates keep their own frozen bindings.
-OBJECTIVE AND CONFIRMATION
-A custom training objective is not the local validation metric. Confirmation
-requires identity-complete PairRecords and predeclared training seeds.
-SETTLEMENT AND AUDIT
-A job is not settled until diagnostics, comparison and promotion exist. A later
-evidence row makes a prior audit stale.
+claim findings, open issues, required corrections and review limits.

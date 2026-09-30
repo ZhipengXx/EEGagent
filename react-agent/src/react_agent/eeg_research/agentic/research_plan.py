@@ -86,6 +86,72 @@ def load_plan(camp: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) and payload.get("plan_version") else {}
 
 
+def _id_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if item not in (None, "")]
+
+
+def normalize_plan_update(
+    update: dict[str, Any],
+    decision: dict[str, Any] | None = None,
+    *,
+    known_evidence_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    """Copy cited evidence and question aliases into the fields apply_update reads.
+
+    Does not invent evidence. Unknown cited ids stay so apply_update can reject them.
+    """
+    if not isinstance(update, dict):
+        raise PlanError("plan_update_not_object")
+    copied = dict(update)
+    decision = decision if isinstance(decision, dict) else {}
+    del known_evidence_ids
+
+    evidence = _id_list(copied.get("based_on_evidence_ids"))
+    if not evidence:
+        cited: list[str] = []
+        cited.extend(_id_list(decision.get("evidence_ids")))
+        cited.extend(_id_list(decision.get("evidence_refs")))
+        cited.extend(_id_list(copied.get("new_evidence_ids")))
+        for row in copied.get("updated_questions") or []:
+            if isinstance(row, dict):
+                cited.extend(_id_list(row.get("evidence_refs") or row.get("evidence_ids")))
+        seen: set[str] = set()
+        evidence = []
+        for item in cited:
+            if item in seen:
+                continue
+            seen.add(item)
+            evidence.append(item)
+        copied["based_on_evidence_ids"] = evidence
+
+    affected = _id_list(copied.get("affected_question_ids") or copied.get("affected_task_ids"))
+    if not affected:
+        found: list[str] = []
+        if decision.get("question_id"):
+            found.append(str(decision["question_id"]))
+        for row in list(copied.get("updated_questions") or []) + list(copied.get("question_updates") or []):
+            if isinstance(row, dict) and row.get("question_id"):
+                found.append(str(row["question_id"]))
+        copied["affected_question_ids"] = list(dict.fromkeys(found))
+
+    if not copied.get("question_updates") and isinstance(copied.get("updated_questions"), list):
+        mapped: list[dict[str, Any]] = []
+        for row in copied["updated_questions"]:
+            if not isinstance(row, dict) or not row.get("question_id"):
+                continue
+            change: dict[str, Any] = {"question_id": row["question_id"]}
+            if row.get("status"):
+                change["status"] = row["status"]
+            note = row.get("note") or row.get("note_zh")
+            if note:
+                change["note"] = note
+            mapped.append(change)
+        copied["question_updates"] = mapped
+    return copied
+
+
 def _persist(camp: Path, plan: dict[str, Any]) -> None:
     _write(camp / PLAN_FILE, plan)
     archive = camp / "plan_versions" / f"v{int(plan['plan_version'])}.json"

@@ -42,7 +42,26 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--checkpoint", default=None, help="Checkpoint path, separate from the output directory")
     parser.add_argument("--negative-policy", default="data_parallel_local")
+    parser.add_argument("--device", default=None, choices=["cpu", "cuda"], help="Training device. Production default remains CUDA.")
     return parser
+
+
+def resolve_train_device(requested: str | None = None):
+    """Public device resolver. Production stays on CUDA; tests may request CPU."""
+    import torch
+
+    choice = (requested or os.environ.get("EEG_TRAIN_DEVICE") or "").strip().lower()
+    if choice == "cpu":
+        return torch.device("cpu")
+    if choice in {"cuda", "gpu"}:
+        if not torch.cuda.is_available():
+            raise SplitError("cuda_unavailable")
+        return torch.device("cuda:0")
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    if os.environ.get("EEG_ALLOW_CPU_TRAIN") == "1":
+        return torch.device("cpu")
+    raise SplitError("cuda_unavailable")
 
 
 def _image_ids(files: tuple[Path, ...], channels: list[str] | None) -> list[str]:
@@ -333,19 +352,36 @@ def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
 
     import torch
 
-    module_name = os.environ.get("EEG_CANDIDATE_MODULE", "")
-    candidate_path = os.environ.get("EEG_CANDIDATE_PATH", "")
     binding_path = out_dir / "source_binding.json"
+    binding = {}
+    packed = False
     if binding_path.is_file():
         binding = json.loads(binding_path.read_text(encoding="utf-8"))
-        module_name = str(binding.get("module") or module_name)
-        class_file = binding.get("class_file")
-        if class_file:
-            parent = str(Path(class_file).resolve().parent)
-            if parent not in sys.path:
-                sys.path.insert(0, parent)
-    if candidate_path and candidate_path not in sys.path:
-        sys.path.insert(0, candidate_path)
+        packed = True
+    module_name = str(binding.get("module") or "")
+    if not packed:
+        module_name = module_name or os.environ.get("EEG_CANDIDATE_MODULE", "")
+        candidate_path = os.environ.get("EEG_CANDIDATE_PATH", "")
+        if candidate_path and candidate_path not in sys.path:
+            sys.path.insert(0, candidate_path)
+    class_file = binding.get("class_file")
+    loaded_from_file = None
+    if class_file:
+        class_path = Path(str(class_file))
+        if not class_path.is_absolute():
+            class_path = (Path(out_dir) / class_file).resolve()
+        if not class_path.is_file():
+            raise SplitError("candidate_source_missing")
+        parent = str(class_path.parent)
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+        import importlib.util
+
+        spec_loader = importlib.util.spec_from_file_location("eeg_candidate_pack", class_path)
+        if spec_loader is None or spec_loader.loader is None:
+            raise SplitError("candidate_reload_failed:spec")
+        loaded_from_file = importlib.util.module_from_spec(spec_loader)
+        spec_loader.loader.exec_module(loaded_from_file)
     baseline = module_name in {
         "",
         "react_agent.eeg_research.agentic.baseline",
@@ -353,7 +389,14 @@ def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
     }
     geometry = {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}
     model_config = _hook_section(out_dir, "model")
-    if baseline:
+    if packed and loaded_from_file is None and not baseline:
+        raise SplitError("candidate_source_missing")
+    if loaded_from_file is not None:
+        try:
+            encoder = _build_hook(loaded_from_file.EEGCandidate(), "build_encoder", geometry, model_config)
+        except Exception as exc:  # noqa: BLE001
+            raise SplitError(f"candidate_reload_failed:{type(exc).__name__}") from exc
+    elif baseline:
         from react_agent.eeg_research.agentic.baseline import EEGCandidate
 
         encoder = _build_hook(EEGCandidate(), "build_encoder", geometry, model_config)
@@ -366,7 +409,8 @@ def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
             raise SplitError(f"candidate_reload_failed:{type(exc).__name__}") from exc
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     encoder.load_state_dict(saved["state_dict"])
-    return encoder.to(torch.device("cuda:0"))
+    device = resolve_train_device()
+    return encoder.to(device)
 
 
 def _load_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path | None = None):
@@ -380,7 +424,7 @@ def _fixed_bank_pass(encoder, loader, records) -> dict[str, float]:
 
     from react_agent.eeg_training.fixed_bank import FixedBankTally, frozen_bank
 
-    device = torch.device("cuda:0")
+    device = next(encoder.parameters()).device
     bank, labels = frozen_bank(records)
     tally = FixedBankTally(bank.to(device), labels.to(device))
     encoder.eval()
@@ -395,8 +439,7 @@ def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path, checkpoi
     limit_visible_gpus(design)
     import torch
 
-    if not torch.cuda.is_available():
-        raise SplitError("cuda_unavailable")
+    resolve_train_device()
     context = Path(context_dir) if context_dir is not None else (Path(checkpoint).parent if checkpoint is not None else out_dir)
     checkpoint = Path(checkpoint) if checkpoint is not None else context / "last.ckpt"
     if not checkpoint.is_file():
@@ -470,17 +513,33 @@ def _build_hook(candidate, method: str, geometry: dict, config: dict):
             raise HookConfigError(f"unknown_{method}_config:{','.join(unknown)}")
     if method == "build_encoder":
         try:
-            return builder(geometry, payload or None)
+            built = builder(geometry, payload or None)
         except TypeError:
             if payload:
                 raise HookConfigError("encoder_rejected_config") from None
-            return builder(geometry)
+            built = builder(geometry)
+        return built
     try:
         return builder(payload or None)
     except TypeError:
         if payload:
             raise HookConfigError(f"{method}_rejected_config") from None
         return builder()
+
+
+def _note_hook_consumed(out_dir: Path, name: str, config: dict) -> None:
+    """Record that a hook actually received its approved section. File presence is not enough."""
+    path = out_dir / "hook_consumed.json"
+    payload: dict[str, object] = {}
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            loaded = {}
+        if isinstance(loaded, dict):
+            payload = loaded
+    payload[name] = {"applied": True, "keys": sorted(config), "config": dict(config)}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _instantiate_candidate(spec: dict[str, object], out_dir: Path, train_loader=None):
@@ -490,19 +549,24 @@ def _instantiate_candidate(spec: dict[str, object], out_dir: Path, train_loader=
     if candidate_path and candidate_path not in sys.path:
         sys.path.insert(0, candidate_path)
     used_fit = False
+    from react_agent.eeg_research.agentic.binding import write_binding
+
     if not module_name:
         from react_agent.eeg_research.agentic.baseline import EEGCandidate
 
         candidate = EEGCandidate()
-        encoder = _build_hook(candidate, "build_encoder", {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}, _hook_section(out_dir, "model"))
+        model_config = _hook_section(out_dir, "model")
+        encoder = _build_hook(candidate, "build_encoder", {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}, model_config)
+        _note_hook_consumed(out_dir, "model", model_config)
+        write_binding(out_dir, candidate)
         return encoder, candidate, "react_agent.eeg_research.agentic.baseline", used_fit
     import importlib
 
-    from react_agent.eeg_research.agentic.binding import write_binding
-
     module = importlib.import_module(module_name)
     candidate = module.EEGCandidate()
-    encoder = _build_hook(candidate, "build_encoder", {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}, _hook_section(out_dir, "model"))
+    model_config = _hook_section(out_dir, "model")
+    encoder = _build_hook(candidate, "build_encoder", {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}, model_config)
+    _note_hook_consumed(out_dir, "model", model_config)
     if hasattr(candidate, "fit_statistics") and train_loader is not None:
         stats = train_channel_statistics(train_loader)
         candidate.fit_statistics(encoder, stats)
@@ -539,8 +603,19 @@ def _batch_image_ids(batch) -> list[str]:
     return []
 
 
+def _query_ids(batch) -> list[str]:
+    raw = batch.get("query_id") if isinstance(batch, dict) else None
+    if isinstance(raw, (list, tuple)) and raw and all(str(item) for item in raw):
+        return [str(item) for item in raw]
+    subjects = batch.get("subject") if isinstance(batch, dict) else None
+    images = _batch_image_ids(batch)
+    if isinstance(subjects, (list, tuple)) and subjects:
+        return [f"{subjects[index]}::{images[index] if index < len(images) else index}" for index in range(len(subjects))]
+    return images
+
+
 def _query_rows(batch, embedding) -> list[tuple[str, list[float]]]:
-    ids = _batch_image_ids(batch)
+    ids = _query_ids(batch)
     vectors = embedding.detach().cpu().tolist()
     if vectors and not isinstance(vectors[0], list):
         vectors = [vectors]
@@ -549,6 +624,33 @@ def _query_rows(batch, embedding) -> list[tuple[str, list[float]]]:
         query_id = ids[index] if index < len(ids) else f"q{index}"
         rows.append((query_id, [float(value) for value in vector]))
     return rows
+
+
+class BoundedQueryReservoir:
+    """Keep at most `limit` query embeddings. Does not materialize the full validation set."""
+
+    def __init__(self, limit: int, seed: int) -> None:
+        self.limit = max(1, int(limit))
+        self.rng = random.Random(int(seed))
+        self.items: list[tuple[str, list[float]]] = []
+        self.seen = 0
+
+    def add(self, batch, embedding) -> None:
+        ids = _query_ids(batch)
+        count = int(embedding.shape[0])
+        for index in range(count):
+            self.seen += 1
+            query_id = ids[index] if index < len(ids) else f"q{self.seen}"
+            vector = [float(value) for value in embedding[index].detach().cpu().tolist()]
+            if len(self.items) < self.limit:
+                self.items.append((query_id, vector))
+                continue
+            replace_at = self.rng.randrange(self.seen)
+            if replace_at < self.limit:
+                self.items[replace_at] = (query_id, vector)
+
+    def rows(self) -> list[tuple[str, list[float]]]:
+        return list(self.items)
 
 
 def unique_trainable_parameters(params):
@@ -603,19 +705,22 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     )
     from react_agent.eeg_training.model import contrastive_loss, within_batch_accuracy
 
-    if not torch.cuda.is_available():
-        raise SplitError("cuda_unavailable")
+    device = resolve_train_device()
     random.seed(design.seed)
     torch.manual_seed(design.seed)
-    torch.cuda.manual_seed_all(design.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(design.seed)
     train_loader, val_loader, train_images, val_images, spec = build_loaders(
         design, data_root, identity=_frozen_identity(out_dir)
     )
-    device = torch.device("cuda:0")
     encoder, candidate, module_name, used_fit = _instantiate_candidate(spec, out_dir, train_loader)
     encoder = encoder.to(device)
-    transform = _build_hook(candidate, "build_training_transform", {}, _hook_section(out_dir, "transform")) if hasattr(candidate, "build_training_transform") else None
-    objective = _build_hook(candidate, "build_training_objective", {}, _hook_section(out_dir, "objective")) if hasattr(candidate, "build_training_objective") else contrastive_loss
+    transform_config = _hook_section(out_dir, "transform")
+    objective_config = _hook_section(out_dir, "objective")
+    transform = _build_hook(candidate, "build_training_transform", {}, transform_config) if hasattr(candidate, "build_training_transform") else None
+    _note_hook_consumed(out_dir, "transform", transform_config)
+    objective = _build_hook(candidate, "build_training_objective", {}, objective_config) if hasattr(candidate, "build_training_objective") else contrastive_loss
+    _note_hook_consumed(out_dir, "objective", objective_config)
     if isinstance(objective, torch.nn.Module):
         objective = objective.to(device)
     counters: dict[str, int] = {
@@ -630,7 +735,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     custom = is_custom_objective(objective)
     negative_policy = resolve_negative_policy(candidate, objective)
     use_global = negative_policy == "global_batch"
-    n_visible = len(design.gpu)
+    n_visible = len(design.gpu) if device.type == "cuda" else 1
     extra = objective_parameters(objective)
     model: torch.nn.Module | None = None
     if use_global:
@@ -655,9 +760,10 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     best_top5 = None
     best_within = None
     finished = 0
+    best_epoch = None
+    last_fixed = None
     early_stop_enabled = design.stop in {"single_early", "chain_early"}
     duplicate_batches: list[list[str]] = []
-    last_queries: list[tuple[str, list[float]]] = []
     write_status(out_dir, "training", 0, design.epochs)
     for epoch_index in range(design.epochs):
         if use_global:
@@ -698,7 +804,6 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             raw_encoder = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
             encoder.eval()
             note_eval_without_transform(counters)
-            last_queries = []
             with torch.no_grad():
                 for batch in val_loader:
                     eeg = batch["eeg"].to(device)
@@ -707,14 +812,12 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                     top1, top5 = within_batch_accuracy(embedding, batch["img_features"].to(device))
                     scores_top1.append(float(top1))
                     scores_top5.append(float(top5))
-                    last_queries.extend(_query_rows(batch, embedding))
         else:
             assert model is not None
             raw = model.module if isinstance(model, torch.nn.DataParallel) else model
             raw_encoder = raw.encoder
             raw_encoder.eval()
             note_eval_without_transform(counters)
-            last_queries = []
             with torch.no_grad():
                 for batch in val_loader:
                     eeg = batch["eeg"].to(device)
@@ -723,7 +826,6 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                     top1, top5 = within_batch_accuracy(embedding, batch["img_features"].to(device))
                     scores_top1.append(float(top1))
                     scores_top5.append(float(top5))
-                    last_queries.extend(_query_rows(batch, embedding))
         finished = epoch_index + 1
         fixed = tally.result()
         val_top1 = sum(scores_top1) / len(scores_top1)
@@ -739,12 +841,14 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 fixed_bank_top5=fixed["fixed_bank_top5"],
             )
         write_status(out_dir, "training", finished, design.epochs)
+        last_fixed = fixed["fixed_bank_top1"]
         if best is None or fixed["fixed_bank_top1"] > best + 0.001:
             best = fixed["fixed_bank_top1"]
             best_top5 = fixed["fixed_bank_top5"]
             best_within = val_top1
+            best_epoch = finished
             stall = 0
-            payload = {"state_dict": raw_encoder.state_dict()}
+            payload = {"state_dict": raw_encoder.state_dict(), "epoch": finished}
             if isinstance(objective, torch.nn.Module):
                 payload["objective_state"] = objective.state_dict()
             torch.save(payload, out_dir / "last.ckpt")
@@ -769,21 +873,58 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             ),
             encoding="utf-8",
         )
-    if last_queries:
+    checkpoint = out_dir / "last.ckpt"
+    (out_dir / "selected_checkpoint.json").write_text(
+        json.dumps(
+            {
+                "checkpoint": "last.ckpt",
+                "source": "selected_checkpoint",
+                "best_epoch": best_epoch,
+                "last_epoch": finished,
+                "best_fixed_bank_top1": best,
+                "last_epoch_fixed_bank_top1": last_fixed,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    if checkpoint.is_file():
         from react_agent.eeg_training.diagnostics import write_validation_artifacts
 
+        best_encoder = _load_encoder(spec, checkpoint, out_dir)
+        best_encoder.eval()
+        note_eval_without_transform(counters)
+        limit = int(os.environ.get("EEG_DIAGNOSTIC_SAMPLE_LIMIT") or 32)
+        sample_seed = int(os.environ.get("EEG_DIAGNOSTIC_SAMPLE_SEED") or design.seed)
+        reservoir = BoundedQueryReservoir(limit, sample_seed)
+        with torch.no_grad():
+            for batch in val_loader:
+                embedding = best_encoder(batch["eeg"].to(device))
+                reservoir.add(batch, embedding)
         seen: dict[str, int] = {}
         for row in val_loader.dataset.records:
             image_id = str(row["img"])
             if image_id not in seen:
                 seen[image_id] = len(seen)
-        vectors = bank.detach().cpu().tolist()
-        bank_pairs = [
-            (image_id, [float(value) for value in vectors[index]])
-            for image_id, index in seen.items()
-            if index < len(vectors)
-        ]
-        write_validation_artifacts(out_dir, last_queries, bank_pairs, {query_id: {query_id} for query_id, _vector in last_queries})
+        bank_pairs = []
+        for image_id, index in seen.items():
+            if index < bank.shape[0]:
+                bank_pairs.append((image_id, [float(value) for value in bank[index].detach().cpu().tolist()]))
+        sampled = reservoir.rows()
+        positives = {}
+        for query_id, _vector in sampled:
+            image_id = query_id.split("::")[-1] if "::" in query_id else query_id
+            positives[query_id] = {image_id, query_id}
+        write_validation_artifacts(
+            out_dir,
+            sampled,
+            bank_pairs,
+            positives,
+            limit=limit,
+            checkpoint_id=str(checkpoint),
+            sample_seed=sample_seed,
+        )
     encoder_params = sum(int(item.numel()) for item in encoder.parameters())
     objective_params = sum(int(item.numel()) for item in extra)
     hook = {}
@@ -824,6 +965,9 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         "validation_image_ids": sorted(set(val_images)),
         "train_validation_overlap": False,
         "negative_sampling_policy": negative_policy,
+        "selected_checkpoint_epoch": best_epoch,
+        "last_epoch": finished,
+        "last_epoch_fixed_bank_top1": last_fixed,
     }
 
 
@@ -845,6 +989,8 @@ def main(argv: list[str] | None = None) -> int:
         weight_decay=args.weight_decay,
         test_only=args.test_only,
     )
+    if args.device:
+        os.environ["EEG_TRAIN_DEVICE"] = args.device
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics = out_dir / "metrics.json"

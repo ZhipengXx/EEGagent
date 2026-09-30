@@ -226,11 +226,22 @@ def main(argv: list[str] | None = None) -> int:
 
             if not os.environ.get("EEG_ALLOW_EVALUATE_PACK"):
                 payload["ok"] = False
-                payload["error"] = "prerequisite_missing:set EEG_ALLOW_EVALUATE_PACK=1 and provide CUDA plus the frozen data root"
+                payload["error"] = "prerequisite_missing:set EEG_ALLOW_EVALUATE_PACK=1; CPU evaluate uses EEG_TRAIN_DEVICE=cpu"
                 print(json.dumps(payload, ensure_ascii=False, indent=2))
                 return 2
             try:
-                completed = subprocess.run(argv_train, check=False)  # noqa: S603
+                from react_agent.eeg_research.adapters.ubp_retrieval import child_env
+
+                env = child_env()
+                env.pop("EEG_CANDIDATE_MODULE", None)
+                env.pop("EEG_CANDIDATE_PATH", None)
+                cwd = os.environ.get("EEG_EVALUATE_PACK_CWD")
+                completed = subprocess.run(  # noqa: S603
+                    argv_train,
+                    check=False,
+                    env=env,
+                    cwd=cwd if cwd else None,
+                )
             except OSError as exc:
                 payload["ok"] = False
                 payload["error"] = f"prerequisite_missing:{exc}"
@@ -251,17 +262,21 @@ def main(argv: list[str] | None = None) -> int:
         from react_agent.eeg_training.protocol import data_root
 
         base = data_root()
+        submitted = goal(args.campaign, design)
+        if args.goal is not None:
+            submitted = {**submitted, **load_goal_file(args.goal)}
+            submitted["goal_id"] = args.campaign
         try:
-            protocol = build_execution_protocol(design, base)
+            protocol = build_execution_protocol(
+                design,
+                base,
+                training_seeds=submitted.get("training_seeds") or None,
+            )
         except ProtocolError as exc:
             print(json.dumps({"error": str(exc)}, ensure_ascii=False))
             return 2
         contract = freeze_contract(design, base)
         contract["execution_fingerprint"] = protocol["fingerprint"]
-        submitted = goal(args.campaign, design)
-        if args.goal is not None:
-            submitted = {**submitted, **load_goal_file(args.goal)}
-            submitted["goal_id"] = args.campaign
         state = create_campaign(
             root,
             goal=submitted,

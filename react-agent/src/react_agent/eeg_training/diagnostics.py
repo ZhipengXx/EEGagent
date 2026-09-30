@@ -195,30 +195,36 @@ def retrieval_rows_from_scores(
     *,
     k: int = 1,
 ) -> list[dict[str, Any]]:
-    """One development query row. Rank is 1-based; ties count strictly higher scores first."""
+    """One development query row. Actual hits match fixed_bank_accuracy; optimistic rank is an interval."""
+    from react_agent.eeg_training.fixed_bank import score_query
+
     rows: list[dict[str, Any]] = []
     for query_id, vector in queries:
         allowed = positives.get(query_id) or set()
-        ranked = sorted(((image_id, _cosine(vector, candidate)) for image_id, candidate in bank), key=lambda item: item[1], reverse=True)
-        pos = [(image_id, score) for image_id, score in ranked if image_id in allowed]
-        neg = [(image_id, score) for image_id, score in ranked if image_id not in allowed]
-        if not pos:
+        if not allowed:
+            image = query_id.split("::")[-1]
+            allowed = {image, query_id}
+        scored = score_query(vector, bank, allowed, k=k)
+        if scored.get("skip"):
             continue
-        best_pos = max(score for _image, score in pos)
-        best_neg = max((score for _image, score in neg), default=float("-inf"))
-        rank = 1 + sum(1 for _image, score in ranked if score > best_pos)
         rows.append(
             {
                 "query_id": query_id,
-                "positive_identity": [image_id for image_id, _score in pos],
-                "positive_count": len(pos),
-                "positive_rank": rank,
-                "positive_score": best_pos,
-                "best_negative_score": best_neg if best_neg != float("-inf") else None,
-                "margin": None if best_neg == float("-inf") else best_pos - best_neg,
-                "top_k_hit": rank <= k,
+                "positive_identity": scored["positive_identity"],
+                "positive_count": scored["positive_count"],
+                "positive_rank": scored["min_rank"],
+                "min_rank": scored["min_rank"],
+                "max_rank": scored["max_rank"],
+                "rank_interval": scored["rank_interval"],
+                "positive_score": scored["positive_score"],
+                "best_negative_score": scored["best_negative_score"],
+                "margin": scored["margin"],
+                "top_k_hit": scored["top_k_hit"],
                 "k": k,
-                "tie_policy": "strictly_higher_scores_precede",
+                "tie_policy": "stable_bank_order_then_score",
+                "all_ties": scored["all_ties"],
+                "zero_norm_query": scored["zero_norm_query"],
+                "non_finite": scored["non_finite"],
             }
         )
     return rows
@@ -265,6 +271,54 @@ def _load_embedding_matrix(job_dir: Path) -> list[list[float]]:
     return matrix
 
 
+def hook_consumption(job_dir: Path) -> dict[str, Any]:
+    """Compare approved hook_config to the train_entry consumption log."""
+    job_dir = Path(job_dir)
+    hook_path = job_dir / "hook_config.json"
+    if not hook_path.is_file():
+        return _item(UNAVAILABLE, reason="hook_config_missing")
+    try:
+        hook = json.loads(hook_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return _item(UNAVAILABLE, reason="hook_config_invalid")
+    if not isinstance(hook, dict):
+        return _item(UNAVAILABLE, reason="hook_config_invalid")
+    consumed_path = job_dir / "hook_consumed.json"
+    consumed: dict[str, Any] = {}
+    if consumed_path.is_file():
+        try:
+            loaded = json.loads(consumed_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            loaded = {}
+        if isinstance(loaded, dict):
+            consumed = loaded
+    mismatches: list[str] = []
+    expected: dict[str, Any] = {}
+    for name in ("model", "objective", "transform"):
+        section = hook.get(name) if isinstance(hook.get(name), dict) else {}
+        expected[name] = section
+        if not section:
+            continue
+        got = consumed.get(name) if isinstance(consumed.get(name), dict) else None
+        applied = (got or {}).get("applied")
+        config = (got or {}).get("config") if isinstance((got or {}).get("config"), dict) else None
+        if applied is not True or config is None:
+            mismatches.append(f"{name}_not_consumed")
+            continue
+        for key, value in section.items():
+            if config.get(key) != value:
+                mismatches.append(f"{name}.{key}")
+    return _item(
+        "observed",
+        {
+            "expected": expected,
+            "consumed": consumed,
+            "mismatches": mismatches,
+            "execution_status": "not_applied" if mismatches else "applied",
+        },
+    )
+
+
 def write_validation_artifacts(
     job_dir: Path,
     queries: list[tuple[str, list[float]]],
@@ -272,6 +326,8 @@ def write_validation_artifacts(
     positives: dict[str, set[str]],
     *,
     limit: int = 32,
+    checkpoint_id: str | None = None,
+    sample_seed: int | None = None,
 ) -> dict[str, Any]:
     """Write retrieval_queries.jsonl and a bounded embeddings.json from a real evaluator pass."""
     job_dir = Path(job_dir)
@@ -284,10 +340,20 @@ def write_validation_artifacts(
     )
     vectors = [vector for _query_id, vector in bounded[:16]]
     (job_dir / "embeddings.json").write_text(
-        json.dumps({"vectors": vectors, "sample_count": len(vectors), "source": "validation_encoder"}, ensure_ascii=False),
+        json.dumps(
+            {
+                "vectors": vectors,
+                "sample_count": len(vectors),
+                "source": "selected_checkpoint",
+                "checkpoint_id": checkpoint_id,
+                "sample_seed": sample_seed,
+                "schema_version": "eeg_research.validation_embeddings.v2",
+            },
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
-    return {"query_rows": len(rows), "embedding_sample": len(vectors)}
+    return {"query_rows": len(rows), "embedding_sample": len(vectors), "checkpoint_id": checkpoint_id}
 
 
 def compute_job_diagnostics(job_dir: Path, *, batches: list[list[str]] | None = None) -> dict[str, Any]:
@@ -325,6 +391,7 @@ def compute_job_diagnostics(job_dir: Path, *, batches: list[list[str]] | None = 
         if not (job_dir / "subject_groups.json").is_file()
         else _item("observed", json.loads((job_dir / "subject_groups.json").read_text(encoding="utf-8"))),
         "intervention_probe": _item(UNAVAILABLE, reason="occlusion_not_requested"),
+        "hook_consumption": hook_consumption(job_dir),
         "integrity_cost": _item(
             "observed" if binding.is_file() else UNAVAILABLE,
             {

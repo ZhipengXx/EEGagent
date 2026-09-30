@@ -22,6 +22,7 @@ from react_agent.eeg_research.agentic.research_plan import (
     consume_for_planner,
     init_plan,
     mark_consumed,
+    normalize_plan_update,
 )
 from react_agent.eeg_research.agentic.runner import accept_job, comparable
 from react_agent.eeg_research.agentic.schemas import SCHEMA_VERSION
@@ -63,15 +64,32 @@ def report_dependency_hash(state: dict[str, Any]) -> str:
     import hashlib
 
     experiment = state.get("experiment") if isinstance(state.get("experiment"), dict) else {}
+    report = state.get("report_draft") if isinstance(state.get("report_draft"), dict) else {}
     deps = {
-        "evidence_ids": [row.get("evidence_id") or row.get("job_id") for row in state.get("evidence") or []],
-        "spec_hashes": [
-            row.get("spec_hash") or ((row.get("experiment") or {}).get("spec_hash") if isinstance(row.get("experiment"), dict) else None)
+        "evidence": [
+            {
+                "evidence_id": row.get("evidence_id") or row.get("job_id"),
+                "spec_hash": row.get("spec_hash")
+                or ((row.get("experiment") or {}).get("spec_hash") if isinstance(row.get("experiment"), dict) else None),
+                "source_hash": row.get("source_hash"),
+                "config_hash": row.get("config_hash"),
+                "metrics": {
+                    "fixed_bank_top1": row.get("fixed_bank_top1"),
+                    "evaluation_valid": row.get("evaluation_valid"),
+                },
+                "comparison": row.get("comparison"),
+                "diagnostics": row.get("diagnostics") or row.get("diagnostic_ref"),
+                "confirmation": row.get("promotion") or row.get("confirmation"),
+                "result_hash": row.get("result_hash"),
+            }
             for row in state.get("evidence") or []
         ],
-        "source_hashes": [row.get("source_hash") for row in state.get("evidence") or []],
-        "claims": state.get("report_draft") or state.get("audit_claims") or [],
+        "report_hash": report.get("report_hash") or state.get("audit_report_hash"),
+        "dependency_manifest_hash": report.get("dependency_manifest_hash") or state.get("audited_report_hash"),
+        "file_hashes": state.get("report_file_hashes") or report.get("file_hashes"),
+        "claims": report.get("claims") or state.get("audit_claims") or [],
         "experiment_spec_hash": experiment.get("spec_hash"),
+        "confirmation_policy_hash": state.get("confirmation_policy_hash"),
     }
     return hashlib.sha256(json.dumps(deps, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
@@ -129,6 +147,7 @@ def create_campaign(
         "llm_calls_left": int(goal.get("max_llm_calls", 300)),
         "max_repairs_per_candidate": int(goal.get("max_repairs_per_candidate", 2)),
         "training_seeds": list(goal.get("training_seeds") or (protocol or {}).get("training_seeds") or []),
+        "confirmation_policy_hash": None,
         "schema_version": SCHEMA_VERSION,
         "baseline_jobs": 0,
         "hypothesis": None,
@@ -140,11 +159,27 @@ def create_campaign(
         "decisions": [],
         "pause_after_step": False,
     }
+    from react_agent.eeg_research.agentic.confirmation_policy import (
+        ConfirmationPolicyError,
+        freeze_confirmation_policy,
+        write_confirmation_policy,
+    )
+
+    try:
+        policy = freeze_confirmation_policy(goal, protocol)
+    except ConfirmationPolicyError:
+        raise
+    state["training_seeds"] = list(policy.get("training_seeds") or state.get("training_seeds") or [])
+    state["confirmation_policy_hash"] = policy.get("policy_hash")
     _write(camp / "goal.json", goal)
     _write(camp / "resolved_goal.json", goal)
     _write(camp / "evaluation_contract.json", contract)
     if protocol is not None:
+        if policy.get("seeds_declared") and policy.get("training_seeds"):
+            protocol = dict(protocol)
+            protocol["training_seeds"] = list(policy["training_seeds"])
         _write(camp / "execution_protocol.json", protocol)
+    write_confirmation_policy(camp, policy)
     _write(camp / "campaign_state.json", state)
     known[request_id] = str(camp)
     _write(index, known)
@@ -272,6 +307,63 @@ def pending_implement(camp: Path, state: dict[str, Any]) -> dict[str, Any] | Non
     return last
 
 
+def _result_hash(result: dict[str, Any]) -> str:
+    import hashlib
+
+    body = {
+        "job_id": result.get("job_id"),
+        "candidate_id": result.get("candidate_id"),
+        "seed": result.get("seed"),
+        "fidelity": result.get("fidelity"),
+        "fixed_bank_top1": result.get("fixed_bank_top1"),
+        "evaluation_valid": result.get("evaluation_valid"),
+        "checkpoint_id": result.get("checkpoint_id"),
+        "source_hash": result.get("source_hash"),
+        "config_hash": result.get("config_hash"),
+        "spec_hash": result.get("spec_hash"),
+        "contract_fingerprint": result.get("contract_fingerprint") or result.get("execution_fingerprint"),
+    }
+    return hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def rebuild_campaign_projection(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild evidence/memory/counts from on-disk RunRecords when outer state lagged."""
+    jobs_root = Path(camp) / "jobs"
+    if not jobs_root.is_dir():
+        return state
+    for job_dir in sorted(path for path in jobs_root.iterdir() if path.is_dir()):
+        job_path = job_dir / "job.json"
+        metrics_path = job_dir / "metrics.json"
+        run_path = job_dir / "run_record.json"
+        if not job_path.is_file() and not run_path.is_file() and not metrics_path.is_file():
+            continue
+        record = _read(job_path) if job_path.is_file() else {}
+        if record.get("status") == "running":
+            continue
+        run_record = _read(run_path) if run_path.is_file() else {}
+        metrics = _read(metrics_path) if metrics_path.is_file() else {}
+        result = run_record.get("result") if isinstance(run_record.get("result"), dict) else {}
+        if not result:
+            result = dict(metrics)
+        if not result and not record:
+            continue
+        job_id = str(record.get("job_id") or run_record.get("job_id") or job_dir.name)
+        _record_job(
+            camp,
+            state,
+            {
+                "job_id": job_id,
+                "candidate_id": record.get("candidate_id") or result.get("candidate_id") or run_record.get("candidate_id"),
+                "seed": record.get("seed") if record.get("seed") is not None else result.get("seed"),
+                "status": record.get("status") or run_record.get("status") or "finished",
+                "gpu_seconds": record.get("gpu_seconds") or 0,
+                "source_hash": record.get("source_hash") or (record.get("manifest") or {}).get("entry_sha256"),
+                "result": result,
+            },
+        )
+    return state
+
+
 def align_interrupt(camp: Path) -> dict[str, Any]:
     """Merge decision files the state does not yet list. Does not call the planner or touch the ledger.
 
@@ -297,6 +389,7 @@ def align_interrupt(camp: Path) -> dict[str, Any]:
             state.setdefault("decisions", []).append(row)
             known.add(decision_id)
             added = True
+    rebuild_campaign_projection(camp, state)
     if added:
         state["status"] = status
         save_state(camp, state)
@@ -379,8 +472,31 @@ def observation(camp: Path) -> dict[str, Any]:
     if state.get("candidate_ready") and state.get("candidate_id") and state["candidate_id"] not in trainable:
         trainable.append(state["candidate_id"])
     latest_job = next((row for row in reversed(state.get("evidence") or []) if row.get("job_dir") or row.get("fidelity")), None)
+    from react_agent.eeg_research.agentic.capabilities import capability_manifest
+    from react_agent.eeg_research.agentic.confirmation_policy import load_confirmation_policy
+    from react_agent.eeg_research.agentic.run_context import load_approved_binding
+
+    goal = _read(camp / "goal.json")
+    policy = load_confirmation_policy(camp, goal)
+    experiment = state.get("experiment") if isinstance(state.get("experiment"), dict) else {}
+    parent_id = experiment.get("parent_candidate_id") or "baseline"
+    control_id = experiment.get("control_candidate_id") or "baseline"
+    parent_binding = None if parent_id == "baseline" else load_approved_binding(camp, str(parent_id))
+    control_binding = None if control_id == "baseline" else load_approved_binding(camp, str(control_id))
     return {
-        "goal": _planner_goal(_read(camp / "goal.json")),
+        "goal": _planner_goal(goal),
+        "confirmation_policy": policy,
+        "confirmation_policy_hash": (policy or {}).get("policy_hash") or state.get("confirmation_policy_hash"),
+        "parent_source": {
+            "candidate_id": parent_id,
+            "spec_hash": None if parent_binding is None else parent_binding.get("spec_hash"),
+            "recipe": None if parent_binding is None else {key: parent_binding.get(key) for key in ("model", "objective", "transform")},
+        },
+        "control_source": {
+            "candidate_id": control_id,
+            "spec_hash": None if control_binding is None else control_binding.get("spec_hash"),
+            "recipe": None if control_binding is None else {key: control_binding.get(key) for key in ("model", "objective", "transform")},
+        },
         "contract": contract,
         "candidate_interface": candidate_interface(protocol),
         "evidence": evidence,
@@ -393,6 +509,7 @@ def observation(camp: Path) -> dict[str, Any]:
         "blocked_actions": blocked_actions(state),
         "trainable_ids": trainable,
         "budget": budget_snapshot(camp, state),
+        "capabilities": capability_manifest(),
         "research_plan": consume_for_planner(camp, state),
         "memory": retrieve(
             state.get("memory") or [],
@@ -421,6 +538,7 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     """One research step. A live job is reconciled first and never double-started."""
     services = services or {}
     state = load_state(camp)
+    rebuild_campaign_projection(camp, state)
     if state.get("status") in _TERMINAL:
         return state
     if state.get("live_job"):
@@ -498,7 +616,9 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         "action": decision.get("action"),
         "ok": decision.get("ok"),
         "reason_zh": decision.get("reason_zh"),
-        "evidence_ids": (decision.get("raw") or {}).get("evidence_ids") or [],
+        "evidence_ids": (decision.get("raw") or {}).get("evidence_ids")
+        or (decision.get("raw") or {}).get("evidence_refs")
+        or [],
         "detail": decision.get("detail"),
         "evidence_count": evidence_count(state),
         "executed": bool(decision.get("ok")) is False,
@@ -522,7 +642,11 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     if isinstance(raw_update, dict):
         known = {str(row.get("evidence_id")) for row in state.get("evidence") or [] if row.get("evidence_id")}
         try:
-            apply_update(camp, raw_update, known_evidence_ids=known)
+            apply_update(
+                camp,
+                normalize_plan_update(raw_update, raw_decision, known_evidence_ids=known),
+                known_evidence_ids=known,
+            )
         except PlanError as exc:
             update_failed = True
             event(camp, "plan_update_rejected", detail=str(exc), decision_id=record["decision_id"])
@@ -618,16 +742,22 @@ def _apply_action(
 
         repairing = bool(state.get("repair_task") and int((state.get("repair_task") or {}).get("remaining") or 0) > 0)
         spec = state.get("experiment") if isinstance(state.get("experiment"), dict) else None
+        repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else {}
+        target_id = repair.get("candidate_id") if repairing else state.get("candidate_id")
         try:
             resolved = resolve_approved_experiment(
                 camp,
                 spec_ref=state.get("experiment_ref"),
-                expected_hash=spec.get("spec_hash") if isinstance(spec, dict) else None,
-                target_id=state.get("candidate_id") or (state.get("repair_task") or {}).get("candidate_id"),
-                attempt_id=(state.get("repair_task") or {}).get("attempt_id"),
+                expected_hash=spec.get("spec_hash") if isinstance(spec, dict) and not repairing else None,
+                target_id=target_id,
+                attempt_id=repair.get("attempt_id"),
                 state=state,
+                action="repair" if repairing else "implement",
             )
-            state["experiment"] = resolved
+            if repairing:
+                state["execution_spec"] = resolved
+            else:
+                state["experiment"] = resolved
         except ExperimentResolutionError as exc:
             persist_failure(
                 camp,
@@ -637,7 +767,12 @@ def _apply_action(
                 detail=exc.reason,
                 recoverable=True,
             )
-            if exc.reason == "experiment_not_approved":
+            if exc.reason in {
+                "experiment_not_approved",
+                "approved_spec_missing",
+                "approved_spec_changed",
+                "missing_binding",
+            }:
                 state["experiment_failed"] = True
             return
         implementer = services.get("implement")
@@ -673,7 +808,8 @@ def _propose_experiment(camp: Path, state: dict[str, Any], decision: dict[str, A
         draft = dict(raw.get("experiment_draft") or {"initial_fidelity": "pilot"})
         draft["parent_candidate_id"] = draft.get("parent_candidate_id") or "baseline"
         draft["hypothesis"] = state["hypothesis"]
-        state["experiment"] = approve_experiment(draft)
+        state["experiment"] = approve_experiment(draft, camp=camp)
+        state["experiment_ref"] = state["experiment"].get("experiment_ref")
         _write(path, {"hypothesis": state["hypothesis"], "experiment": state["experiment"]})
     from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
 
@@ -806,6 +942,7 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     )
     payload: dict[str, Any] = {"status": "completed", "experiment_spec": spec, "summary_zh": "已写出 ExperimentSpec"}
     blocked = False
+    design_failed = False
     if designer is not None:
         try:
             reply = designer(
@@ -827,20 +964,31 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
                 status = str(reply.get("status") or "")
                 if status in {"partial", "failed", "requires_framework_extension", "blocked"} or reply.get("requires_framework_extension"):
                     blocked = True
+                    design_failed = True
                     spec["role_status"] = status or "requires_framework_extension"
-                    spec["status"] = "requires_framework_extension" if status in {"requires_framework_extension", "blocked"} or reply.get("requires_framework_extension") else spec.get("status")
+                    spec["status"] = "requires_framework_extension" if status in {"requires_framework_extension", "blocked"} or reply.get("requires_framework_extension") else "draft"
                     spec["missing_capability"] = reply.get("required_capability_ids") or reply.get("missing_inputs")
             if isinstance(spec_reply, dict):
+                spec_reply = dict(spec_reply)
+                if spec_reply.get("status") == "approved":
+                    spec_reply["status"] = "draft"
+                spec_reply.pop("approval_record", None)
                 spec = {**spec, **spec_reply}
         except LlmUnavailable:
             payload["status"] = "partial"
-            payload["summary_zh"] = "设计角色不可用，使用 planner 草稿"
-    if not blocked:
-        spec = approve_experiment(spec)
-        blocked = not experiment_is_approved(spec)
+            payload["summary_zh"] = "设计角色不可用，草稿未批准"
+            spec["role_status"] = "partial"
+            spec["status"] = "draft"
+            design_failed = True
+    if design_failed or blocked:
+        spec["status"] = "blocked" if blocked and spec.get("role_status") in {"requires_framework_extension", "blocked"} else "draft"
+        spec["blocked_reason"] = spec.get("blocked_reason") or ("requires_framework_extension" if blocked else "experiment_not_approved")
+        spec["approval_record"] = None
+        spec = approve_experiment(spec, camp=camp, context=context, producer=task)
+        blocked = True
     else:
-        spec["status"] = "blocked"
-        spec["blocked_reason"] = "requires_framework_extension"
+        spec = approve_experiment(spec, camp=camp, context=context, producer=task)
+        blocked = not experiment_is_approved(spec)
     payload["experiment_spec"] = spec
     payload["status"] = "blocked" if blocked else payload["status"]
     path = camp / "experiments" / f"spec_{task['task_id']}.json"
@@ -850,7 +998,11 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
         inner = envelope.get("payload")
         stored = inner.get("experiment_spec") if isinstance(inner, dict) else spec
     state["experiment"] = stored
-    state["experiment_ref"] = (envelope.get("artifact_refs") or [None])[-1]
+    state["experiment_ref"] = (
+        (stored.get("experiment_ref") if isinstance(stored, dict) else None)
+        or (spec.get("experiment_ref") if isinstance(spec, dict) else None)
+        or (envelope.get("artifact_refs") or [None])[-1]
+    )
     state["hypothesis"] = stored.get("hypothesis") if isinstance(stored, dict) else state.get("hypothesis")
     state["candidate_ready"] = False
     state["experiment_failed"] = blocked
@@ -1131,7 +1283,12 @@ def _implement_inline(camp: Path, state: dict[str, Any], decision: dict[str, Any
     if state["candidate_ready"] and isinstance(state.get("experiment"), dict):
         from react_agent.eeg_research.agentic.run_context import persist_approved_binding
 
-        persist_approved_binding(camp, candidate_id, state["experiment"], spec_ref=state.get("experiment_ref"))
+        persist_approved_binding(
+            camp,
+            candidate_id,
+            state.get("execution_spec") if isinstance(state.get("execution_spec"), dict) else state["experiment"],
+            spec_ref=state.get("experiment_ref"),
+        )
 
 
 def _pair_record(result: dict[str, Any], comparison: dict[str, Any]) -> dict[str, Any]:
@@ -1198,18 +1355,61 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
         ),
         None,
     )
+    incoming = dict(record.get("result") or {})
+    incoming_hash = _result_hash({**incoming, "job_id": job_id, "candidate_id": record.get("candidate_id") or incoming.get("candidate_id")}) if incoming else None
+    if existing is not None and existing.get("result_hash") and incoming_hash and incoming and incoming_hash != existing["result_hash"]:
+        material = {key: incoming.get(key) for key in ("fixed_bank_top1", "evaluation_valid", "checkpoint_id", "source_hash", "config_hash") if key in incoming}
+        existing_material = {key: existing.get(key) for key in material}
+        if material and existing_material != material:
+            _write(
+                job_dir / "job_result_conflict.json",
+                {
+                    "schema_version": "eeg_research.job_result_conflict.v1",
+                    "job_id": job_id,
+                    "existing_hash": existing["result_hash"],
+                    "incoming_hash": incoming_hash,
+                },
+            )
+            persist_failure(
+                camp,
+                state,
+                phase="settle",
+                error_type="job_result_conflict",
+                detail="job_result_conflict",
+                recoverable=False,
+            )
+            return
+    comparison_path = camp / "comparisons" / f"{(existing or {}).get('evidence_id') or incoming.get('evidence_id') or f'ev_{job_id}'}.json"
+    completed = list(settlement.get("completed") or [])
+    if settlement.get("status") == "complete":
+        if not (job_dir / "diagnostic_summary.json").is_file() and "diagnostics_committed" in completed:
+            completed.remove("diagnostics_committed")
+            settlement["status"] = "partial"
+        if not comparison_path.is_file() and "comparison_committed" in completed:
+            completed.remove("comparison_committed")
+            if "promotion_committed" in completed:
+                completed.remove("promotion_committed")
+            settlement["status"] = "partial"
+        settlement["completed"] = completed
     if (
         existing is not None
         and settlement.get("status") == "complete"
         and (job_dir / "diagnostic_summary.json").is_file()
-        and (camp / "comparisons" / f"{existing.get('evidence_id')}.json").is_file()
+        and comparison_path.is_file()
+        and incoming_hash in {None, existing.get("result_hash")}
     ):
+        if existing not in (state.get("evidence") or []):
+            state.setdefault("evidence", []).append(existing)
         return
-    incoming = dict(record.get("result") or {})
     if existing is None:
         result = incoming
     else:
-        existing.update(incoming)
+        if incoming:
+            for key, value in incoming.items():
+                if value is not None:
+                    if key == "evidence_id" and existing.get("evidence_id"):
+                        continue
+                    existing[key] = value
         result = existing
     result["evidence_id"] = result.get("evidence_id") or f"ev_{job_id or record.get('candidate_id')}"
     result["job_id"] = job_id
@@ -1226,14 +1426,34 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
     hook_path = job_dir / "hook_config.json"
     if hook_path.is_file():
         hook = _read(hook_path)
-        result["config_hash"] = hook.get("config_hash")
+        result["config_hash"] = hook.get("config_hash") or hook.get("intervention_config_hash")
+        result["intervention_config_hash"] = hook.get("intervention_config_hash") or result.get("config_hash")
+        result["run_config_hash"] = hook.get("run_config_hash")
+        result["spec_hash"] = result.get("spec_hash") or hook.get("spec_hash")
+        result["experiment_ref"] = result.get("experiment_ref") or hook.get("spec_ref")
+    frozen_path = job_dir / "frozen_run_spec.json"
+    if frozen_path.is_file():
+        frozen = _read(frozen_path)
+        result["spec_hash"] = result.get("spec_hash") or frozen.get("spec_hash")
+        result["experiment_ref"] = result.get("experiment_ref") or frozen.get("approval_ref")
+        result["intervention_config_hash"] = result.get("intervention_config_hash") or frozen.get("intervention_config_hash")
+        result["run_config_hash"] = result.get("run_config_hash") or frozen.get("run_config_hash")
     if result.get("evaluation_valid"):
         result["contract_fingerprint"] = result.get("execution_fingerprint") or state.get("contract_fingerprint")
-    if state.get("candidate_id") == result.get("candidate_id"):
+    from react_agent.eeg_research.agentic.run_context import load_approved_binding
+
+    binding = load_approved_binding(camp, str(result.get("candidate_id") or ""))
+    if binding:
+        result["experiment_ref"] = binding.get("spec_ref") or result.get("experiment_ref")
+        result["spec_hash"] = binding.get("spec_hash") or result.get("spec_hash")
+    elif state.get("candidate_id") == result.get("candidate_id"):
         result["hypothesis"] = state.get("hypothesis")
-        result["experiment"] = state.get("experiment")
-        result["experiment_ref"] = state.get("experiment_ref")
-        result["spec_hash"] = (state.get("experiment") or {}).get("spec_hash") if isinstance(state.get("experiment"), dict) else None
+        result["experiment_ref"] = result.get("experiment_ref") or state.get("experiment_ref")
+        result["spec_hash"] = result.get("spec_hash") or (
+            (state.get("experiment") or {}).get("spec_hash") if isinstance(state.get("experiment"), dict) else None
+        )
+    result["result_hash"] = result.get("result_hash") or _result_hash(result)
+    _write(job_dir / "run_record.json", {"schema_version": "eeg_research.run_record.v1", "result": result, "result_hash": result["result_hash"]})
 
     completed = list(settlement.get("completed") or [])
 
@@ -1253,6 +1473,8 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
         cost.setdefault("api_usd", None)
         _write(cost_path, cost)
         mark("cost_committed")
+    if existing is None and not any(row.get("job_id") == job_id for row in state.get("evidence") or []):
+        state.setdefault("evidence", []).append(result)
     if "episode_committed" not in completed:
         store = EpisodeStore(camp)
         ep = episode(
@@ -1270,9 +1492,14 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
         if not any(item.get("episode_id") == stored.get("episode_id") or item.get("job_id") == job_id for item in state.get("memory") or []):
             state.setdefault("memory", []).append(stored)
         mark("episode_committed")
+    else:
+        store = EpisodeStore(camp)
+        for item in store.list_episodes():
+            if str(item.get("job_id") or "") == job_id and not any(
+                row.get("episode_id") == item.get("episode_id") or row.get("job_id") == job_id for row in state.get("memory") or []
+            ):
+                state.setdefault("memory", []).append(item)
     if "evidence_committed" not in completed:
-        if existing is None:
-            state.setdefault("evidence", []).append(result)
         mark("evidence_committed")
     if "diagnostics_committed" not in completed or not (job_dir / "diagnostic_summary.json").is_file():
         from react_agent.eeg_research.agentic.diagnostics import write_job_bundle
@@ -1309,17 +1536,33 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
             and isinstance(row.get("pair_record"), dict)
             and row.get("evaluation_valid")
         ]
+        from react_agent.eeg_research.agentic.confirmation_policy import load_confirmation_policy
+
+        policy = load_confirmation_policy(camp, goal)
         promo = promotion_decision(
             comparison=comparison if isinstance(comparison, dict) else {},
             goal=goal,
             paired_records=paired_records,
             fidelity=str(result.get("fidelity") or ""),
+            policy=policy,
         )
         result["promotion"] = promo
         _write(
             camp / "comparisons" / f"{result['evidence_id']}.json",
             {"comparison": comparison, "promotion": promo, "diagnostics": result.get("diagnostics") or diagnostics},
         )
+        if promo.get("status") == "confirmed":
+            confirmation = {
+                "schema_version": "eeg_research.confirmation_record.v1",
+                "policy_hash": (policy or {}).get("policy_hash"),
+                "status": "confirmed",
+                "pair_refs": [row.get("run_id") for row in paired_records if isinstance(row, dict)],
+                "aggregate": promo,
+                "limitations": ["development_scope_only"],
+            }
+            confirm_path = camp / "confirmations" / f"{result['evidence_id']}.json"
+            _write(confirm_path, confirmation)
+            result["confirmation_ref"] = str(confirm_path)
         mark("promotion_committed")
     if "audit_marked" not in completed:
         if state.get("audit_status") in {"pass", "revise", "block"}:
@@ -1452,13 +1695,17 @@ def _train(
         from react_agent.eeg_research.agentic.experiment_gate import ExperimentResolutionError, resolve_approved_experiment
 
         spec = state.get("experiment") if isinstance(state.get("experiment"), dict) else None
+        from react_agent.eeg_research.agentic.run_context import load_approved_binding
+
+        binding = load_approved_binding(camp, candidate_id)
         try:
             resolve_approved_experiment(
                 camp,
-                spec_ref=state.get("experiment_ref"),
-                expected_hash=spec.get("spec_hash") if isinstance(spec, dict) else None,
+                spec_ref=(binding or {}).get("spec_ref") or state.get("experiment_ref"),
+                expected_hash=(binding or {}).get("spec_hash"),
                 target_id=candidate_id,
                 state=state,
+                action="replicate" if action == "replicate" else "train",
             )
         except ExperimentResolutionError as exc:
             persist_failure(
@@ -1471,6 +1718,12 @@ def _train(
             )
             return
     protocol = load_protocol(camp) or {}
+    from react_agent.eeg_research.agentic.confirmation_policy import load_confirmation_policy
+
+    policy = load_confirmation_policy(camp, _read(camp / "goal.json"))
+    if policy and policy.get("seeds_declared"):
+        protocol = dict(protocol)
+        protocol["training_seeds"] = list(policy.get("training_seeds") or [])
     used = {
         int(row.get("seed") or 0)
         for row in state.get("evidence") or []
@@ -1533,8 +1786,19 @@ def _train(
     from react_agent.eeg_research.agentic.hook_config import write_hook_config
     from react_agent.eeg_research.agentic.run_context import resolve_run_context
 
-    run_context = resolve_run_context(camp, candidate_id, state, fidelity=fidelity)
-    write_hook_config(job, run_context["hook_spec"], spec_ref=run_context.get("spec_ref"))
+    run_context = resolve_run_context(camp, candidate_id, state, fidelity=fidelity, seed=training_seed, protocol=protocol)
+    write_hook_config(
+        job,
+        run_context.get("frozen_run_spec") or run_context["hook_spec"],
+        spec_ref=run_context.get("spec_ref"),
+        spec_hash=run_context.get("spec_hash"),
+        seed=training_seed,
+        fidelity=fidelity,
+    )
+    if run_context.get("frozen_run_spec"):
+        from react_agent.eeg_research.agentic.run_context import persist_frozen_run_spec
+
+        persist_frozen_run_spec(job, run_context["frozen_run_spec"])
     manifest = _read(camp / "candidates" / candidate_id / "source_manifest.json")
     if runner is None:
         state["status"] = "blocked"

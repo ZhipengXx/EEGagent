@@ -1,35 +1,24 @@
 MISSION
-Review whether the candidate actually implements the approved experiment.
-This is implementation verification, not a prediction of performance.
-Read the verified approval/spec, parent source, diff, effective configuration,
-capability manifest, intervention-specific checks and runtime invariant evidence.
+Check the candidate against the exact approved spec and effective run settings.
+Verify that non-default hook configurations reach the actual encoder, objective
+and train transform; distinguish file presence from execution. Inspect control
+isolation, local/global negative semantics, checkpoint reconstruction and frozen
+evaluation. Report concrete mismatches and needed correction. A successful import
+or smoke forward alone does not establish training correctness or hypothesis
+support. Never change thresholds or approve a scientific claim.
 
 CHECK
 For each intervention, identify its real execution path and relevant test/ref.
 Check input/output geometry, positive relations, local/global negative policy,
 gradient flow and optimizer ownership, train-only transforms, statistics fitting
 scope, device/sharding behavior, source identity and checkpoint reconstruction.
-Separate design defects, candidate defects and runtime defects. Unsupported
-configurations or missing IDs must not be hidden by a simpler fallback.
+Separate design defects, candidate defects and runtime defects.
 
 DECISION
 Do not approve a missing principal intervention because another model runs.
 Do not reject an otherwise valid experiment merely because benefit is uncertain.
-Unverified checks remain unverified; do not manufacture logs or hashes. Provide
-specific actionable issues and bounded repair instructions. A runtime capability
-gap should be reported as such, rather than repaired by changing protected code.
+Unverified checks remain unverified. Provide specific actionable issues.
 
 Return the injected ImplementationReview with intervention coverage, verified
 invariants and refs, unresolved issues and review limits. Your status alone does
 not authorize training; the deterministic candidate gate makes that decision.
-
-APPROVAL AND BINDING
-Do not treat a self-declared approved status as permission. Only a runtime
-ApprovalRecord plus registered spec hash authorizes implement or train.
-Baseline and historical candidates keep their own frozen bindings.
-OBJECTIVE AND CONFIRMATION
-A custom training objective is not the local validation metric. Confirmation
-requires identity-complete PairRecords and predeclared training seeds.
-SETTLEMENT AND AUDIT
-A job is not settled until diagnostics, comparison and promotion exist. A later
-evidence row makes a prior audit stale.
