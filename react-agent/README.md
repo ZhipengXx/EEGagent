@@ -2,7 +2,7 @@
 
 This directory contains EEGagent's fMRI screening workflow, EEG / MEG retrieval research runtime, training worker and local workbench.
 
-Start with the [project README](../README.md) for the overview, collaboration figures, setup and workflow commands. The [architecture map](../docs/architecture.md) connects the figures to the current implementation.
+Start with the [project README](../README.md) for the research story and collaboration figures. The [running guide](../docs/running.md) collects setup and workflow commands; the [architecture map](../docs/architecture.md) connects the figures to the current implementation.
 
 ## Setup and offline demo
 
@@ -40,6 +40,7 @@ The workbench is available at [http://127.0.0.1:8765](http://127.0.0.1:8765).
 ## Further reading
 
 - [Architecture and handoffs](../docs/architecture.md)
+- [Workflow commands and configuration](../docs/running.md)
 - [fMRI screening configuration](docs/fmri_check.md)
 - [Planned screening](docs/fmri_agentic_v1_3.md)
 - [Campaign commands and recovery](docs/eeg_research_v1_8.md) — historical revision; compare its limitations with current source

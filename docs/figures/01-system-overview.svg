@@ -1,78 +1,102 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1110" viewBox="0 0 1440 1110" role="img" aria-labelledby="title desc">
-<title id="title">One workbench. Two research loops.</title><desc id="desc">A local workbench and CLI expose two independent loops. fMRI uses a planner, screening tools, reports and episode memory. EEG uses eight LLM roles coordinated by a campaign runtime, training tools and evidence records. The separate ReAct chat entry is not a third research loop. No automatic screening-to-training connection is shown.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="800" viewBox="0 0 1440 800" role="img" aria-labelledby="title desc">
+<title id="title">Two studies. One research workbench.</title>
+<desc id="desc">Separate EEG/MEG retrieval and fMRI screening workflows share a local workbench. Neither workflow automatically feeds into the other.</desc>
 <defs>
-<marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#8292A8"/></marker>
-<marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10Z" fill="#7354CF"/></marker>
+<marker id="arrow-ink" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#203744"/></marker>
+<marker id="arrow-teal" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#35756E"/></marker>
+<marker id="arrow-rust" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#AE663B"/></marker>
 </defs>
-<rect width="1440" height="1110" rx="26" fill="#FFFFFF"/>
-<rect x="1" y="1" width="1438" height="1108" rx="25" fill="none" stroke="#E1E7F0"/>
-<g font-family="DejaVu Sans, Arial, sans-serif">
-<text x="48" y="52" font-size="16" fill="#62728A" font-weight="700" text-anchor="start">EEGagent  /  RESEARCH WORKFLOWS</text>
-<text x="1392" y="52" font-size="18" fill="#7354CF" font-weight="700" text-anchor="end">01</text>
-<text x="48" y="108" font-size="38" fill="#17263D" font-weight="700" text-anchor="start">One workbench. Two research loops.</text>
-<text x="48" y="144" font-size="19" fill="#62728A" font-weight="400" text-anchor="start">Screen predicted fMRI responses and investigate EEG-to-image retrieval under explicit protocols.</text>
-<rect x="48" y="185" width="1344" height="92" rx="17" fill="#17263D" stroke="#17263D"/>
-<text x="76" y="224" font-size="26" fill="#FFFFFF" font-weight="700" text-anchor="start">Local workbench + CLI</text>
-<text x="76" y="254" font-size="18" fill="#CAD5E5" font-weight="400" text-anchor="start">Goals, input data, protocol choices, budgets and run controls</text>
-<text x="1362" y="224" font-size="21" fill="#FFFFFF" font-weight="500" text-anchor="end">127.0.0.1:8765</text>
-<text x="1362" y="254" font-size="17" fill="#CAD5E5" font-weight="400" text-anchor="end">Optional LangGraph Studio views</text>
-<path d="M720 277 V299 H373 V327" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<path d="M720 299 H1067 V327" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<rect x="48" y="327" width="650" height="548" rx="20" fill="#F8FAFD" stroke="#E3E9F2"/>
-<text x="75" y="369" font-size="28" fill="#138582" font-weight="700" text-anchor="start">fMRI screening</text>
-<text x="75" y="399" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Image or existing prediction series</text>
-<rect x="742" y="327" width="650" height="548" rx="20" fill="#F8FAFD" stroke="#E3E9F2"/>
-<text x="769" y="369" font-size="28" fill="#7354CF" font-weight="700" text-anchor="start">EEG / MEG retrieval research</text>
-<text x="769" y="399" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Frozen evaluation + code-level experiments</text>
-<rect x="73" y="425" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
-<path d="M93 443 V499" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
-<text x="109" y="464" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Materialize the stimulus</text>
-<text x="109" y="490" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Optional TRIBE worker + matched gray control</text>
-<rect x="73" y="539" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
-<path d="M93 557 V613" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
-<text x="109" y="578" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Plan, validate and execute checks</text>
-<text x="109" y="604" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">LLM planning or rule policy; numeric tool registry</text>
-<rect x="73" y="653" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
-<path d="M93 671 V727" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
-<text x="109" y="692" font-size="22" fill="#17263D" font-weight="700" text-anchor="start">Update evidence and decide when to stop</text>
-<text x="109" y="718" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Question coverage, resources and diagnostic gates</text>
-<rect x="73" y="767" width="600" height="82" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
-<path d="M93 785 V831" stroke="#60718A" stroke-width="4" stroke-linecap="round"/>
-<text x="109" y="806" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Screening report + episode memory</text>
-<text x="109" y="832" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Scope: numeric_consistency_only</text>
-<path d="M373 517 V539" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<path d="M373 631 V653" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<path d="M373 745 V767" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<rect x="767" y="425" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
-<path d="M787 443 V499" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
-<text x="803" y="464" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Plan and design an experiment</text>
-<text x="803" y="490" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Planner, Librarian and Experiment Designer</text>
-<rect x="767" y="539" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
-<path d="M787 557 V613" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
-<text x="803" y="578" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Approve, implement and review</text>
-<text x="803" y="604" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Runtime approval; Candidate Coder + Reviewer</text>
-<rect x="767" y="653" width="600" height="92" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
-<path d="M787 671 V727" stroke="#138582" stroke-width="4" stroke-linecap="round"/>
-<text x="803" y="692" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Train, compare and analyze</text>
-<text x="803" y="718" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Training tools + Result Analyst; matched controls</text>
-<rect x="767" y="767" width="600" height="82" rx="16" fill="#FFFFFF" stroke="#D6DFEB"/>
-<path d="M787 785 V831" stroke="#7354CF" stroke-width="4" stroke-linecap="round"/>
-<text x="803" y="806" font-size="23" fill="#17263D" font-weight="700" text-anchor="start">Audit results and curate memory</text>
-<text x="803" y="832" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">Result Auditor + Memory Curator; scoped evidence</text>
-<path d="M1067 517 V539" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<path d="M1067 631 V653" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<path d="M1067 745 V767" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" marker-end="url(#arrow)"/>
-<rect x="48" y="903" width="1344" height="78" rx="14" fill="#F2F5F9" stroke="#E3E9F2"/>
-<text x="76" y="936" font-size="20" fill="#17263D" font-weight="700" text-anchor="start">Separate chat entry</text>
-<text x="76" y="963" font-size="18" fill="#62728A" font-weight="400" text-anchor="start">graph.py provides a ReAct conversation graph; it does not orchestrate either research loop.</text>
-<path d="M48 1003 H1392" fill="none" stroke="#D6DFEB" stroke-width="1" stroke-linejoin="round" stroke-linecap="round"/>
-<rect x="48" y="1020" width="12" height="12" rx="3" fill="#7354CF" stroke="#7354CF"/>
-<text x="70" y="1031" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">LLM role</text>
-<rect x="283" y="1020" width="12" height="12" rx="3" fill="#138582" stroke="#138582"/>
-<text x="305" y="1031" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Runtime / tool</text>
-<rect x="518" y="1020" width="12" height="12" rx="3" fill="#60718A" stroke="#60718A"/>
-<text x="540" y="1031" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Stored artifact</text>
-<path d="M753 1026 h35" fill="none" stroke="#8292A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 7"/>
-<text x="798" y="1031" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Conditional / memory handoff</text>
-<text x="48" y="1067" font-size="16" fill="#62728A" font-weight="400" text-anchor="start">Shared interface; separate workflow state and memory. No automatic fMRI-to-EEG training handoff.</text>
-</g></svg>
+<rect width="1440" height="800" fill="#F7F4EE"/>
+<text x="54" y="47" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="2">EEGagent  /  BRAIN DECODING RESEARCH</text>
+<text x="1385" y="47" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="18" font-weight="normal" text-anchor="end" letter-spacing="0">01</text>
+<text x="54" y="109" fill="#203744" font-family="DejaVu Serif" font-size="43" font-weight="normal" text-anchor="start" letter-spacing="0">Choose the question you want to investigate.</text>
+<text x="54" y="150" fill="#5C6C70" font-family="DejaVu Sans" font-size="23" font-weight="normal" text-anchor="start" letter-spacing="0">One interface for two workflows, each with its own evidence and memory.</text>
+<rect x="54" y="197" width="640" height="516" rx="0" fill="#FFFDFA" stroke="#CCCFC7" stroke-width="1.2"/>
+<rect x="746" y="197" width="640" height="516" rx="0" fill="#FFFDFA" stroke="#CCCFC7" stroke-width="1.2"/>
+<text x="80" y="242" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="0">A  /  EEG + MEG</text>
+<text x="80" y="287" fill="#203744" font-family="DejaVu Serif" font-size="32" font-weight="normal" text-anchor="start" letter-spacing="0">Brain-to-image retrieval</text>
+<path d="M86 343 H298" fill="none" stroke="#CCCFC7" stroke-width="0.8" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M86.00 343.00 L87.77 339.60 L89.53 337.07 L91.30 335.93 L93.07 336.09 L94.83 336.98 L96.60 337.83 L98.37 338.05 L100.13 337.56 L101.90 336.76 L103.67 336.36 L105.43 337.00 L107.20 338.89 L108.97 341.67 L110.73 344.55 L112.50 346.62 L114.27 347.30 L116.03 346.56 L117.80 344.91 L119.57 343.17 L121.33 342.08 L123.10 341.93 L124.87 342.49 L126.63 343.12 L128.40 343.14 L130.17 342.19 L131.93 340.45 L133.70 338.58 L135.47 337.44 L137.23 337.67 L139.00 339.40 L140.77 342.18 L142.53 345.15 L144.30 347.48 L146.07 348.67 L147.83 348.79 L149.60 348.38 L151.37 348.16 L153.13 348.63 L154.90 349.80 L156.67 351.17 L158.43 351.96 L160.20 351.49 L161.97 349.53 L163.73 346.42 L165.50 342.98 L167.27 340.13 L169.03 338.49 L170.80 338.15 L172.57 338.65 L174.33 339.24 L176.10 339.28 L177.87 338.57 L179.63 337.42 L181.40 336.53 L183.17 336.59 L184.93 337.95 L186.70 340.41 L188.47 343.23 L190.23 345.53 L192.00 346.57 L193.77 346.18 L195.53 344.72 L197.30 342.97 L199.07 341.70 L200.83 341.33 L202.60 341.73 L204.37 342.33 L206.13 342.44 L207.90 341.57 L209.67 339.79 L211.43 337.67 L213.20 336.07 L214.97 335.74 L216.73 336.96 L218.50 339.44 L220.27 342.42 L222.03 345.01 L223.80 346.63 L225.57 347.19 L227.33 347.14 L229.10 347.18 L230.87 347.88 L232.63 349.36 L234.40 351.22 L236.17 352.70 L237.93 353.01 L239.70 351.78 L241.47 349.21 L243.23 345.99 L245.00 343.05 L246.77 341.13 L248.53 340.44 L250.30 340.66 L252.07 341.11 L253.83 341.08 L255.60 340.28 L257.37 338.90 L259.13 337.60 L260.90 337.12 L262.67 337.94 L264.43 340.01 L266.20 342.71 L267.97 345.15 L269.73 346.52 L271.50 346.47 L273.27 345.23 L275.03 343.50 L276.80 342.07 L278.57 341.44 L280.33 341.64 L282.10 342.15 L283.87 342.28 L285.63 341.47 L287.40 339.63 L289.17 337.23 L290.93 335.12 L292.70 334.11 L294.47 334.67 L296.23 336.65 L298.00 339.40" fill="none" stroke="#35756E" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M86 375 H298" fill="none" stroke="#CCCFC7" stroke-width="0.8" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M86.00 366.56 L87.77 365.16 L89.53 365.31 L91.30 366.68 L93.07 368.51 L94.83 370.01 L96.60 370.73 L98.37 370.75 L100.13 370.61 L101.90 371.01 L103.67 372.43 L105.43 374.86 L107.20 377.72 L108.97 380.18 L110.73 381.43 L112.50 381.14 L114.27 379.56 L116.03 377.41 L117.80 375.55 L119.57 374.62 L121.33 374.69 L123.10 375.36 L124.87 375.92 L126.63 375.76 L128.40 374.71 L130.17 373.14 L131.93 371.80 L133.70 371.46 L135.47 372.55 L137.23 374.90 L139.00 377.85 L140.77 380.47 L142.53 382.03 L144.30 382.25 L146.07 381.44 L147.83 380.29 L149.60 379.50 L151.37 379.45 L153.13 379.98 L154.90 380.46 L156.67 380.17 L158.43 378.61 L160.20 375.81 L161.97 372.36 L163.73 369.17 L165.50 367.06 L167.27 366.45 L169.03 367.14 L170.80 368.48 L172.57 369.67 L174.33 370.17 L176.10 369.95 L177.87 369.46 L179.63 369.42 L181.40 370.40 L183.17 372.51 L184.93 375.33 L186.70 378.02 L188.47 379.72 L190.23 379.94 L192.00 378.77 L193.77 376.83 L195.53 374.96 L197.30 373.87 L199.07 373.78 L200.83 374.39 L202.60 375.02 L204.37 375.03 L206.13 374.12 L207.90 372.54 L209.67 370.99 L211.43 370.29 L213.20 370.99 L214.97 373.11 L216.73 376.09 L218.50 379.05 L220.27 381.15 L222.03 381.99 L223.80 381.73 L225.57 380.98 L227.33 380.47 L229.10 380.65 L230.87 381.46 L232.63 382.38 L234.40 382.63 L236.17 381.61 L237.93 379.20 L239.70 375.85 L241.47 372.42 L243.23 369.82 L245.00 368.57 L246.77 368.67 L248.53 369.55 L250.30 370.44 L252.07 370.74 L253.83 370.28 L255.60 369.45 L257.37 368.93 L259.13 369.38 L260.90 371.06 L262.67 373.66 L264.43 376.41 L266.20 378.42 L267.97 379.07 L269.73 378.27 L271.50 376.50 L273.27 374.60 L275.03 373.30 L276.80 372.98 L278.57 373.43 L280.33 374.05 L282.10 374.14 L283.87 373.31 L285.63 371.67 L287.40 369.87 L289.17 368.74 L290.93 368.95 L292.70 370.68 L294.47 373.52 L296.23 376.63 L298.00 379.15" fill="none" stroke="#AE663B" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M86 407 H298" fill="none" stroke="#CCCFC7" stroke-width="0.8" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M86.00 396.74 L87.77 398.37 L89.53 400.91 L91.30 403.50 L93.07 405.41 L94.83 406.35 L96.60 406.59 L98.37 406.76 L100.13 407.54 L101.90 409.21 L103.67 411.56 L105.43 413.91 L107.20 415.40 L108.97 415.45 L110.73 413.99 L112.50 411.54 L114.27 408.96 L116.03 407.09 L117.80 406.37 L119.57 406.67 L121.33 407.41 L123.10 407.85 L124.87 407.51 L126.63 406.40 L128.40 405.05 L130.17 404.22 L131.93 404.55 L133.70 406.21 L135.47 408.79 L137.23 411.46 L139.00 413.32 L140.77 413.83 L142.53 412.96 L144.30 411.27 L146.07 409.53 L147.83 408.39 L149.60 408.06 L151.37 408.21 L153.13 408.18 L154.90 407.29 L156.67 405.27 L158.43 402.39 L160.20 399.39 L161.97 397.19 L163.73 396.45 L165.50 397.27 L167.27 399.21 L169.03 401.45 L170.80 403.23 L172.57 404.12 L174.33 404.30 L176.10 404.33 L177.87 404.90 L179.63 406.44 L181.40 408.83 L183.17 411.47 L184.93 413.51 L186.70 414.23 L188.47 413.40 L190.23 411.40 L192.00 409.01 L193.77 407.10 L195.53 406.24 L197.30 406.43 L199.07 407.18 L200.83 407.77 L202.60 407.64 L204.37 406.67 L206.13 405.29 L207.90 404.25 L209.67 404.29 L211.43 405.70 L213.20 408.24 L214.97 411.15 L216.73 413.50 L218.50 414.63 L220.27 414.36 L222.03 413.11 L223.80 411.60 L225.57 410.54 L227.33 410.25 L229.10 410.50 L230.87 410.66 L232.63 410.02 L234.40 408.17 L236.17 405.25 L237.93 401.92 L239.70 399.09 L241.47 397.53 L243.23 397.53 L245.00 398.80 L246.77 400.59 L248.53 402.10 L250.30 402.84 L252.07 402.84 L253.83 402.60 L255.60 402.83 L257.37 404.04 L259.13 406.27 L260.90 409.01 L262.67 411.40 L264.43 412.66 L266.20 412.39 L267.97 410.80 L269.73 408.59 L271.50 406.64 L273.27 405.60 L275.03 405.63 L276.80 406.33 L278.57 407.01 L280.33 407.05 L282.10 406.21 L283.87 404.81 L285.63 403.58 L287.40 403.30 L289.17 404.42 L290.93 406.83 L292.70 409.89 L294.47 412.69 L296.23 414.44 L298.00 414.84" fill="none" stroke="#35756E" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M329 375 H380" fill="none" stroke="#5C6C70" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#arrow-ink)"/>
+<rect x="413" y="337" width="63" height="63" rx="0" fill="#EEEAE1" stroke="#CCCFC7" stroke-width="1"/>
+<circle cx="458.36" cy="351.49" r="5.04" fill="#E3C39D" stroke="none" stroke-width="1"/>
+<path d="M419 392 L433.16 365.35 L445.76 377.95 L458.36 363.46 L470 392 Z" fill="#A7B9AA" stroke="none" stroke-width="0" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<rect x="490" y="337" width="63" height="63" rx="0" fill="#EEEAE1" stroke="#AE663B" stroke-width="2"/>
+<circle cx="535.36" cy="351.49" r="5.04" fill="#E3C39D" stroke="none" stroke-width="1"/>
+<path d="M496 392 L510.16 365.35 L522.76 377.95 L535.36 363.46 L547 392 Z" fill="#A7B9AA" stroke="none" stroke-width="0" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<rect x="567" y="337" width="63" height="63" rx="0" fill="#EEEAE1" stroke="#CCCFC7" stroke-width="1"/>
+<circle cx="612.36" cy="351.49" r="5.04" fill="#E3C39D" stroke="none" stroke-width="1"/>
+<path d="M573 392 L587.16 365.35 L599.76 377.95 L612.36 363.46 L624 392 Z" fill="#A7B9AA" stroke="none" stroke-width="0" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="85" y="456" fill="#5C6C70" font-family="DejaVu Sans" font-size="22" font-weight="normal" text-anchor="start" letter-spacing="0">Preprocessed signals + fixed image features</text>
+<path d="M80 486 H668" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="80" y="530" fill="#203744" font-family="DejaVu Sans" font-size="25" font-weight="bold" text-anchor="start" letter-spacing="0">Ask what changes the decoder.</text>
+<text x="80" y="573" fill="#5C6C70" font-family="DejaVu Sans" font-size="22" font-weight="normal" text-anchor="start" letter-spacing="0">Design a control. Implement a candidate.</text>
+<text x="80" y="608" fill="#5C6C70" font-family="DejaVu Sans" font-size="22" font-weight="normal" text-anchor="start" letter-spacing="0">Train, compare and revise the next step.</text>
+<text x="80" y="663" fill="#5C6C70" font-family="DejaVu Sans" font-size="22" font-weight="normal" text-anchor="start" letter-spacing="0">Outputs  /  code · comparisons · checkpoints</text>
+<text x="772" y="242" fill="#35756E" font-family="DejaVu Sans Mono" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="0">B  /  fMRI</text>
+<text x="772" y="287" fill="#203744" font-family="DejaVu Serif" font-size="32" font-weight="normal" text-anchor="start" letter-spacing="0">Screen predicted responses</text>
+<g transform="translate(786 316) scale(0.76)">
+<path d="M22 111 C2 90 8 54 30 43 C32 20 57 10 78 17 C96 0 126 5 139 18 C165 10 190 24 193 47 C220 58 224 90 209 107 C211 134 182 151 157 146 L136 151 C117 155 108 138 111 124 C90 132 71 125 57 127 C39 130 27 122 22 111 Z" fill="#EBEEE5" stroke="#203744" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M32 48 C58 31 73 47 71 67 C67 84 43 73 43 94 C43 109 62 114 77 103" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M80 22 C97 43 89 54 103 67 C112 77 125 67 126 54 C128 36 145 30 162 39" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M45 38 C48 24 65 22 77 29" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M111 21 C123 31 113 46 106 49" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M177 47 C158 49 149 65 161 78 C169 87 193 74 202 91" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M82 76 C100 73 110 88 99 102 C91 114 75 115 79 122" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M116 94 C135 83 147 89 146 106 C145 126 167 132 188 117" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M164 89 C181 88 191 101 184 111" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M118 124 C131 116 138 131 140 142" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<circle cx="40" cy="87" r="10" fill="#AE663B" stroke="none" stroke-width="0"/>
+<circle cx="59" cy="100" r="7" fill="#AE663B" stroke="none" stroke-width="0"/>
+<circle cx="167" cy="59" r="8" fill="#AE663B" stroke="none" stroke-width="0"/>
+<circle cx="180" cy="104" r="11" fill="#AE663B" stroke="none" stroke-width="0"/>
+</g>
+<path d="M995 376 H1042" fill="none" stroke="#5C6C70" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#arrow-ink)"/>
+<rect x="1081" y="327" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1106" y="327" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1131" y="327" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1156" y="327" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1181" y="327" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1206" y="327" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1231" y="327" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1081" y="349" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1106" y="349" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1131" y="349" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1156" y="349" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1181" y="349" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1206" y="349" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1231" y="349" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1081" y="371" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1106" y="371" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1131" y="371" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1156" y="371" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1181" y="371" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1206" y="371" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1231" y="371" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1081" y="393" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1106" y="393" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1131" y="393" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1156" y="393" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1181" y="393" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1206" y="393" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1231" y="393" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1081" y="415" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1106" y="415" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1131" y="415" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1156" y="415" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1181" y="415" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<rect x="1206" y="415" width="22" height="19" rx="0" fill="#D4A88B" stroke="none" stroke-width="1.2"/>
+<rect x="1231" y="415" width="22" height="19" rx="0" fill="#D4DDD2" stroke="none" stroke-width="1.2"/>
+<text x="777" y="456" fill="#5C6C70" font-family="DejaVu Sans" font-size="21" font-weight="normal" text-anchor="start" letter-spacing="0">Existing series, or configured TRIBE generation</text>
+<path d="M772 486 H1360" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="772" y="530" fill="#203744" font-family="DejaVu Sans" font-size="25" font-weight="bold" text-anchor="start" letter-spacing="0">Ask which checks the response passes.</text>
+<text x="772" y="573" fill="#5C6C70" font-family="DejaVu Sans" font-size="21" font-weight="normal" text-anchor="start" letter-spacing="0">Run required checks. Inspect remaining questions.</text>
+<text x="772" y="608" fill="#5C6C70" font-family="DejaVu Sans" font-size="21" font-weight="normal" text-anchor="start" letter-spacing="0">Select a tool, update evidence, then stop or replan.</text>
+<text x="772" y="663" fill="#5C6C70" font-family="DejaVu Sans" font-size="21" font-weight="normal" text-anchor="start" letter-spacing="0">Outputs  /  screening report · diagnostics</text>
+<path d="M54 730 H1386" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="54" y="767" fill="#5C6C70" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="0">Shared workbench and controls. Separate protocols, state and memory. All signal imagery is schematic.</text>
+</svg>

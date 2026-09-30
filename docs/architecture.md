@@ -1,12 +1,12 @@
 # Architecture and source map
 
-Inspection baseline: [`f698e71bdfcedefd1e44229793553c123dbef777`](https://github.com/ZhipengXx/EEGagent/tree/f698e71bdfcedefd1e44229793553c123dbef777), committed on 2026-09-30. The diagrams summarize that implementation. Revisit this map when orchestration changes.
+Inspection baseline: [`a5e8fff8a0266cc64860324ed5701cf782abef3d`](https://github.com/ZhipengXx/EEGagent/tree/a5e8fff8a0266cc64860324ed5701cf782abef3d), committed on 2026-09-30. Its runtime is unchanged from `f698e71`; this revision changes README storytelling and figure design. Revisit this map when orchestration changes. See the [running guide](running.md) for setup and commands.
 
 ## Reading the figures
 
-Purple marks LLM responsibilities, teal marks runtime code or tools, and slate marks artifacts. Dashed connectors indicate conditional or memory handoffs. Boxes combining an optional role or policy with deterministic code are labeled explicitly.
+The visual system uses warm paper, ink blue, muted teal and copper. Dark bullet labels identify LLM roles; teal text identifies runtime responsibilities or study context. Copper arrows show representative forward handoffs; dashed arrows show conditional paths, repairs, feedback or scoped-memory retrieval. Color is paired with text labels.
 
-Arrows represent semantic handoffs mediated by the runtime. They do not imply direct role-to-role messages, separate services, mandatory invocation order, or parallel execution. The overview groups responsibilities; the EEG figure shows a representative candidate path, and the fMRI figure shows the check-and-observe loop.
+Arrows represent semantic handoffs mediated by the runtime. They do not imply direct role-to-role messages, separate services, mandatory invocation order, or parallel execution. The overview separates the two studies; the EEG figure groups roles into four research stages with conditional feedback, and the fMRI figure shows the check-and-observe loop. Brain shapes, activity colors, signal traces, representation tiles and image glyphs are conceptual drawings, not anatomical maps, measured data or benchmark results.
 
 ## System overview
 

@@ -1,0 +1,99 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="670" viewBox="0 0 1440 670" role="img" aria-labelledby="title desc">
+<title id="title">EEGagent: from brain signals to testable ideas</title>
+<desc id="desc">Editorial illustration of EEG signals, learned representations and image-gallery retrieval. The brain and signal traces are conceptual drawings, not recorded data or reconstruction results.</desc>
+<defs>
+<marker id="arrow-ink" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#203744"/></marker>
+<marker id="arrow-teal" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#35756E"/></marker>
+<marker id="arrow-rust" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#AE663B"/></marker>
+</defs>
+<rect width="1440" height="670" fill="#F7F4EE"/>
+<text x="54" y="53" fill="#5C6C70" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="2">BRAIN DECODING  /  AN EXPERIMENTAL WORKBENCH</text>
+<path d="M54 76 H1386" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="50" y="210" fill="#203744" font-family="DejaVu Serif" font-size="108" font-weight="normal" text-anchor="start" letter-spacing="0">EEGagent</text>
+<text x="58" y="274" fill="#203744" font-family="DejaVu Serif" font-size="37" font-weight="normal" text-anchor="start" letter-spacing="0">From brain signals</text>
+<text x="58" y="324" fill="#203744" font-family="DejaVu Serif" font-size="37" font-weight="normal" text-anchor="start" letter-spacing="0">to testable ideas.</text>
+<text x="58" y="376" fill="#5C6C70" font-family="DejaVu Sans" font-size="23" font-weight="normal" text-anchor="start" letter-spacing="0">Plan the experiment. Read the evidence. Decide what comes next.</text>
+<g transform="translate(1053 119) scale(1.38)">
+<path d="M22 111 C2 90 8 54 30 43 C32 20 57 10 78 17 C96 0 126 5 139 18 C165 10 190 24 193 47 C220 58 224 90 209 107 C211 134 182 151 157 146 L136 151 C117 155 108 138 111 124 C90 132 71 125 57 127 C39 130 27 122 22 111 Z" fill="#EBEEE5" stroke="#203744" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M32 48 C58 31 73 47 71 67 C67 84 43 73 43 94 C43 109 62 114 77 103" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M80 22 C97 43 89 54 103 67 C112 77 125 67 126 54 C128 36 145 30 162 39" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M45 38 C48 24 65 22 77 29" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M111 21 C123 31 113 46 106 49" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M177 47 C158 49 149 65 161 78 C169 87 193 74 202 91" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M82 76 C100 73 110 88 99 102 C91 114 75 115 79 122" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M116 94 C135 83 147 89 146 106 C145 126 167 132 188 117" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M164 89 C181 88 191 101 184 111" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<path d="M118 124 C131 116 138 131 140 142" fill="none" stroke="#35756E" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" opacity="0.65"/>
+<circle cx="34" cy="36" r="6" fill="#F7F4EE" stroke="#AE663B" stroke-width="2"/>
+<circle cx="73" cy="12" r="6" fill="#F7F4EE" stroke="#AE663B" stroke-width="2"/>
+<circle cx="113" cy="10" r="6" fill="#F7F4EE" stroke="#AE663B" stroke-width="2"/>
+<circle cx="161" cy="22" r="6" fill="#F7F4EE" stroke="#AE663B" stroke-width="2"/>
+<circle cx="199" cy="57" r="6" fill="#F7F4EE" stroke="#AE663B" stroke-width="2"/>
+</g>
+<path d="M965 365 H1329" fill="none" stroke="#CCCFC7" stroke-width="0.8" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M965.00 365.00 L968.03 360.05 L971.07 356.38 L974.10 354.71 L977.13 354.94 L980.17 356.24 L983.20 357.47 L986.23 357.80 L989.27 357.08 L992.30 355.92 L995.33 355.34 L998.37 356.28 L1001.40 359.03 L1004.43 363.07 L1007.47 367.25 L1010.50 370.27 L1013.53 371.26 L1016.57 370.18 L1019.60 367.77 L1022.63 365.25 L1025.67 363.66 L1028.70 363.45 L1031.73 364.26 L1034.77 365.18 L1037.80 365.20 L1040.83 363.82 L1043.87 361.29 L1046.90 358.58 L1049.93 356.92 L1052.97 357.25 L1056.00 359.77 L1059.03 363.80 L1062.07 368.13 L1065.10 371.52 L1068.13 373.24 L1071.17 373.42 L1074.20 372.82 L1077.23 372.51 L1080.27 373.19 L1083.30 374.89 L1086.33 376.89 L1089.37 378.04 L1092.40 377.35 L1095.43 374.49 L1098.47 369.97 L1101.50 364.98 L1104.53 360.83 L1107.57 358.45 L1110.60 357.95 L1113.63 358.67 L1116.67 359.52 L1119.70 359.59 L1122.73 358.56 L1125.77 356.89 L1128.80 355.59 L1131.83 355.67 L1134.87 357.66 L1137.90 361.23 L1140.93 365.34 L1143.97 368.67 L1147.00 370.20 L1150.03 369.62 L1153.07 367.50 L1156.10 364.96 L1159.13 363.11 L1162.17 362.57 L1165.20 363.15 L1168.23 364.03 L1171.27 364.18 L1174.30 362.92 L1177.33 360.34 L1180.37 357.25 L1183.40 354.92 L1186.43 354.43 L1189.47 356.22 L1192.50 359.83 L1195.53 364.16 L1198.57 367.93 L1201.60 370.28 L1204.63 371.10 L1207.67 371.02 L1210.70 371.08 L1213.73 372.10 L1216.77 374.26 L1219.80 376.96 L1222.83 379.10 L1225.87 379.56 L1228.90 377.78 L1231.93 374.03 L1234.97 369.35 L1238.00 365.08 L1241.03 362.27 L1244.07 361.28 L1247.10 361.60 L1250.13 362.25 L1253.17 362.21 L1256.20 361.04 L1259.23 359.04 L1262.27 357.14 L1265.30 356.44 L1268.33 357.64 L1271.37 360.65 L1274.40 364.58 L1277.43 368.12 L1280.47 370.11 L1283.50 370.04 L1286.53 368.25 L1289.57 365.73 L1292.60 363.64 L1295.63 362.74 L1298.67 363.02 L1301.70 363.77 L1304.73 363.96 L1307.77 362.77 L1310.80 360.10 L1313.83 356.61 L1316.87 353.54 L1319.90 352.07 L1322.93 352.88 L1325.97 355.76 L1329.00 359.76" fill="none" stroke="#35756E" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="1340" y="412" fill="#5C6C70" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="end" letter-spacing="0">Neural signals, drawn schematically</text>
+<path d="M54 438 H1386" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M72 495 H296" fill="none" stroke="#CCCFC7" stroke-width="0.8" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M72.00 495.00 L73.87 491.60 L75.73 489.07 L77.60 487.93 L79.47 488.09 L81.33 488.98 L83.20 489.83 L85.07 490.05 L86.93 489.56 L88.80 488.76 L90.67 488.36 L92.53 489.00 L94.40 490.89 L96.27 493.67 L98.13 496.55 L100.00 498.62 L101.87 499.30 L103.73 498.56 L105.60 496.91 L107.47 495.17 L109.33 494.08 L111.20 493.93 L113.07 494.49 L114.93 495.12 L116.80 495.14 L118.67 494.19 L120.53 492.45 L122.40 490.58 L124.27 489.44 L126.13 489.67 L128.00 491.40 L129.87 494.18 L131.73 497.15 L133.60 499.48 L135.47 500.67 L137.33 500.79 L139.20 500.38 L141.07 500.16 L142.93 500.63 L144.80 501.80 L146.67 503.17 L148.53 503.96 L150.40 503.49 L152.27 501.53 L154.13 498.42 L156.00 494.98 L157.87 492.13 L159.73 490.49 L161.60 490.15 L163.47 490.65 L165.33 491.24 L167.20 491.28 L169.07 490.57 L170.93 489.42 L172.80 488.53 L174.67 488.59 L176.53 489.95 L178.40 492.41 L180.27 495.23 L182.13 497.53 L184.00 498.57 L185.87 498.18 L187.73 496.72 L189.60 494.97 L191.47 493.70 L193.33 493.33 L195.20 493.73 L197.07 494.33 L198.93 494.44 L200.80 493.57 L202.67 491.79 L204.53 489.67 L206.40 488.07 L208.27 487.74 L210.13 488.96 L212.00 491.44 L213.87 494.42 L215.73 497.01 L217.60 498.63 L219.47 499.19 L221.33 499.14 L223.20 499.18 L225.07 499.88 L226.93 501.36 L228.80 503.22 L230.67 504.70 L232.53 505.01 L234.40 503.78 L236.27 501.21 L238.13 497.99 L240.00 495.05 L241.87 493.13 L243.73 492.44 L245.60 492.66 L247.47 493.11 L249.33 493.08 L251.20 492.28 L253.07 490.90 L254.93 489.60 L256.80 489.12 L258.67 489.94 L260.53 492.01 L262.40 494.71 L264.27 497.15 L266.13 498.52 L268.00 498.47 L269.87 497.23 L271.73 495.50 L273.60 494.07 L275.47 493.44 L277.33 493.64 L279.20 494.15 L281.07 494.28 L282.93 493.47 L284.80 491.63 L286.67 489.23 L288.53 487.12 L290.40 486.11 L292.27 486.67 L294.13 488.65 L296.00 491.40" fill="none" stroke="#35756E" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M72 527 H296" fill="none" stroke="#CCCFC7" stroke-width="0.8" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<path d="M72.00 518.56 L73.87 517.16 L75.73 517.31 L77.60 518.68 L79.47 520.51 L81.33 522.01 L83.20 522.73 L85.07 522.75 L86.93 522.61 L88.80 523.01 L90.67 524.43 L92.53 526.86 L94.40 529.72 L96.27 532.18 L98.13 533.43 L100.00 533.14 L101.87 531.56 L103.73 529.41 L105.60 527.55 L107.47 526.62 L109.33 526.69 L111.20 527.36 L113.07 527.92 L114.93 527.76 L116.80 526.71 L118.67 525.14 L120.53 523.80 L122.40 523.46 L124.27 524.55 L126.13 526.90 L128.00 529.85 L129.87 532.47 L131.73 534.03 L133.60 534.25 L135.47 533.44 L137.33 532.29 L139.20 531.50 L141.07 531.45 L142.93 531.98 L144.80 532.46 L146.67 532.17 L148.53 530.61 L150.40 527.81 L152.27 524.36 L154.13 521.17 L156.00 519.06 L157.87 518.45 L159.73 519.14 L161.60 520.48 L163.47 521.67 L165.33 522.17 L167.20 521.95 L169.07 521.46 L170.93 521.42 L172.80 522.40 L174.67 524.51 L176.53 527.33 L178.40 530.02 L180.27 531.72 L182.13 531.94 L184.00 530.77 L185.87 528.83 L187.73 526.96 L189.60 525.87 L191.47 525.78 L193.33 526.39 L195.20 527.02 L197.07 527.03 L198.93 526.12 L200.80 524.54 L202.67 522.99 L204.53 522.29 L206.40 522.99 L208.27 525.11 L210.13 528.09 L212.00 531.05 L213.87 533.15 L215.73 533.99 L217.60 533.73 L219.47 532.98 L221.33 532.47 L223.20 532.65 L225.07 533.46 L226.93 534.38 L228.80 534.63 L230.67 533.61 L232.53 531.20 L234.40 527.85 L236.27 524.42 L238.13 521.82 L240.00 520.57 L241.87 520.67 L243.73 521.55 L245.60 522.44 L247.47 522.74 L249.33 522.28 L251.20 521.45 L253.07 520.93 L254.93 521.38 L256.80 523.06 L258.67 525.66 L260.53 528.41 L262.40 530.42 L264.27 531.07 L266.13 530.27 L268.00 528.50 L269.87 526.60 L271.73 525.30 L273.60 524.98 L275.47 525.43 L277.33 526.05 L279.20 526.14 L281.07 525.31 L282.93 523.67 L284.80 521.87 L286.67 520.74 L288.53 520.95 L290.40 522.68 L292.27 525.52 L294.13 528.63 L296.00 531.15" fill="none" stroke="#AE663B" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="330" y="501" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">01  SIGNAL</text>
+<text x="330" y="538" fill="#203744" font-family="DejaVu Serif" font-size="26" font-weight="normal" text-anchor="start" letter-spacing="0">EEG / MEG</text>
+<path d="M492 513 H548" fill="none" stroke="#5C6C70" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#arrow-ink)"/>
+<rect x="579" y="477" width="10" height="10" rx="0" fill="#35756E" stroke="none" stroke-width="1.2"/>
+<rect x="593" y="477" width="10" height="10" rx="0" fill="#DEE6DC" stroke="none" stroke-width="1.2"/>
+<rect x="607" y="477" width="10" height="10" rx="0" fill="#E6C8AF" stroke="none" stroke-width="1.2"/>
+<rect x="621" y="477" width="10" height="10" rx="0" fill="#B8CEC4" stroke="none" stroke-width="1.2"/>
+<rect x="635" y="477" width="10" height="10" rx="0" fill="#AE663B" stroke="none" stroke-width="1.2"/>
+<rect x="649" y="477" width="10" height="10" rx="0" fill="#35756E" stroke="none" stroke-width="1.2"/>
+<rect x="663" y="477" width="10" height="10" rx="0" fill="#DEE6DC" stroke="none" stroke-width="1.2"/>
+<rect x="677" y="477" width="10" height="10" rx="0" fill="#E6C8AF" stroke="none" stroke-width="1.2"/>
+<rect x="579" y="491" width="10" height="10" rx="0" fill="#AE663B" stroke="none" stroke-width="1.2"/>
+<rect x="593" y="491" width="10" height="10" rx="0" fill="#35756E" stroke="none" stroke-width="1.2"/>
+<rect x="607" y="491" width="10" height="10" rx="0" fill="#DEE6DC" stroke="none" stroke-width="1.2"/>
+<rect x="621" y="491" width="10" height="10" rx="0" fill="#E6C8AF" stroke="none" stroke-width="1.2"/>
+<rect x="635" y="491" width="10" height="10" rx="0" fill="#B8CEC4" stroke="none" stroke-width="1.2"/>
+<rect x="649" y="491" width="10" height="10" rx="0" fill="#AE663B" stroke="none" stroke-width="1.2"/>
+<rect x="663" y="491" width="10" height="10" rx="0" fill="#35756E" stroke="none" stroke-width="1.2"/>
+<rect x="677" y="491" width="10" height="10" rx="0" fill="#DEE6DC" stroke="none" stroke-width="1.2"/>
+<rect x="579" y="505" width="10" height="10" rx="0" fill="#B8CEC4" stroke="none" stroke-width="1.2"/>
+<rect x="593" y="505" width="10" height="10" rx="0" fill="#AE663B" stroke="none" stroke-width="1.2"/>
+<rect x="607" y="505" width="10" height="10" rx="0" fill="#35756E" stroke="none" stroke-width="1.2"/>
+<rect x="621" y="505" width="10" height="10" rx="0" fill="#DEE6DC" stroke="none" stroke-width="1.2"/>
+<rect x="635" y="505" width="10" height="10" rx="0" fill="#E6C8AF" stroke="none" stroke-width="1.2"/>
+<rect x="649" y="505" width="10" height="10" rx="0" fill="#B8CEC4" stroke="none" stroke-width="1.2"/>
+<rect x="663" y="505" width="10" height="10" rx="0" fill="#AE663B" stroke="none" stroke-width="1.2"/>
+<rect x="677" y="505" width="10" height="10" rx="0" fill="#35756E" stroke="none" stroke-width="1.2"/>
+<rect x="579" y="519" width="10" height="10" rx="0" fill="#E6C8AF" stroke="none" stroke-width="1.2"/>
+<rect x="593" y="519" width="10" height="10" rx="0" fill="#B8CEC4" stroke="none" stroke-width="1.2"/>
+<rect x="607" y="519" width="10" height="10" rx="0" fill="#AE663B" stroke="none" stroke-width="1.2"/>
+<rect x="621" y="519" width="10" height="10" rx="0" fill="#35756E" stroke="none" stroke-width="1.2"/>
+<rect x="635" y="519" width="10" height="10" rx="0" fill="#DEE6DC" stroke="none" stroke-width="1.2"/>
+<rect x="649" y="519" width="10" height="10" rx="0" fill="#E6C8AF" stroke="none" stroke-width="1.2"/>
+<rect x="663" y="519" width="10" height="10" rx="0" fill="#B8CEC4" stroke="none" stroke-width="1.2"/>
+<rect x="677" y="519" width="10" height="10" rx="0" fill="#AE663B" stroke="none" stroke-width="1.2"/>
+<rect x="579" y="533" width="10" height="10" rx="0" fill="#DEE6DC" stroke="none" stroke-width="1.2"/>
+<rect x="593" y="533" width="10" height="10" rx="0" fill="#E6C8AF" stroke="none" stroke-width="1.2"/>
+<rect x="607" y="533" width="10" height="10" rx="0" fill="#B8CEC4" stroke="none" stroke-width="1.2"/>
+<rect x="621" y="533" width="10" height="10" rx="0" fill="#AE663B" stroke="none" stroke-width="1.2"/>
+<rect x="635" y="533" width="10" height="10" rx="0" fill="#35756E" stroke="none" stroke-width="1.2"/>
+<rect x="649" y="533" width="10" height="10" rx="0" fill="#DEE6DC" stroke="none" stroke-width="1.2"/>
+<rect x="663" y="533" width="10" height="10" rx="0" fill="#E6C8AF" stroke="none" stroke-width="1.2"/>
+<rect x="677" y="533" width="10" height="10" rx="0" fill="#B8CEC4" stroke="none" stroke-width="1.2"/>
+<text x="731" y="501" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">02  REPRESENTATION</text>
+<text x="731" y="538" fill="#203744" font-family="DejaVu Serif" font-size="26" font-weight="normal" text-anchor="start" letter-spacing="0">Learned alignment</text>
+<path d="M984 513 H1040" fill="none" stroke="#5C6C70" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#arrow-ink)"/>
+<rect x="1070" y="477" width="55" height="55" rx="0" fill="#EEEAE1" stroke="#CCCFC7" stroke-width="1"/>
+<circle cx="1109.6" cy="489.65" r="4.4" fill="#E3C39D" stroke="none" stroke-width="1"/>
+<path d="M1076 524 L1087.6 501.75 L1098.6 512.75 L1109.6 500.1 L1119 524 Z" fill="#A7B9AA" stroke="none" stroke-width="0" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<rect x="1139" y="477" width="55" height="55" rx="0" fill="#EEEAE1" stroke="#AE663B" stroke-width="2"/>
+<circle cx="1178.6" cy="489.65" r="4.4" fill="#E3C39D" stroke="none" stroke-width="1"/>
+<path d="M1145 524 L1156.6 501.75 L1167.6 512.75 L1178.6 500.1 L1188 524 Z" fill="#A7B9AA" stroke="none" stroke-width="0" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<rect x="1208" y="477" width="55" height="55" rx="0" fill="#EEEAE1" stroke="#CCCFC7" stroke-width="1"/>
+<circle cx="1247.6" cy="489.65" r="4.4" fill="#E3C39D" stroke="none" stroke-width="1"/>
+<path d="M1214 524 L1225.6 501.75 L1236.6 512.75 L1247.6 500.1 L1257 524 Z" fill="#A7B9AA" stroke="none" stroke-width="0" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="1070" y="568" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">03  IMAGE RETRIEVAL</text>
+<path d="M54 600 H1386" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="54" y="637" fill="#5C6C70" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="0">EEG / MEG retrieval research   ·   fMRI screening   /   Conceptual illustration</text>
+</svg>
