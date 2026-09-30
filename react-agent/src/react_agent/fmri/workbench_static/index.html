@@ -3,45 +3,51 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>检查工作台</title>
-<link rel="stylesheet" href="/static/app.css">
+<title>EEGagent</title>
+<!-- 检索实验工作台：代码级自主研究为默认入口 -->
+<link rel="stylesheet" href="/static/app.css?v=ws5">
 </head>
-<body data-surface="home">
+<body data-surface="agentic">
 <div class="app">
 <header class="top">
-  <button type="button" id="toggle-side" aria-label="打开运行列表" hidden>记录</button>
-  <div class="brand">检查工作台</div>
+  <button type="button" id="toggle-side" aria-label="打开导航">研究列表</button>
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    EEGagent
+    <span class="brand-sub">Brain Decoding Lab</span>
+  </div>
   <nav class="mode-switch" aria-label="工作台页面">
-    <button type="button" id="surface-home" class="active">首页</button>
-    <button type="button" id="surface-screen">检查结果</button>
-    <button type="button" id="surface-retrieval">检索实验</button>
+    <button type="button" id="surface-agentic" class="active">自主研究</button>
+    <button type="button" id="surface-create">新建研究</button>
+    <button type="button" id="surface-screen">fMRI 筛查</button>
+    <button type="button" id="surface-adaptive">对照实验</button>
   </nav>
   <div id="header-status" class="header-status"></div>
-  <button type="button" id="open-drawer">新建检查</button>
+  <button type="button" id="open-drawer">新建筛查</button>
 </header>
 <div class="body">
   <aside class="side" id="sidebar">
-    <label class="search-label" for="search">搜索样本</label>
+    <label class="search-label" for="search" id="side-label">搜索样本</label>
     <input id="search" type="search" placeholder="搜索样本或运行 ID" autocomplete="off">
     <div id="run-list" class="run-list"></div>
   </aside>
   <main id="main"></main>
 </div>
 </div>
-<div id="drawer" class="drawer" hidden>
+<div id="drawer" class="drawer" hidden aria-hidden="true">
   <div class="drawer-panel" role="dialog" aria-labelledby="drawer-title">
     <div class="drawer-head">
-      <h2 id="drawer-title">新建检查</h2>
-      <button type="button" id="close-drawer" class="ghost" aria-label="关闭新建检查">关闭</button>
+      <h2 id="drawer-title">新建 fMRI 筛查</h2>
+      <button type="button" id="close-drawer" class="ghost" aria-label="关闭新建筛查">关闭</button>
     </div>
     <form id="run-form">
       <label for="image_path">服务器图片路径</label>
       <input id="image_path" name="image_path" spellcheck="false" autocomplete="off" placeholder="/path/to/image.jpg">
       <p id="image-preview" class="hint"></p>
-      <label for="check_mode">检查模式</label>
+      <label for="check_mode">筛查模式</label>
       <select id="check_mode" name="check_mode">
-        <option value="quick">快速数值检查</option>
-        <option value="diagnostic">分层数值检查</option>
+        <option value="quick">快速数值筛查</option>
+        <option value="diagnostic">分层数值筛查</option>
       </select>
       <p id="mode-note" class="hint"></p>
       <p id="mode-resolved" class="hint"></p>
@@ -77,12 +83,12 @@
       <p id="form-error" class="error" role="alert"></p>
       <div class="drawer-footer">
         <p class="hint">页面不显示密钥。没有取消接口，运行中只能查看状态。</p>
-        <button type="submit" id="start-check">开始检查</button>
+        <button type="submit" id="start-check">开始筛查</button>
       </div>
     </form>
   </div>
 </div>
-<div id="explain" class="drawer" hidden>
+<div id="explain" class="drawer" hidden aria-hidden="true">
   <div class="drawer-panel explain-panel" role="dialog" aria-labelledby="explain-title">
     <div class="drawer-head">
       <h2 id="explain-title">指标解释</h2>
@@ -91,6 +97,6 @@
     <div id="explain-body"></div>
   </div>
 </div>
-<script src="/static/app.js"></script>
+<script src="/static/app.js?v=ws5"></script>
 </body>
 </html>

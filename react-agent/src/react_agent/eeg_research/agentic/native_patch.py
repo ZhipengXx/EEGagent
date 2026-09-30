@@ -284,29 +284,78 @@ def implement(
     return {"status": "implementation_failed", "detail": "step_limit", "check": last_check, "steps": max_steps}
 
 
+def _camp_from_workspace(workspace: Path) -> Path:
+    return workspace.parent.parent
+
+
 def _execute(workspace: Path, tool: str, args: dict[str, Any], last_check: Any, python: str | None) -> dict[str, Any]:
-    if tool == "list_project_files":
-        return list_project_files(workspace)
-    if tool == "search_code":
-        return search_code(workspace, str(args.get("query") or ""))
-    if tool == "read_code":
-        return read_code(workspace, str(args.get("path") or ""), int(args.get("start") or 1), int(args.get("end") or 200))
-    if tool == "apply_candidate_patch":
-        return apply_candidate_patch(
-            workspace,
-            str(args.get("path") or ""),
-            str(args.get("content") or ""),
-            str(args.get("expected_base_hash") or ""),
+    from react_agent.eeg_research.agentic.ui_events import append_ui_event
+
+    camp = _camp_from_workspace(workspace)
+    emit = (camp / "campaign_state.json").is_file()
+    candidate_id = workspace.name
+    started = None
+    if emit:
+        started = append_ui_event(
+            camp,
+            "tool_started",
+            role="candidate_coder",
+            candidate_id=candidate_id,
+            tool=tool,
+            status="active",
+            summary=tool,
         )
-    if tool == "run_candidate_check":
-        return run_candidate_check(workspace, python=python)
-    if tool == "inspect_check_result":
-        return {"ok": last_check is not None, "result": last_check}
-    if tool == "finish_patch":
-        return finish_patch(workspace, str(args.get("summary") or ""))
-    if tool == "requires_framework_extension":
-        return {"ok": True}
-    return {"ok": False, "error": f"unknown_tool:{tool}"}
+    try:
+        if tool == "list_project_files":
+            result = list_project_files(workspace)
+        elif tool == "search_code":
+            result = search_code(workspace, str(args.get("query") or ""))
+        elif tool == "read_code":
+            result = read_code(workspace, str(args.get("path") or ""), int(args.get("start") or 1), int(args.get("end") or 200))
+        elif tool == "apply_candidate_patch":
+            result = apply_candidate_patch(
+                workspace,
+                str(args.get("path") or ""),
+                str(args.get("content") or ""),
+                str(args.get("expected_base_hash") or ""),
+            )
+        elif tool == "run_candidate_check":
+            result = run_candidate_check(workspace, python=python)
+        elif tool == "inspect_check_result":
+            result = {"ok": last_check is not None, "result": last_check}
+        elif tool == "finish_patch":
+            result = finish_patch(workspace, str(args.get("summary") or ""))
+        elif tool == "requires_framework_extension":
+            result = {"ok": True}
+        else:
+            result = {"ok": False, "error": f"unknown_tool:{tool}"}
+    except Exception as exc:  # noqa: BLE001
+        if emit:
+            append_ui_event(
+                camp,
+                "tool_failed",
+                role="candidate_coder",
+                candidate_id=candidate_id,
+                tool=tool,
+                status="failed",
+                error=type(exc).__name__,
+                parent_event_id=None if started is None else started.get("event_id"),
+                summary=tool,
+            )
+        raise
+    if emit:
+        append_ui_event(
+            camp,
+            "tool_finished" if result.get("ok") else "tool_failed",
+            role="candidate_coder",
+            candidate_id=candidate_id,
+            tool=tool,
+            status="completed" if result.get("ok") else "failed",
+            error=result.get("error"),
+            parent_event_id=None if started is None else started.get("event_id"),
+            summary=tool,
+        )
+    return result
 
 
 _SHORT_LIMIT = 3000

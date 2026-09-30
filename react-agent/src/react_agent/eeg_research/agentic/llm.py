@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from react_agent.eeg_research.agentic.identity import new_call_row
 from react_agent.eeg_research.agentic.roles import ENVELOPE_ROLES
+from react_agent.eeg_research.agentic.ui_events import append_ui_event
 
 PROMPTS = Path(__file__).resolve().parent / "prompts"
 PARSE_ATTEMPTS = 3
@@ -136,6 +137,17 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 started_at=started,
                 **bound,
             )
+            append_ui_event(
+                camp,
+                "llm_call_started",
+                role=role,
+                call_id=row.get("call_id"),
+                candidate_id=bound.get("candidate_id"),
+                task_id=bound.get("task_id"),
+                attempt_id=bound.get("attempt_id"),
+                job_id=bound.get("job_id"),
+                status="active",
+            )
             try:
                 reply, usage = loop.run_until_complete(
                     client.complete_json(
@@ -148,9 +160,27 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             except DeepSeekParseError as exc:
                 last = exc
                 _ledger(camp, _fail_row(row, exc, started))
+                append_ui_event(
+                    camp,
+                    "llm_parse_retry",
+                    role=role,
+                    call_id=row.get("call_id"),
+                    candidate_id=bound.get("candidate_id"),
+                    status="failed",
+                    error=type(exc).__name__,
+                )
                 continue
             except Exception as exc:  # noqa: BLE001
                 _ledger(camp, _fail_row(row, exc, started))
+                append_ui_event(
+                    camp,
+                    "llm_call_failed",
+                    role=role,
+                    call_id=row.get("call_id"),
+                    candidate_id=bound.get("candidate_id"),
+                    status="failed",
+                    error=type(exc).__name__,
+                )
                 raise LlmUnavailable(type(exc).__name__) from exc
             row.update(
                 {
@@ -164,16 +194,40 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 }
             )
             _ledger(camp, row)
+            append_ui_event(
+                camp,
+                "llm_call_finished",
+                role=role,
+                call_id=row.get("call_id"),
+                candidate_id=bound.get("candidate_id"),
+                status="completed",
+            )
             parsed = reply if isinstance(reply, dict) else {"_not_object": reply}
             if role in ENVELOPE_ROLES:
                 from react_agent.eeg_research.agentic.roles import RoleResultError, bind_role_output, task_identity_from_payload
 
                 task = task_identity_from_payload(payload, bound)
                 if task is None:
+                    append_ui_event(
+                        camp,
+                        "role_output_invalid",
+                        role=role,
+                        call_id=row.get("call_id"),
+                        status="failed",
+                        error="role_result_task_missing",
+                    )
                     raise LlmUnavailable("role_result_task_missing")
                 try:
                     return bind_role_output(parsed, task=task, prompt_hash=prompt_hash)
                 except RoleResultError as exc:
+                    append_ui_event(
+                        camp,
+                        "role_output_invalid",
+                        role=role,
+                        call_id=row.get("call_id"),
+                        status="failed",
+                        error=str(exc),
+                    )
                     raise LlmUnavailable(str(exc)) from exc
             return parsed
         raise LlmUnavailable(type(last).__name__ if last is not None else "DeepSeekParseError") from last

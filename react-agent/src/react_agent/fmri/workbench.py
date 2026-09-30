@@ -15,6 +15,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 _REPO = Path(__file__).resolve().parents[3]
 RUNS = (_REPO / "runs").resolve()
 RESEARCH = (RUNS / "eeg_research").resolve()
+DEMO_ROOT = (RUNS / "eeg_research_ui_demo").resolve()
 CONFIGS = (_REPO / "configs").resolve()
 DEFAULT_CONFIG = "fmri_check_tribe_image16.yaml"
 DEFAULT_OUT = "workbench"
@@ -254,6 +255,23 @@ def _json_bytes(payload: Any, status: int = 200) -> tuple[int, str, bytes]:
     return status, "application/json; charset=utf-8", json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
+def _agentic_root(query: dict[str, str] | None = None, form: dict[str, str] | None = None) -> Path:
+    from react_agent.eeg_research.agentic.cli import DEFAULT_ROOT
+
+    flag = ""
+    if query:
+        flag = query.get("demo") or ""
+    if form and not flag:
+        flag = form.get("demo") or ""
+    if flag == "1":
+        return DEMO_ROOT
+    return DEFAULT_ROOT
+
+
+def _json_error(message: str, status: int = 404) -> tuple[int, str, bytes]:
+    return _json_bytes({"ok": False, "error": message}, status)
+
+
 def _research_campaigns() -> list[dict[str, str]]:
     if not RESEARCH.is_dir():
         return []
@@ -366,8 +384,47 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
         if path == "/api/agentic_status":
             from react_agent.eeg_research.agentic.view import agentic_status
 
-            payload = agentic_status(campaign=_query(self.path).get("campaign", ""))
+            query = _query(self.path)
+            payload = agentic_status(root=_agentic_root(query), campaign=query.get("campaign", ""))
             status, mime, body = _json_bytes(payload)
+            self._send(status, mime, body, store=False)
+            return
+        if path == "/api/agentic_timeline":
+            from react_agent.eeg_research.agentic.timeline import campaign_timeline
+
+            query = _query(self.path)
+            payload = campaign_timeline(
+                _agentic_root(query),
+                query.get("campaign", ""),
+                cursor=query.get("cursor", ""),
+                limit=int(query.get("limit") or 20) if str(query.get("limit") or "").isdigit() else 20,
+            )
+            code = 200 if payload.get("ok") else 404
+            status, mime, body = _json_bytes(payload, code)
+            self._send(status, mime, body, store=False)
+            return
+        if path == "/api/agentic_job":
+            from react_agent.eeg_research.agentic.job_metrics import job_metrics
+
+            query = _query(self.path)
+            payload = job_metrics(_agentic_root(query), query.get("campaign", ""), query.get("job", ""))
+            code = 200 if payload.get("ok") else 404
+            status, mime, body = _json_bytes(payload, code)
+            self._send(status, mime, body, store=False)
+            return
+        if path == "/api/agentic_source":
+            from react_agent.eeg_research.agentic.view import candidate_source
+
+            query = _query(self.path)
+            preview = query.get("preview") == "1"
+            payload = candidate_source(
+                _agentic_root(query),
+                query.get("campaign", ""),
+                query.get("candidate", ""),
+                preview=preview,
+            )
+            code = 200 if payload.get("ok") else 404
+            status, mime, body = _json_bytes(payload, code)
             self._send(status, mime, body, store=False)
             return
         if path == "/api/train_status":
@@ -421,6 +478,15 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             status, mime, body = _json_bytes(payload, code)
             self._send(status, mime, body)
             return
+        if path == "/api/agentic_demo":
+            from react_agent.eeg_research.agentic.ui_demo import DEMO_CAMPAIGN, write_demo_campaign
+
+            DEMO_ROOT.mkdir(parents=True, exist_ok=True)
+            camp = write_demo_campaign(DEMO_ROOT)
+            payload = {"ok": True, "campaign": camp.name, "demo": True, "root": "runs/eeg_research_ui_demo"}
+            status, mime, body = _json_bytes(payload)
+            self._send(status, mime, body, store=False)
+            return
         if path == "/api/agentic_control":
             from react_agent.eeg_research.agentic.view import control
 
@@ -428,7 +494,7 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length).decode("utf-8", errors="replace")
             parsed = parse_qs(raw, keep_blank_values=True)
             form = {key: _form_value(parsed, key) for key in parsed}
-            payload = control(form.get("action", ""), form.get("campaign", ""))
+            payload = control(form.get("action", ""), form.get("campaign", ""), root=_agentic_root(form=form))
             status, mime, body = _json_bytes(payload, 200 if payload.get("ok") else 400)
             self._send(status, mime, body)
             return

@@ -19,7 +19,7 @@ const state = {
   followJob: false,
   traceIndex: 0,
   configs: null,
-  surface: "home",
+  surface: "agentic",
   retrieval: {
     dataset: "eeg",
     exp_setting: "intra-subject",
@@ -34,7 +34,7 @@ const state = {
     train_dir: "",
     test_dir: "",
     stop: "chain_early",
-    policy: "adaptive",
+    policy: "agentic",
     training_strategy: "pooled_subjects",
     generalization_target: "",
     held_out_subjects: "",
@@ -52,6 +52,21 @@ const state = {
   trainPoll: null,
   agenticFocus: "",
   agenticKnown: [],
+  agenticTab: "process",
+  selectedJob: "",
+  selectedStep: "",
+  selectedCandidate: "",
+  demo: false,
+  timeline: null,
+  jobMetrics: null,
+  pollSeq: 0,
+  stickBottom: true,
+  pendingEvents: 0,
+  controlBusy: false,
+  showTop5: false,
+  sourceFull: {},
+  detailOpen: false,
+  timelineAccum: null,
 };
 
 const main = document.getElementById("main");
@@ -102,19 +117,19 @@ function renderHome() {
       </header>
       <div class="task-grid">
         <article class="task-card">
-          <h2>查看检查结果</h2>
-          <p class="muted">看每次检查是否通过，哪些地方需要关注。</p>
-          <button type="button" class="primary" id="home-results"${state.runs.length ? "" : " disabled"}>查看最近结果</button>
+          <h2>自主研究</h2>
+          <p class="muted">代码级实验：提出干预、编写候选、对照比较。Pilot 默认 3 个 epoch，只用于探索，不能当作确认结果。</p>
+          <button type="button" class="primary" id="home-research">进入自主研究</button>
         </article>
         <article class="task-card">
-          <h2>新建数值检查</h2>
-          <p class="muted">填写服务器上的图片路径，生成信号后自动做数值检查。</p>
-          <button type="button" class="primary" id="home-new">新建检查</button>
+          <h2>fMRI 数值筛查</h2>
+          <p class="muted">检查预测响应的数值一致性，不代表真实脑激活已验证。</p>
+          <button type="button" class="primary" id="home-results"${state.runs.length ? "" : " disabled"}>查看筛查结果</button>
         </article>
         <article class="task-card">
-          <h2>EEG / MEG 检索研究</h2>
-          <p class="muted">选好数据和被试，由 agent 规划并运行检索实验。</p>
-          <button type="button" class="primary" id="home-research">进入检索实验</button>
+          <h2>对照 / 自适应实验</h2>
+          <p class="muted">固定两试或自适应检索，不改候选代码。</p>
+          <button type="button" class="primary" id="home-adaptive">打开对照实验</button>
         </article>
       </div>
       <section class="card">
@@ -128,8 +143,11 @@ function renderHome() {
     state.selected = state.runs[0].run_id;
     setSurface("screen");
   });
-  document.getElementById("home-new").addEventListener("click", openDrawer);
-  document.getElementById("home-research").addEventListener("click", () => setSurface("retrieval"));
+  document.getElementById("home-research").addEventListener("click", () => setSurface("agentic"));
+  document.getElementById("home-adaptive").addEventListener("click", () => {
+    state.retrieval.policy = "legacy_fixed";
+    setSurface("adaptive");
+  });
   main.querySelectorAll(".recent-row").forEach((button) => {
     button.addEventListener("click", () => {
       state.selected = button.dataset.run;
@@ -714,7 +732,13 @@ document.getElementById("toggle-side").addEventListener("click", () => {
 document.getElementById("open-drawer").addEventListener("click", openDrawer);
 document.getElementById("close-drawer").addEventListener("click", closeDrawer);
 document.getElementById("close-explain").addEventListener("click", () => { document.getElementById("explain").hidden = true; });
-document.getElementById("search").addEventListener("input", renderList);
+document.getElementById("search").addEventListener("input", () => {
+  if (state.surface === "agentic") {
+    paintWorkspaceShell();
+    return;
+  }
+  renderList();
+});
 document.getElementById("check_mode").addEventListener("change", refreshModeNote);
 document.getElementById("screen_depth").addEventListener("change", refreshModeNote);
 document.getElementById("image_path").addEventListener("input", refreshModeNote);
@@ -762,13 +786,19 @@ async function pollJob() {
 function setSurface(name) {
   state.surface = name;
   document.body.dataset.surface = name;
-  ["home", "screen", "retrieval"].forEach((id) => {
-    document.getElementById("surface-" + id).classList.toggle("active", name === id);
+  ["agentic", "create", "screen", "adaptive"].forEach((id) => {
+    const node = document.getElementById("surface-" + id);
+    if (node) node.classList.toggle("active", name === id || (id === "create" && name === "create"));
   });
-  document.getElementById("open-drawer").hidden = name === "retrieval";
-  document.getElementById("toggle-side").hidden = name !== "screen";
-  if (name === "retrieval") renderRetrieval();
-  else if (name === "home") loadRuns();
+  document.getElementById("open-drawer").hidden = name === "create" || name === "adaptive" || name === "agentic";
+  document.getElementById("toggle-side").hidden = name !== "screen" && name !== "agentic";
+  document.getElementById("toggle-side").textContent = name === "agentic" ? "研究列表" : "记录";
+  if (name === "agentic") renderAgenticWorkspace();
+  else if (name === "create") renderRetrieval();
+  else if (name === "adaptive") {
+    if (state.retrieval.policy === "agentic") state.retrieval.policy = "adaptive";
+    renderRetrieval();
+  } else if (name === "home") loadRuns();
   else if (state.selected) selectRun(state.selected);
   else loadRuns();
 }
@@ -949,12 +979,10 @@ function agenticOrdinals(rows) {
 
 function chooseAgentic(rows) {
   const ids = rows.map((row) => row.campaign_id);
-  const known = state.agenticKnown || [];
-  const fresh = ids.filter((id) => known.indexOf(id) < 0);
-  let focus = state.agenticFocus;
-  if (!known.length) focus = ids[0] || "";
-  else if (fresh.length) focus = fresh[0];
-  else if (ids.indexOf(focus) < 0) focus = ids[0] || "";
+  const route = parseRoute();
+  let focus = route.campaign || state.agenticFocus;
+  if (focus && ids.indexOf(focus) < 0) focus = "";
+  if (!focus) focus = ids[0] || "";
   state.agenticFocus = focus;
   state.agenticKnown = ids;
   return focus;
@@ -1025,6 +1053,7 @@ function agenticCard() {
 }
 
 function paintAgentic(box) {
+  if (!box) return;
   const open = new Set();
   box.querySelectorAll("details[open][data-keep]").forEach((el) => open.add(el.dataset.keep));
   box.innerHTML = agenticCard();
@@ -1036,17 +1065,43 @@ function paintAgentic(box) {
 }
 
 async function refreshAgentic() {
+  const seq = ++state.pollSeq;
   try {
-    const res = await fetch("/api/agentic_status", { cache: "no-store" });
-    state.agentic = await res.json();
-  } catch (_err) {
-    return;
+    const focus = state.agenticFocus || parseRoute().campaign;
+    const listRes = await fetch(apiUrl("/api/agentic_status"), { cache: "no-store" });
+    const list = await listRes.json();
+    if (seq !== state.pollSeq) return;
+    state.agenticList = list;
+    const rows = list.campaigns || [];
+    chooseAgentic(rows);
+    if (!state.agenticFocus) {
+      state.agentic = { campaigns: [] };
+      if (state.surface === "agentic") paintWorkspaceShell();
+      return;
+    }
+    const detailRes = await fetch(apiUrl("/api/agentic_status", { campaign: state.agenticFocus }), { cache: "no-store" });
+    const detail = await detailRes.json();
+    if (seq !== state.pollSeq) return;
+    if (state.agenticFocus !== (detail.campaigns && detail.campaigns[0] && detail.campaigns[0].campaign_id)) return;
+    state.agentic = detail;
+    const camp = (detail.campaigns || [])[0];
+    if (camp && !state.selectedJob) state.selectedJob = camp.live_job || (camp.jobs && camp.jobs[0] && camp.jobs[0].job_id) || "";
+    const timelineRes = await fetch(apiUrl("/api/agentic_timeline", { campaign: state.agenticFocus, cursor: "0", limit: "40" }), { cache: "no-store" });
+    const timeline = await timelineRes.json();
+    if (seq !== state.pollSeq) return;
+    state.timeline = timeline;
+    if (state.selectedJob) {
+      const jobRes = await fetch(apiUrl("/api/agentic_job", { campaign: state.agenticFocus, job: state.selectedJob }), { cache: "no-store" });
+      const metrics = await jobRes.json();
+      if (seq !== state.pollSeq) return;
+      state.jobMetrics = metrics.ok ? metrics : null;
+    }
+    if (state.surface === "agentic") paintWorkspaceShell();
+  } catch (err) {
+    if (state.surface === "agentic") {
+      main.innerHTML = `<section class="workspace"><div class="workspace-center"><p class="error">工作区读取失败：${esc(err && err.message ? err.message : err)}</p></div></section>`;
+    }
   }
-  const box = document.getElementById("agentic-card");
-  if (!box) return;
-  const next = JSON.stringify(state.agentic);
-  if (next === box.dataset.snapshot) return;
-  paintAgentic(box);
 }
 
 function bindAgentic() {
@@ -1055,16 +1110,31 @@ function bindAgentic() {
       const id = button.getAttribute("data-agentic-select") || "";
       if (!id || id === state.agenticFocus) return;
       state.agenticFocus = id;
-      const box = document.getElementById("agentic-card");
-      if (box) paintAgentic(box);
+      state.selectedStep = "";
+      state.selectedJob = "";
+      writeRoute();
+      refreshAgentic();
     });
   });
   document.querySelectorAll("[data-agentic-action]").forEach((button) => {
     button.addEventListener("click", async () => {
+      if (state.controlBusy) return;
       const action = button.getAttribute("data-agentic-action");
-      if (action === "stop" && !window.confirm("停止当前训练作业？已写入的结果会保留。")) return;
+      if (action === "stop" && !window.confirm("停止当前训练作业？不会取消整个研究。已写入的结果会保留。")) return;
+      state.controlBusy = true;
+      button.disabled = true;
       const body = new URLSearchParams({ action, campaign: button.getAttribute("data-campaign") || "" });
-      await fetch("/api/agentic_control", { method: "POST", body });
+      if (state.demo) body.set("demo", "1");
+      try {
+        const res = await fetch("/api/agentic_control", { method: "POST", body });
+        if (!res.ok) {
+          const payload = await res.json().catch(() => ({}));
+          window.alert(payload.error || "控制请求失败");
+        }
+      } catch (_err) {
+        window.alert("控制请求失败");
+      }
+      state.controlBusy = false;
       refreshAgentic();
     });
   });
@@ -1073,17 +1143,346 @@ function bindAgentic() {
 function scheduleAgentic() {
   if (state.agenticTimer) return;
   state.agenticTimer = window.setInterval(() => {
-    if (state.surface === "retrieval") refreshAgentic();
+    if (state.surface === "agentic") refreshAgentic();
   }, 5000);
 }
 
-async function renderRetrieval() {
+function missing(label) {
+  return `<p class="missing">${esc(label)}：未提供</p>`;
+}
+
+function roleLabel(role) {
+  return {
+    research_planner: "规划",
+    research_librarian: "检索",
+    experiment_designer: "设计",
+    candidate_coder: "编码",
+    candidate_reviewer: "审查",
+    result_analyst: "分析",
+    memory_curator: "记忆",
+    result_auditor: "审计",
+  }[role] || role || "—";
+}
+
+function isNarrowWorkspace() {
+  const toggle = document.getElementById("toggle-side");
+  if (toggle) {
+    const display = getComputedStyle(toggle).display;
+    if (display && display !== "none") return true;
+  }
+  return window.matchMedia("(max-width: 1024px)").matches;
+}
+
+function roleStatusText(status) {
+  return {
+    not_called: "未调用",
+    queued: "排队",
+    active: "活动",
+    completed: "已完成",
+    failed: "失败",
+    waiting: "等待依赖",
+    unknown: "未知",
+  }[status] || status || "未知";
+}
+
+function gapChart(title, points, field, caption) {
+  const ok = (points || []).map((row) => ({ epoch: row.epoch, cell: row[field] })).filter((row) => row.cell);
+  const usable = ok.filter((row) => row.cell.status === "ok");
+  const captionHtml = `<p class="chart-caption">${esc(caption)}</p>`;
+  if (!usable.length) return `<div class="chart"><h3>${esc(title)}</h3>${captionHtml}<p class="missing">曲线缺失</p></div>`;
+  const width = 520;
+  const height = 180;
+  const left = 42;
+  const right = 12;
+  const top = 12;
+  const bottom = 28;
+  const epochs = ok.map((row) => row.epoch);
+  const minX = Math.min(...epochs);
+  const maxX = Math.max(...epochs);
+  const values = usable.map((row) => row.cell.value);
+  const minY = Math.min(...values);
+  const maxY = Math.max(...values);
+  const spanY = maxY === minY ? Math.max(Math.abs(minY) * 0.05, 0.01) : (maxY - minY);
+  const xOf = (epoch) => left + (maxX === minX ? (width - left - right) / 2 : (epoch - minX) / (maxX - minX) * (width - left - right));
+  const yOf = (value) => top + (1 - (value - minY) / spanY) * (height - top - bottom);
+  let d = "";
+  let drawing = false;
+  ok.forEach((row) => {
+    if (row.cell.status !== "ok") {
+      drawing = false;
+      return;
+    }
+    const cmd = drawing ? "L" : "M";
+    d += `${cmd}${xOf(row.epoch).toFixed(1)} ${yOf(row.cell.value).toFixed(1)} `;
+    drawing = true;
+  });
+  const dots = usable.map((row) => `<circle cx="${xOf(row.epoch).toFixed(1)}" cy="${yOf(row.cell.value).toFixed(1)}" r="3" fill="${cssVar("--accent", "#35756e")}"><title>epoch ${row.epoch}: ${row.cell.value}</title></circle>`).join("");
+  return `<div class="chart"><h3>${esc(title)}</h3>${captionHtml}<svg viewBox="0 0 ${width} ${height}" role="img"><path d="${d}" fill="none" stroke="${cssVar("--accent", "#35756e")}" stroke-width="2"></path>${dots}</svg></div>`;
+}
+
+function jobPicker(camp) {
+  const jobs = (camp && camp.jobs) || [];
+  if (!jobs.length) return "";
+  return `<div class="job-picker">${jobs.map((row) => `<button type="button" class="${row.job_id === state.selectedJob ? "active" : ""}" data-job="${esc(row.job_id)}">${esc(row.job_id)} · ${esc(row.fidelity || "—")}</button>`).join("")}</div>`;
+}
+
+function jobCharts(camp) {
+  const picker = jobPicker(camp);
+  const metrics = state.jobMetrics;
+  if (!metrics) return `${picker}<p class="missing">没有选中的训练作业，或历史不可读。</p>`;
+  const cap = `${metrics.job_id || "—"} · ${metrics.fidelity || "—"} · seed ${metrics.seed ?? "—"} · ${metrics.epochs_completed ?? "—"} / ${metrics.epochs_budget ?? "—"} epoch`;
+  const points = metrics.history || [];
+  const top = state.showTop5 ? "fixed_bank_top5" : "fixed_bank_top1";
+  const topTitle = state.showTop5 ? "固定 gallery validation Top-5" : "固定 gallery validation Top-1";
+  return `${picker}<p class="chart-caption">${esc(cap)}</p>
+    <p class="muted">Pilot 是探索；对照线只在可比协议下有意义。loss 下降不是研究成功。</p>
+    ${gapChart("训练 loss", points, "train_loss", cap)}
+    ${gapChart(topTitle, points, top, cap)}
+    <p class="muted">batch 内 top1/top5 仅诊断，不是固定 gallery 指标。</p>
+    <button type="button" id="toggle-top5">${state.showTop5 ? "查看 Top-1" : "查看 Top-5"}</button>`;
+}
+
+function healthLine(health) {
+  const live = health.process_liveness;
+  const stateText = health.process_state ? String(health.process_state) : "";
+  if (live === "alive") return `进程存活${stateText ? ` · ${stateText}` : ""}`;
+  if (live === "zombie") return "进程僵尸（仅视图中断）";
+  if (live === "exited") return "进程已退出";
+  if (live === "missing") return "无研究进程";
+  return "进程未知";
+}
+
+function eventDetail(event) {
+  const close = `<button type="button" class="detail-close" id="close-detail">关闭详情</button>`;
+  if (!event) return `${close}${missing("步骤详情")}`;
+  const reason = event.reason_zh || "";
+  return `<div>
+    ${close}
+    <p class="muted">步骤详情</p>
+    <h2>${esc(event.summary || event.event_type)}</h2>
+    <p>${esc(roleLabel(event.role))} · ${esc(event.status || "—")}</p>
+    <h3>观察 / 证据</h3>
+    ${reason ? `<p>${esc(firstClause(reason))}</p>` : missing("观察")}
+    <h3>假设或行动理由</h3>
+    ${reason ? `<p class="agentic-prose">${renderProse(reason)}</p>` : missing("理由")}
+    <h3>工具 / 改动</h3>
+    ${event.tool ? `<p>${esc(event.tool)}</p>` : missing("工具")}
+    <h3>执行 / 审查结果</h3>
+    ${event.error ? `<p class="error">${esc(event.error)}</p>` : (event.status ? `<p>${esc(event.status)}</p>` : missing("结果"))}
+    <h3>下一步条件</h3>
+    ${missing("下一步条件")}
+  </div>`;
+}
+
+function paintWorkspaceShell() {
+  const lists = (state.agenticList && state.agenticList.campaigns) || [];
+  const camp = ((state.agentic && state.agentic.campaigns) || [])[0];
+  const side = document.getElementById("run-list");
+  const label = document.getElementById("side-label");
+  const search = document.getElementById("search");
+  if (label) label.textContent = "研究";
+  if (search) search.placeholder = "搜索研究";
+  if (side) {
+    if (!lists.length) {
+      side.innerHTML = `<p class="muted">还没有代码级研究。</p><button type="button" id="side-create">新建研究</button>`;
+      const create = document.getElementById("side-create");
+      if (create) create.addEventListener("click", () => setSurface("create"));
+    } else {
+      const query = String((search && search.value) || "").trim().toLowerCase();
+      const visible = lists.filter((row) => {
+        if (!query) return true;
+        const hay = `${row.objective || ""} ${row.campaign_id || ""} ${row.status || ""}`.toLowerCase();
+        return hay.indexOf(query) >= 0;
+      }).slice().sort((a, b) => {
+        if (a.campaign_id === state.agenticFocus) return -1;
+        if (b.campaign_id === state.agenticFocus) return 1;
+        return (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0);
+      });
+      side.innerHTML = `<button type="button" id="side-create">+ 新建研究</button>
+        <p class="muted">研究</p>
+        ${visible.map((row) => `<button type="button" class="run-item${row.campaign_id === state.agenticFocus ? " active" : ""}" data-agentic-select="${esc(row.campaign_id)}"><span class="run-name">${esc(row.objective || row.campaign_id)}</span><span class="run-meta">${esc(AGENTIC_STATUS[row.status] || row.status || "")}</span></button>`).join("")}
+        ${camp ? `<p class="muted">候选</p><div class="candidate-list">${(camp.candidates || []).map((row) => {
+          const parent = row.parent_candidate_id ? `父候选 ${esc(row.parent_candidate_id)}` : "无线索关系";
+          return `<button type="button" data-candidate="${esc(row.candidate_id)}">${esc(row.candidate_id)} · ${esc(row.status || "")}<span class="run-meta">${parent} · attempt ${esc(row.attempt_id || "未知")}</span></button>`;
+        }).join("")}</div>` : ""}`;
+    }
+  }
+  if (!camp) {
+    main.innerHTML = `<section class="workspace"><div class="workspace-head"><h1>自主研究</h1></div><div class="workspace-center"><p>还没有代码级研究。用「新建研究」从本页创建，不必只用命令行。</p><button type="button" class="primary" id="empty-create">新建研究</button></div></section>`;
+    const empty = document.getElementById("empty-create");
+    if (empty) empty.addEventListener("click", () => setSurface("create"));
+    bindAgentic();
+    return;
+  }
+  const best = camp.best_full;
+  const bestLine = best
+    ? (best.beats_control ? `${esc(best.candidate_id)} +${esc(best.delta_vs_control_pp)} pp` : `${esc(best.candidate_id)} ${esc(best.delta_vs_control_pp)} pp · ${esc(best.rank_note || "尚未优于对照")}`)
+    : "没有可比的完整结果";
+  const events = (state.timeline && state.timeline.events) || [];
+  const selected = events.find((row) => row.event_id === state.selectedStep) || events[events.length - 1];
+  const activity = (state.timeline && state.timeline.activity) || {};
+  const health = camp.health || {};
+  const roles = (activity.roles || []).map((row) => `<button type="button" class="role-chip${row.status === "active" ? " active" : ""}" data-role="${esc(row.role)}"><span>${esc(roleLabel(row.role))}</span><span class="role-status">${esc(roleStatusText(row.status))}</span></button>`).join("");
+  const timelineHtml = events.map((row) => `<li class="${row.event_id === (selected && selected.event_id) ? "selected" : ""}"><button type="button" class="event" data-step="${esc(row.event_id)}"><strong>${esc(row.summary || row.event_type)}</strong><span class="muted"> ${esc(roleLabel(row.role))} · ${esc(row.status || "")}</span></button></li>`).join("");
+  const more = state.timeline && state.timeline.has_more ? `<button type="button" id="load-more-events">加载更多事件</button>` : "";
+  main.innerHTML = `<section class="workspace">
+    <header class="workspace-head">
+      ${state.demo ? `<p class="demo-banner">DEMO 数据 · 不是实验结果</p>` : ""}
+      <h1>${esc(camp.objective || camp.campaign_id)}</h1>
+      <div class="workspace-controls">
+        <button type="button" data-agentic-action="pause" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy ? " disabled" : ""}>当前步骤后暂停</button>
+        <button type="button" data-agentic-action="stop" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy ? " disabled" : ""}>停止当前训练作业</button>
+        <button type="button" data-agentic-action="resume" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy ? " disabled" : ""}>继续</button>
+      </div>
+      <p class="workspace-rank">${bestLine}</p>
+      <div class="workspace-meta">
+        <span>${esc(camp.scope_zh || camp.research_scope || "协议未记录")}</span>
+        <span>${esc(AGENTIC_STATUS[camp.status] || camp.status || "")}</span>
+        <span>更新 ${esc(agenticWhen(camp.updated_at))}</span>
+        <span>${esc(healthLine(health))}</span>
+        <span>最后进展 ${esc(health.last_progress_at ? agenticWhen(health.last_progress_at) : "未知")}</span>
+      </div>
+      <details class="workspace-budget"><summary>预算</summary>
+        <p>训练 ${esc((camp.budget && camp.budget.training_jobs) ?? 0)}/${esc((camp.budget && camp.budget.max_training_jobs) ?? "—")} · 调用 ${esc((camp.budget && camp.budget.llm_calls) ?? 0)}/${esc((camp.budget && camp.budget.max_llm_calls) ?? "—")} · GPU 剩余 ${esc((camp.budget && camp.budget.gpu_seconds_left) ?? "—")} · 费用 ${(camp.budget && camp.budget.api_usd) == null ? "未记录" : esc(camp.budget.api_usd)}</p>
+      </details>
+    </header>
+    <div class="workspace-body">
+      <div class="workspace-center" id="workspace-center">
+        <div class="workspace-tabs">
+          <button type="button" data-tab="process" class="${state.agenticTab === "process" ? "active" : ""}">过程</button>
+          <button type="button" data-tab="experiments" class="${state.agenticTab === "experiments" ? "active" : ""}">实验</button>
+          <button type="button" data-tab="code" class="${state.agenticTab === "code" ? "active" : ""}">代码与产物</button>
+        </div>
+        <div class="role-strip">${roles || `<p class="missing">${activity.activity_available ? "没有角色事件" : "活动记录不可用"}</p>`}<span class="muted role-note">Training worker 不是 LLM 角色</span></div>
+        ${state.agenticTab === "process" ? `<ol class="timeline-list">${timelineHtml || "<li>还没有事件</li>"}</ol>${more}${jobCharts(camp)}<button type="button" class="new-events" id="jump-latest">新事件</button>` : ""}
+        ${state.agenticTab === "experiments" ? agenticBody(camp) : ""}
+        ${state.agenticTab === "code" ? (camp.candidates || []).map((row) => `<details data-keep="candidate-${esc(row.candidate_id)}"><summary>${esc(row.candidate_id)} ${row.source_truncated ? "· 预览已截断" : ""}</summary><pre class="agentic-source">${esc(row.source || "没有写出文件")}</pre>${row.source_truncated ? `<button type="button" data-load-source="${esc(row.candidate_id)}">加载完整内容</button>` : ""}</details>`).join("") : ""}
+      </div>
+      <aside class="workspace-detail${state.detailOpen ? " is-open" : ""}" id="workspace-detail">${eventDetail(selected)}</aside>
+    </div>
+  </section>`;
+  bindAgentic();
+  document.querySelectorAll("[data-tab]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.agenticTab = button.getAttribute("data-tab");
+      writeRoute();
+      paintWorkspaceShell();
+    });
+  });
+  document.querySelectorAll("[data-step]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedStep = button.getAttribute("data-step") || "";
+      state.detailOpen = true;
+      writeRoute();
+      paintWorkspaceShell();
+    });
+  });
+  document.querySelectorAll("[data-role]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const role = button.getAttribute("data-role");
+      const hit = [...events].reverse().find((row) => row.role === role);
+      if (hit) {
+        state.selectedStep = hit.event_id;
+        state.detailOpen = true;
+        writeRoute();
+        paintWorkspaceShell();
+      }
+    });
+  });
+  document.querySelectorAll("[data-job]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const jobId = button.getAttribute("data-job") || "";
+      if (!jobId || jobId === state.selectedJob) return;
+      state.selectedJob = jobId;
+      writeRoute();
+      const jobRes = await fetch(apiUrl("/api/agentic_job", { campaign: state.agenticFocus, job: jobId }), { cache: "no-store" });
+      const metrics = await jobRes.json();
+      state.jobMetrics = metrics.ok ? metrics : null;
+      paintWorkspaceShell();
+    });
+  });
+  const closeDetail = document.getElementById("close-detail");
+  if (closeDetail) closeDetail.addEventListener("click", () => {
+    state.detailOpen = false;
+    paintWorkspaceShell();
+  });
+  const moreBtn = document.getElementById("load-more-events");
+  if (moreBtn) moreBtn.addEventListener("click", async () => {
+    const cursor = state.timeline && state.timeline.next_cursor;
+    if (cursor == null || cursor === "") return;
+    const pageRes = await fetch(apiUrl("/api/agentic_timeline", { campaign: state.agenticFocus, cursor: String(cursor), limit: "20" }), { cache: "no-store" });
+    const page = await pageRes.json();
+    const prev = (state.timeline && state.timeline.events) || [];
+    const seen = new Set(prev.map((row) => row.event_id));
+    const extra = (page.events || []).filter((row) => !seen.has(row.event_id));
+    state.timeline = { ...page, events: prev.concat(extra), has_more: page.has_more, next_cursor: page.next_cursor };
+    paintWorkspaceShell();
+  });
+  document.querySelectorAll("[data-candidate]").forEach((button) => {
+    button.addEventListener("click", () => {
+      state.selectedCandidate = button.getAttribute("data-candidate") || "";
+      state.agenticTab = "code";
+      writeRoute();
+      paintWorkspaceShell();
+    });
+  });
+  const top5 = document.getElementById("toggle-top5");
+  if (top5) top5.addEventListener("click", () => {
+    state.showTop5 = !state.showTop5;
+    paintWorkspaceShell();
+  });
+  document.querySelectorAll("[data-load-source]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const id = button.getAttribute("data-load-source");
+      const res = await fetch(apiUrl("/api/agentic_source", { campaign: state.agenticFocus, candidate: id }));
+      const payload = await res.json();
+      if (payload.ok) button.previousElementSibling.textContent = payload.source || "";
+      button.remove();
+    });
+  });
+  const center = document.getElementById("workspace-center");
+  if (center) {
+    center.addEventListener("scroll", () => {
+      const nearBottom = center.scrollHeight - center.scrollTop - center.clientHeight < 48;
+      state.stickBottom = nearBottom;
+    }, { once: false });
+    if (!state.stickBottom) {
+      const jump = document.getElementById("jump-latest");
+      if (jump) jump.classList.add("show");
+    }
+  }
+  const jump = document.getElementById("jump-latest");
+  if (jump) jump.addEventListener("click", () => {
+    state.stickBottom = true;
+    const node = document.getElementById("workspace-center");
+    if (node) node.scrollTop = node.scrollHeight;
+    jump.classList.remove("show");
+  });
+  const active = document.querySelector(".run-item.active");
+  if (active && typeof active.scrollIntoView === "function") active.scrollIntoView({ block: "nearest" });
+  writeRoute();
+}
+
+async function renderAgenticWorkspace() {
   scheduleAgentic();
-  refreshAgentic();
+  const route = parseRoute();
+  if (route.campaign) state.agenticFocus = route.campaign;
+  if (route.tab) state.agenticTab = route.tab;
+  if (route.job) state.selectedJob = route.job;
+  if (route.step) state.selectedStep = route.step;
+  if (route.candidate) state.selectedCandidate = route.candidate;
+  if (state.demo) {
+    await fetch("/api/agentic_demo", { method: "POST" }).catch(() => {});
+  }
+  await refreshAgentic();
+}
+
+async function renderRetrieval() {
   paintRetrieval(state.shell || { discovered: false, campaigns: [] });
   const res = await fetch("/api/retrieval");
   const payload = await res.json();
-  if (state.surface !== "retrieval" || state.discovered) return;
+  if (state.surface !== "create" && state.surface !== "adaptive") return;
+  if (state.discovered) return;
   state.shell = payload;
   paintRetrieval({ ...payload, discovered: false, subjects: [], gpus: [] });
 }
@@ -1131,14 +1530,58 @@ const METRIC_NOTES = [
   ["GPU 小时", "本任务分配 GPU 的累计时长。", "不是美元费用或实际利用率。"],
 ];
 
+function demoQuery() {
+  return state.demo ? "demo=1" : "";
+}
+
+function apiUrl(path, params) {
+  const search = new URLSearchParams();
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") search.set(key, value);
+  });
+  if (state.demo) search.set("demo", "1");
+  const qs = search.toString();
+  return qs ? path + "?" + qs : path;
+}
+
+function parseRoute() {
+  const raw = decodeURIComponent((location.hash || "").replace(/^#/, ""));
+  const [path, query] = raw.split("?");
+  const params = new URLSearchParams(query || location.search.replace(/^\?/, ""));
+  if (params.get("demo") === "1") state.demo = true;
+  let campaign = "";
+  if (path.startsWith("research/")) campaign = path.slice("research/".length).split("/")[0];
+  else if (path.startsWith("campaign/")) campaign = path.slice("campaign/".length);
+  return {
+    campaign,
+    tab: params.get("tab") || state.agenticTab || "process",
+    job: params.get("job") || "",
+    step: params.get("step") || "",
+    candidate: params.get("candidate") || "",
+  };
+}
+
+function writeRoute() {
+  if (!state.agenticFocus) return;
+  const params = new URLSearchParams();
+  if (state.agenticTab && state.agenticTab !== "process") params.set("tab", state.agenticTab);
+  if (state.selectedJob) params.set("job", state.selectedJob);
+  if (state.selectedStep) params.set("step", state.selectedStep);
+  if (state.selectedCandidate) params.set("candidate", state.selectedCandidate);
+  if (state.demo) params.set("demo", "1");
+  const qs = params.toString();
+  const next = "#research/" + encodeURIComponent(state.agenticFocus) + (qs ? "?" + qs : "");
+  if (location.hash !== next) history.replaceState(null, "", next);
+}
+
 function campaignFromHash() {
-  const hash = decodeURIComponent(location.hash.replace(/^#/, ""));
-  return hash.startsWith("campaign/") ? hash.slice("campaign/".length) : "";
+  return parseRoute().campaign;
 }
 
 function paintRetrieval(payload) {
+  if (state.surface === "agentic") return;
   const active = campaignFromHash();
-  if (active) {
+  if (active && state.surface !== "create" && state.surface !== "adaptive") {
     paintProgress(active);
     return;
   }
@@ -1152,14 +1595,11 @@ function paintRetrieval(payload) {
   const split = payload.split || {};
   const lrPlaceholder = payload.lr == null ? "" : payload.lr;
   const rootPlaceholder = payload.data_root || options.data_root || "";
-  const openKeeps = new Set();
-  const previousCard = document.getElementById("agentic-card");
-  if (previousCard) previousCard.querySelectorAll("details[open][data-keep]").forEach((el) => openKeeps.add(el.dataset.keep));
   main.innerHTML = `
     <section class="research-page">
       <header>
-        <h1>检索实验</h1>
-        <p class="muted research-lead">选好数据和被试，点「开始研究」，agent 会规划并运行检索实验。</p>
+        <h1>${state.surface === "adaptive" ? "对照 / 自适应实验" : "新建自主研究"}</h1>
+        <p class="muted research-lead">${state.surface === "adaptive" ? "固定两试或自适应检索。这不是代码级研究。" : "填写数据与预算后创建代码级研究。长配置只出现在本页。"}</p>
         <details class="muted how-to"><summary>这个页面怎么用</summary>
           <p>先发现数据与设备，再开始研究。多被试合在一起训练、又没有留出被试时，验证是图像留出，不是跨被试泛化。固定候选 Top-1 才用于比较试验；训练 batch 里的 top1 只用来观察训练过程。GPU 小时是分配时长，不是费用。</p>
         </details>
@@ -1185,12 +1625,12 @@ function paintRetrieval(payload) {
         ${gpuChecks(gpus)}
         <h2 class="step-title"><span class="step-no">3</span>研究方式</h2>
         <label class="choice">研究方式<select id="retrieval-policy">
-          <option value="adaptive"${state.retrieval.policy === "adaptive" ? " selected" : ""}>自适应研究</option>
+          <option value="agentic"${state.retrieval.policy === "agentic" ? " selected" : ""}>代码级自主研究</option>
+          <option value="adaptive"${state.retrieval.policy === "adaptive" ? " selected" : ""}>自适应研究（不改代码）</option>
           <option value="legacy_fixed"${state.retrieval.policy === "legacy_fixed" ? " selected" : ""}>固定两试（对照）</option>
-          <option value="agentic"${state.retrieval.policy === "agentic" ? " selected" : ""}>代码级研究</option>
         </select></label>
         ${state.retrieval.policy === "agentic"
-          ? `<p class="muted">结束由研究循环决定，不使用两试早停。</p>`
+          ? `<p class="muted">结束由研究循环决定，不使用两试早停。Pilot 默认 3 个 epoch，只用于探索。完整训练与复现才可能进入确认。代码级协议暂不支持时会明确提示，不会静默改成其它模式。</p>`
           : `<label class="choice">结束条件<select id="retrieval-stop">${stopOptions(options)}</select></label>`}
         <details class="advanced-settings" id="advanced-settings"${state.advancedOpen ? " open" : ""}>
         <summary>高级设置</summary>
@@ -1231,7 +1671,6 @@ function paintRetrieval(payload) {
       <section class="research-note" id="retrieval-result">
         ${outcomeText(payload, blockers)}
       </section>
-      <section class="card agentic-card" id="agentic-card">${agenticCard()}</section>
       <details class="card tech-details" id="retrieval-tech"${state.techOpen ? " open" : ""}>
         <summary>技术详情</summary>
         <div id="split-panel">
@@ -1253,14 +1692,6 @@ function paintRetrieval(payload) {
       </details>
     </section>`;
   bindRetrieval();
-  bindAgentic();
-  const agenticBox = document.getElementById("agentic-card");
-  if (agenticBox) {
-    agenticBox.dataset.snapshot = JSON.stringify(state.agentic || {});
-    agenticBox.querySelectorAll("details[data-keep]").forEach((el) => {
-      if (openKeeps.has(el.dataset.keep)) el.open = true;
-    });
-  }
   if (state.focusHeldout) {
     state.focusHeldout = false;
     const heldout = document.getElementById("retrieval-heldout");
@@ -1728,12 +2159,18 @@ async function submitRetrieval(action) {
   if (action === "run" && state.retrieval.policy !== "agentic") await pollTrainStatus();
   if (payload && payload.agentic_campaign) {
     agenticRequestId = "";
-    refreshAgentic();
+    state.agenticFocus = payload.agentic_campaign;
+    writeRoute();
+    setSurface("agentic");
+    stopTrainPoll();
+    state.busy = false;
+    state.phase = "done";
+    return;
   }
   stopTrainPoll();
   state.busy = false;
   state.phase = "done";
-  if (state.surface !== "retrieval") return;
+  if (state.surface !== "create" && state.surface !== "adaptive") return;
   paintRetrieval(payload);
 }
 
@@ -1777,9 +2214,27 @@ async function showCampaign(campaignId) {
 }
 
 window.addEventListener("hashchange", () => {
-  if (state.surface === "retrieval") paintRetrieval(state.shell || {});
+  const route = parseRoute();
+  if (route.campaign) {
+    if (state.surface !== "agentic") setSurface("agentic");
+    else renderAgenticWorkspace();
+  } else if (state.surface === "create" || state.surface === "adaptive") {
+    paintRetrieval(state.shell || {});
+  }
 });
-document.getElementById("surface-home").addEventListener("click", () => setSurface("home"));
+document.getElementById("surface-agentic").addEventListener("click", () => setSurface("agentic"));
+document.getElementById("surface-create").addEventListener("click", () => {
+  state.retrieval.policy = "agentic";
+  setSurface("create");
+});
 document.getElementById("surface-screen").addEventListener("click", () => setSurface("screen"));
-document.getElementById("surface-retrieval").addEventListener("click", () => setSurface("retrieval"));
-setSurface(campaignFromHash() ? "retrieval" : "home");
+document.getElementById("surface-adaptive").addEventListener("click", () => {
+  if (state.retrieval.policy === "agentic") state.retrieval.policy = "adaptive";
+  setSurface("adaptive");
+});
+if (new URLSearchParams(location.search).get("demo") === "1") state.demo = true;
+{
+  const boot = parseRoute();
+  if (boot.campaign) state.agenticFocus = boot.campaign;
+  setSurface("agentic");
+}
