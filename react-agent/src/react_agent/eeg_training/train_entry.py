@@ -351,19 +351,17 @@ def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
         "react_agent.eeg_research.agentic.baseline",
         "react_agent.eeg_training.model",
     }
+    geometry = {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}
+    model_config = _hook_section(out_dir, "model")
     if baseline:
-        from react_agent.eeg_training.model import EEGProjectLayer
+        from react_agent.eeg_research.agentic.baseline import EEGCandidate
 
-        encoder = EEGProjectLayer(
-            z_dim=1024,
-            c_num=int(spec["c_num"]),  # type: ignore[arg-type]
-            timesteps=list(spec["timesteps"]),  # type: ignore[arg-type]
-        )
+        encoder = _build_hook(EEGCandidate(), "build_encoder", geometry, model_config)
     else:
         try:
             module = importlib.import_module(module_name)
             candidate = module.EEGCandidate()
-            encoder = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
+            encoder = _build_hook(candidate, "build_encoder", geometry, model_config)
         except Exception as exc:  # noqa: BLE001
             raise SplitError(f"candidate_reload_failed:{type(exc).__name__}") from exc
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
@@ -392,20 +390,21 @@ def _fixed_bank_pass(encoder, loader, records) -> dict[str, float]:
     return tally.result()
 
 
-def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path, checkpoint: Path | None = None) -> dict[str, object]:
+def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path, checkpoint: Path | None = None, context_dir: Path | None = None) -> dict[str, object]:
     """Score an existing checkpoint on frozen validation. Final test is not computed."""
     limit_visible_gpus(design)
     import torch
 
     if not torch.cuda.is_available():
         raise SplitError("cuda_unavailable")
-    checkpoint = Path(checkpoint) if checkpoint is not None else out_dir / "last.ckpt"
+    context = Path(context_dir) if context_dir is not None else (Path(checkpoint).parent if checkpoint is not None else out_dir)
+    checkpoint = Path(checkpoint) if checkpoint is not None else context / "last.ckpt"
     if not checkpoint.is_file():
         raise SplitError("checkpoint_missing")
     _train_loader, val_loader, _train_images, _val_images, spec = build_loaders(
-        design, data_root, identity=_frozen_identity(out_dir)
+        design, data_root, identity=_frozen_identity(context)
     )
-    encoder = _load_encoder(spec, checkpoint, out_dir)
+    encoder = _load_encoder(spec, checkpoint, context)
     validation = _fixed_bank_pass(encoder, val_loader, val_loader.dataset.records)
     return {
         "fixed_bank_top1": validation["fixed_bank_top1"],
@@ -458,23 +457,28 @@ def _hook_section(out_dir: Path, name: str) -> dict:
 
 def _build_hook(candidate, method: str, geometry: dict, config: dict):
     """Call a hook with geometry plus approved config. Unknown config is an error."""
-    from react_agent.eeg_training.hooks import HookConfigError, call_configured
+    from react_agent.eeg_training.hooks import HookConfigError
 
     builder = getattr(candidate, method)
     accepted = getattr(builder, "accepted_config_keys", None)
+    if accepted is None:
+        accepted = getattr(getattr(builder, "__func__", None), "accepted_config_keys", None)
+    payload = dict(config or {})
     if accepted is not None:
-        return call_configured(lambda payload: builder(geometry, payload), {**geometry, **config}, kind=method)
+        unknown = sorted(set(payload) - set(accepted))
+        if unknown:
+            raise HookConfigError(f"unknown_{method}_config:{','.join(unknown)}")
     if method == "build_encoder":
         try:
-            return builder(geometry, config or None)
+            return builder(geometry, payload or None)
         except TypeError:
-            if config:
+            if payload:
                 raise HookConfigError("encoder_rejected_config") from None
             return builder(geometry)
     try:
-        return builder(config or None)
+        return builder(payload or None)
     except TypeError:
-        if config:
+        if payload:
             raise HookConfigError(f"{method}_rejected_config") from None
         return builder()
 
@@ -649,7 +653,11 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 loss = scalar_loss(compute_objective(objective, eeg_z, img, scale, ids))
             else:
                 assert model is not None
-                loss, _top1, _top5 = model(eeg, img)
+                if ids:
+                    codes = torch.tensor([int(hashlib.sha256(item.encode("utf-8")).hexdigest()[:8], 16) % (2**31) for item in ids], device=device, dtype=torch.long)
+                    loss, _top1, _top5 = model(eeg, img, codes)
+                else:
+                    loss, _top1, _top5 = model(eeg, img)
                 loss = scalar_loss(loss)
             losses.append(float(loss))
             optimizer.zero_grad(set_to_none=True)
@@ -815,7 +823,8 @@ def _evaluate_main(design: Design, data_root: Path, out_dir: Path, checkpoint: P
     target = out_dir / "eval_scores.json"
     try:
         validate_design(design)
-        payload = evaluate_checkpoint(design, data_root, out_dir, checkpoint=checkpoint)
+        context = Path(checkpoint).parent if checkpoint is not None else out_dir
+        payload = evaluate_checkpoint(design, data_root, out_dir, checkpoint=checkpoint, context_dir=context)
     except (SplitError, OSError, RuntimeError, ValueError) as exc:
         target.write_text(json.dumps({"error": str(exc)}), encoding="utf-8")
         return 2

@@ -30,11 +30,24 @@ def summarize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             "reason": item.get("reason"),
         }
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-        if name == "training_dynamics" and payload:
-            summary["items"][name]["last_fixed_bank_top1"] = payload.get("last_fixed_bank_top1")
-            summary["items"][name]["epochs"] = payload.get("epochs")
-        if name == "image_id_duplicates" and payload:
-            summary["items"][name]["mean_duplicate_rate"] = payload.get("mean_duplicate_rate")
+        if payload:
+            for key in (
+                "sample_count",
+                "definition",
+                "mean_margin",
+                "hit_rate",
+                "effective_rank",
+                "effective_rank_definition",
+                "method",
+                "last_fixed_bank_top1",
+                "epochs",
+                "best_epoch",
+                "mean_duplicate_rate",
+                "query_count",
+                "gallery_size",
+            ):
+                if key in payload:
+                    summary["items"][name][key] = payload[key]
     return summary
 
 

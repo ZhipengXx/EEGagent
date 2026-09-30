@@ -110,6 +110,7 @@ def query_lessons(context: dict[str, Any], lessons: list[dict[str, Any]]) -> dic
     """Structured filter. Compatible lessons may be cited; other protocols are analogy only."""
     compatible: list[dict[str, Any]] = []
     analogy: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
     keys = (
         "task",
         "dataset",
@@ -132,14 +133,23 @@ def query_lessons(context: dict[str, Any], lessons: list[dict[str, Any]]) -> dic
             and conditions.get(key) not in (None, "")
             and context.get(key) != conditions.get(key)
         ]
-        if mismatches:
+        required_missing = [
+            key
+            for key in keys
+            if context.get(key) not in (None, "") and conditions.get(key) in (None, "")
+        ]
+        if required_missing:
+            copied["retrieval"] = "applicability_unknown"
+            copied["missing_conditions"] = required_missing
+            unknown.append(copied)
+        elif mismatches:
             copied["retrieval"] = "analogy_only"
             copied["mismatch"] = mismatches
             analogy.append(copied)
         else:
             copied["retrieval"] = "compatible_evidence"
             compatible.append(copied)
-    return {"compatible_evidence": compatible, "analogy_only": analogy}
+    return {"compatible_evidence": compatible, "analogy_only": analogy, "applicability_unknown": unknown}
 
 
 def open_store(camp: Path) -> sqlite3.Connection:
@@ -285,6 +295,8 @@ class EpisodeStore:
                 supporting = [str(item) for item in lesson.get("supporting_episode_ids") or proposal.get("supporting_episode_ids") or []]
                 contradicting = [str(item) for item in lesson.get("contradicting_episode_ids") or []]
                 reasons: list[str] = []
+                if not supporting:
+                    reasons.append("supporting_missing")
                 missing = [item for item in supporting if item not in episodes]
                 missing_counter = [item for item in contradicting if item not in episodes]
                 if missing or missing_counter:
@@ -303,9 +315,18 @@ class EpisodeStore:
                 if not isinstance(conditions, dict) or not conditions:
                     reasons.append("conditions_missing")
                 effect = lesson.get("observed_effect")
-                comparison_refs = [str(item) for item in lesson.get("comparison_refs") or []]
+                comparison_refs = [str(item) for item in lesson.get("comparison_refs") or lesson.get("observed_effect_refs") or []]
                 if effect not in (None, "") and not comparison_refs:
                     reasons.append("forged_effect")
+                fake_refs = [item for item in comparison_refs if not (self.camp / "comparisons" / f"{item}.json").is_file() and item not in {row.get("evidence_id") for row in self.list_episodes()}]
+                if comparison_refs and fake_refs:
+                    reasons.append("comparison_ref_missing")
+                if requested in {"confirmed_result"} and not any(
+                    (self.camp / "comparisons" / f"{item}.json").is_file() for item in comparison_refs
+                ):
+                    reasons.append("confirmation_missing")
+                if requested in {"confirmed_result"} and not supporting:
+                    reasons.append("confirmation_missing")
                 if reasons:
                     rejected.append({"reason": reasons[0], "reasons": reasons, "ids": missing + missing_counter, "requested": requested})
                     continue

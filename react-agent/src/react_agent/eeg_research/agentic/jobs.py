@@ -136,6 +136,9 @@ def start_job(
     if protocol is not None:
         write_evaluation_identity(job_dir, protocol)
         env["EEG_EVALUATION_IDENTITY"] = str((job_dir / "evaluation_identity.json").resolve())
+    from react_agent.eeg_research.agentic.hook_config import write_hook_config
+
+    write_hook_config(job_dir, state.get("experiment") if isinstance(state.get("experiment"), dict) else {}, spec_ref=state.get("experiment_ref"))
     log = (job_dir / "train.log").open("wb")
     proc = subprocess.Popen(  # noqa: S603
         command,

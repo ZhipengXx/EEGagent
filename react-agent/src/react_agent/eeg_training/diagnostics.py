@@ -135,21 +135,102 @@ def representation_from_vectors(vectors: list[list[float]]) -> dict[str, Any]:
         sum((row[index] - means[index]) ** 2 for row in vectors) / count
         for index in range(width)
     ]
-    total = sum(variances)
-    squares = sum(value * value for value in variances)
-    effective = None if squares == 0 else (total * total) / squares
+    centered = [[row[index] - means[index] for index in range(width)] for row in vectors]
+    if count < 2 or all(all(value == 0 for value in row) for row in centered):
+        return _item(
+            "undefined",
+            {
+                "sample_count": count,
+                "width": width,
+                "mean_norm": sum(norms) / count,
+                "mean_dimension_variance": (sum(variances) / width) if width else 0.0,
+                "effective_rank": None,
+                "effective_rank_definition": "participation_ratio_of_centered_covariance_eigenvalues",
+                "method": "thin_svd_of_centered_samples",
+                "centered": True,
+                "reason": "constant_or_insufficient_samples",
+            },
+        )
+    import math
+
+    try:
+        import numpy as np
+
+        matrix = np.asarray(centered, dtype=float)
+        singular = np.linalg.svd(matrix, compute_uv=False)
+        eigenvalues = [float(value * value) / max(count - 1, 1) for value in singular]
+    except Exception:  # noqa: BLE001
+        gram = [[0.0] * width for _ in range(width)]
+        for row in centered:
+            for i in range(width):
+                for j in range(width):
+                    gram[i][j] += row[i] * row[j]
+        scale = 1.0 / max(count - 1, 1)
+        eigenvalues = [gram[i][i] * scale for i in range(width)]
+    total = sum(eigenvalues)
+    squares = sum(value * value for value in eigenvalues)
+    if not math.isfinite(total) or squares == 0:
+        return _item("undefined", {"sample_count": count, "width": width, "effective_rank": None, "reason": "non_finite_or_zero_spectrum"})
+    effective = (total * total) / squares
     return _item(
         "observed",
         {
             "sample_count": count,
             "width": width,
             "mean_norm": sum(norms) / count,
-            "mean_dimension_variance": total / width,
+            "mean_dimension_variance": (sum(variances) / width) if width else 0.0,
             "effective_rank": effective,
-            "effective_rank_definition": "participation_ratio_of_dimension_variance",
+            "effective_rank_definition": "participation_ratio_of_centered_covariance_eigenvalues",
+            "method": "thin_svd_of_centered_samples",
+            "centered": True,
             "scope": "supplied_embeddings",
         },
     )
+
+
+def retrieval_rows_from_scores(
+    queries: list[tuple[str, list[float]]],
+    bank: list[tuple[str, list[float]]],
+    positives: dict[str, set[str]],
+    *,
+    k: int = 1,
+) -> list[dict[str, Any]]:
+    """One development query row. Rank is 1-based; ties count strictly higher scores first."""
+    rows: list[dict[str, Any]] = []
+    for query_id, vector in queries:
+        allowed = positives.get(query_id) or set()
+        ranked = sorted(((image_id, _cosine(vector, candidate)) for image_id, candidate in bank), key=lambda item: item[1], reverse=True)
+        pos = [(image_id, score) for image_id, score in ranked if image_id in allowed]
+        neg = [(image_id, score) for image_id, score in ranked if image_id not in allowed]
+        if not pos:
+            continue
+        best_pos = max(score for _image, score in pos)
+        best_neg = max((score for _image, score in neg), default=float("-inf"))
+        rank = 1 + sum(1 for _image, score in ranked if score > best_pos)
+        rows.append(
+            {
+                "query_id": query_id,
+                "positive_identity": [image_id for image_id, _score in pos],
+                "positive_count": len(pos),
+                "positive_rank": rank,
+                "positive_score": best_pos,
+                "best_negative_score": best_neg if best_neg != float("-inf") else None,
+                "margin": None if best_neg == float("-inf") else best_pos - best_neg,
+                "top_k_hit": rank <= k,
+                "k": k,
+                "tie_policy": "strictly_higher_scores_precede",
+            }
+        )
+    return rows
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_n = sum(a * a for a in left) ** 0.5
+    right_n = sum(b * b for b in right) ** 0.5
+    if left_n == 0 or right_n == 0:
+        return 0.0
+    return dot / (left_n * right_n)
 
 
 def _load_jsonl(path: Path) -> list[Any]:

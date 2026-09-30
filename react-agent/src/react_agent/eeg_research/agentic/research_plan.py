@@ -63,7 +63,7 @@ def init_plan(camp: Path, goal: dict[str, Any], *, protocol: dict[str, Any] | No
         "candidate_pool": [],
         "pending_comparisons": [],
         "reserved_confirmation": {
-            "target_pairs": int(goal.get("confirmation_target_pairs") or 3),
+            "target_pairs": None if goal.get("confirmation_target_pairs") is None else int(goal.get("confirmation_target_pairs") or 0),
             "training_seeds": list((protocol or {}).get("training_seeds") or goal.get("training_seeds") or []),
         },
         "stopping_policy": {

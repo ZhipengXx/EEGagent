@@ -41,6 +41,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--pack", type=Path, default=None, help="Candidate pack directory for evaluate-export")
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--execute", action="store_true", help="Run evaluate-only for a pack. Default is dry-run argv.")
     return parser
 
 
@@ -209,22 +210,37 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         out = args.out or (pack / "eval_only")
         argv_train = evaluate_only_argv(pack, out=out, data_root=args.data_root)
-        print(
-            json.dumps(
-                {
-                    "ok": True,
-                    "evaluate_only": True,
-                    "final_test": False,
-                    "pack": str(pack),
-                    "out": str(out),
-                    "rebuild_encoder": True,
-                    "argv": argv_train,
-                    "note": "prints train_entry argv; does not spawn training. uses rebuild_encoder; does not fall back to EEGProjectLayer for candidate modules",
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
-        )
+        payload = {
+            "ok": True,
+            "evaluate_only": True,
+            "final_test": False,
+            "pack": str(pack),
+            "out": str(out),
+            "rebuild_encoder": True,
+            "argv": argv_train,
+            "dry_run": not args.execute,
+            "note": "dry-run prints train_entry argv; --execute runs evaluate-only without fitting or reading final holdout",
+        }
+        if args.execute:
+            import os
+
+            if not os.environ.get("EEG_ALLOW_EVALUATE_PACK"):
+                payload["ok"] = False
+                payload["error"] = "prerequisite_missing:set EEG_ALLOW_EVALUATE_PACK=1 and provide CUDA plus the frozen data root"
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+                return 2
+            try:
+                completed = subprocess.run(argv_train, check=False)  # noqa: S603
+            except OSError as exc:
+                payload["ok"] = False
+                payload["error"] = f"prerequisite_missing:{exc}"
+                print(json.dumps(payload, ensure_ascii=False, indent=2))
+                return 2
+            payload["returncode"] = completed.returncode
+            payload["ok"] = completed.returncode == 0
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            return 0 if completed.returncode == 0 else 2
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
     root = args.root.resolve()
     camp = root / args.campaign

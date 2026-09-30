@@ -30,19 +30,34 @@ def _paired_rows(
 
 
 def _confirmation_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Full runs only. The same run, seed, or checkpoint is one observation."""
+    """Full runs only. One predeclared training seed is one independent pair."""
     kept: list[dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
+    seen_tokens: set[tuple[Any, ...]] = set()
+    seen_seeds: set[Any] = set()
+    seen_checkpoints: set[Any] = set()
     for row in rows:
-        if str(row.get("fidelity") or "") == "pilot":
+        fidelity = str(row.get("fidelity") or "")
+        if fidelity in {"pilot", "check", "smoke"}:
+            continue
+        if fidelity and fidelity != "full":
             continue
         if row.get("evaluation_valid") is False:
             continue
-        token = (row.get("run_id") or row.get("job_id"), row.get("seed"), row.get("checkpoint_id"))
-        if any(token) and token in seen:
+        seed = row.get("seed")
+        if seed is not None and seed in seen_seeds:
+            continue
+        checkpoint = row.get("checkpoint_id")
+        if checkpoint not in (None, "") and checkpoint in seen_checkpoints:
+            continue
+        token = (row.get("run_id") or row.get("job_id"), seed, checkpoint)
+        if any(token) and token in seen_tokens:
             continue
         if any(token):
-            seen.add(token)
+            seen_tokens.add(token)
+        if seed is not None:
+            seen_seeds.add(seed)
+        if checkpoint not in (None, ""):
+            seen_checkpoints.add(checkpoint)
         kept.append(row)
     return kept
 

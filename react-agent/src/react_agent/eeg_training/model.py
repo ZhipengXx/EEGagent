@@ -62,17 +62,20 @@ class LocalRetrieval(nn.Module):
             self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
             self.softplus = nn.Softplus()
 
-    def forward(self, eeg: torch.Tensor, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, eeg: torch.Tensor, image: torch.Tensor, image_codes: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return the local loss and within-batch top-1 and top-5."""
+        from react_agent.eeg_training.hooks import compute_objective
+
         embedding = self.encoder(eeg)
         if hasattr(self.encoder, "logit_scale"):
             scale = self.encoder.softplus(self.encoder.logit_scale)
         else:
             scale = self.softplus(self.logit_scale)
+        positives = None if image_codes is None else [str(int(value)) for value in image_codes.detach().reshape(-1).tolist()]
         if self.objective is None:
             loss = contrastive_loss(embedding, image, scale)
         else:
-            loss = self.objective(embedding, image, scale)
+            loss = compute_objective(self.objective, embedding, image, scale, positives)
         eeg_n = embedding / embedding.norm(dim=-1, keepdim=True)
         image_n = image / image.norm(dim=-1, keepdim=True)
         similarity = eeg_n @ image_n.T

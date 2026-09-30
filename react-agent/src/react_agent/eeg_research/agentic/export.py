@@ -17,6 +17,8 @@ PACK_FILES = (
     "history.jsonl",
     "diagnostic_bundle.json",
     "diagnostic_summary.json",
+    "hook_config.json",
+    "job.json",
 )
 
 
@@ -74,6 +76,8 @@ def pack_is_rebuildable(dest: Path) -> tuple[bool, str]:
         return False, "source_missing"
     if not (dest / "evaluation_identity.json").is_file():
         return False, "evaluation_identity_missing"
+    if not (dest / "source_binding.json").is_file() and not (dest / "hook_config.json").is_file():
+        return False, "config_or_binding_missing"
     return True, "ok"
 
 

@@ -21,12 +21,65 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+VOLATILE_REQUEST_KEYS = {
+    "task_id",
+    "attempt_id",
+    "request_id",
+    "started_at",
+    "created_at",
+    "ended_at",
+    "at",
+    "nonce",
+}
+
+
 def input_digest(paths: list[Path]) -> str:
     """Stable digest of input artifacts. Order is normalized by path."""
     rows = []
     for path in sorted(paths, key=lambda item: str(item)):
         rows.append({"path": str(path), "sha256": file_digest(path) if path.is_file() else None, "missing": not path.is_file()})
     encoded = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def stable_request(value: Any) -> Any:
+    """Drop cyclic metadata so a digest covers business content only."""
+    if isinstance(value, dict):
+        return {key: stable_request(item) for key, item in value.items() if key not in VOLATILE_REQUEST_KEYS}
+    if isinstance(value, list):
+        return [stable_request(item) for item in value]
+    return value
+
+
+def request_digest(*, request: dict[str, Any] | None = None, artifacts: list[dict[str, Any]] | None = None, paths: list[Path] | None = None) -> str:
+    """Hash the normalized request plus {id, kind, content hash, schema} refs."""
+    manifest: list[dict[str, Any]] = []
+    for row in artifacts or []:
+        if not isinstance(row, dict):
+            continue
+        manifest.append(
+            {
+                "artifact_id": row.get("artifact_id"),
+                "kind": row.get("kind"),
+                "content_sha256": row.get("content_sha256") or row.get("sha256"),
+                "schema_version": row.get("schema_version"),
+            }
+        )
+    for path in paths or []:
+        manifest.append(
+            {
+                "artifact_id": None,
+                "kind": "file",
+                "content_sha256": file_digest(path) if path.is_file() else None,
+                "schema_version": None,
+                "path": str(path),
+            }
+        )
+    body = {
+        "request": stable_request(request or {}),
+        "artifacts": sorted(manifest, key=lambda row: (str(row.get("artifact_id") or ""), str(row.get("path") or ""), str(row.get("content_sha256") or ""))),
+    }
+    encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 

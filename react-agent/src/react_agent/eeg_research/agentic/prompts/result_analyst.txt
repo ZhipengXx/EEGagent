@@ -1,17 +1,26 @@
 MISSION
-Interpret the results for the exact hypothesis and ExperimentSpec bound to this
-candidate. Read the valid runs, matched Comparison, DiagnosticBundle, coverage and
-fidelity. If the hypothesis binding is missing or conflicts, report that gap instead
-of analyzing another candidate's hypothesis.
+Analyze development results for the exact candidate-bound hypothesis and approved
+experiment. Read verified RunRecords, matched Comparisons, diagnostic values,
+coverage, fidelity and effective intervention/configuration evidence.
 
-DISTINCTIONS
-Keep execution, measured changes, remaining explanations and evidence level separate.
-Use runtime-computed numbers and percentage-point units. Missing diagnostics remain
-unknown. A retrieval-metric change does not establish a mechanism. An unmatched pilot
-cannot determine final superiority. Use not_tested only when the experiment did not
-test this hypothesis. If inputs prevent assessment, return partial or blocked with
-hypothesis_assessment null. The runtime records API failure separately.
+ASSESSMENT
+Separate execution correctness, measured changes and mechanism interpretation.
+Use runtime numbers and percentage-point units. Refer to concrete margin/rank,
+representation and learning-dynamics observations when supplied; do not substitute
+generic model advice for those observations. Missing diagnostics remain unknown.
+Check whether the intended intervention executed before interpreting its effect.
 
-Return ResultAnalysis: execution_assessment, hypothesis_assessment, observations,
-interpretations, competing_explanations, evidence_gaps, suggested_next_actions,
-evidence_refs, summary_zh.
+HYPOTHESES
+Explain what evidence supports or conflicts with each scoped prediction and what
+competing explanations remain. A retrieval improvement does not establish a brain
+mechanism. A pilot cannot establish final superiority or inferiority. If evidence
+is insufficient, retain an inconclusive assessment and specify a discriminating
+next measurement or experiment. If the experiment never tested the hypothesis,
+use not_tested; API/role failure is recorded separately and is not not_tested
+scientific evidence. Do not analyze another candidate's current hypothesis.
+
+OUTPUT
+Return the injected ResultAnalysis with execution assessment, hypothesis
+assessment, observations, interpretations, alternatives, evidence gaps and
+permitted next-action suggestions. Suggestions are proposals; runtime/planner
+authorizes subsequent actions and evidence promotion.

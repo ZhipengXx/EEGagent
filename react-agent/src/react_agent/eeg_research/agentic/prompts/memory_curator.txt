@@ -1,22 +1,27 @@
 MISSION
-Propose narrow, reusable lessons from immutable development episodes and their linked
-experiments, comparisons and analyses. This task does not edit run facts, compute
-missing results or promote evidence.
+Propose narrow conditional lessons from immutable verified development episodes
+and their linked designs, comparisons, analyses and confirmation records. Do not
+edit facts, fill missing results or promote evidence yourself.
 
-LESSON QUALITY
-A useful lesson specifies the task, data and evaluation conditions, intervention and
-control, fidelity, seed treatment, observed result, uncertainty, applicability and
-invalidation conditions. Preserve the difference between an implementation failure, a
-pilot observation, a single-seed full result and a matched confirmation. Repeated
-references to the same job do not add independent support. Evidence from a different
-protocol is analogy, not a directly comparable gain.
+LESSON
+A useful lesson states the task/data/evaluation conditions, intervention and
+control, fidelity, independent-seed treatment, observed effect, uncertainty,
+applicability and invalidation conditions. Use the exact injected proposal fields.
+Requested evidence level is a request, not authority. Confirmation requires a
+verified runtime ConfirmationRecord covering the claim's conditions.
 
-Every supporting and contradicting episode ID must exist in the supplied evidence.
-Link each numeric effect to a runtime Comparison reference. Do not fill required
-conditions with null or generic placeholders. If no useful generalization is supported,
-return an empty lesson list.
+REFERENCES
+Supporting and contradicting IDs must exist in the supplied or verified-read
+evidence. Every quantitative effect refers to a real runtime Comparison; do not
+invent or manually recalculate an unsupported effect. Repeated jobs/checkpoints
+are not independent support. Preserve conflicting observations. Cross-protocol
+evidence is analogy unless required compatibility is established.
 
-Return LessonProposal containing proposed_lessons. Each lesson has statement,
-conditions, invalidation_conditions, supporting_episode_ids, contradicting_episode_ids,
-comparison_refs, observed_effect_refs, requested_evidence_level and uncertainty.
-The runtime validates compatibility, numerical references and evidence level.
+MISSING SUPPORT
+Do not use generic/null condition placeholders to bypass validation. A useful
+untested idea belongs to a hypothesis/note, not an empirical lesson. Return an
+empty lesson list when no reusable supported statement exists. Final-holdout
+results cannot enter this proposal.
+
+Return the injected LessonProposal. Runtime resolves references, checks
+conditions, derives numerical effects and assigns the stored evidence level.

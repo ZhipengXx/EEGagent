@@ -287,7 +287,8 @@ def test_retrieval_and_representation_match_direct_numbers(tmp_path: Path) -> No
     assert bundle["retrieval_errors"]["status"] == "observed"
     assert bundle["retrieval_errors"]["payload"]["mean_margin"] == pytest.approx(0.3)
     assert bundle["representation"]["status"] == "observed"
-    assert bundle["representation"]["payload"]["effective_rank"] == pytest.approx(2.0)
+    assert bundle["representation"]["payload"]["effective_rank"] == pytest.approx(1.0)
+    assert "covariance" in bundle["representation"]["payload"]["effective_rank_definition"]
     assert bundle["group_results"]["status"] == "unavailable"
 
 
@@ -340,6 +341,8 @@ def test_lessons_retrieve_compatible_and_analogy(tmp_path: Path) -> None:
         episode(task_hash="g", candidate_id="c1", kind="exploratory_result", fidelity="full", seed=1, metric=0.9, contract_fingerprint="fp", artifact="b", job_id="j1")
     )
     assert again["episode_id"] == saved["episode_id"]
+    (tmp_path / "comparisons").mkdir()
+    (tmp_path / "comparisons" / "cmp_1.json").write_text(json.dumps({"comparison": {"delta_pp": 1.0}}), encoding="utf-8")
     accepted = store.accept_lessons(
         {
             "proposed_lessons": [

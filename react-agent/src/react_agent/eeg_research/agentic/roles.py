@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from react_agent.eeg_research.agentic.artifacts import allocate_artifact_id, input_digest, register, verify
+from react_agent.eeg_research.agentic.artifacts import allocate_artifact_id, input_digest, register, request_digest, verify
 from react_agent.eeg_research.agentic.schemas import ROLE_RESULT_VERSION, RoleResult
 from react_agent.eeg_research.agentic.task_ledger import create_task, mark, reusable
 
@@ -201,9 +201,15 @@ def begin_role_task(
     role: str,
     inputs: list[Path],
     candidate_id: str | None = None,
+    request: dict[str, Any] | None = None,
+    artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Open a ledger task whose digest covers the listed input files."""
-    digest = input_digest(inputs)
+    """Open a ledger task whose digest covers the business request and input files."""
+    digest = (
+        request_digest(request=request, artifacts=artifacts, paths=inputs)
+        if request is not None or artifacts
+        else input_digest(inputs)
+    )
     refs = [str(path) for path in inputs]
     return create_task(
         camp,
