@@ -245,17 +245,17 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
     if parsed.get("ok"):
         return parsed
     if repairs >= 1:
-        return _blocked_reply(parsed)
+        return _blocked_reply(parsed, reply)
     repaired = backend({**observation, "schema_error": parsed.get("detail"), "previous": reply})
     second = _validate_reply(repaired, observation, allowed, known, trainable, eligible)
     if second.get("ok"):
         second["repairs"] = 1
         return second
-    return {**_blocked_reply(second), "repairs": 1}
+    return {**_blocked_reply(second, repaired), "repairs": 1}
 
 
-def _blocked_reply(parsed: dict[str, Any]) -> dict[str, Any]:
-    result = {"ok": False, "status": "blocked", "detail": parsed.get("detail")}
+def _blocked_reply(parsed: dict[str, Any], reply: Any) -> dict[str, Any]:
+    result = {"ok": False, "status": "blocked", "detail": parsed.get("detail"), "raw": reply if isinstance(reply, dict) else None}
     if parsed.get("plan_update_error"):
         result.update(detail="plan_update_blocks_action", plan_update_error=parsed["plan_update_error"])
     return result
@@ -294,10 +294,12 @@ def _parse(
     if not isinstance(reply, dict):
         return {"ok": False, "detail": "not_json"}
     action = reply.get("action")
+    if not isinstance(action, str):
+        return {"ok": False, "detail": "action_not_string"}
     if action not in ACTIONS or (allowed and action not in allowed):
         return {"ok": False, "detail": f"unknown_action:{action}"}
     evidence_ids = reply.get("evidence_ids") if isinstance(reply.get("evidence_ids"), list) and reply.get("evidence_ids") else reply.get("evidence_refs") or []
-    if not isinstance(evidence_ids, list) or any(item not in known for item in evidence_ids):
+    if not isinstance(evidence_ids, list) or any(not isinstance(item, str) or item not in known for item in evidence_ids):
         return {"ok": False, "detail": "unknown_evidence"}
     if not reply.get("evidence_ids"):
         reply["evidence_ids"] = list(evidence_ids)
@@ -305,7 +307,7 @@ def _parse(
         return {"ok": False, "detail": "hypothesis_draft_missing"}
     if action == "stop":
         reason = reply.get("stop_reason")
-        if reason not in {None, ""} and reason not in STOP_REASONS:
+        if reason not in (None, "") and reason not in STOP_REASONS:
             return {"ok": False, "detail": f"stop_reason_invalid:{reason}"}
     if action in {"run_pilot", "run_full", "replicate"}:
         target = reply.get("target_id")

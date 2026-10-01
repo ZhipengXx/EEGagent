@@ -108,6 +108,9 @@ def normalize_plan_update(
     copied = dict(update)
     decision = decision if isinstance(decision, dict) else {}
     del known_evidence_ids
+    for field in ("updated_questions", "question_updates"):
+        if copied.get(field) is not None and not isinstance(copied[field], list):
+            raise PlanError("bad_question_updates")
 
     evidence = _id_list(copied.get("based_on_evidence_ids"))
     if not evidence:
@@ -192,11 +195,13 @@ def validate_update(
     evidence_ids = update.get("based_on_evidence_ids") or []
     if not isinstance(evidence_ids, list) or not evidence_ids:
         raise PlanError("plan_update_needs_evidence")
+    if any(not isinstance(item, str) for item in evidence_ids):
+        raise PlanError("plan_update_unknown_evidence")
     unknown = [item for item in evidence_ids if item not in known_evidence_ids]
     if unknown:
         raise PlanError("plan_update_unknown_evidence")
     affected = update.get("affected_question_ids") or update.get("affected_task_ids") or []
-    if not affected:
+    if not isinstance(affected, list) or not affected or any(not isinstance(item, str) for item in affected):
         raise PlanError("plan_update_needs_affected")
     next_plan = json.loads(json.dumps(plan))
     next_plan["plan_version"] = int(plan["plan_version"]) + 1
@@ -209,12 +214,15 @@ def validate_update(
     if isinstance(update.get("reserved_confirmation"), dict):
         next_plan["reserved_confirmation"] = update["reserved_confirmation"]
     questions = {row.get("question_id"): dict(row) for row in next_plan.get("research_questions") or []}
-    for change in update.get("question_updates") or []:
+    changes = update.get("question_updates") or []
+    if not isinstance(changes, list) or any(not isinstance(item, dict) for item in changes):
+        raise PlanError("bad_question_updates")
+    for change in changes:
         qid = change.get("question_id")
         status = change.get("status")
-        if qid not in questions:
+        if not isinstance(qid, str) or qid not in questions:
             raise PlanError("unknown_question")
-        if status not in QUESTION_STATES:
+        if not isinstance(status, str) or status not in QUESTION_STATES:
             raise PlanError("bad_question_status")
         questions[qid]["status"] = status
         if change.get("note"):

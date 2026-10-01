@@ -57,6 +57,10 @@ If schema_error and previous are supplied, return a corrected full decision
 using the original observation, current version, evidence and eligible targets.
 If the error is plan_update_needs_evidence, choose an independent legal action
 with plan_update: null instead of fabricating an evidence-backed revision.
+action must be a single string from available_actions. target_id and question_id
+are exact id strings or null. evidence_refs is a list of existing id strings,
+for example ["ev_audit_1"], never objects containing id/description fields.
+Use required_artifact_refs for artifact paths; they are not evidence ids.
 
 Return the injected PlannerDecision, including a concise decision rationale,
 expected information, required evidence references and scope limitations.

@@ -623,14 +623,14 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         save_state(camp, state)
         return state
     _sync_ledger(camp, state)
+    raw_decision = decision.get("raw") if isinstance(decision.get("raw"), dict) else {}
+    cited = raw_decision.get("evidence_ids") or raw_decision.get("evidence_refs") or []
     record = {
         "decision_id": f"d{len(state.get('decisions') or []) + 1}",
         "action": decision.get("action"),
         "ok": decision.get("ok"),
         "reason_zh": decision.get("reason_zh"),
-        "evidence_ids": (decision.get("raw") or {}).get("evidence_ids")
-        or (decision.get("raw") or {}).get("evidence_refs")
-        or [],
+        "evidence_ids": [item for item in cited if isinstance(item, str)] if isinstance(cited, list) else [],
         "detail": decision.get("detail"),
         "evidence_count": evidence_count(state),
         "executed": bool(decision.get("ok")) is False,
@@ -650,7 +650,6 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
             event(camp, "plan_update_rejected", detail=decision["plan_update_error"], decision_id=record["decision_id"])
         save_state(camp, state)
         return state
-    raw_decision = decision.get("raw") if isinstance(decision.get("raw"), dict) else {}
     raw_update = raw_decision.get("plan_update")
     update_failed = False
     if isinstance(raw_update, dict):
