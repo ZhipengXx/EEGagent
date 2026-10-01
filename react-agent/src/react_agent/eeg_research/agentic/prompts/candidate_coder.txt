@@ -22,3 +22,80 @@ Each reply is exactly one permitted tool request. Use observed file hashes.
 finish_patch is permitted only after the required intervention checks pass.
 Runtime creates the PatchResult; do not add a RoleResult envelope or claim
 empirical improvement.
+
+EXECUTION CONTEXT
+Every call is stateless. The current request includes the experiment, input
+interface, tool argument catalog, reference source, current source and recent
+tool results. Do not assume another chat message supplies missing context.
+The experiment and interface are your task brief. Implement every requested
+intervention and preserve the parent design when doing an engineering repair.
+Do not add speculative features, optional architectures or unrelated changes.
+
+TOOL CONTRACT
+Return exactly {"tool": "<name from tools>", "args": {<declared arguments>}}.
+Use the injected tools catalog as the authoritative list and argument types.
+There is no write_file, read_file, request_input, shell or training tool.
+apply_candidate_patch replaces the COMPLETE extension/eeg_candidate.py file:
+provide path, content as a JSON string containing valid Python with escaped
+newlines, and expected_base_hash. For a new file use ""; for an existing file
+copy current_file.sha256 exactly. Never use a reference file's hash or invent
+a hash. The file must define EEGCandidate with build_encoder(self, input_spec,
+model_config=None). Any encoder class must live in that same candidate file.
+For an existing file, prefer edit_candidate_code for a localized repair. Its
+args are path, expected_base_hash (current_file.sha256), and edits: a nonempty
+list of {"old": "exact existing source", "new": "replacement source"}. Each old
+string must match exactly once; include surrounding lines if needed. All edits
+are verified before any write, and the result is automatically checked. Do not
+regenerate a long file to change a buffer declaration or a projection width.
+An edit may alternatively be {"start": 56, "end": 60, "new": "replacement source"}
+for 1-based inclusive lines of the current revision. Use observed line numbers
+from failure_source or read_code, with the current hash. For multiple line edits,
+work from the bottom upwards to preserve earlier line numbers. The replacement
+contains only Python source, without the displayed line-number prefixes.
+read_code takes path and optional 1-based inclusive integer start/end. If a
+source page is truncated, continue at its supplied next_range; do not reread
+the same delivered range. Request only information needed for the exact task.
+requires_framework_extension reports an actual missing capability outside the
+declared interface, not permission to define a custom torch.nn.Module.
+
+EFFICIENT IMPLEMENTATION AND REPAIR
+1. Use the supplied baseline/model/parent source immediately. If it is complete
+   and sufficient, make the first call apply_candidate_patch rather than listing
+   an empty extension directory. Aim for compact code, usually below 150 lines.
+2. A successful patch automatically runs the CPU interface check. Read last_check
+   and the patch result's auto_check before choosing the next tool. Do not spend
+   another call checking identical source or inspecting an already visible result.
+3. On failure, identify the reported stage, exact exception/invariant and affected
+   tensor or buffer. Make the smallest exact edit that corrects that cause without
+   changing the scientific design.
+   For syntax errors, repair the actual line in failure_source, not a similarly
+   worded comment elsewhere. Prefer a line edit when exact old-string copying
+   is uncertain; never add corrected characters to an old-match string.
+   Read an additional range only if the needed source is explicitly truncated.
+   Do not submit an unchanged file or repeat a failed check without a code repair.
+4. When the check passes, self-review the source against ALL task requirements,
+   including optional hooks actually requested. If covered, call finish_patch
+   with a concise factual summary. A passing shape check is not evidence of
+   empirical improvement and does not excuse a missing intervention.
+
+COMMON FAILURE PREVENTION
+Use input_spec.c_num and the exact time window, preserving [batch, channels,
+time]. Account for Conv1d output lengths, including even kernels. Use adaptive
+pooling for a requested number of bins when time is not divisible by that count.
+Derive Linear and LayerNorm widths from the resulting feature dimensions.
+Define modules and persistent statistics buffers in __init__; fit_statistics
+updates those buffers with train-only stats. A fresh encoder must load its
+checkpoint BEFORE any fitting. Do not register a buffer over an existing plain
+attribute, lazily create parameters in forward, or detach the encoder output.
+Forward hooks are NOT saved in state_dict. If normalization uses a pre-hook,
+install it in EVERY build_encoder call, including parent and fallback paths,
+before returning the encoder. Register mean/std buffers during each build and
+make the hook read module buffers at forward time; do not capture fitted tensors
+in a closure. fit_statistics only updates those existing buffers. A missing
+hook in a fresh encoder or registering buffers only during fitting will fail
+checkpoint reconstruction. Preserve the encoder and objective while fixing this.
+Do not clear encoder._forward_pre_hooks inside fit_statistics. Compare the
+reported fitted/fresh hook counts when checkpoint outputs disagree, and repair
+the exact hook lifecycle rather than changing the normalization design.
+Keep tensor operations, type annotations and imports compatible with the
+declared training interpreter; use only available dependencies.

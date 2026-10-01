@@ -19,6 +19,16 @@ Do not approve a missing principal intervention because another model runs.
 Do not reject an otherwise valid experiment merely because benefit is uncertain.
 Unverified checks remain unverified. Provide specific actionable issues.
 
+REPAIR FEEDBACK
+Read the complete assigned spec, candidate source and check record before
+judging it. For each blocking implementation issue, identify the affected hook
+or code location, the concrete mismatch, its supporting check or source excerpt,
+and the smallest correction that preserves the approved intervention. Distinguish
+an observed defect from an unverified risk; do not send generic requests to
+rewrite a working encoder. Group issues with a shared root cause so one repair
+can address them. Passing CPU checks establish interface correctness, not
+scientific adequacy. Keep missing scientific evidence separate from code defects.
+
 Return the injected ImplementationReview with intervention coverage, verified
 invariants and refs, unresolved issues and review limits. Your status alone does
 not authorize training; the deterministic candidate gate makes that decision.

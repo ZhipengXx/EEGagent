@@ -137,9 +137,11 @@ class DeepSeekBackend:
         if spec.supports_temperature and spec.temperature is not None:
             kwargs["temperature"] = spec.temperature
         extra: dict[str, Any] = {}
-        if spec.supports_thinking and spec.thinking:
-            extra["thinking"] = {"type": "enabled"}
-            if spec.reasoning_effort:
+        if spec.supports_thinking:
+            # Some models enable thinking by default. Omitting the field does
+            # not honor a fast profile that explicitly sets thinking=False.
+            extra["thinking"] = {"type": "enabled" if spec.thinking else "disabled"}
+            if spec.thinking and spec.reasoning_effort:
                 extra["reasoning_effort"] = spec.reasoning_effort
         if extra:
             kwargs["extra_body"] = extra

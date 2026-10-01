@@ -113,6 +113,16 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
         last: DeepSeekParseError | None = None
         for _attempt in range(PARSE_ATTEMPTS):
+            call_payload = payload
+            if last is not None:
+                call_payload = {
+                    **payload,
+                    "previous_response_error": {
+                        "kind": "invalid_json",
+                        "finish_reason": getattr(last.usage, "finish_reason", None),
+                        "instruction": "Return one complete JSON object matching OUTPUT_SCHEMA. Escape Python newlines and quotes inside content. Keep the implementation concise; do not omit requested interventions.",
+                    },
+                }
             goal_path = camp / "goal.json"
             if goal_path.is_file():
                 try:
@@ -152,7 +162,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 reply, usage = loop.run_until_complete(
                     client.complete_json(
                         system=system,
-                        user=json.dumps(payload, ensure_ascii=False, default=str),
+                        user=json.dumps(call_payload, ensure_ascii=False, default=str),
                         profile="fast",
                         role=role,
                     )

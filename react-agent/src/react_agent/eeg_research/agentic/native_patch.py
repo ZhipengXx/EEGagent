@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -10,15 +11,39 @@ from typing import Any, Callable
 
 from react_agent.eeg_research.agentic.coder import (
     apply_candidate_patch,
+    edit_candidate_code,
     finish_patch,
     list_project_files,
     read_code,
     run_candidate_check,
     search_code,
+    source_page,
+    tool_catalog,
+    validate_tool_request,
 )
 
 Backend = Callable[[dict[str, Any]], dict[str, Any]]
 _READ_TOOLS = {"list_project_files", "search_code", "read_code", "inspect_check_result"}
+_WRITE_TOOLS = {"apply_candidate_patch", "edit_candidate_code"}
+
+
+def _read_key(tool: str, args: dict[str, Any], revision: str) -> tuple[Any, ...]:
+    return (tool, str(args.get("path") or ""), str(args.get("query") or ""),
+            int(args.get("start") or 1), int(args.get("end") or 200), revision)
+
+
+def _check_fingerprint(workspace: Path, python: str | None) -> str:
+    from react_agent.eeg_research.agentic.binding import file_sha256
+    from react_agent.eeg_training.protocol import torch_python
+
+    spec = workspace / "input_spec.json"
+    payload = {
+        "source": file_sha256(workspace / "extension" / "eeg_candidate.py"),
+        "input_spec": spec.read_text(encoding="utf-8") if spec.is_file() else "eeg",
+        "python": python or torch_python(),
+        "checker": file_sha256(Path(__file__).with_name("check_entry.py")),
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
 class RecoveryBlocked(RuntimeError):
@@ -57,10 +82,13 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
     last_check: dict[str, Any] | None = None
     last_patch_sha = ""
     failed_checks = 0
+    failed_revisions: set[str] = set()
     writes = 0
     reads = 0
     finished = False
     last_step = 0
+    check_fingerprint = ""
+    extension_answered = False
     seen_reads: set[tuple[Any, ...]] = set()
     for row in rows:
         tool = str(row.get("tool") or "")
@@ -73,26 +101,29 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
             reads += 1
             args = row.get("args") if isinstance(row.get("args"), dict) else {}
             if result.get("ok"):
-                seen_reads.add(
-                    (
-                        tool,
-                        str(args.get("path") or ""),
-                        int(args.get("start") or 1),
-                        int(args.get("end") or 200),
-                    )
-                )
-        if tool == "apply_candidate_patch" and result.get("ok"):
+                key = row.get("read_key")
+                seen_reads.add(tuple(key) if isinstance(key, list) else _read_key(tool, args, last_patch_sha))
+        if tool == "requires_framework_extension_answered":
+            extension_answered = True
+        if tool in _WRITE_TOOLS and result.get("ok"):
+            finished = False
             writes += 1
             last_patch_sha = str(result.get("sha256") or "")
             auto_check = result.get("auto_check")
             if isinstance(auto_check, dict):
                 last_check = auto_check
-                if not auto_check.get("ok"):
+                check_fingerprint = str(auto_check.get("check_fingerprint") or "")
+                failed_key = check_fingerprint or last_patch_sha
+                if not auto_check.get("ok") and failed_key not in failed_revisions:
                     failed_checks += 1
-        if tool == "run_candidate_check":
+                    failed_revisions.add(failed_key)
+        if tool == "run_candidate_check" and result.get("error") != "invalid_tool_args":
             last_check = result
-            if not result.get("ok"):
+            check_fingerprint = str(result.get("check_fingerprint") or "")
+            failed_key = check_fingerprint or last_patch_sha
+            if not result.get("ok") and failed_key not in failed_revisions:
                 failed_checks += 1
+                failed_revisions.add(failed_key)
         if tool == "finish_patch" and result.get("ok"):
             finished = True
     if ignore_finish:
@@ -106,6 +137,7 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
         if not isinstance(stored, dict):
             raise RecoveryBlocked("checks_unreadable")
         last_check = stored
+        check_fingerprint = str(stored.get("check_fingerprint") or check_fingerprint)
     entry = workspace / "extension" / "eeg_candidate.py"
     if entry.is_file():
         current = file_sha256(entry)
@@ -129,6 +161,9 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
         "last_check": last_check,
         "last_hash": last_patch_sha,
         "failed_checks": failed_checks,
+        "failed_revisions": failed_revisions,
+        "check_fingerprint": check_fingerprint,
+        "extension_answered": extension_answered,
         "writes": writes,
         "reads": reads,
         "seen_reads": seen_reads,
@@ -161,6 +196,8 @@ def implement(
     last_check: dict[str, Any] | None = restored["last_check"]
     last_hash = str(restored["last_hash"] or "")
     failed_checks = int(restored["failed_checks"])
+    failed_revisions = set(restored["failed_revisions"])
+    last_check_fingerprint = str(restored["check_fingerprint"])
     writes = int(restored["writes"])
     reads = int(restored["reads"])
     seen_reads: set[tuple[Any, ...]] = set(restored.get("seen_reads") or [])
@@ -174,18 +211,21 @@ def implement(
         input_spec = json.loads(spec_path.read_text(encoding="utf-8"))
     else:
         input_spec = candidate_interface(None)
-    references = {name: path.read_text(encoding="utf-8")[:6000] for name, path in _REFERENCES.items()}
+    pages = {name: source_page(path.read_text(encoding="utf-8").splitlines(), 1, 100000, char_limit=12000) for name, path in _REFERENCES.items()}
     parent = workspace / "reference" / "parent.py"
     if parent.is_file():
-        references["reference/parent.py"] = parent.read_text(encoding="utf-8")[:6000]
+        pages["reference/parent.py"] = source_page(parent.read_text(encoding="utf-8").splitlines(), 1, 100000, char_limit=12000)
+    references = {name: page["text"] for name, page in pages.items()}
+    reference_ranges = {name: {key: value for key, value in page.items() if key != "text"} for name, page in pages.items()}
     entry = workspace / "extension" / "eeg_candidate.py"
-    extension_answered = False
+    extension_answered = bool(restored["extension_answered"])
     for step in range(next_step, max_steps + 1):
         if calls_left is not None and calls_left() <= reserve:
             return {"status": "implementation_failed", "detail": "budget_exhausted", "check": last_check, "steps": step - 1}
         current = None
         if entry.is_file():
-            current = {"path": "extension/eeg_candidate.py", "sha256": file_sha256(entry), "text": entry.read_text(encoding="utf-8")[:6000]}
+            current = {"path": "extension/eeg_candidate.py", "sha256": file_sha256(entry),
+                       **source_page(entry.read_text(encoding="utf-8").splitlines(), 1, 100000, char_limit=16000)}
         request = {
             "experiment_spec": spec,
             "input_spec": input_spec,
@@ -195,27 +235,48 @@ def implement(
             "repairs_used": max(0, failed_checks - 1) if failed_checks else 0,
             "max_repairs": max_repairs,
             "current_file": current,
-            "references": references if step == 1 else "same as step 1",
+            "references": references,
+            "reference_ranges": reference_ranges,
+            "tools": tool_catalog(),
+            "check_policy": {"automatic_after_patch": True, "explicit_recheck": "cached for identical source, interface and interpreter"},
             "last_check": last_check,
             "history": history[-8:],
         }
+        location = (last_check or {}).get("location") or {}
+        if entry.is_file() and isinstance(location.get("line"), int):
+            line = location["line"]
+            page = read_code(workspace, "extension/eeg_candidate.py", max(1, line - 5), line + 10)
+            if page.get("ok"):
+                request["failure_source"] = {**page, "numbered_text": "\n".join(f"{page['start'] + i}: {text}" for i, text in enumerate(page["text"].splitlines()))}
         if step >= 3 and writes == 0:
             request["runtime_note"] = "References and the current file are already supplied. Call apply_candidate_patch now."
         elif last_check is not None and not last_check.get("ok"):
-            request["runtime_note"] = "The last check failed. Repair with apply_candidate_patch, then run_candidate_check."
+            request["runtime_note"] = "The last check failed. Prefer edit_candidate_code for a local correction, or apply_candidate_patch for a full replacement; new source is automatically checked."
+            recent_reads = sum(item.get("tool") == "read_code" and bool(item.get("result", {}).get("ok")) for item in history[-2:])
+            if recent_reads == 2:
+                request["runtime_note"] += " Two source ranges were just supplied. Use those ranges and the exact diagnostic now; do not spend another call rereading overlapping lines."
         elif last_check is not None and last_check.get("ok"):
             request["runtime_note"] = "The check passed. Call finish_patch unless a required change is missing."
         reply = backend(request)
-        tool = str(reply.get("tool") or "")
-        args = reply.get("args") if isinstance(reply.get("args"), dict) else {}
+        tool, args, request_error = validate_tool_request(reply)
         started = time.time()
-        if tool in _READ_TOOLS:
-            key = (
-                tool,
-                str(args.get("path") or ""),
-                int(args.get("start") or 1),
-                int(args.get("end") or 200),
-            )
+        key = None
+        cached_check = False
+        if request_error is not None:
+            result = request_error
+        elif tool == "finish_patch":
+            fresh = entry.is_file() and file_sha256(entry) == last_hash
+            if fresh and last_check_fingerprint:
+                fresh = _check_fingerprint(workspace, python) == last_check_fingerprint
+            if not (fresh and last_check and last_check.get("ok")):
+                result = {"ok": False, "error": "check_not_passed", "detail": "The current source must pass its interface check before finish_patch."}
+            else:
+                result = _execute(workspace, tool, args, last_check, python)
+        elif tool == "run_candidate_check" and entry.is_file() and last_check is not None and _check_fingerprint(workspace, python) == last_check_fingerprint:
+            result = {**last_check, "cached": True}
+            cached_check = True
+        elif tool in _READ_TOOLS:
+            key = _read_key(tool, args, last_hash)
             if key in seen_reads:
                 result = {
                     "ok": False,
@@ -244,42 +305,53 @@ def implement(
             result = _execute(workspace, tool, args, last_check, python)
         if tool in _READ_TOOLS:
             reads += 1
-        if tool == "apply_candidate_patch" and result.get("ok"):
+        if tool in _WRITE_TOOLS and result.get("ok"):
             last_hash = str(result.get("sha256"))
             writes += 1
-            check = run_candidate_check(workspace, python=python)
+            fingerprint = _check_fingerprint(workspace, python)
+            if last_check is not None and fingerprint == last_check_fingerprint:
+                check = {**last_check, "cached": True}
+                cached_check = True
+            else:
+                check = {**run_candidate_check(workspace, python=python), "source_sha256": last_hash, "check_fingerprint": fingerprint}
             result = {**result, "auto_check": check}
             tool_for_check = check
         else:
             tool_for_check = None
         if tool_for_check is not None:
             last_check = tool_for_check
+            last_check_fingerprint = str(tool_for_check.get("check_fingerprint") or "")
             (workspace / "checks.json").write_text(json.dumps(tool_for_check, ensure_ascii=False, indent=2), encoding="utf-8")
-            if not tool_for_check.get("ok"):
+            if not tool_for_check.get("ok") and last_check_fingerprint not in failed_revisions:
                 failed_checks += 1
-        if tool == "run_candidate_check":
+                failed_revisions.add(last_check_fingerprint)
+        if tool == "run_candidate_check" and request_error is None and not cached_check:
+            if entry.is_file():
+                result = {**result, "source_sha256": file_sha256(entry), "check_fingerprint": _check_fingerprint(workspace, python)}
             last_check = result
+            last_check_fingerprint = str(result.get("check_fingerprint") or "")
             (workspace / "checks.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-            if not result.get("ok"):
+            if not result.get("ok") and last_check_fingerprint not in failed_revisions:
                 failed_checks += 1
-        if tool == "finish_patch" and not (last_check and last_check.get("ok")):
-            result = {"ok": False, "error": "check_not_passed"}
+                failed_revisions.add(last_check_fingerprint)
         row = {
             "call_id": uuid.uuid4().hex[:12],
             "step": step,
             "tool": tool,
             "args": _short(args),
-            "result": _short(result),
+            "result": result if tool in _READ_TOOLS else _short(result),
             "elapsed_seconds": round(time.time() - started, 3),
         }
+        if key is not None:
+            row["read_key"] = list(key)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-        history.append({"tool": tool, "result": _short(result)})
+        history.append({"tool": tool, "result": result if tool in _READ_TOOLS else _short(result)})
         if tool == "requires_framework_extension":
             return {"status": "requires_framework_extension", "detail": args, "steps": step}
         if tool == "finish_patch" and result.get("ok"):
             return {"status": "ready_for_review", "manifest": result["manifest"], "check": last_check, "steps": step}
-        if failed_checks > max_repairs + 1:
+        if failed_checks >= max_repairs + 1:
             return {"status": "implementation_failed", "detail": "repair_limit", "check": last_check, "steps": step}
     return {"status": "implementation_failed", "detail": "step_limit", "check": last_check, "steps": max_steps}
 
@@ -319,6 +391,8 @@ def _execute(workspace: Path, tool: str, args: dict[str, Any], last_check: Any, 
                 str(args.get("content") or ""),
                 str(args.get("expected_base_hash") or ""),
             )
+        elif tool == "edit_candidate_code":
+            result = edit_candidate_code(workspace, args["path"], args["edits"], args["expected_base_hash"])
         elif tool == "run_candidate_check":
             result = run_candidate_check(workspace, python=python)
         elif tool == "inspect_check_result":
@@ -375,7 +449,9 @@ def _short(value: Any, *, limit: int = _SHORT_LIMIT) -> Any:
                 shortened[key] = field[:400] + "…"
         if len(json.dumps(shortened, ensure_ascii=False, default=str)) <= limit:
             return shortened
-        compact = {key: shortened[key] for key in ("ok", "error", "path", "sha256") if key in shortened}
+        compact = {key: shortened[key] for key in ("ok", "error", "path", "sha256", "source_sha256", "check_fingerprint", "cached", "stage") if key in shortened}
+        if isinstance(shortened.get("auto_check"), dict):
+            compact["auto_check"] = _short(shortened["auto_check"], limit=2000)
         compact["truncated"] = True
         compact["keys"] = sorted(shortened)
         return compact
