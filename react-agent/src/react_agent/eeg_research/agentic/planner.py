@@ -57,6 +57,29 @@ IMPLEMENT_CALLS = 8 + 2 + 1
 _DERIVED = {"data_audit", "learning_profile"}
 
 
+def audit_completed(scope: dict[str, Any]) -> bool:
+    """Fresh completion includes an audit with required revisions or blocks."""
+    return bool(scope.get("audit_fresh") is True and scope.get("audited_report_hash")
+                and scope.get("audit_status") in {"pass", "revise", "block"})
+
+
+def completion_block_reason(scope: dict[str, Any], reason: Any) -> str | None:
+    """An opted-in goal cannot claim completion with an unfinished audit."""
+    if reason != "goal_addressed" or not scope.get("require_audit_before_completion"):
+        return None
+    if not audit_completed(scope):
+        return "audit_required_before_goal_addressed"
+    return None
+
+
+def training_actions(scope: dict[str, Any]) -> set[str]:
+    """Explicit execution scope. Empty permits no training; missing keeps defaults."""
+    declared = scope.get("allowed_training_actions", ["run_pilot", "run_full", "replicate"])
+    if not isinstance(declared, list) or any(name not in {"run_pilot", "run_full", "replicate"} for name in declared):
+        return set()
+    return set(declared)
+
+
 def submitted_candidates(state: dict[str, Any]) -> int:
     """Scientific candidates that produced a patch. Baseline is counted separately."""
     unwritten = {"implementation_failed", "requires_framework_extension"}
@@ -85,7 +108,9 @@ def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
     """Actions bound to one candidate. Readiness of c1 does not authorize c2."""
     evidence = state.get("evidence") or []
     room = int(state.get("training_jobs", 0)) < int(state.get("max_training_jobs", 0)) and float(state.get("gpu_seconds_left", 1)) > 0
-    names: list[str] = []
+    # A frozen baseline is an independent legal measurement, including cold start.
+    # It must not require a candidate that in turn requires baseline diagnostics.
+    names: list[str] = ["baseline"] if state.get("execution_fingerprint") else []
     if state.get("candidate_ready") and state.get("candidate_id"):
         names.append(str(state["candidate_id"]))
     for row in state.get("candidates") or []:
@@ -94,6 +119,7 @@ def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
     if "baseline" not in names and any(row.get("candidate_id") == "baseline" for row in evidence):
         names.append("baseline")
     targets: dict[str, list[str]] = {"run_pilot": [], "run_full": [], "replicate": []}
+    permitted = training_actions(state)
     if not room:
         return targets
     from react_agent.eeg_research.agentic.confirmation_policy import policy_training_seeds
@@ -103,11 +129,11 @@ def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
     if declared is None:
         declared = [int(item) for item in state.get("training_seeds") or []]
     for name in dict.fromkeys(names):
-        if not _has(evidence, name, "pilot"):
+        if not _has(evidence, name, "pilot") and "run_pilot" in permitted:
             targets["run_pilot"].append(name)
-        elif not _has(evidence, name, "full"):
+        elif _has(evidence, name, "pilot") and not _has(evidence, name, "full") and "run_full" in permitted:
             targets["run_full"].append(name)
-        else:
+        elif _has(evidence, name, "full") and "replicate" in permitted:
             used = {
                 int(row.get("seed") or 0)
                 for row in evidence
@@ -162,6 +188,8 @@ def available_actions(state: dict[str, Any]) -> list[str]:
     ):
         actions.append("implement_candidate")
     actions = [name for name in actions if name not in _LOCAL or not _seen_without_new_evidence(state, name)]
+    if audit_completed(state):
+        actions = [name for name in actions if name != "audit_result"]
     targets = eligible_targets(state)
     for name in ("run_pilot", "run_full", "replicate"):
         if targets.get(name):
@@ -272,6 +300,10 @@ def _validate_reply(
     parsed = _parse(reply, allowed, known, trainable, eligible)
     if not parsed.get("ok"):
         return parsed
+    if parsed["action"] == "stop":
+        reason = completion_block_reason(observation, reply.get("stop_reason"))
+        if reason:
+            return {"ok": False, "detail": reason}
     from react_agent.eeg_research.agentic.research_plan import PLAN_DEPENDENT_ACTIONS, PlanError, normalize_plan_update, validate_update
 
     if reply.get("action_depends_on_plan_update") and parsed["action"] in PLAN_DEPENDENT_ACTIONS:
@@ -296,8 +328,10 @@ def _parse(
     action = reply.get("action")
     if not isinstance(action, str):
         return {"ok": False, "detail": "action_not_string"}
-    if action not in ACTIONS or (allowed and action not in allowed):
+    if action not in ACTIONS:
         return {"ok": False, "detail": f"unknown_action:{action}"}
+    if allowed and action not in allowed:
+        return {"ok": False, "detail": f"action_unavailable:{action}"}
     evidence_ids = reply.get("evidence_ids") if isinstance(reply.get("evidence_ids"), list) and reply.get("evidence_ids") else reply.get("evidence_refs") or []
     if not isinstance(evidence_ids, list) or any(not isinstance(item, str) or item not in known for item in evidence_ids):
         return {"ok": False, "detail": "unknown_evidence"}

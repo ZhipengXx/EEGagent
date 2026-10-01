@@ -105,6 +105,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
     config = FmriCheckConfig(
         deepseek_api_key=key,
         deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL") or "https://api.deepseek.com",
+        deepseek_trust_env=os.environ.get("DEEPSEEK_TRUST_ENV", "true").strip().lower() not in {"0", "false", "no"},
     )
     if os.environ.get("DEEPSEEK_FAST_MODEL"):
         config.fast.model = os.environ["DEEPSEEK_FAST_MODEL"]
@@ -122,6 +123,8 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
         last: DeepSeekParseError | None = None
+        schema_error = None
+        previous_domain = None
         for _attempt in range(PARSE_ATTEMPTS):
             call_payload = payload
             if last is not None:
@@ -133,6 +136,9 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                         "instruction": "Return one complete JSON object matching OUTPUT_SCHEMA. Escape Python newlines and quotes inside content. Keep the implementation concise; do not omit requested interventions.",
                     },
                 }
+            elif schema_error is not None:
+                call_payload = {**payload, "schema_error": schema_error, "previous": previous_domain,
+                                "correction_instruction": "Return the exact injected domain JSON Schema. Keep this task and business context unchanged."}
             goal_path = camp / "goal.json"
             if goal_path.is_file():
                 try:
@@ -214,43 +220,47 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 }
             )
             _ledger(camp, row)
-            append_ui_event(
-                camp,
-                "llm_call_finished",
-                role=role,
-                call_id=row.get("call_id"),
-                candidate_id=bound.get("candidate_id"),
-                status="completed",
-            )
             parsed = reply if isinstance(reply, dict) else {"_not_object": reply}
+            bound_reply = None
             if role in ENVELOPE_ROLES:
                 from react_agent.eeg_research.agentic.roles import RoleResultError, bind_role_output, task_identity_from_payload
-
                 task = task_identity_from_payload(payload, bound)
                 if task is None:
-                    append_ui_event(
-                        camp,
-                        "role_output_invalid",
-                        role=role,
-                        call_id=row.get("call_id"),
-                        status="failed",
-                        error="role_result_task_missing",
-                    )
+                    append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
+                                    status="failed", error="role_result_task_missing")
                     raise LlmUnavailable("role_result_task_missing")
                 try:
-                    return bind_role_output(parsed, task=task, prompt_hash=prompt_hash)
+                    bound_reply = bind_role_output(parsed, task=task, prompt_hash=prompt_hash)
                 except RoleResultError as exc:
-                    append_ui_event(
-                        camp,
-                        "role_output_invalid",
-                        role=role,
-                        call_id=row.get("call_id"),
-                        status="failed",
-                        error=str(exc),
-                    )
+                    append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
+                                    status="failed", error=str(exc))
                     raise LlmUnavailable(str(exc)) from exc
+            if role != "candidate_coder":
+                from pydantic import ValidationError
+                from react_agent.eeg_research.agentic.schemas import DOMAIN_OUTPUT_MODELS
+
+                domain_model = DOMAIN_OUTPUT_MODELS.get(role)
+                body = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else parsed
+                identity_keys = {"schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "artifact_refs", "candidate_id"}
+                if domain_model is not None:
+                    body = {key: value for key, value in body.items() if key not in identity_keys
+                            and (key != "status" or "status" in domain_model.model_fields)}
+                    try:
+                        domain_model.model_validate(body)
+                    except ValidationError as exc:
+                        schema_error = json.dumps(exc.errors(include_input=False), ensure_ascii=False, default=str)[:3000]
+                        previous_domain = body
+                        last = None
+                        append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
+                                        status="failed", error="domain_schema_invalid")
+                        continue
+            append_ui_event(camp, "llm_call_finished", role=role, call_id=row.get("call_id"),
+                            candidate_id=bound.get("candidate_id"), status="completed")
+            if bound_reply is not None:
+                return bound_reply
             return parsed
-        raise LlmUnavailable(type(last).__name__ if last is not None else "DeepSeekParseError") from last
+        raise LlmUnavailable("domain_schema_invalid" if schema_error is not None else
+                             (type(last).__name__ if last is not None else "DeepSeekParseError")) from last
 
     call.model = config.fast.model  # type: ignore[attr-defined]
     call.bind = bind  # type: ignore[attr-defined]

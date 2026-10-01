@@ -256,6 +256,8 @@ def _role_activity(items: list[dict[str, Any]], *, live_starts: bool) -> dict[st
             status = "failed"
         elif row.get("status") in {"pending"}:
             status = "queued"
+        elif row.get("status") in {"partial", "blocked", "waiting_for_evidence", "superseded", "failed"}:
+            status = str(row["status"])
         elif row.get("event_type") in {"llm_call_finished", "task_completed", "decision"}:
             status = "completed"
         elif row.get("status") in {"completed", "ok"}:

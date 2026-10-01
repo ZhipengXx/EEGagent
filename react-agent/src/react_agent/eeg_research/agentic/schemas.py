@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SCHEMA_VERSION = "eeg_research.v1.9"
 ROLE_RESULT_VERSION = "eeg_research.role_result.v1"
@@ -22,8 +23,157 @@ ROLE_OUTPUT_SCHEMAS = {
 
 
 def role_output_schema(role: str) -> str:
-    """Field list injected with the prompt. Roles do not keep a second handwritten schema."""
+    """Generate the business response schema; tool requests keep their own protocol."""
+    model = DOMAIN_OUTPUT_MODELS.get(role)
+    if model is not None:
+        return json.dumps(model.model_json_schema(), ensure_ascii=False)
     return ROLE_OUTPUT_SCHEMAS.get(role, "role-specific JSON object")
+
+
+class DomainOutput(BaseModel):
+    """No role response grants runtime execution permission."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PlannerDecision(DomainOutput):
+    action: Literal["inspect_data", "retrieve_memory", "retrieve_methods", "diagnose_results",
+                    "collect_diagnostics", "design_experiment", "propose_experiment",
+                    "implement_candidate", "repair_candidate", "run_pilot", "run_full",
+                    "replicate", "audit_result", "stop"]
+    target_id: str | None = None
+    question_id: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    decision_rationale: str = ""
+    reason_zh: str = ""
+    summary_zh: str = ""
+    expected_information: Any = None
+    required_artifact_refs: list[str] = Field(default_factory=list)
+    hypothesis_draft: dict[str, Any] | None = None
+    experiment_draft: dict[str, Any] | None = None
+    plan_update: dict[str, Any] | None = None
+    action_depends_on_plan_update: bool = False
+    stop_reason: Literal["goal_addressed", "no_supported_next_experiment", "no_progress",
+                         "budget_exhausted", "blocked", "user_cancelled"] | None = None
+    scope_limits: list[str] = Field(default_factory=list)
+
+
+class MethodEvidencePacket(DomainOutput):
+    question: Any = None
+    search_scope: str = "local_method_cards"
+    sources: list[dict[str, Any]] = Field(default_factory=list)
+    method_cards: list[dict[str, Any]] = Field(default_factory=list)
+    competing_hypotheses: list[Any] = Field(default_factory=list)
+    applicability_limits: list[Any] = Field(default_factory=list)
+    knowledge_gaps: list[Any] = Field(default_factory=list)
+    local_only: Literal[True] = True
+    summary_zh: str = ""
+
+
+class DesignerExperimentSpec(BaseModel):
+    """The executable fields required by the deterministic experiment gate."""
+
+    model_config = ConfigDict(extra="allow")
+    parent_candidate_id: str = Field(min_length=1)
+    control_candidate_id: str = "baseline"
+    initial_fidelity: Literal["pilot", "full"]
+    hypothesis: Any
+    intervention: str = ""
+    principal_intervention: str | dict[str, Any] | None = None
+    required_capability_ids: list[str] = Field(default_factory=list)
+    model: dict[str, Any] = Field(default_factory=dict)
+    objective: dict[str, Any] = Field(default_factory=dict)
+    transform: dict[str, Any] = Field(default_factory=dict)
+    status: Literal["draft"] = "draft"
+
+    @model_validator(mode="after")
+    def executable_fields(self):
+        if not (self.principal_intervention or self.intervention.strip()):
+            raise ValueError("intervention_missing")
+        if not self.hypothesis:
+            raise ValueError("hypothesis_missing")
+        return self
+
+
+class ExperimentDesignResult(DomainOutput):
+    status: Literal["completed", "partial", "failed", "blocked", "requires_framework_extension"]
+    experiment_spec: DesignerExperimentSpec | None = None
+    missing_inputs: list[str] = Field(default_factory=list)
+    required_capability_ids: list[str] = Field(default_factory=list)
+    confounders: list[Any] = Field(default_factory=list)
+    required_corrections: list[Any] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    summary_zh: str = ""
+
+    @model_validator(mode="after")
+    def completed_design_has_spec(self):
+        if self.status == "completed" and self.experiment_spec is None:
+            raise ValueError("completed_design_requires_executable_spec")
+        return self
+
+
+class ImplementationIssue(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    severity: Literal["blocking", "non_blocking"]
+    category: str = ""
+    blocking: bool | None = None
+
+    @model_validator(mode="after")
+    def consistent_blocking_flag(self):
+        if self.blocking is not None and self.blocking != (self.severity == "blocking"):
+            raise ValueError("conflicting_blocking_severity")
+        return self
+
+
+class ImplementationReview(DomainOutput):
+    status: Literal["ready", "needs_fix", "blocked"]
+    intervention_coverage: Any = None
+    issues: list[ImplementationIssue] = Field(default_factory=list)
+    verified_invariants_with_refs: list[Any] = Field(default_factory=list)
+    unverified_invariants: list[Any] = Field(default_factory=list)
+    review_limits: Any = None
+    summary_zh: str = ""
+
+
+class ResultAnalysis(DomainOutput):
+    execution_assessment: Any = None
+    hypothesis_assessment: Literal["supported", "weakened", "inconclusive", "not_tested"] | None = None
+    observations: list[dict[str, Any]] = Field(default_factory=list)
+    prediction_checks: list[dict[str, Any]] = Field(default_factory=list)
+    interpretations: list[Any] = Field(default_factory=list)
+    competing_explanations: list[Any] = Field(default_factory=list)
+    evidence_gaps: list[Any] = Field(default_factory=list)
+    suggested_next_actions: list[Any] = Field(default_factory=list)
+    scope_limits: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    summary_zh: str = ""
+
+
+class LessonProposal(DomainOutput):
+    proposed_lessons: list[dict[str, Any]] = Field(default_factory=list)
+    summary_zh: str = ""
+
+
+class AuditReport(DomainOutput):
+    verdict: Literal["PASS", "REVISE", "BLOCK"]
+    audited_report_ref: str | None = None
+    claims: list[dict[str, Any]] = Field(default_factory=list)
+    open_issues: list[Any] = Field(default_factory=list)
+    required_corrections: list[Any] = Field(default_factory=list)
+    review_limits: Any = None
+    summary_zh: str = ""
+
+
+DOMAIN_OUTPUT_MODELS = {
+    "research_planner": PlannerDecision,
+    "research_librarian": MethodEvidencePacket,
+    "experiment_designer": ExperimentDesignResult,
+    "candidate_reviewer": ImplementationReview,
+    "result_analyst": ResultAnalysis,
+    "memory_curator": LessonProposal,
+    "result_auditor": AuditReport,
+}
 
 
 PLAN_VERSION_NAME = "eeg_research.research_plan.v1"
@@ -49,6 +199,10 @@ class GoalSpec(BaseModel):
     max_concurrent_training_jobs: int = 1
     max_api_usd: float | None = None
     max_repairs_per_candidate: int = 2
+    require_audit_before_completion: bool = False
+    allowed_training_actions: list[Literal["run_pilot", "run_full", "replicate"]] = Field(
+        default_factory=lambda: ["run_pilot", "run_full", "replicate"]
+    )
     confirmation_target_pairs: int = 3
     training_seeds: list[int] = Field(default_factory=list)
     allowed_changes: list[str] = Field(default_factory=list)

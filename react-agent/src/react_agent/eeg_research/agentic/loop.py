@@ -14,7 +14,7 @@ from react_agent.eeg_research.agentic.contract import public_contract
 from react_agent.eeg_research.agentic.execution_protocol import load_protocol, next_unused_training_seed
 from react_agent.eeg_research.agentic.llm import LlmUnavailable
 from react_agent.eeg_research.agentic.memory import EpisodeStore, episode, query_lessons, retrieve
-from react_agent.eeg_research.agentic.planner import STOP_REASONS, available_actions, decide, evidence_count
+from react_agent.eeg_research.agentic.planner import STOP_REASONS, audit_completed, available_actions, completion_block_reason, decide, evidence_count
 from react_agent.eeg_research.agentic.promotion import promotion_decision
 from react_agent.eeg_research.agentic.research_plan import (
     PLAN_DEPENDENT_ACTIONS,
@@ -44,7 +44,9 @@ def _planner_goal(goal: dict[str, Any]) -> dict[str, Any]:
         if key.startswith("final_test_"):
             continue
         public[key] = value
-    return public
+    from react_agent.eeg_research.agentic.handoffs import development_view
+
+    return development_view(public)
 
 
 def _read(path: Path) -> dict[str, Any]:
@@ -66,6 +68,12 @@ def report_dependency_hash(state: dict[str, Any]) -> str:
 
     experiment = state.get("experiment") if isinstance(state.get("experiment"), dict) else {}
     report = state.get("report_draft") if isinstance(state.get("report_draft"), dict) else {}
+    actual_files = []
+    for row in report.get("dependency_manifest") or []:
+        if not isinstance(row, dict) or row.get("scope") != "development":
+            continue
+        path = Path(str(row.get("path") or ""))
+        actual_files.append({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None})
     deps = {
         "evidence": [
             {
@@ -86,11 +94,12 @@ def report_dependency_hash(state: dict[str, Any]) -> str:
             for row in state.get("evidence") or []
         ],
         "report_hash": report.get("report_hash") or state.get("audit_report_hash"),
-        "dependency_manifest_hash": report.get("dependency_manifest_hash") or state.get("audited_report_hash"),
+        "dependency_manifest_hash": report.get("dependency_manifest_hash"),
         "file_hashes": state.get("report_file_hashes") or report.get("file_hashes"),
         "claims": report.get("claims") or state.get("audit_claims") or [],
         "experiment_spec_hash": experiment.get("spec_hash"),
         "confirmation_policy_hash": state.get("confirmation_policy_hash"),
+        "actual_dependency_files": actual_files,
     }
     return hashlib.sha256(json.dumps(deps, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
@@ -98,7 +107,7 @@ def report_dependency_hash(state: dict[str, Any]) -> str:
 def refresh_audit_freshness(state: dict[str, Any]) -> str:
     current = report_dependency_hash(state)
     audited = state.get("audited_report_hash")
-    if audited and audited != current and state.get("audit_status") in {"pass", "revise", "block"}:
+    if audited and audited != current and state.get("audit_status") in {"pass", "revise", "block", "partial", "failed", "blocked"}:
         state["audit_status"] = "stale"
         state["audit_fresh"] = False
     return current
@@ -147,6 +156,8 @@ def create_campaign(
         "gpu_seconds_reserved": 0.0,
         "llm_calls_left": int(goal.get("max_llm_calls", 300)),
         "max_repairs_per_candidate": int(goal.get("max_repairs_per_candidate", 2)),
+        "require_audit_before_completion": bool(goal.get("require_audit_before_completion", False)),
+        "allowed_training_actions": list(goal.get("allowed_training_actions", ["run_pilot", "run_full", "replicate"])),
         "training_seeds": list(goal.get("training_seeds") or (protocol or {}).get("training_seeds") or []),
         "confirmation_policy_hash": None,
         "schema_version": SCHEMA_VERSION,
@@ -465,6 +476,7 @@ def _dev_row(row: dict[str, Any]) -> dict[str, Any]:
 
 def observation(camp: Path) -> dict[str, Any]:
     state = load_state(camp)
+    refresh_audit_freshness(state)
     contract = public_contract(_read(camp / "evaluation_contract.json"))
     from react_agent.eeg_research.agentic.planner import blocked_actions, eligible_targets
 
@@ -489,22 +501,21 @@ def observation(camp: Path) -> dict[str, Any]:
     experiment = state.get("experiment") if isinstance(state.get("experiment"), dict) else {}
     parent_id = experiment.get("parent_candidate_id") or "baseline"
     control_id = experiment.get("control_candidate_id") or "baseline"
-    parent_binding = None if parent_id == "baseline" else load_approved_binding(camp, str(parent_id))
-    control_binding = None if control_id == "baseline" else load_approved_binding(camp, str(control_id))
-    return {
+    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views
+
+    return development_view({
         "goal": _planner_goal(goal),
+        "require_audit_before_completion": bool(goal.get("require_audit_before_completion", False)),
+        "audit_status": state.get("audit_status") or "pending",
+        "audit_fresh": state.get("audit_fresh") is True,
+        "completion_audit_ready": audit_completed(state),
+        "audited_report_hash": state.get("audited_report_hash"),
         "confirmation_policy": policy,
         "confirmation_policy_hash": (policy or {}).get("policy_hash") or state.get("confirmation_policy_hash"),
-        "parent_source": {
-            "candidate_id": parent_id,
-            "spec_hash": None if parent_binding is None else parent_binding.get("spec_hash"),
-            "recipe": None if parent_binding is None else {key: parent_binding.get(key) for key in ("model", "objective", "transform")},
-        },
-        "control_source": {
-            "candidate_id": control_id,
-            "spec_hash": None if control_binding is None else control_binding.get("spec_hash"),
-            "recipe": None if control_binding is None else {key: control_binding.get(key) for key in ("model", "objective", "transform")},
-        },
+        "parent_source": candidate_context(camp, str(parent_id)),
+        "control_source": candidate_context(camp, str(control_id)),
+        "analyses": load_analysis_views(camp, state),
+        "method_evidence_packet": state.get("method_evidence_packet"),
         "contract": contract,
         "candidate_interface": candidate_interface(protocol),
         "evidence": evidence,
@@ -536,7 +547,7 @@ def observation(camp: Path) -> dict[str, Any]:
         "latest_comparison": None if latest_job is None else latest_job.get("comparison"),
         "latest_diagnostics": None if latest_job is None else latest_job.get("diagnostics"),
         "_known_evidence_ids": [row.get("evidence_id") for row in evidence],
-    }
+    })
 
 
 Services = dict[str, Callable[..., Any]]
@@ -630,6 +641,9 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         "action": decision.get("action"),
         "ok": decision.get("ok"),
         "reason_zh": decision.get("reason_zh"),
+        "expected_information": raw_decision.get("expected_information"),
+        "required_artifact_refs": raw_decision.get("required_artifact_refs") or [],
+        "question_id": raw_decision.get("question_id"),
         "evidence_ids": [item for item in cited if isinstance(item, str)] if isinstance(cited, list) else [],
         "detail": decision.get("detail"),
         "evidence_count": evidence_count(state),
@@ -727,6 +741,13 @@ def _apply_action(
                 recoverable=True,
             )
             return
+        refresh_audit_freshness(state)
+        goal = _read(camp / "goal.json")
+        gate = {**state, "require_audit_before_completion": bool(goal.get("require_audit_before_completion", False))}
+        if completion_block_reason(gate, reason):
+            persist_failure(camp, state, phase="stop", error_type="audit_required_before_goal_addressed",
+                            detail="audit_required_before_goal_addressed", recoverable=True)
+            return
         state["status"] = "finished"
         state["execution_status"] = "completed"
         state["research_outcome"] = state.get("research_outcome") or "not_evaluated"
@@ -752,7 +773,13 @@ def _apply_action(
     elif action == "repair_candidate":
         _repair_candidate(camp, state, services)
     elif action == "audit_result":
-        _audit_result(camp, state, services)
+        refresh_audit_freshness(state)
+        if audit_completed(state):
+            state["last_local_result"] = {"kind": "audit", "new_information": False,
+                                          "reason": "fresh_audit_reused"}
+            event(camp, "audit_reused", audited_dependency_hash=state["audited_report_hash"])
+        else:
+            _audit_result(camp, state, services)
     elif action == "implement_candidate":
         from react_agent.eeg_research.agentic.experiment_gate import ExperimentResolutionError, resolve_approved_experiment
 
@@ -844,7 +871,7 @@ def _retrieve_methods(camp: Path, state: dict[str, Any], raw: dict[str, Any], se
     packed["local_only"] = True
     packed["online"] = False
     inputs = [camp / "goal.json", camp / "evaluation_contract.json"]
-    task = begin_role_task(camp, role="research_librarian", inputs=inputs)
+    task = begin_role_task(camp, role="research_librarian", inputs=inputs, request={"query": query, "retrieval": packed})
     payload = {
         "schema_version": ROLE_RESULT_VERSION,
         "task_id": task["task_id"],
@@ -862,8 +889,13 @@ def _retrieve_methods(camp: Path, state: dict[str, Any], raw: dict[str, Any], se
         try:
             reply = librarian({**payload, "task_id": task["task_id"], "input_digest": task["input_digest"], "online_retrieval": False})
             if isinstance(reply, dict):
+                reply_status = str(reply.get("status") or "completed")
+                if reply_status in {"partial", "failed", "blocked"}:
+                    payload["status"] = reply_status
                 payload["summary_zh"] = str(reply.get("summary_zh") or payload["summary_zh"])
                 payload["payload"] = reply
+                body = reply.get("payload") if isinstance(reply.get("payload"), dict) else reply
+                state["method_evidence_packet"] = body
             payload["local_only"] = True
         except LlmUnavailable:
             payload["status"] = "partial"
@@ -892,13 +924,14 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     """Verified inputs the designer actually receives. Missing pieces stay listed."""
     from react_agent.eeg_research.agentic.budget import snapshot as budget_snapshot
     from react_agent.eeg_research.agentic.capabilities import capability_manifest
+    from react_agent.eeg_research.agentic.confirmation_policy import load_confirmation_policy
 
     missing: list[str] = []
-    diagnostics = None
-    for row in reversed(state.get("evidence") or []):
-        if row.get("diagnostics") or row.get("diagnostic_ref"):
-            diagnostics = {"summary": row.get("diagnostics"), "ref": row.get("diagnostic_ref"), "evidence_id": row.get("evidence_id")}
-            break
+    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views, matched_diagnostics
+
+    parent = str(spec.get("parent_candidate_id") or "baseline")
+    control = str(spec.get("control_candidate_id") or "baseline")
+    diagnostics = matched_diagnostics(state, parent)
     if diagnostics is None:
         missing.append("diagnostics")
     methods = state.get("method_hits") or []
@@ -908,21 +941,29 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     contract = _read(contract_path) if contract_path.is_file() else {}
     if not contract:
         missing.append("evaluation_contract")
-    return {
+    return development_view({
         "hypothesis": spec.get("hypothesis") or state.get("hypothesis"),
+        "goal": _planner_goal(_read(camp / "goal.json")),
+        "confirmation_policy": load_confirmation_policy(camp),
         "diagnostics": diagnostics,
         "method_evidence": methods,
+        "method_evidence_packet": state.get("method_evidence_packet"),
         "parent_candidate_id": spec.get("parent_candidate_id"),
         "control_candidate_id": spec.get("control_candidate_id") or "baseline",
+        "parent_source": candidate_context(camp, parent),
+        "control_source": candidate_context(camp, control),
+        "analyses": load_analysis_views(camp, state, target=parent),
+        "cold_start_prior": diagnostics is None,
+        "capability_status_semantics": "available=wired and usable; verified=false=no execution receipt yet, not missing",
         "evaluation_contract": {
             "fingerprint": contract.get("fingerprint"),
             "research_scope": contract.get("research_scope"),
             "primary_metric": contract.get("primary_metric"),
         },
-        "capabilities": capability_manifest(),
+        "capabilities": capability_manifest(load_protocol(camp)),
         "budget": budget_snapshot(camp, state),
         "missing_inputs": missing,
-    }
+    })
 
 
 def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, Any], raw: dict[str, Any], services: Services) -> None:
@@ -934,6 +975,9 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     if not isinstance(spec, dict):
         spec = {"initial_fidelity": "pilot"}
     spec = dict(spec)
+    for key in ("spec_hash", "approval_record", "allowed_actions", "blocked_reason", "validator_version", "role_status", "experiment_ref"):
+        spec.pop(key, None)
+    spec["status"] = "draft"
     spec["parent_candidate_id"] = spec.get("parent_candidate_id") or "baseline"
     spec["hypothesis"] = raw.get("hypothesis_draft") or spec.get("hypothesis") or state.get("hypothesis")
     designer = services.get("designer")
@@ -945,16 +989,7 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
         camp,
         role="experiment_designer",
         inputs=inputs,
-        request={
-            "draft": spec,
-            "diagnostics": context.get("diagnostics"),
-            "method_evidence": context.get("method_evidence"),
-            "budget": context.get("budget"),
-            "capabilities": context.get("capabilities"),
-            "parent_candidate_id": context.get("parent_candidate_id"),
-            "control_candidate_id": context.get("control_candidate_id"),
-            "evaluation_contract": context.get("evaluation_contract"),
-        },
+        request={"draft": spec, **context},
     )
     payload: dict[str, Any] = {"status": "completed", "experiment_spec": spec, "summary_zh": "已写出 ExperimentSpec"}
     blocked = False
@@ -1107,7 +1142,60 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
             verdict = "REVISE" if verdict != "BLOCK" else verdict
     import hashlib
 
-    report_hash = hashlib.sha256(json.dumps({"claims": claims, "latest": latest}, default=str, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+    from react_agent.eeg_research.agentic.handoffs import development_view, load_analysis_views
+    from react_agent.eeg_research.agentic.artifacts import file_digest
+
+    manifest = []
+    for row in state.get("evidence") or []:
+        job_dir = row.get("job_dir")
+        if not job_dir:
+            continue
+        job_path = Path(str(job_dir))
+        try:
+            job_path.resolve().relative_to(camp.resolve())
+        except ValueError:
+            continue
+        for name in ("run_record.json", "metrics.json", "selected_checkpoint.json", "diagnostic_summary.json",
+                     "frozen_run_spec.json", "source_binding.json", "hook_consumed.json"):
+            path = job_path / name
+            if not path.is_file():
+                continue
+            contents = json.loads(path.read_text(encoding="utf-8"))
+            manifest.append({"path": str(path), "kind": name.removesuffix(".json"), "content_hash": file_digest(path),
+                "scope": "development", "payload": development_view(contents)})
+    from react_agent.eeg_research.agentic.artifacts import lookup, verify
+    for row in state.get("evidence") or []:
+        ref = row.get("analysis_artifact_id")
+        if row.get("kind") != "analysis" or not ref:
+            continue
+        artifact = lookup(camp, str(ref))
+        ok, reason = verify(camp, str(ref))
+        if not ok:
+            claims.append({"claim": "analysis_dependency_valid", "status": "unsupported", "ref": ref, "reason": reason})
+            verdict = "REVISE" if verdict != "BLOCK" else verdict
+        if artifact:
+            path = Path(artifact["path"])
+            if path.is_file() and path.resolve().is_relative_to(camp.resolve()):
+                manifest.append({"path": str(path), "kind": "analysis", "content_hash": file_digest(path),
+                    "declared_hash": artifact["sha256"], "verification_status": "verified" if ok else "invalid",
+                    "scope": "development", "payload": development_view(json.loads(path.read_text())) if ok else None})
+    for name in ("goal.json", "evaluation_contract.json", "confirmation_policy.json"):
+        path = camp / name
+        if path.is_file():
+            manifest.append({"path": str(path), "kind": name.removesuffix(".json"), "content_hash": file_digest(path),
+                "scope": "development", "payload": development_view(json.loads(path.read_text()))})
+    report_draft = {
+        "schema_version": "eeg_research.report_draft.v1", "scope": "development",
+        "claims": claims, "latest": development_view(latest),
+        "analyses": load_analysis_views(camp, state),
+        "scope_limits": ["pilot evidence is not confirmed superiority", "final holdout excluded", "same-provider audit is not independent replication"],
+        "dependency_manifest": manifest,
+    }
+    report_draft["dependency_manifest_hash"] = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    report_draft["report_hash"] = hashlib.sha256(json.dumps(report_draft, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    state["report_draft"] = report_draft
+
+    report_hash = report_draft["report_hash"]
     payload = {
         "status": "completed",
         "verdict": verdict,
@@ -1120,7 +1208,7 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
         camp,
         role="result_auditor",
         inputs=[camp / "goal.json"],
-        request={"claims": claims, "report_hash": report_hash, "latest": latest},
+        request={"report_draft": report_draft},
     )
     auditor = services.get("auditor")
     if auditor is not None:
@@ -1132,12 +1220,18 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
                     "input_digest": task["input_digest"],
                     "latest": latest,
                     "draft": payload,
+                    "report_draft": report_draft,
+                    "dependency_manifest": manifest,
+                    "analyses": report_draft["analyses"],
                     "claims": claims,
                     "report_hash": report_hash,
                 }
             )
             if isinstance(reply, dict):
                 model_verdict = reply.get("verdict") or (reply.get("payload") or {}).get("verdict")
+                reply_status = str(reply.get("status") or "completed")
+                if reply_status in {"partial", "failed", "blocked"}:
+                    payload["status"] = reply_status
                 payload["auditor_claims"] = reply.get("claims") or (reply.get("payload") or {}).get("claims") or []
                 payload["open_issues"] = reply.get("open_issues") or []
                 payload["required_corrections"] = reply.get("required_corrections") or []
@@ -1152,7 +1246,10 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
             payload["summary_zh"] = "审计角色不可用，保留确定性核查"
     path = camp / "audits" / f"{task['task_id']}.json"
     finish_role_task(camp, task, payload, kind="audit", path=path)
-    state["audit_status"] = {"PASS": "pass", "REVISE": "revise", "BLOCK": "block"}.get(str(payload["verdict"]), "unavailable")
+    state["audit_status"] = (
+        str(payload["status"]) if payload.get("status") in {"partial", "failed", "blocked"}
+        else {"PASS": "pass", "REVISE": "revise", "BLOCK": "block"}.get(str(payload["verdict"]), "unavailable")
+    )
     state["audit_report_hash"] = report_hash
     state["audit_claims"] = claims
     state["audit_fresh"] = True
@@ -1678,6 +1775,12 @@ def _train(
     services: Services,
     raw: dict[str, Any] | None = None,
 ) -> None:
+    from react_agent.eeg_research.agentic.planner import training_actions
+
+    if action not in training_actions(_read(camp / "goal.json")):
+        persist_failure(camp, state, phase="train", error_type="training_action_outside_goal",
+                        detail=f"training_action_outside_goal:{action}", recoverable=False)
+        return
     if state.get("gpu_seconds_left", 0) <= 0 or state["training_jobs"] >= state["max_training_jobs"]:
         state["status"] = "blocked"
         state["detail"] = "budget_exhausted"

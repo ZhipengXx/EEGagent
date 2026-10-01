@@ -40,6 +40,7 @@ def _check_fingerprint(workspace: Path, python: str | None) -> str:
     payload = {
         "source": file_sha256(workspace / "extension" / "eeg_candidate.py"),
         "input_spec": spec.read_text(encoding="utf-8") if spec.is_file() else "eeg",
+        "approved_spec": (workspace / "spec.json").read_text(encoding="utf-8") if (workspace / "spec.json").is_file() else None,
         "python": python or torch_python(),
         "checker": file_sha256(Path(__file__).with_name("check_entry.py")),
     }
@@ -202,6 +203,21 @@ def implement(
     reads = int(restored["reads"])
     seen_reads: set[tuple[Any, ...]] = set(restored.get("seen_reads") or [])
     next_step = int(restored["next_step"])
+    step_limit = max_steps
+    first_step = 1
+    failed_at_start = 0
+    if resume_repair:
+        from react_agent.eeg_research.agentic.identity import ensure_attempt
+        attempt = ensure_attempt(workspace, workspace.name)
+        budget_path = workspace / "coder_attempt_budget.json"
+        budget = json.loads(budget_path.read_text()) if budget_path.is_file() else {}
+        if budget.get("attempt_id") != attempt["attempt_id"]:
+            budget = {"attempt_id": attempt["attempt_id"], "first_step": next_step,
+                      "last_step": next_step + max_steps - 1, "failed_checks_at_start": failed_checks}
+            budget_path.write_text(json.dumps(budget, indent=2), encoding="utf-8")
+        first_step = int(budget["first_step"])
+        step_limit = int(budget["last_step"])
+        failed_at_start = int(budget["failed_checks_at_start"])
     from react_agent.eeg_research.agentic.binding import file_sha256
     from react_agent.eeg_research.agentic.coder import _REFERENCES
     from react_agent.eeg_research.agentic.interface import candidate_interface
@@ -219,7 +235,7 @@ def implement(
     reference_ranges = {name: {key: value for key, value in page.items() if key != "text"} for name, page in pages.items()}
     entry = workspace / "extension" / "eeg_candidate.py"
     extension_answered = bool(restored["extension_answered"])
-    for step in range(next_step, max_steps + 1):
+    for step in range(next_step, step_limit + 1):
         if calls_left is not None and calls_left() <= reserve:
             return {"status": "implementation_failed", "detail": "budget_exhausted", "check": last_check, "steps": step - 1}
         current = None
@@ -231,8 +247,10 @@ def implement(
             "input_spec": input_spec,
             "allowed_write_paths": ["extension/eeg_candidate.py"],
             "step": step,
-            "max_steps": max_steps,
-            "repairs_used": max(0, failed_checks - 1) if failed_checks else 0,
+            "max_steps": step_limit,
+            "attempt_step": step - first_step + 1,
+            "attempt_max_steps": step_limit - first_step + 1,
+            "repairs_used": max(0, failed_checks - failed_at_start - 1),
             "max_repairs": max_repairs,
             "current_file": current,
             "references": references,
@@ -351,9 +369,9 @@ def implement(
             return {"status": "requires_framework_extension", "detail": args, "steps": step}
         if tool == "finish_patch" and result.get("ok"):
             return {"status": "ready_for_review", "manifest": result["manifest"], "check": last_check, "steps": step}
-        if failed_checks >= max_repairs + 1:
+        if failed_checks - failed_at_start >= max_repairs + 1:
             return {"status": "implementation_failed", "detail": "repair_limit", "check": last_check, "steps": step}
-    return {"status": "implementation_failed", "detail": "step_limit", "check": last_check, "steps": max_steps}
+    return {"status": "implementation_failed", "detail": "step_limit", "check": last_check, "steps": step_limit}
 
 
 def _camp_from_workspace(workspace: Path) -> Path:
@@ -510,6 +528,10 @@ def filter_runtime_blocking(
     filtered: list[dict[str, Any]] = []
     for issue in issues:
         row = dict(issue) if isinstance(issue, dict) else {"title": str(issue), "severity": "blocking"}
+        if row.get("blocking") is True:
+            row["severity"] = "blocking"
+        elif row.get("severity") not in {"blocking", "non_blocking"}:
+            row["severity"] = "non_blocking" if row.get("blocking") is False else "blocking"
         invariant = str(row.get("invariant_id") or "")
         if row.get("severity") == "blocking" and invariant and invariant in known and invariant in _RUNTIME_INVARIANTS:
             row["severity"] = "non_blocking"
@@ -529,8 +551,22 @@ def apply_review_filter(result: dict[str, Any], *, satisfied: set[str] | None = 
     updated["runtime_issues_downgraded"] = sum(1 for row in issues if row.get("already_satisfied"))
     if result.get("format_failed"):
         updated["status"] = "blocked"
-    elif not blocking:
+    elif blocking and result.get("status") == "ready":
+        updated["status"] = "needs_fix"
+    elif not blocking and (result.get("status") == "ready" or updated["runtime_issues_downgraded"]):
         updated["status"] = "ready"
+    coverage = result.get("intervention_coverage")
+    def unresolved(value: Any) -> bool:
+        if isinstance(value, dict):
+            if value.get("status") in {"missing", "not_implemented", "partial", "failed", "unknown"}:
+                return True
+            return any(unresolved(item) for item in value.values())
+        if isinstance(value, list):
+            return any(unresolved(item) for item in value)
+        return isinstance(value, str) and value in {"missing", "not_implemented", "partial", "failed", "unknown"}
+    if coverage is not None and unresolved(coverage):
+        updated["status"] = "needs_fix"
+        updated["coverage_unresolved"] = True
     updated["blocking_remaining"] = len(blocking)
     return updated
 
@@ -560,6 +596,14 @@ def review(
         "reviewer_model": model,
         "executor_model": model,
     }
+    from react_agent.eeg_research.agentic.handoffs import training_semantics
+    payload["training_runtime_source"] = training_semantics()
+    parent = workspace / "reference/parent.py"
+    if parent.is_file():
+        from react_agent.eeg_research.agentic.artifacts import file_digest
+        text = parent.read_text(encoding="utf-8")
+        payload["parent_source"] = {"source_ref": str(parent), "source_hash": file_digest(parent),
+                                    "source": text[:16000], "source_truncated": len(text) > 16000}
     reply = backend(payload)
     repaired = False
     if not _review_valid(reply):
@@ -578,6 +622,9 @@ def review(
             "model_status": "blocked" if format_failed else reply["status"],
             "issues": [] if format_failed else reply.get("issues") or [],
             "review_limits": None if format_failed else reply.get("review_limits"),
+            "intervention_coverage": None if format_failed else reply.get("intervention_coverage"),
+            "verified_invariants_with_refs": [] if format_failed else reply.get("verified_invariants_with_refs") or [],
+            "unverified_invariants": [] if format_failed else reply.get("unverified_invariants") or [],
             "summary_zh": "审查回复格式不合格，按受阻处理。" if format_failed else reply.get("summary_zh"),
             "format_failed": format_failed,
             "schema_repaired": repaired,
@@ -591,6 +638,12 @@ def review(
         for key in ("candidate_id", "attempt_id", "phase", "operation_id"):
             if identity.get(key):
                 result[key] = identity[key]
+    experiment = spec.get("experiment") or {}
+    if (experiment.get("principal_intervention") or experiment.get("intervention")) and not result.get("intervention_coverage"):
+        result["status"] = "needs_fix"
+        result["coverage_unresolved"] = True
+        result["issues"].append({"severity": "blocking", "kind": "intervention_coverage_missing",
+                                 "detail": "Review must identify the approved intervention's implementation and supporting source/check refs."})
     from react_agent.eeg_research.agentic.identity import source_hash
 
     result["input_hash"] = source_hash(workspace)

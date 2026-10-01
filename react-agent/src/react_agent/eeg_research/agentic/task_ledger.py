@@ -11,7 +11,7 @@ from typing import Any
 from react_agent.eeg_research.agentic.identity import result_matches
 
 LEDGER = "task_ledger.jsonl"
-STATUSES = {"pending", "running", "completed", "failed", "superseded", "cancelled"}
+STATUSES = {"pending", "running", "waiting_for_evidence", "completed", "partial", "blocked", "failed", "superseded", "cancelled"}
 
 
 def _append(camp: Path, row: dict[str, Any]) -> dict[str, Any]:

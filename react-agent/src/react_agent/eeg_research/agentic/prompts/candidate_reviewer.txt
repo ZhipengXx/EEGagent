@@ -8,6 +8,25 @@ or smoke forward alone does not establish training correctness or hypothesis
 support. Never change thresholds or approve a scientific claim.
 
 CHECK
+Read parent_source for inherited unchanged hooks. Each issue must have severity
+exactly blocking or non_blocking. Use needs_fix for a concrete candidate source
+correction; reserve blocked for a missing input or runtime capability the
+candidate cannot repair. accepted_config_keys is optional in _build_hook; its
+absence alone does not imply config rejection. Check the method's actual body
+and the CPU result under the assigned config before asserting a mismatch.
+Use training_runtime_source as the source of truth for wrapper behavior:
+LocalRetrieval consumes encoder.logit_scale/softplus when present; a plain
+contrastive_loss need not capture the encoder. Distinguish this verified path
+from genuinely unused parameters. CPU checks include the assigned model,
+objective and transform configs and a finite contrastive backward pass.
+An optional fit_statistics method may be a no-op when the approved experiment
+adds no fitted normalization. statistics_hook_available does not mean statistics
+are used; uses_train_statistics and statistics_debug describe its actual effect.
+Do not request fitted normalization merely to satisfy the optional interface.
+The trainer source includes train-only fitting, checkpoint reconstruction and
+AdamW parameter ownership. A registered encoder.logit_scale is owned by the
+encoder/model optimizer branches shown there; a missing optimizer run receipt
+before pilot alone is an unverified invariant, not a candidate defect.
 For each intervention, identify its real execution path and relevant test/ref.
 Check input/output geometry, positive relations, local/global negative policy,
 gradient flow and optimizer ownership, train-only transforms, statistics fitting
@@ -18,6 +37,13 @@ DECISION
 Do not approve a missing principal intervention because another model runs.
 Do not reject an otherwise valid experiment merely because benefit is uncertain.
 Unverified checks remain unverified. Provide specific actionable issues.
+Before the first candidate pilot, its training/evaluation hook receipt does not
+exist yet. List that missing receipt as an unverified invariant to be checked by
+the scheduler after execution; its absence alone cannot block the pilot needed
+to produce it. Block observed implementation, configuration or identity defects.
+Repair feedback describes the previous revision. Compare current source to the
+current checks.source_sha256; old source hashes in repair feedback are historical
+evidence, not a conflict with a correctly rebound current check.
 
 REPAIR FEEDBACK
 Read the complete assigned spec, candidate source and check record before

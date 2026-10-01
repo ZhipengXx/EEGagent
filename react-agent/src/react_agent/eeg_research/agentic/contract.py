@@ -47,4 +47,6 @@ def public_contract(contract: dict[str, Any]) -> dict[str, Any]:
     kept = dict(contract)
     kept["files"] = files
     kept.pop("forbidden_contents", None)
-    return kept
+    from react_agent.eeg_research.agentic.handoffs import development_view
+
+    return development_view(kept)

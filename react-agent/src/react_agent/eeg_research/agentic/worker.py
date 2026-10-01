@@ -107,7 +107,8 @@ def _stored_review(workspace: Path, *, candidate_id: str, attempt_id: str, input
         input_hash=input_hash,
     ):
         return None
-    return payload
+    from react_agent.eeg_research.agentic.native_patch import apply_review_filter, satisfied_invariants
+    return apply_review_filter(payload, satisfied=satisfied_invariants(workspace))
 
 
 def _review_or_reuse(
@@ -178,9 +179,18 @@ def _review_or_reuse(
 
 
 def build_services(camp: Path) -> dict[str, Any]:
-    coder = role_backend(camp, "candidate_coder")
-    reviewer = role_backend(camp, "candidate_reviewer")
-    analyst = role_backend(camp, "result_analyst")
+    # Launch/settlement remain usable without constructing a paid role client.
+    # Each role is resolved only when its service actually invokes it.
+    def lazy_backend(role: str):
+        client = None
+        def call(payload: dict[str, Any]) -> dict[str, Any]:
+            nonlocal client
+            if client is None:
+                client = role_backend(camp, role)
+            return client(payload)
+        return call
+
+    analyst = lazy_backend("result_analyst")
     contract = public_contract(json.loads((camp / "evaluation_contract.json").read_text(encoding="utf-8")))
     summary = {key: contract.get(key) for key in ("research_scope", "primary_metric", "val_mode", "fingerprint")}
 
@@ -205,6 +215,8 @@ def build_services(camp: Path) -> dict[str, Any]:
         return jobs.reconcile(camp_dir / "jobs" / job_id)
 
     def do_implement(camp_dir: Path, state: dict[str, Any]) -> None:
+        coder = role_backend(camp, "candidate_coder")
+        reviewer = role_backend(camp, "candidate_reviewer")
         if state.get("status") in {"paused", "cancelled"}:
             return
         repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else None
@@ -223,7 +235,15 @@ def build_services(camp: Path) -> dict[str, Any]:
         spec = {"hypothesis": state.get("hypothesis"), "experiment": state.get("experiment")}
         if repairing:
             spec["repair_issues"] = repair.get("issues") or []
+            spec["repair_intervention_coverage"] = repair.get("intervention_coverage")
+            spec["repair_unverified_invariants"] = repair.get("unverified_invariants") or []
         workspace.mkdir(parents=True, exist_ok=True)
+        from react_agent.eeg_research.agentic.run_context import load_approved_binding, persist_approved_binding
+        from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
+        assigned = state.get("execution_spec") if repairing and isinstance(state.get("execution_spec"), dict) else state.get("experiment")
+        if load_approved_binding(camp_dir, candidate_id) is None and experiment_is_approved(assigned):
+            persist_approved_binding(camp_dir, candidate_id, assigned,
+                spec_ref=assigned.get("experiment_ref") or state.get("experiment_ref"))
         (workspace / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
         protocol = load_protocol(camp_dir)
         (workspace / "input_spec.json").write_text(
@@ -254,7 +274,16 @@ def build_services(camp: Path) -> dict[str, Any]:
 
         impl_path = workspace / "implementation.json"
         if repairing:
-            attempt = rotate_attempt(workspace, candidate_id)
+            if repair.get("attempt_id"):
+                attempt = ensure_attempt(workspace, candidate_id)
+                if attempt["attempt_id"] != repair["attempt_id"]:
+                    _block_phase(camp_dir, state, phase="implement_candidate", error_type="RecoveryBlocked",
+                                 detail="repair_attempt_mismatch", recoverable=False)
+                    return
+            else:
+                attempt = rotate_attempt(workspace, candidate_id)
+                repair["attempt_id"] = attempt["attempt_id"]
+                save_state(camp_dir, state)
         else:
             attempt = ensure_attempt(workspace, candidate_id)
         _attach(
@@ -326,7 +355,35 @@ def build_services(camp: Path) -> dict[str, Any]:
                     ),
                     encoding="utf-8",
                 )
-        row = {"candidate_id": candidate_id, "status": outcome["status"], "steps": outcome.get("steps")}
+        row = {"candidate_id": candidate_id, "status": outcome["status"], "steps": outcome.get("steps"), "detail": outcome.get("detail")}
+        check = outcome.get("check") if isinstance(outcome.get("check"), dict) else {}
+        row["check"] = {key: check.get(key) for key in ("ok", "error", "stage", "location", "failures", "source_sha256", "check_fingerprint")}
+        row["check"]["detail"] = str(check.get("detail") or "")[-2000:]
+        if (state.get("failure") or {}).get("phase") in {"implement_candidate", "repair_candidate", "review_candidate"}:
+            state.pop("failure", None)
+            state.pop("detail", None)
+        if row["status"] == "implementation_failed":
+            state["detail"] = row["detail"]
+        if outcome["status"] == "implementation_failed":
+            used = int((repair or {}).get("used") or 0)
+            limit = int(state.get("max_repairs_per_candidate", 2))
+            # A failed preflight is concrete engineering feedback, even before
+            # the first review. Keep the same approved candidate and bounded
+            # repair policy rather than making repair an unavailable action.
+            if (used < limit and outcome.get("detail") != "budget_exhausted"
+                    and (check.get("error") or check.get("failures"))
+                    and (workspace / "extension/eeg_candidate.py").is_file()):
+                state["repair_task"] = {"candidate_id": candidate_id, "remaining": 1, "used": used + 1,
+                    "issues": [{"category": "candidate_check_failure", **row["check"],
+                                "correction_scope": "Repair the exact failing hook and approved config; preserve the scientific intervention."}],
+                    "intervention_coverage": None, "unverified_invariants": []}
+                state["experiment_failed"] = False
+            else:
+                state["repair_task"] = None
+                state["experiment_failed"] = True
+        elif repairing and outcome["status"] != "ready_for_review":
+            state["repair_task"] = None
+            state["experiment_failed"] = True
         if outcome["status"] == "ready_for_review":
             verdict = _review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state)
             if verdict is None:
@@ -350,20 +407,26 @@ def build_services(camp: Path) -> dict[str, Any]:
                         attempt_id=attempt.get("attempt_id"),
                         source_hash=source_hash(workspace),
                     )
-            elif verdict["status"] == "needs_fix":
+            elif verdict["status"] == "needs_fix" or (
+                verdict["status"] == "blocked"
+                and (blocking := [issue for issue in verdict.get("issues") or [] if issue.get("severity") == "blocking"])
+                and all(issue.get("category") == "candidate_defect" and issue.get("smallest_correction") for issue in blocking)
+            ):
                 used = int((repair or {}).get("used") or 0)
                 limit = int(state.get("max_repairs_per_candidate", 2))
                 if used < limit:
                     state["repair_task"] = {
                         "candidate_id": candidate_id,
                         "issues": verdict.get("issues") or [],
+                        "intervention_coverage": verdict.get("intervention_coverage"),
+                        "unverified_invariants": verdict.get("unverified_invariants") or [],
                         "remaining": 1,
                         "used": used + 1,
                     }
                 else:
                     state["repair_task"] = None
                     state["experiment_failed"] = True
-                row["status"] = "review_needs_fix"
+                row["status"] = "review_" + verdict["status"]
             else:
                 state["repair_task"] = None
                 row["status"] = f"review_{verdict['status']}"
@@ -399,7 +462,10 @@ def build_services(camp: Path) -> dict[str, Any]:
         event(camp_dir, "implemented", **row)
 
     def analyze(camp_dir: Path, state: dict[str, Any]) -> None:
-        latest = state["evidence"][-1]
+        latest = next((row for row in reversed(state.get("evidence") or [])
+                       if row.get("fidelity") and row.get("candidate_id") and "evaluation_valid" in row), None)
+        if latest is None:
+            return
         comparison = latest.get("comparison")
         diagnostics = latest.get("diagnostics")
         if not latest.get("evaluation_valid"):
@@ -412,7 +478,8 @@ def build_services(camp: Path) -> dict[str, Any]:
                     bound_hypothesis = row.get("hypothesis")
                     bound_experiment = row.get("experiment")
         payload = {
-            "latest": {key: latest.get(key) for key in ("evidence_id", "candidate_id", "fidelity", "fixed_bank_top1", "gallery_size", "delta_vs_control_pp", "control_id", "seed")},
+            "latest": {key: latest.get(key) for key in ("evidence_id", "job_id", "candidate_id", "fidelity", "fixed_bank_top1", "gallery_size", "delta_vs_control_pp", "control_id", "seed",
+                "evaluation_valid", "reason", "execution_succeeded", "implementation_failure", "job_status", "checkpoint_id", "source_hash", "config_hash", "spec_hash", "contract_fingerprint")},
             "comparison": comparison,
             "diagnostics": diagnostics,
             "hypothesis": bound_hypothesis,
@@ -424,53 +491,122 @@ def build_services(camp: Path) -> dict[str, Any]:
                 if row.get("candidate_id") == "baseline" and row.get("evaluation_valid")
             ],
         }
+        from react_agent.eeg_research.agentic.artifacts import request_digest, resolve_verified_artifact
+        from react_agent.eeg_research.agentic.handoffs import development_view, load_analysis_views
+        from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
+        from react_agent.eeg_research.agentic.schemas import ResultAnalysis
+
+        payload["run_identity"] = {key: latest.get(key) for key in (
+            "job_id", "source_hash", "config_hash", "spec_hash", "checkpoint_id", "contract_fingerprint", "result_hash")}
+        from react_agent.eeg_research.agentic.handoffs import candidate_context
+        payload["candidate_context"] = candidate_context(camp_dir, str(latest["candidate_id"]))
+        payload["is_frozen_baseline"] = latest["candidate_id"] == "baseline"
+        payload["run_artifacts"] = []
+        job_dir = Path(str(latest.get("job_dir") or ""))
+        if latest.get("job_dir") and job_dir.resolve().is_relative_to(camp_dir.resolve()):
+            from react_agent.eeg_research.agentic.artifacts import file_digest
+            for name in ("run_record.json", "metrics.json", "selected_checkpoint.json", "hook_consumed.json", "source_binding.json", "frozen_run_spec.json"):
+                path = job_dir / name
+                if path.is_file():
+                    content = path.read_text(encoding="utf-8")
+                    payload["run_artifacts"].append({"ref": str(path), "content_hash": file_digest(path),
+                        "payload": json.loads(content) if len(content) <= 30000 else None,
+                        "missing_inputs": [] if len(content) <= 30000 else ["artifact_exceeds_context_limit"]})
+        payload = development_view(payload)
+        digest = request_digest(request=payload)
+        for row in state.get("evidence") or []:
+            if row.get("kind") == "analysis" and row.get("run_evidence_id") == latest["evidence_id"] and row.get("analysis_input_digest") == digest:
+                try:
+                    artifact = resolve_verified_artifact(camp_dir, row["analysis_artifact_id"])
+                    stored = json.loads(Path(artifact["path"]).read_text(encoding="utf-8"))
+                except (OSError, ValueError, KeyError):
+                    continue
+                if stored.get("status") == "completed":
+                    return
+        task = begin_role_task(camp_dir, role="result_analyst", inputs=[],
+                               candidate_id=latest.get("candidate_id"), request=payload)
+        task_payload = {**payload, "task_id": task["task_id"], "attempt_id": task["attempt_id"], "input_digest": task["input_digest"]}
         billed = 0
         try:
-            reply = analyst(payload)
+            raw_reply = analyst(task_payload)
             billed += 1
+            body = raw_reply.get("payload") if isinstance(raw_reply.get("payload"), dict) else raw_reply
+            body = {key: value for key, value in body.items() if key not in {
+                "schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "status", "artifact_refs"}}
+            reply = ResultAnalysis.model_validate(body).model_dump()
+            role_status = str(raw_reply.get("status") or "completed")
+            if role_status not in {"completed", "partial", "failed", "blocked"}:
+                role_status = "partial"
         except LlmUnavailable as exc:
             billed += 1
             reply = {"status": "failed", "role_failed": True, "hypothesis_assessment": None, "summary_zh": f"分析未完成：{exc}"}
-        target = camp_dir / "analyses" / f"{latest['evidence_id']}.json"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            json.dumps({"reply": reply, "comparison": comparison, "diagnostics": diagnostics}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+            role_status = "failed"
+        except ValueError as exc:
+            reply = {"hypothesis_assessment": None, "summary_zh": f"分析格式未通过运行时验证：{type(exc).__name__}"}
+            role_status = "failed"
+        target = camp_dir / "analyses" / f"{latest['evidence_id']}_{task['task_id']}.json"
+        envelope = finish_role_task(camp_dir, task, {**reply, "status": role_status},
+            kind="analysis", path=target, candidate_id=latest.get("candidate_id"))
         state["evidence"].append(
             {
-                "evidence_id": f"ev_analysis_{latest['evidence_id']}",
+                "evidence_id": f"ev_analysis_{task['task_id']}",
                 "kind": "analysis",
                 "candidate_id": latest.get("candidate_id"),
+                "run_evidence_id": latest["evidence_id"],
+                "analysis_input_digest": digest,
+                "analysis_artifact_id": envelope["artifact_refs"][-1],
+                "status": role_status,
                 "summary": {key: reply.get(key) for key in ("hypothesis_assessment", "summary_zh", "suggested_next_actions")},
             }
         )
         from react_agent.eeg_research.agentic.memory import EpisodeStore
-        from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
 
         store = EpisodeStore(camp_dir)
         try:
             curator = role_backend(camp, "memory_curator")
-            task = begin_role_task(camp_dir, role="memory_curator", inputs=[camp_dir / "goal.json"])
+            from react_agent.eeg_research.agentic.confirmation_policy import load_confirmation_policy
+
+            episodes = [item for item in store.list_episodes()
+                        if item.get("job_id") == latest.get("job_id") or item.get("candidate_id") == latest.get("candidate_id")][-8:]
+            curation_context = development_view({
+                "episodes": episodes,
+                "design": bound_experiment,
+                "run": latest,
+                "comparison": comparison,
+                "diagnostics": diagnostics,
+                "analyses": load_analysis_views(camp_dir, state, target=latest.get("candidate_id")),
+                "confirmation": latest.get("promotion", {}).get("confirmation") if isinstance(latest.get("promotion"), dict) else None,
+                "confirmation_policy": load_confirmation_policy(camp_dir),
+                "missing_inputs": ["confirmation"] if not (latest.get("promotion") or {}).get("confirmation") else [],
+                "related_lessons": store.list_lessons()[-8:],
+            })
+            task = begin_role_task(camp_dir, role="memory_curator", inputs=[camp_dir / "goal.json"], request=curation_context)
             try:
                 proposal = curator(
                     {
-                        "episodes": store.list_episodes(),
+                        **curation_context,
                         "task_id": task["task_id"],
                         "attempt_id": task["attempt_id"],
                         "input_digest": task["input_digest"],
                     }
                 )
                 billed += 1
-            except LlmUnavailable:
+            except LlmUnavailable as exc:
                 billed += 1
                 store.mark_pending_curation("curator_unavailable")
+                finish_role_task(camp_dir, task, {"status": "failed", "summary_zh": f"经验提议未完成：{exc}"},
+                                 kind="lessons", path=camp_dir / "memory" / f"lessons_{task['task_id']}.json")
             else:
-                accepted = store.accept_lessons(_lesson_proposal(proposal))
+                proposal_status = str(proposal.get("status") or "completed")
+                if proposal_status not in {"completed", "partial", "failed", "blocked"}:
+                    proposal_status = "partial"
+                accepted = store.accept_lessons(_lesson_proposal(proposal)) if proposal_status == "completed" else {"accepted": [], "rejected": []}
+                if proposal_status != "completed":
+                    store.mark_pending_curation("curator_incomplete")
                 finish_role_task(
                     camp_dir,
                     task,
-                    {"status": "completed", "summary_zh": "已提议条件化经验", "accepted": accepted},
+                    {"status": proposal_status, "summary_zh": "已校验条件化经验提议", "proposal": _lesson_proposal(proposal), "accepted": accepted},
                     kind="lessons",
                     path=camp_dir / "memory" / f"lessons_{task['task_id']}.json",
                 )

@@ -304,6 +304,7 @@ class FmriCheckConfig(BaseModel):
     generation: GenerationParams = Field(default_factory=GenerationParams)
     deepseek_base_url: str = "https://api.deepseek.com"
     deepseek_api_key: str | None = None
+    deepseek_trust_env: bool = True
     backend_default: Literal["mock", "deepseek", "none"] = "mock"
     policy_default: Literal["rule", "hybrid", "planned"] = "rule"
     prompt_version: str = "fmri_decision.v1"
@@ -425,6 +426,9 @@ def load_config(
     base = os.environ.get("DEEPSEEK_BASE_URL")
     if base:
         cfg.deepseek_base_url = base
+    trust_env = os.environ.get("DEEPSEEK_TRUST_ENV")
+    if trust_env is not None:
+        cfg.deepseek_trust_env = trust_env.strip().lower() not in {"0", "false", "no"}
     fast_model = os.environ.get("DEEPSEEK_FAST_MODEL")
     if fast_model:
         cfg.fast.model = fast_model

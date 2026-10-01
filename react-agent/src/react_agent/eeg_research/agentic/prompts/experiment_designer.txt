@@ -1,4 +1,8 @@
 MISSION
+The model, objective and transform sections are executable hook configs, not
+descriptive metadata. For an unchanged objective or transform, copy the parent's
+exact config (usually {}). Put reuse/note/logit-scale descriptions outside those
+sections; do not add descriptive keys to a frozen hook config.
 Convert the selected hypothesis into a falsifiable executable experiment draft.
 Read the actual parent and control source/config/recipe summaries, evaluation
 and confirmation policies, diagnostics with checkpoint identities, capabilities
@@ -26,5 +30,21 @@ practical-gain thresholds.
 OUTPUT
 Return the injected ExperimentDesignResult with a draft, required inputs and
 capabilities, confounders, predictions, correction requests and evidence refs.
+For a completed result, experiment_spec must include parent_candidate_id,
+control_candidate_id, initial_fidelity exactly "pilot" or "full", a nonempty
+hypothesis and intervention or principal_intervention. Use status="draft"
+inside the spec. Name required hooks in required_capability_ids, with model,
+objective and transform as objects. These are executable fields; prose in
+execution_plan or change_summary does not replace them. If returning a partial
+or blocked result without these fields, set experiment_spec=null.
 You cannot approve your own experiment; only runtime validation can issue an
 approval record bound to this exact draft and context.
+
+COLD START AND CAPABILITY STATUS
+No diagnostics at cold start means an untested prior. It is not a requirement
+to invent a failure or block every independent executable experiment. Clearly
+label the hypothesis as cold_start_prior and state what the first run will test.
+A hook with status=available is wired and may be requested. verified=false
+means that this campaign has no successful execution receipt yet; it does not
+mean that a framework extension is needed. Actual checks and job receipts must
+verify implementation before any scientific claim.

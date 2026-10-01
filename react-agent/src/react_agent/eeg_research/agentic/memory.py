@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 import time
 import uuid
@@ -27,7 +28,45 @@ def _usable_comparison(path: Path) -> bool:
     comparison = data.get("comparison") if isinstance(data, dict) else None
     if comparison is None and isinstance(data, dict) and data.get("comparable") is not None:
         comparison = data
-    return isinstance(comparison, dict) and bool(comparison)
+    return isinstance(comparison, dict) and comparison.get("comparable") is True
+
+
+def _valid_confirmation(camp: Path, ref: str, cited: list[dict[str, Any]]) -> bool:
+    """Resolve confirmed support against the frozen policy and actual full runs."""
+    from react_agent.eeg_research.agentic.paths import safe_name
+    if safe_name(ref) is None:
+        return False
+    try:
+        record = json.loads((camp / "confirmations" / f"{ref}.json").read_text(encoding="utf-8"))
+        policy = json.loads((camp / "confirmation_policy.json").read_text(encoding="utf-8"))
+        state = json.loads((camp / "campaign_state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(record, dict) or record.get("schema_version") != "eeg_research.confirmation_record.v1":
+        return False
+    if record.get("status") != "confirmed" or not policy.get("policy_hash") or record.get("policy_hash") != policy["policy_hash"]:
+        return False
+    refs = record.get("pair_refs") or []
+    required = int(policy.get("target_pairs") or 0)
+    if required < 1 or len(set(refs)) < required or (record.get("aggregate") or {}).get("status") != "confirmed":
+        return False
+    rows = []
+    for ref_id in refs:
+        row = next((item for item in state.get("evidence") or []
+                    if item.get("job_id") == ref_id or item.get("evidence_id") == ref_id), None)
+        if row is None or row.get("fidelity") != "full" or row.get("evaluation_valid") is not True:
+            return False
+        if (row.get("comparison") or {}).get("comparable") is not True:
+            return False
+        rows.append(row)
+    seeds = {row.get("seed") for row in rows}
+    if len(seeds) < required or not seeds.issubset(set(policy.get("training_seeds") or [])):
+        return False
+    identities = {(row.get("candidate_id"), row.get("source_hash"), row.get("config_hash"), row.get("contract_fingerprint")) for row in rows}
+    if len(identities) != 1 or any(part in (None, "") for part in next(iter(identities))):
+        return False
+    run_ids = {row.get("job_id") for row in rows}
+    return all(item.get("job_id") in run_ids for item in cited)
 
 
 _LESSON_ALIASES = {
@@ -49,6 +88,8 @@ def canonicalize_lesson_proposal(lesson: dict[str, Any]) -> dict[str, Any]:
     for old, new in _LESSON_ALIASES.items():
         if old in copied and new not in copied:
             copied[new] = copied[old]
+        elif old in copied and copied[new] != copied[old]:
+            raise ValueError(f"lesson_alias_conflict:{old}")
     return copied
 
 
@@ -327,7 +368,11 @@ class EpisodeStore:
                 if not isinstance(lesson, dict):
                     rejected.append({"reason": "lesson_not_object"})
                     continue
-                lesson = canonicalize_lesson_proposal(lesson)
+                try:
+                    lesson = canonicalize_lesson_proposal(lesson)
+                except ValueError:
+                    rejected.append({"reason": "lesson_alias_conflict"})
+                    continue
                 supporting = [str(item) for item in lesson.get("supporting_episode_ids") or proposal.get("supporting_episode_ids") or []]
                 contradicting = [str(item) for item in lesson.get("contradicting_episode_ids") or []]
                 reasons: list[str] = []
@@ -347,8 +392,6 @@ class EpisodeStore:
                     or proposal.get("evidence_level_requested")
                     or "exploratory_result"
                 )
-                if cited and _rank(requested) > group_level:
-                    reasons.append("evidence_level_exceeds_runs")
                 job_ids = [str(item.get("job_id") or item.get("artifact")) for item in cited]
                 if job_ids and len(set(job_ids)) < len(job_ids):
                     reasons.append("same_job_not_independent")
@@ -361,31 +404,39 @@ class EpisodeStore:
                 if effect not in (None, "") and not comparison_refs:
                     reasons.append("forged_effect")
                 fake_refs = []
+                from react_agent.eeg_research.agentic.paths import safe_name
+                effects = []
                 for item in comparison_refs:
+                    if safe_name(item) is None:
+                        fake_refs.append(item)
+                        continue
                     path = self.camp / "comparisons" / f"{item}.json"
                     if path.is_file():
                         if not _usable_comparison(path):
                             fake_refs.append(item)
+                        else:
+                            raw = json.loads(path.read_text(encoding="utf-8"))
+                            comp = raw.get("comparison") or raw
+                            if comp.get("delta_pp") is not None:
+                                effects.append({"comparison_ref": item, "delta_pp": float(comp["delta_pp"]), "unit": "percentage_points"})
                     elif item not in {row.get("evidence_id") for row in self.list_episodes()}:
                         fake_refs.append(item)
                 if comparison_refs and fake_refs:
                     reasons.append("comparison_ref_missing")
                 if requested in {"confirmed_result"}:
-                    confirmed = False
-                    for item in confirmation_refs or comparison_refs:
-                        path = self.camp / "confirmations" / f"{item}.json"
-                        alt = self.camp / "comparisons" / f"{item}.json"
-                        if path.is_file() or (alt.is_file() and _usable_comparison(alt)):
-                            confirmed = True
+                    confirmed = any(_valid_confirmation(self.camp, item, cited) for item in confirmation_refs)
                     if not confirmed:
                         reasons.append("confirmation_missing")
+                    else:
+                        group_level = _rank("confirmed_result")
+                if cited and _rank(requested) > group_level:
+                    reasons.insert(0, "evidence_level_exceeds_runs")
                 if requested in {"confirmed_result"} and not supporting:
                     reasons.append("confirmation_missing")
                 if reasons:
                     rejected.append({"reason": reasons[0], "reasons": reasons, "ids": missing + missing_counter, "requested": requested})
                     continue
                 stored = {
-                    "lesson_id": f"les_{uuid.uuid4().hex[:12]}",
                     "statement": lesson.get("statement") or proposal.get("statement") or "",
                     "uncertainty": lesson.get("uncertainty") if "uncertainty" in lesson else proposal.get("uncertainty"),
                     "requested_evidence_level": requested,
@@ -394,12 +445,20 @@ class EpisodeStore:
                     "contradicting_episode_ids": contradicting,
                     "conditions": conditions,
                     "invalidation_conditions": lesson.get("invalidation_conditions") or proposal.get("invalidation_conditions"),
-                    "observed_effect": None,
+                    "observed_effect": effects or None,
                     "observed_effect_refs": comparison_refs,
                     "comparison_refs": comparison_refs,
                     "confirmation_refs": confirmation_refs,
                     "summary_zh": lesson.get("summary_zh") or proposal.get("summary_zh") or "",
                 }
+                canonical = {key: value for key, value in stored.items() if key not in {"summary_zh", "uncertainty"}}
+                for key in ("supporting_episode_ids", "contradicting_episode_ids", "observed_effect_refs", "comparison_refs", "confirmation_refs"):
+                    canonical[key] = sorted(set(canonical[key]))
+                stored["lesson_id"] = "les_" + hashlib.sha256(json.dumps(canonical, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+                existing = conn.execute("SELECT payload FROM lessons WHERE lesson_id = ?", (stored["lesson_id"],)).fetchone()
+                if existing:
+                    accepted.append(json.loads(existing[0]))
+                    continue
                 conn.execute(
                     "INSERT INTO lessons(lesson_id, evidence_level, payload, created_at) VALUES (?, ?, ?, ?)",
                     (stored["lesson_id"], stored["evidence_level"], json.dumps(stored, ensure_ascii=False), time.time()),

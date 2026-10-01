@@ -114,6 +114,7 @@ def list_project_files(workspace: Path) -> dict[str, Any]:
 _REFERENCES = {
     "reference/baseline.py": Path(__file__).resolve().parent / "baseline.py",
     "reference/model.py": Path(__file__).resolve().parents[2] / "eeg_training" / "model.py",
+    "reference/train_entry.py": Path(__file__).resolve().parents[2] / "eeg_training" / "train_entry.py",
 }
 
 
@@ -213,9 +214,13 @@ def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: f
     env["CUDA_VISIBLE_DEVICES"] = ""
     spec_path = workspace / "input_spec.json"
     dataset_arg = str(spec_path.resolve()) if spec_path.is_file() else "eeg"
+    command = [interpreter, "-m", "react_agent.eeg_research.agentic.check_entry", dataset_arg]
+    approved_spec = workspace / "spec.json"
+    if approved_spec.is_file():
+        command.append(str(approved_spec.resolve()))
     try:
         completed = subprocess.run(  # noqa: S603
-            [interpreter, "-m", "react_agent.eeg_research.agentic.check_entry", dataset_arg],
+            command,
             cwd=str(extension),
             env=env,
             capture_output=True,

@@ -23,6 +23,7 @@ LONG_JSON_ROLES = {
     "result_auditor",
 }
 ENVELOPE_ROLES = {
+    "result_analyst",
     "research_librarian",
     "experiment_designer",
     "memory_curator",
@@ -258,5 +259,11 @@ def finish_role_task(
     ok, reason = verify(camp, artifact["artifact_id"])
     if not ok:
         raise RoleResultError(reason)
-    mark(camp, task["task_id"], "completed", artifact_id=artifact["artifact_id"], path=str(path))
+    task_status = str(envelope.get("status") or "failed")
+    if task_status == "requires_framework_extension":
+        task_status = "blocked"
+    if task_status not in {"completed", "partial", "blocked", "failed"}:
+        task_status = "partial"
+    mark(camp, task["task_id"], task_status, role=task.get("role"), attempt_id=task.get("attempt_id"),
+         candidate_id=candidate_id or task.get("candidate_id"), artifact_id=artifact["artifact_id"], path=str(path))
     return envelope

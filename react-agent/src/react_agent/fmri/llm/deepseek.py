@@ -111,13 +111,14 @@ class DeepSeekBackend:
             raise DeepSeekConfigError(
                 "DEEPSEEK_API_KEY missing; refuse to fake an online call"
             )
-        from openai import AsyncOpenAI
+        from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
         self.config = config
         self._client = AsyncOpenAI(
             api_key=config.deepseek_api_key,
             base_url=config.deepseek_base_url,
             max_retries=0,
+            http_client=DefaultAsyncHttpxClient(trust_env=config.deepseek_trust_env),
         )
 
     def _profile(self, name: str) -> LmProfile:

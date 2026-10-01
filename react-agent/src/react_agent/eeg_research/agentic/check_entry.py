@@ -22,7 +22,7 @@ def _spec(dataset_or_path: str) -> dict[str, object]:
     return geometry(dataset_or_path)
 
 
-def run(dataset: str = "eeg", *, context: dict[str, object] | None = None) -> dict[str, object]:
+def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_config: dict | None = None) -> dict[str, object]:
     import torch
 
     context = context if context is not None else {}
@@ -34,16 +34,27 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None) -> di
     context["file"] = str(Path(inspect.getfile(module)).resolve())
     context["stage"] = "build_encoder"
     candidate = module.EEGCandidate()
-    encoder = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
+    from react_agent.eeg_training.train_entry import _build_hook
+    config = hook_config or {}
+    geom = {"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])}
+    encoder = _build_hook(candidate, "build_encoder", geom, config.get("model") or {})
+    context["stage"] = "build_training_hooks"
+    transform = _build_hook(candidate, "build_training_transform", {}, config.get("transform") or {}) if hasattr(candidate, "build_training_transform") else None
+    objective = _build_hook(candidate, "build_training_objective", {}, config.get("objective") or {}) if hasattr(candidate, "build_training_objective") else None
     length = int(spec["timesteps"][1]) - int(spec["timesteps"][0])
-    uses_statistics = hasattr(candidate, "fit_statistics")
+    statistics_hook_available = hasattr(candidate, "fit_statistics")
+    uses_statistics = False
     stats_in_state = None
     statistics_debug = None
-    if uses_statistics:
+    if statistics_hook_available:
         context["stage"] = "fit_statistics"
         buffers_before = {name: value.clone() for name, value in encoder.named_buffers()}
         pre_hooks_before = len(encoder._forward_pre_hooks)
-        params_before = {name for name, _ in encoder.named_parameters()}
+        params_before = {name: value.detach().clone() for name, value in encoder.named_parameters()}
+        probe = torch.randn(4, int(spec["c_num"]), length)
+        encoder.eval()
+        with torch.no_grad():
+            output_before = encoder(probe).clone()
         candidate.fit_statistics(
             encoder,
             {
@@ -59,17 +70,39 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None) -> di
             for name, value in encoder.named_buffers()
             if name not in buffers_before or not torch.equal(buffers_before[name], value)
         ]
-        new_params = {name for name, _ in encoder.named_parameters()} - params_before
-        stats_in_state = bool(changed) and not new_params and all(name in encoder.state_dict() for name in changed)
+        changed_params = [name for name, value in encoder.named_parameters()
+                          if name not in params_before or not torch.equal(params_before[name], value)]
+        with torch.no_grad():
+            output_after = encoder(probe)
+        output_changed = output_before.shape != output_after.shape or not torch.allclose(output_before, output_after)
+        hooks_changed = pre_hooks_before != len(encoder._forward_pre_hooks)
+        uses_statistics = bool(changed or changed_params or output_changed or hooks_changed)
+        stats_in_state = (bool(changed) and not changed_params
+                          and all(name in encoder.state_dict() for name in changed)) if uses_statistics else None
         statistics_debug = {"buffers_before_fitting": list(buffers_before), "changed_buffers": changed,
+                            "changed_parameters": changed_params, "output_changed_by_fitting": output_changed,
+                            "no_op": not uses_statistics,
                             "forward_pre_hooks_before_fitting": pre_hooks_before, "forward_pre_hooks_after_fitting": len(encoder._forward_pre_hooks)}
     batch = torch.randn(4, int(spec["c_num"]), length)
     context["stage"] = "train_forward"
     encoder.train()
+    if transform is not None:
+        batch = transform(batch)
     out = encoder(batch)
     finite = bool(torch.isfinite(out).all())
     context["stage"] = "backward"
-    out.float().pow(2).mean().backward()
+    from react_agent.eeg_training.model import LocalRetrieval
+    from react_agent.eeg_training.hooks import scalar_loss
+    objective_finite = False
+    if finite and tuple(out.shape) == (4, 1024):
+        loss, _, _ = LocalRetrieval(encoder, objective)(batch, torch.randn(4, 1024), torch.arange(4))
+        loss = scalar_loss(loss)
+        objective_finite = bool(torch.isfinite(loss))
+        if not objective_finite:
+            raise ValueError("non_finite_training_objective")
+    else:
+        loss = out.float().pow(2).mean()
+    loss.backward()
     trainable = [param for param in encoder.parameters() if param.requires_grad]
     with_grad = sum(1 for param in trainable if param.grad is not None and bool(torch.isfinite(param.grad).all()))
     finite_gradients = all(bool(torch.isfinite(param.grad).all()) for param in trainable if param.grad is not None)
@@ -81,7 +114,7 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None) -> di
     context["stage"] = "checkpoint_round_trip"
     torch.save(encoder.state_dict(), buffer)
     buffer.seek(0)
-    rebuilt = candidate.build_encoder({"c_num": int(spec["c_num"]), "timesteps": list(spec["timesteps"])})
+    rebuilt = _build_hook(candidate, "build_encoder", geom, config.get("model") or {})
     if statistics_debug is not None:
         statistics_debug["buffers_in_fresh_encoder"] = [name for name, _ in rebuilt.named_buffers()]
         statistics_debug["forward_pre_hooks_in_fresh_encoder"] = len(rebuilt._forward_pre_hooks)
@@ -118,6 +151,7 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None) -> di
         )
     result = {
         "uses_train_statistics": uses_statistics,
+        "statistics_hook_available": statistics_hook_available,
         "statistics_stored_as_buffers": stats_in_state,
         "statistics_debug": statistics_debug,
         "ok": not failures,
@@ -132,6 +166,8 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None) -> di
         "python": sys.executable,
         "torch": torch.__version__,
         "stage": "complete",
+        "approved_hook_config": config,
+        "training_objective_finite": objective_finite,
     }
     if failures:
         result["error"] = "candidate_invariant_failed"
@@ -143,7 +179,9 @@ def main() -> int:
     context: dict[str, object] = {"stage": "import_torch", "python": sys.executable,
                                   "file": str((Path.cwd() / "eeg_candidate.py").resolve())}
     try:
-        payload = run(sys.argv[1] if len(sys.argv) > 1 else "eeg", context=context)
+        assigned = json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 else {}
+        hook_config = assigned.get("experiment") or assigned
+        payload = run(sys.argv[1] if len(sys.argv) > 1 else "eeg", context=context, hook_config={key: hook_config.get(key) or {} for key in ("model", "objective", "transform")})
     except Exception as exc:  # noqa: BLE001
         payload = {**context, "ok": False, "error": type(exc).__name__, "detail": traceback.format_exc()[-1500:]}
         if isinstance(exc, SyntaxError):

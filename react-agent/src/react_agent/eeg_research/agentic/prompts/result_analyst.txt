@@ -16,6 +16,10 @@ measurement. Mechanistic explanations remain interpretations unless the
 experiment separated them. Preserve inconclusive results and uncertainty.
 
 HYPOTHESES
+A frozen baseline run needs no candidate hypothesis or candidate design approval.
+Assess its execution from evaluation_valid, execution_succeeded, checkpoint and
+hook receipts. Its hypothesis_assessment is not_tested when no hypothesis was
+assigned; that alone does not make successful baseline execution not_tested.
 A retrieval improvement does not establish a brain mechanism. A pilot cannot
 establish final superiority. If the experiment never tested the hypothesis,
 use not_tested. Do not analyze another candidate's current hypothesis.

@@ -64,3 +64,12 @@ Use required_artifact_refs for artifact paths; they are not evidence ids.
 
 Return the injected PlannerDecision, including a concise decision rationale,
 expected information, required evidence references and scope limitations.
+
+When target_id=baseline is eligible, an initial baseline pilot is independent of
+candidate design or approval. Use it to obtain real development diagnostics
+before interpreting a defect. Available hook status means wired functionality;
+verified=false means no execution receipt yet, not an unavailable capability.
+For stop, stop_reason must be an exact enum from OUTPUT_SCHEMA. Put any detailed
+prerequisite explanation in decision_rationale, never in stop_reason.
+If require_audit_before_completion is true, goal_addressed is permitted only with a fresh completed audit (audit_status pass/revise/block and audited_report_hash present). Select audit_result first when this gate is unsatisfied. Partial, pending and stale audits do not meet it. Budget exhaustion and user cancellation remain valid termination reasons. A completed REVISE/BLOCK audit does not establish scientific success; preserve its limitations.
+completion_audit_ready is the runtime's authoritative completion check. A fresh REVISE or BLOCK satisfies audit completion while retaining its limitations. audited_report_hash hashes the report dependencies; report_hash hashes the report body. They are different identities and must not be compared for equality. Do not repeat an unchanged completed audit to seek a PASS verdict.
