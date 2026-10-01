@@ -251,8 +251,22 @@ def _query(path: str) -> dict[str, str]:
     return {key: values[0] for key, values in parsed.items() if values}
 
 
+def _json_safe(value: Any) -> Any:
+    """Represent invalid numbers as missing values in standard JSON responses."""
+    import math
+
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _json_bytes(payload: Any, status: int = 200) -> tuple[int, str, bytes]:
-    return status, "application/json; charset=utf-8", json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    body = json.dumps(_json_safe(payload), ensure_ascii=False, allow_nan=False).encode("utf-8")
+    return status, "application/json; charset=utf-8", body
 
 
 def _agentic_root(query: dict[str, str] | None = None, form: dict[str, str] | None = None) -> Path:
@@ -593,4 +607,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

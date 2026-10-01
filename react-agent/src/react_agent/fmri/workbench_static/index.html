@@ -1,35 +1,40 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>EEGagent</title>
+<title>EEGagent · Brain Decoding Lab</title>
 <!-- 检索实验工作台：代码级自主研究为默认入口 -->
-<link rel="stylesheet" href="/static/app.css?v=ws5">
+<link rel="stylesheet" href="/static/app.css?v=ws9">
 </head>
 <body data-surface="agentic">
 <div class="app">
 <header class="top">
-  <button type="button" id="toggle-side" aria-label="打开导航">研究列表</button>
+  <button type="button" id="toggle-side" aria-label="Open navigation" aria-expanded="false">Menu</button>
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true"></span>
+    <svg class="brand-mark" viewBox="0 0 44 28" aria-hidden="true"><path d="M2 14h8l5-9 6 19 5-10h16"/></svg>
     EEGagent
-    <span class="brand-sub">Brain Decoding Lab</span>
+    <span class="brand-sub">BRAIN DECODING LAB</span>
   </div>
-  <nav class="mode-switch" aria-label="工作台页面">
-    <button type="button" id="surface-agentic" class="active">自主研究</button>
-    <button type="button" id="surface-create">新建研究</button>
-    <button type="button" id="surface-screen">fMRI 筛查</button>
-    <button type="button" id="surface-adaptive">对照实验</button>
-  </nav>
+  <span id="demo-indicator" class="demo-indicator" hidden>DEMO · SYNTHETIC DATA</span>
   <div id="header-status" class="header-status"></div>
-  <button type="button" id="open-drawer">新建筛查</button>
+  <button type="button" id="open-drawer">New screening</button>
 </header>
 <div class="body">
   <aside class="side" id="sidebar">
-    <label class="search-label" for="search" id="side-label">搜索样本</label>
-    <input id="search" type="search" placeholder="搜索样本或运行 ID" autocomplete="off">
-    <div id="run-list" class="run-list"></div>
+    <button type="button" id="surface-create" class="primary new-research">+ New research</button>
+    <p class="nav-heading">WORKSPACE</p>
+    <nav class="mode-switch" aria-label="Workspace">
+      <button type="button" id="surface-agentic" class="active">Autonomous research</button>
+      <button type="button" id="surface-screen">fMRI screening</button>
+      <button type="button" id="surface-adaptive">Baseline experiments</button>
+    </nav>
+    <div class="side-records">
+      <label class="search-label nav-heading" for="search" id="side-label">RESEARCH CAMPAIGNS</label>
+      <input id="search" type="search" placeholder="Find a campaign…" autocomplete="off">
+      <div id="run-list" class="run-list"></div>
+    </div>
+    <footer id="side-context" class="side-context"></footer>
   </aside>
   <main id="main"></main>
 </div>
@@ -97,6 +102,6 @@
     <div id="explain-body"></div>
   </div>
 </div>
-<script src="/static/app.js?v=ws5"></script>
+<script src="/static/app.js?v=ws9"></script>
 </body>
 </html>

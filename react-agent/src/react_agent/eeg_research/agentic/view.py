@@ -186,6 +186,8 @@ def _candidate_rows(camp: Path, state: dict[str, Any], *, include_source: bool) 
             "lineage": lineage if isinstance(lineage, dict) else None,
             "attempt_id": attempt.get("attempt_id") if isinstance(attempt, dict) else None,
             "source": None,
+            "source_loaded": include_source,
+            "source_available": entry.is_file(),
             "source_truncated": False,
             "source_chars": 0,
         }
@@ -239,13 +241,13 @@ def campaign_summary(camp: Path) -> dict[str, Any]:
     }
 
 
-def campaign_view(camp: Path) -> dict[str, Any]:
+def campaign_view(camp: Path, *, include_source: bool = True) -> dict[str, Any]:
     view = status_view(camp)
     goal = _read(camp / "goal.json") or {}
     contract = _read(camp / "evaluation_contract.json") or {}
     cost = _read(camp / "cost.json") or {}
     state = _read(camp / "campaign_state.json") or {}
-    candidates = _candidate_rows(camp, state, include_source=True)
+    candidates = _candidate_rows(camp, state, include_source=include_source)
     rows = _experiment_rows(state)
     by_candidate = {item.get("candidate_id"): item for item in candidates}
     for row in rows:
@@ -359,7 +361,7 @@ def agentic_status(root: Path | None = None, campaign: str = "") -> dict[str, An
         camp = resolve_campaign(base, campaign)
         if camp is None:
             return {"campaigns": []}
-        return {"campaigns": [campaign_view(camp)]}
+        return {"campaigns": [campaign_view(camp, include_source=False)]}
     names = sorted(path.name for path in base.iterdir() if (path / "campaign_state.json").is_file())
     rows = [campaign_summary(base / name) for name in names if safe_name(name)]
     rows.sort(key=lambda row: float(row.get("updated_at") or 0), reverse=True)

@@ -28,7 +28,7 @@ def _number(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         return {"status": "invalid", "value": None, "raw": value}
     if not math.isfinite(number):
-        return {"status": "non_finite", "value": None, "raw": value}
+        return {"status": "non_finite", "value": None, "raw": str(value)}
     return {"status": "ok", "value": number, "raw": value}
 
 

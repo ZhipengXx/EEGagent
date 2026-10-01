@@ -727,7 +727,8 @@ async function refreshModeNote() {
 }
 
 document.getElementById("toggle-side").addEventListener("click", () => {
-  document.getElementById("sidebar").classList.toggle("open");
+  const open = document.getElementById("sidebar").classList.toggle("open");
+  document.getElementById("toggle-side").setAttribute("aria-expanded", String(open));
 });
 document.getElementById("open-drawer").addEventListener("click", openDrawer);
 document.getElementById("close-drawer").addEventListener("click", closeDrawer);
@@ -791,8 +792,14 @@ function setSurface(name) {
     if (node) node.classList.toggle("active", name === id || (id === "create" && name === "create"));
   });
   document.getElementById("open-drawer").hidden = name === "create" || name === "adaptive" || name === "agentic";
-  document.getElementById("toggle-side").hidden = name !== "screen" && name !== "agentic";
-  document.getElementById("toggle-side").textContent = name === "agentic" ? "研究列表" : "记录";
+  document.getElementById("toggle-side").hidden = false;
+  document.getElementById("toggle-side").textContent = "Menu";
+  closeNavigation();
+  if (name === "screen") {
+    document.getElementById("side-label").textContent = "SCREENING RUNS";
+    document.getElementById("search").placeholder = "Find a sample or run…";
+    document.getElementById("side-context").textContent = "";
+  }
   if (name === "agentic") renderAgenticWorkspace();
   else if (name === "create") renderRetrieval();
   else if (name === "adaptive") {
@@ -823,9 +830,15 @@ function clearDiscovery() {
   state.retrieval.gpu = "";
 }
 
+// Preserve labels used by the existing legacy views.
 const AGENTIC_STATUS = {
   created: "已创建", planning: "规划中", implementing: "编写代码", checking: "检查中", training: "训练中", interrupted: "已中断",
   analyzing: "分析结果", paused: "已暂停", finished: "已结束", blocked: "受阻", cancelled: "已停止",
+};
+
+const WORKSPACE_STATUS = {
+  created: "Created", planning: "Planning", implementing: "Implementing", checking: "Reviewing", training: "Training", interrupted: "Interrupted",
+  analyzing: "Analyzing results", paused: "Paused", finished: "Finished", blocked: "Blocked", cancelled: "Stopped",
 };
 
 const AGENTIC_DETAIL = {
@@ -922,14 +935,15 @@ function renderProse(raw) {
   return text;
 }
 
-const DECISION_LABELS = ["竞争解释", "预期证据", "诚实性声明", "观察", "推理", "假设", "动作", "理由", "判定", "诚实性"];
+const DECISION_LABELS = ["下一步", "竞争解释", "预期证据", "诚实性声明", "观察", "推理", "假设", "动作", "理由", "判定", "诚实性"];
 
 function decisionParts(text) {
   const source = String(text || "").trim();
   if (!source) return [];
   const marks = [];
-  DECISION_LABELS.forEach((label) => {
-    const token = `${label}：`;
+  const aliases = { Observation: "观察", "Observed evidence": "观察", Hypothesis: "假设", Rationale: "理由", "Next step": "下一步", "Next decision": "下一步" };
+  const labels = [...DECISION_LABELS.map(label => [label, label]), ...Object.entries(aliases)];
+  labels.flatMap(([name, label]) => [":", "："].map(colon => [name + colon, label])).forEach(([token, label]) => {
     let from = 0;
     while (from < source.length) {
       const at = source.indexOf(token, from);
@@ -1003,45 +1017,8 @@ function agenticSwitch(rows) {
 }
 
 function agenticBody(camp) {
-  const budget = camp.budget || {};
-  const last = (camp.decisions || []).slice(-1)[0] || {};
-  const best = camp.best_full || null;
-  const progress = camp.live_progress ? `（epoch ${esc(camp.live_progress.epoch)} / ${esc(camp.live_progress.epochs)}）` : "";
-  const rowHtml = (row) => `<tr><td>${esc(row.candidate_id === "baseline" ? "对照" : row.candidate_id)}</td><td>${row.fixed_bank_top1 == null ? "未评估" : formatTick(row.fixed_bank_top1)}</td><td>${row.delta_vs_control_pp == null ? "—" : `${row.delta_vs_control_pp > 0 ? "+" : ""}${esc(row.delta_vs_control_pp)} pp`}</td><td>${row.evaluation_valid ? (row.candidate_id === "baseline" ? "对照" : (row.confirmation || row.promotion_tier || "开发结果")) : `无效：${esc(row.reason || "")}`}</td></tr>`;
-  const pilotRows = (camp.pilot_rows || []).map(rowHtml).join("");
-  const fullRows = (camp.full_rows || []).map(rowHtml).join("");
-  const candidates = (camp.candidates || []).map((row) => `<details data-keep="candidate-${esc(camp.campaign_id)}-${esc(row.candidate_id)}"><summary>${esc(row.candidate_id)} · ${esc(row.status)}</summary>${row.review_summary ? `<p class="agentic-prose">${renderProse(row.review_summary)}</p>` : ""}<pre class="agentic-source">${esc(row.source || "没有写出文件")}</pre></details>`).join("");
-  const analyses = (camp.analyses || []).filter(Boolean).map((row) => `<p class="agentic-prose">${renderProse(row.summary_zh || "")}</p>`).join("");
-  const decisions = (camp.decisions || []).slice().reverse().map(decisionCard).join("");
-  const detail = camp.detail ? (AGENTIC_DETAIL[camp.detail] || camp.detail) : "";
-  const gpuUsed = budget.gpu_seconds_used == null ? "未记录" : Math.round(budget.gpu_seconds_used);
-  const gpuReserved = budget.gpu_seconds_reserved == null ? "—" : Math.round(budget.gpu_seconds_reserved);
-  const gpuLeft = budget.gpu_seconds_left == null ? "—" : Math.round(budget.gpu_seconds_left);
-  const fee = budget.api_usd == null ? "未记录" : esc(budget.api_usd);
-  const brief = firstClause(last.reason_zh || "");
-  const bestLine = best
-    ? `${esc(best.candidate_id)} 相对对照 ${best.delta_vs_control_pp > 0 ? "+" : ""}${esc(best.delta_vs_control_pp)} pp<span class="agentic-sub">完整 · 可比</span>`
-    : "没有可比的完整结果";
-  return `<h2>代码级研究 · ${esc(camp.objective || camp.campaign_id)}</h2>
-      <p class="muted">${esc(camp.campaign_id || "")}</p>
-      <p class="muted">${esc(camp.scope_zh || "")}。验证固定候选集 top1 用于比较，测试集本轮关闭。</p>
-      <div class="agentic-summary">
-        <div><span class="muted">当前问题</span><p>${esc(hypothesisLine(camp.hypothesis))}</p></div>
-        <div><span class="muted">正在做什么</span><p>${esc(AGENTIC_STATUS[camp.status] || camp.status)}${progress}${detail ? `<span class="agentic-sub">${esc(detail)}</span>` : ""}</p><p class="agentic-sub">结论 ${esc(camp.research_outcome || "not_evaluated")} · 审计 ${esc(camp.audit_status || "pending")}</p></div>
-        <div><span class="muted">最好可比完整结果</span><p>${bestLine}</p></div>
-        <div><span class="muted">剩余预算</span><ul class="agentic-budget"><li>训练 ${esc(budget.training_jobs ?? 0)}/${esc(budget.max_training_jobs ?? "—")}</li><li>模型调用 ${esc(budget.llm_calls ?? 0)}/${esc(budget.max_llm_calls ?? "—")}</li><li>GPU 已用 ${esc(gpuUsed)}</li><li>GPU 预留 ${esc(gpuReserved)}</li><li>GPU 剩余 ${esc(gpuLeft)}</li><li>费用 ${fee}</li></ul></div>
-      </div>
-      <p class="agentic-note">最近决定：${esc(last.action_zh || "—")}${brief ? `。${esc(brief)}` : ""}</p>
-      <div class="trial-trace"><h3>试跑</h3><div class="trial-scroll"><table><thead><tr><th>改动</th><th>开发指标</th><th>相对对照</th><th>证据状态</th></tr></thead><tbody>${pilotRows || `<tr><td colspan="4">还没有试跑</td></tr>`}</tbody></table></div></div>
-      <div class="trial-trace"><h3>完整训练</h3><div class="trial-scroll"><table><thead><tr><th>改动</th><th>开发指标</th><th>相对对照</th><th>证据状态</th></tr></thead><tbody>${fullRows || `<tr><td colspan="4">还没有完整训练</td></tr>`}</tbody></table></div></div>
-      ${analyses ? `<h3>结果分析</h3>${analyses}` : ""}
-      ${candidates ? `<h3>候选代码</h3>${candidates}` : ""}
-      <details data-keep="decisions-${esc(camp.campaign_id)}"><summary>决策记录</summary><div class="agentic-decisions">${decisions}</div></details>
-      <div class="actions">
-        <button type="button" data-agentic-action="resume" data-campaign="${esc(camp.campaign_id)}">继续</button>
-        <button type="button" data-agentic-action="pause" data-campaign="${esc(camp.campaign_id)}">本轮后暂停</button>
-        <button type="button" data-agentic-action="stop" data-campaign="${esc(camp.campaign_id)}">停止当前作业</button>
-      </div>`;
+  const experiments = (title, rows, note) => `<section class="panel process-panel"><div class="panel-heading"><h2>${title}</h2><span class="muted">${note}</span></div><div class="trial-scroll"><table><thead><tr><th>Candidate</th><th>Fixed-gallery Top-1</th><th>Delta vs. control</th><th>Seed / attempt</th><th>Evidence</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${esc(row.candidate_id)}</td><td>${typeof row.fixed_bank_top1 === "number" && Number.isFinite(row.fixed_bank_top1) ? `${(row.fixed_bank_top1 * 100).toFixed(1)}%` : "Not evaluated"}</td><td>${typeof row.delta_vs_control_pp === "number" && Number.isFinite(row.delta_vs_control_pp) ? `${row.delta_vs_control_pp > 0 ? "+" : ""}${row.delta_vs_control_pp} pp` : "—"}</td><td>${esc(row.seed ?? "unknown")} / ${esc(row.attempt_id || "unknown")}</td><td>${!row.evaluation_valid ? `Invalid: ${esc(row.reason || "not recorded")}` : row.candidate_id === "baseline" ? "Matched control" : row.comparable !== true ? "Not comparable" : esc(row.confirmation || row.promotion_tier || "Pending confirmation")}</td></tr>`).join("") || `<tr><td colspan="5">No ${title.toLowerCase()} results recorded.</td></tr>`}</tbody></table></div></section>`;
+  return `${experiments("Pilot experiments", camp.pilot_rows || [], "Exploratory evidence")}${experiments("Full experiments", camp.full_rows || [], "Confirmation tracked separately")}<section class="panel"><h2>Research conclusion</h2><p class="workspace-note">Outcome: ${esc(statusLabel(camp.research_outcome))} · Audit: ${esc(statusLabel(camp.audit_status))}</p>${camp.termination_reason ? `<p>Termination reason: ${esc(camp.termination_reason)}</p>` : missing("Termination reason")}${(camp.analyses || []).filter(Boolean).map((row) => `<p class="agentic-prose">${renderProse(row.summary_zh || row.summary || "")}</p>`).join("")}</section>`;
 }
 
 function agenticCard() {
@@ -1065,42 +1042,62 @@ function paintAgentic(box) {
 }
 
 async function refreshAgentic() {
+  state.agenticAbort?.abort();
+  const controller = new AbortController();
+  state.agenticAbort = controller;
   const seq = ++state.pollSeq;
+  state.agenticLoading = true;
+  const signal = controller.signal;
   try {
-    const focus = state.agenticFocus || parseRoute().campaign;
-    const listRes = await fetch(apiUrl("/api/agentic_status"), { cache: "no-store" });
-    const list = await listRes.json();
+    const list = await workspaceJSON(apiUrl("/api/agentic_status"), { signal });
     if (seq !== state.pollSeq) return;
-    state.agenticList = list;
-    const rows = list.campaigns || [];
-    chooseAgentic(rows);
-    if (!state.agenticFocus) {
+    chooseAgentic(list.campaigns || []);
+    const campaign = state.agenticFocus;
+    const jobBefore = state.selectedJob;
+    if (!campaign) {
+      state.agenticList = list;
       state.agentic = { campaigns: [] };
       if (state.surface === "agentic") paintWorkspaceShell();
       return;
     }
-    const detailRes = await fetch(apiUrl("/api/agentic_status", { campaign: state.agenticFocus }), { cache: "no-store" });
-    const detail = await detailRes.json();
-    if (seq !== state.pollSeq) return;
-    if (state.agenticFocus !== (detail.campaigns && detail.campaigns[0] && detail.campaigns[0].campaign_id)) return;
+    const detail = await workspaceJSON(apiUrl("/api/agentic_status", { campaign }), { signal });
+    const camp = detail.campaigns?.[0];
+    if (!camp || camp.campaign_id !== campaign) throw new Error("Campaign detail unavailable");
+    const job = jobBefore || defaultJobId(camp);
+    const [page, metrics] = await Promise.all([
+      workspaceJSON(apiUrl("/api/agentic_timeline", { campaign, cursor: "0", limit: "40" }), { signal }),
+      job ? workspaceJSON(apiUrl("/api/agentic_job", { campaign, job }), { signal }) : Promise.resolve(null),
+    ]);
+    // Read the latest bounded page as well, so a long history cannot hide current work.
+    const recent = page.has_more ? await workspaceJSON(apiUrl("/api/agentic_timeline", { campaign, cursor: String(Math.max(0, page.total - 40)), limit: "40" }), { signal }) : null;
+    if (seq !== state.pollSeq || campaign !== state.agenticFocus || state.selectedJob !== jobBefore) return;
+    const previous = state.timeline?.campaign_id === campaign ? state.timeline : null;
+    const merged = new Map((previous?.events || []).map((row) => [row.event_id, row]));
+    [...(page.events || []), ...(recent?.events || [])].forEach((row) => merged.set(row.event_id, row));
+    const timeline = { ...page, events: [...merged.values()].sort((a, b) => a.timestamp - b.timestamp || a.event_id.localeCompare(b.event_id)) };
+    timeline.has_more = merged.size < Number(page.total);
+    timeline.next_cursor = !timeline.has_more ? null : previous?.has_more ? previous.next_cursor : previous ? String(previous.total) : page.next_cursor;
+    if (previous && page.total > previous.total && state.selectedStep) state.pendingEvents += page.total - previous.total;
+    state.agenticList = list;
     state.agentic = detail;
-    const camp = (detail.campaigns || [])[0];
-    if (camp && !state.selectedJob) state.selectedJob = camp.live_job || (camp.jobs && camp.jobs[0] && camp.jobs[0].job_id) || "";
-    const timelineRes = await fetch(apiUrl("/api/agentic_timeline", { campaign: state.agenticFocus, cursor: "0", limit: "40" }), { cache: "no-store" });
-    const timeline = await timelineRes.json();
-    if (seq !== state.pollSeq) return;
     state.timeline = timeline;
-    if (state.selectedJob) {
-      const jobRes = await fetch(apiUrl("/api/agentic_job", { campaign: state.agenticFocus, job: state.selectedJob }), { cache: "no-store" });
-      const metrics = await jobRes.json();
-      if (seq !== state.pollSeq) return;
-      state.jobMetrics = metrics.ok ? metrics : null;
+    state.selectedJob = job;
+    state.jobMetrics = metrics;
+    state.connectionStatus = "Connected";
+    const snapshot = JSON.stringify([list, detail, timeline, metrics, state.selectedJob, state.selectedStep, state.agenticTab]);
+    if (state.surface === "agentic" && (snapshot !== state.workspaceSnapshot || !document.querySelector(".workspace"))) {
+      paintWorkspaceShell();
+      state.workspaceSnapshot = JSON.stringify([list, detail, timeline, metrics, state.selectedJob, state.selectedStep, state.agenticTab]);
     }
-    if (state.surface === "agentic") paintWorkspaceShell();
   } catch (err) {
+    if (err.name === "AbortError" || seq !== state.pollSeq) return;
+    state.connectionStatus = "Disconnected · retrying";
     if (state.surface === "agentic") {
-      main.innerHTML = `<section class="workspace"><div class="workspace-center"><p class="error">工作区读取失败：${esc(err && err.message ? err.message : err)}</p></div></section>`;
+      if (state.agentic?.campaigns?.length) paintWorkspaceShell();
+      else main.innerHTML = `<section class="panel"><h1>Research workspace unavailable</h1><p class="error">${esc(err.message || err)}</p><p class="muted">Reconnecting automatically.</p></section>`;
     }
+  } finally {
+    if (state.agenticAbort === controller) state.agenticLoading = false;
   }
 }
 
@@ -1112,6 +1109,13 @@ function bindAgentic() {
       state.agenticFocus = id;
       state.selectedStep = "";
       state.selectedJob = "";
+      state.selectedCandidate = "";
+      state.timeline = null;
+      state.jobMetrics = null;
+      state.pendingEvents = 0;
+      state.detailOpen = false;
+      closeNavigation();
+      main.scrollTop = 0;
       writeRoute();
       refreshAgentic();
     });
@@ -1120,7 +1124,7 @@ function bindAgentic() {
     button.addEventListener("click", async () => {
       if (state.controlBusy) return;
       const action = button.getAttribute("data-agentic-action");
-      if (action === "stop" && !window.confirm("停止当前训练作业？不会取消整个研究。已写入的结果会保留。")) return;
+      if (action === "stop" && !window.confirm("Stop the current training job? The campaign and recorded results are retained.")) return;
       state.controlBusy = true;
       button.disabled = true;
       const body = new URLSearchParams({ action, campaign: button.getAttribute("data-campaign") || "" });
@@ -1143,25 +1147,16 @@ function bindAgentic() {
 function scheduleAgentic() {
   if (state.agenticTimer) return;
   state.agenticTimer = window.setInterval(() => {
-    if (state.surface === "agentic") refreshAgentic();
+    if (state.surface === "agentic" && !state.agenticLoading) refreshAgentic();
   }, 5000);
 }
 
 function missing(label) {
-  return `<p class="missing">${esc(label)}：未提供</p>`;
+  return `<p class="missing">${esc(label)} not recorded.</p>`;
 }
 
 function roleLabel(role) {
-  return {
-    research_planner: "规划",
-    research_librarian: "检索",
-    experiment_designer: "设计",
-    candidate_coder: "编码",
-    candidate_reviewer: "审查",
-    result_analyst: "分析",
-    memory_curator: "记忆",
-    result_auditor: "审计",
-  }[role] || role || "—";
+  return { research_planner: "Planner", research_librarian: "Librarian", experiment_designer: "Designer", candidate_coder: "Coder", candidate_reviewer: "Reviewer", result_analyst: "Analyst", memory_curator: "Memory curator", result_auditor: "Auditor" }[role] || role || "Unassigned";
 }
 
 function isNarrowWorkspace() {
@@ -1174,293 +1169,255 @@ function isNarrowWorkspace() {
 }
 
 function roleStatusText(status) {
-  return {
-    not_called: "未调用",
-    queued: "排队",
-    active: "活动",
-    completed: "已完成",
-    failed: "失败",
-    waiting: "等待依赖",
-    unknown: "未知",
-  }[status] || status || "未知";
+  return { not_called: "Not called", queued: "Queued", active: "Active", completed: "Completed", failed: "Failed", waiting: "Waiting for dependency", unknown: "Unknown" }[status] || statusLabel(status);
+}
+
+function defaultJobId(camp) {
+  if (state.selectedJob) return state.selectedJob;
+  if (camp && camp.live_job) return camp.live_job;
+  const jobs = (camp && camp.jobs) || [];
+  const pilot = jobs.find((row) => row.fidelity === "pilot");
+  if (pilot && pilot.job_id) return pilot.job_id;
+  return (jobs[0] && jobs[0].job_id) || "";
+}
+
+function recordedNext(reason) {
+  const hit = String(reason || "").match(/(?:下一步|Next step|Next decision)[：:]([^。\n]*)/i);
+  return hit ? hit[1].trim() : "";
+}
+
+function processEvents(events) {
+  return (events || []).filter((row) => row.event_type === "decision" || row.event_type === "training_job" || (row.event_type || "").startsWith("tool_"));
+}
+
+function defaultProcessEvent(events) {
+  const decisions = processEvents(events);
+  const preferred = [...decisions].reverse().find((row) => row.action !== "stop" && row.status !== "failed");
+  return preferred || decisions[decisions.length - 1] || events[events.length - 1];
+}
+
+function roleFlowHtml(activity) {
+  const rows = activity.roles || [];
+  const primaryRoles = ["research_planner", "candidate_coder", "candidate_reviewer", "result_analyst"];
+  const byRole = new Map(rows.map((row) => [row.role, row]));
+  const chip = (role) => {
+    const row = byRole.get(role) || { status: "unknown" };
+    return `<button type="button" class="role-chip ${esc(row.status)}" data-role="${esc(role)}"><span class="role-dot" aria-hidden="true"></span><strong>${esc(roleLabel(role))}</strong><span class="role-status">${esc(roleStatusText(row.status))}</span></button>`;
+  };
+  const extras = ["research_librarian", "experiment_designer", "memory_curator", "result_auditor"];
+  return `<section class="panel activity-panel"><div class="panel-heading"><h2>AGENT ACTIVITY</h2><details class="role-more" data-keep="roles"><summary>4 more roles + training worker</summary><div class="extra-roles">${extras.map((role) => `<button type="button" data-role="${esc(role)}"><span>${esc(roleLabel(role))}</span><span>${esc(roleStatusText((byRole.get(role) || {}).status))}</span></button>`).join("")}<p class="worker-note">Training is a separate process.</p></div></details></div><div class="role-flow">${primaryRoles.map(chip).join("")}</div>${!activity.activity_available ? `<p class="worker-note">Live activity records unavailable; historical records shown.</p>` : ""}</section>`;
 }
 
 function gapChart(title, points, field, caption) {
-  const ok = (points || []).map((row) => ({ epoch: row.epoch, cell: row[field] })).filter((row) => row.cell);
-  const usable = ok.filter((row) => row.cell.status === "ok");
-  const captionHtml = `<p class="chart-caption">${esc(caption)}</p>`;
-  if (!usable.length) return `<div class="chart"><h3>${esc(title)}</h3>${captionHtml}<p class="missing">曲线缺失</p></div>`;
-  const width = 520;
-  const height = 180;
-  const left = 42;
-  const right = 12;
-  const top = 12;
-  const bottom = 28;
-  const epochs = ok.map((row) => row.epoch);
-  const minX = Math.min(...epochs);
-  const maxX = Math.max(...epochs);
+  const rows = (points || []).map((row) => ({ epoch: Number(row.epoch), cell: row[field] })).filter((row) => Number.isFinite(row.epoch)).sort((a, b) => a.epoch - b.epoch);
+  const valid = (row) => row.cell && row.cell.status === "ok" && typeof row.cell.value === "number" && Number.isFinite(row.cell.value);
+  const usable = rows.filter(valid);
+  const heading = `<h3>${esc(title)}</h3><p class="chart-caption">${esc(caption)}</p>`;
+  const note = state.demo ? `<p class="chart-footnote">Synthetic values · not experimental results</p>` : "";
+  if (!usable.length) return `<div class="chart">${heading}${missing("Metric history")}${note}</div>`;
+  const width = 520, height = 250, left = 54, right = 14, top = 18, bottom = 42;
+  const minX = Math.min(...rows.map((row) => row.epoch));
+  const maxX = Math.max(...rows.map((row) => row.epoch));
   const values = usable.map((row) => row.cell.value);
-  const minY = Math.min(...values);
-  const maxY = Math.max(...values);
-  const spanY = maxY === minY ? Math.max(Math.abs(minY) * 0.05, 0.01) : (maxY - minY);
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const pad = Math.max((hi - lo) * .12, Math.abs(hi) * .03, .01);
+  const minY = lo >= 0 ? Math.max(0, lo - pad) : lo - pad;
+  const maxY = hi + pad;
   const xOf = (epoch) => left + (maxX === minX ? (width - left - right) / 2 : (epoch - minX) / (maxX - minX) * (width - left - right));
-  const yOf = (value) => top + (1 - (value - minY) / spanY) * (height - top - bottom);
-  let d = "";
-  let drawing = false;
-  ok.forEach((row) => {
-    if (row.cell.status !== "ok") {
-      drawing = false;
-      return;
-    }
-    const cmd = drawing ? "L" : "M";
-    d += `${cmd}${xOf(row.epoch).toFixed(1)} ${yOf(row.cell.value).toFixed(1)} `;
-    drawing = true;
+  const yOf = (value) => top + (maxY - value) / (maxY - minY) * (height - top - bottom);
+  const tick = (value) => field.startsWith("fixed_bank_") ? `${(value * 100).toFixed(1)}%` : value.toFixed(2);
+  const grid = [maxY, (maxY + minY) / 2, minY].map((v) => `<line x1="${left}" x2="${width - right}" y1="${yOf(v).toFixed(1)}" y2="${yOf(v).toFixed(1)}" stroke="var(--border-default)"/><text x="${left - 12}" y="${(yOf(v) + 5).toFixed(1)}" text-anchor="end" font-size="14" fill="var(--text-muted)">${tick(v)}</text>`).join("");
+  const allEpochs = [...new Set(rows.map((row) => row.epoch))];
+  const ticks = allEpochs.length <= 6 ? allEpochs : [allEpochs[0], allEpochs[Math.floor(allEpochs.length / 2)], allEpochs[allEpochs.length - 1]];
+  const xTicks = ticks.map((v) => `<text x="${xOf(v).toFixed(1)}" y="${height - 20}" text-anchor="middle" font-size="14" fill="var(--text-muted)">${v}</text>`).join("");
+  let path = "", previous = null;
+  rows.forEach((row) => {
+    if (!valid(row)) { previous = null; return; }
+    const command = previous !== null && row.epoch - previous <= 1 ? "L" : "M";
+    path += `${command}${xOf(row.epoch).toFixed(1)} ${yOf(row.cell.value).toFixed(1)} `;
+    previous = row.epoch;
   });
-  const dots = usable.map((row) => `<circle cx="${xOf(row.epoch).toFixed(1)}" cy="${yOf(row.cell.value).toFixed(1)}" r="3" fill="${cssVar("--accent", "#35756e")}"><title>epoch ${row.epoch}: ${row.cell.value}</title></circle>`).join("");
-  return `<div class="chart"><h3>${esc(title)}</h3>${captionHtml}<svg viewBox="0 0 ${width} ${height}" role="img"><path d="${d}" fill="none" stroke="${cssVar("--accent", "#35756e")}" stroke-width="2"></path>${dots}</svg></div>`;
+  const dots = usable.map((row) => `<circle cx="${xOf(row.epoch).toFixed(1)}" cy="${yOf(row.cell.value).toFixed(1)}" r="4" fill="var(--accent)" tabindex="0"><title>Epoch ${row.epoch}: ${esc(row.cell.raw ?? row.cell.value)}</title></circle>`).join("");
+  const gaps = rows.filter((row) => !valid(row)).length;
+  return `<div class="chart">${heading}<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${esc(title)} by epoch">${grid}${xTicks}<text x="${width - right}" y="${height - 2}" text-anchor="end" font-size="13" fill="var(--text-muted)">Epoch</text><path class="metric-line" d="${path}" fill="none" stroke="var(--accent)" stroke-width="2.5"/>${dots}</svg>${gaps ? `<p class="chart-footnote">${gaps} epoch metric${gaps === 1 ? "" : "s"} missing or invalid; gaps preserved.</p>` : ""}${note}</div>`;
 }
 
 function jobPicker(camp) {
-  const jobs = (camp && camp.jobs) || [];
+  const jobs = camp.jobs || [];
   if (!jobs.length) return "";
-  return `<div class="job-picker">${jobs.map((row) => `<button type="button" class="${row.job_id === state.selectedJob ? "active" : ""}" data-job="${esc(row.job_id)}">${esc(row.job_id)} · ${esc(row.fidelity || "—")}</button>`).join("")}</div>`;
+  return `<label class="job-picker" for="job-select"><span>TRAINING JOB</span><select id="job-select">${jobs.map((row) => `<option value="${esc(row.job_id)}"${row.job_id === state.selectedJob ? " selected" : ""}>${esc(row.candidate_id || row.job_id)} / ${esc(row.fidelity || "unknown")} / seed ${esc(row.seed ?? "unknown")} · ${esc(row.job_id)}</option>`).join("")}</select></label>`;
 }
 
 function jobCharts(camp) {
-  const picker = jobPicker(camp);
   const metrics = state.jobMetrics;
-  if (!metrics) return `${picker}<p class="missing">没有选中的训练作业，或历史不可读。</p>`;
-  const cap = `${metrics.job_id || "—"} · ${metrics.fidelity || "—"} · seed ${metrics.seed ?? "—"} · ${metrics.epochs_completed ?? "—"} / ${metrics.epochs_budget ?? "—"} epoch`;
-  const points = metrics.history || [];
-  const top = state.showTop5 ? "fixed_bank_top5" : "fixed_bank_top1";
-  const topTitle = state.showTop5 ? "固定 gallery validation Top-5" : "固定 gallery validation Top-1";
-  return `${picker}<p class="chart-caption">${esc(cap)}</p>
-    <p class="muted">Pilot 是探索；对照线只在可比协议下有意义。loss 下降不是研究成功。</p>
-    ${gapChart("训练 loss", points, "train_loss", cap)}
-    ${gapChart(topTitle, points, top, cap)}
-    <p class="muted">batch 内 top1/top5 仅诊断，不是固定 gallery 指标。</p>
-    <button type="button" id="toggle-top5">${state.showTop5 ? "查看 Top-1" : "查看 Top-5"}</button>`;
+  const picker = jobPicker(camp);
+  if (!metrics) return `${picker}<section class="panel">${missing("Selected training history")}</section>`;
+  const cap = `${metrics.candidate_id || "Unassigned"} / ${metrics.fidelity || "unknown"} / seed ${metrics.seed ?? "unknown"} / ${metrics.epochs_completed ?? "?"} of ${metrics.epochs_budget ?? "?"} epochs · ${metrics.job_id} · ${statusLabel(metrics.status)}`;
+  const field = state.showTop5 ? "fixed_bank_top5" : "fixed_bank_top1";
+  const diagnostics = metrics.history_diagnostics || [];
+  return `${picker}<div class="chart-grid">${gapChart("Training loss", metrics.history, "train_loss", cap)}${gapChart(`Fixed-gallery validation Top-${state.showTop5 ? "5" : "1"}`, metrics.history, field, cap)}</div><div class="metrics-note"><button type="button" id="toggle-top5">Show Top-${state.showTop5 ? "1" : "5"}</button><p>${metrics.fidelity === "pilot" ? "Pilot evidence is exploratory; Full confirmation is separate. " : ""}Batch metrics are diagnostic only. Loss alone does not confirm improvement.</p>${metrics.history_truncated ? `<p class="missing">History preview is bounded; earlier records may be omitted.</p>` : ""}${diagnostics.length ? `<details data-keep="metric-diagnostics"><summary>History diagnostics (${diagnostics.length})</summary>${diagnostics.map((row) => `<p>${esc(JSON.stringify(row))}</p>`).join("")}</details>` : ""}</div>`;
 }
 
 function healthLine(health) {
-  const live = health.process_liveness;
-  const stateText = health.process_state ? String(health.process_state) : "";
-  if (live === "alive") return `进程存活${stateText ? ` · ${stateText}` : ""}`;
-  if (live === "zombie") return "进程僵尸（仅视图中断）";
-  if (live === "exited") return "进程已退出";
-  if (live === "missing") return "无研究进程";
-  return "进程未知";
+  return { alive: `Process alive${health.process_state ? ` (${health.process_state})` : ""}`, zombie: "Zombie process · interrupted view", exited: "Process exited", missing: "No research process", unknown: "Process state unknown" }[health.process_liveness] || "Process state unknown";
 }
 
-function eventDetail(event) {
-  const close = `<button type="button" class="detail-close" id="close-detail">关闭详情</button>`;
-  if (!event) return `${close}${missing("步骤详情")}`;
-  const reason = event.reason_zh || "";
-  return `<div>
-    ${close}
-    <p class="muted">步骤详情</p>
-    <h2>${esc(event.summary || event.event_type)}</h2>
-    <p>${esc(roleLabel(event.role))} · ${esc(event.status || "—")}</p>
-    <h3>观察 / 证据</h3>
-    ${reason ? `<p>${esc(firstClause(reason))}</p>` : missing("观察")}
-    <h3>假设或行动理由</h3>
-    ${reason ? `<p class="agentic-prose">${renderProse(reason)}</p>` : missing("理由")}
-    <h3>工具 / 改动</h3>
-    ${event.tool ? `<p>${esc(event.tool)}</p>` : missing("工具")}
-    <h3>执行 / 审查结果</h3>
-    ${event.error ? `<p class="error">${esc(event.error)}</p>` : (event.status ? `<p>${esc(event.status)}</p>` : missing("结果"))}
-    <h3>下一步条件</h3>
-    ${missing("下一步条件")}
-  </div>`;
+function eventDetail(event, camp) {
+  const close = `<button type="button" class="detail-close" id="close-detail">Close details</button>`;
+  if (!event) return `${close}<p class="detail-label">STEP DETAILS</p>${missing("Selected event")}`;
+  const reason = event.reason_zh || event.detail || "";
+  const parts = decisionParts(typeof reason === "string" ? reason : "");
+  const observed = parts.find((row) => row.label === "观察");
+  const rationale = parts.filter((row) => !["观察", "下一步"].includes(row.label)).map((row) => row.body).join("\n");
+  const section = (title, body) => `<section class="detail-section"><h3>${title}</h3>${body}</section>`;
+  const refs = event.artifact_refs || [];
+  const health = camp.health || {};
+  const budget = camp.budget || {};
+  return `${close}<p class="detail-label">STEP DETAILS</p><h2>${esc(eventTitle(event))}</h2><span class="status-chip ${esc(event.status)}">${esc(statusLabel(event.status))}</span><div class="detail-identity"><span>${esc(roleLabel(event.role))} · ${esc(agenticWhen(event.timestamp))}</span>${event.candidate_id ? `<span>Candidate ${esc(event.candidate_id)}${event.attempt_id ? ` / attempt ${esc(event.attempt_id)}` : ""}</span>` : ""}</div>${section("Observed evidence", observed ? `<p>${esc(observed.body)}</p>` : missing("Observation"))}${section("Current question / rationale", reason ? `<p>${esc(rationale || (typeof reason === "string" ? reason : JSON.stringify(reason)))}</p>` : missing("Rationale"))}${section("Tools & changes", event.tool ? `<p>${esc(event.tool)}</p>` : missing("Tool record"))}${section("Execution / review result", event.error ? `<p class="error">${esc(event.error)}</p>` : `<p>${esc(statusLabel(event.status))}${event.executed === false ? " · Decision not executed" : ""}</p>`)}${section("Evidence & artifacts", refs.length ? refs.map((ref) => `<span class="artifact-ref">${esc(ref)}</span>`).join("") : missing("Artifact references"))}${section("Next decision", recordedNext(reason) ? `<p>${esc(recordedNext(reason))}</p>` : missing("Next-step condition"))}<footer class="detail-health"><span>${esc(healthLine(health))}</span><span>Last progress: ${esc(health.last_progress_at ? agenticWhen(health.last_progress_at) : "unknown")}</span><span>Page connection: ${esc(state.connectionStatus || "Connected")}</span><span>LLM calls: ${esc(budget.llm_calls ?? "?")} / ${esc(budget.max_llm_calls ?? "?")}</span><span>Updated: ${esc(agenticWhen(camp.updated_at) || "unknown")}</span></footer>`;
 }
 
 function paintWorkspaceShell() {
-  const lists = (state.agenticList && state.agenticList.campaigns) || [];
-  const camp = ((state.agentic && state.agentic.campaigns) || [])[0];
-  const side = document.getElementById("run-list");
-  const label = document.getElementById("side-label");
+  const saved = rememberWorkspace();
+  const lists = state.agenticList?.campaigns || [];
+  const camp = state.agentic?.campaigns?.[0];
+  if (!state.selectedCandidate && state.jobMetrics?.candidate_id) state.selectedCandidate = state.jobMetrics.candidate_id;
   const search = document.getElementById("search");
-  if (label) label.textContent = "研究";
-  if (search) search.placeholder = "搜索研究";
-  if (side) {
-    if (!lists.length) {
-      side.innerHTML = `<p class="muted">还没有代码级研究。</p><button type="button" id="side-create">新建研究</button>`;
-      const create = document.getElementById("side-create");
-      if (create) create.addEventListener("click", () => setSurface("create"));
-    } else {
-      const query = String((search && search.value) || "").trim().toLowerCase();
-      const visible = lists.filter((row) => {
-        if (!query) return true;
-        const hay = `${row.objective || ""} ${row.campaign_id || ""} ${row.status || ""}`.toLowerCase();
-        return hay.indexOf(query) >= 0;
-      }).slice().sort((a, b) => {
-        if (a.campaign_id === state.agenticFocus) return -1;
-        if (b.campaign_id === state.agenticFocus) return 1;
-        return (Number(b.updated_at) || 0) - (Number(a.updated_at) || 0);
-      });
-      side.innerHTML = `<button type="button" id="side-create">+ 新建研究</button>
-        <p class="muted">研究</p>
-        ${visible.map((row) => `<button type="button" class="run-item${row.campaign_id === state.agenticFocus ? " active" : ""}" data-agentic-select="${esc(row.campaign_id)}"><span class="run-name">${esc(row.objective || row.campaign_id)}</span><span class="run-meta">${esc(AGENTIC_STATUS[row.status] || row.status || "")}</span></button>`).join("")}
-        ${camp ? `<p class="muted">候选</p><div class="candidate-list">${(camp.candidates || []).map((row) => {
-          const parent = row.parent_candidate_id ? `父候选 ${esc(row.parent_candidate_id)}` : "无线索关系";
-          return `<button type="button" data-candidate="${esc(row.candidate_id)}">${esc(row.candidate_id)} · ${esc(row.status || "")}<span class="run-meta">${parent} · attempt ${esc(row.attempt_id || "未知")}</span></button>`;
-        }).join("")}</div>` : ""}`;
-    }
-  }
+  document.getElementById("side-label").textContent = "RESEARCH CAMPAIGNS";
+  search.placeholder = "Find a campaign…";
+  const query = search.value.trim().toLowerCase();
+  const visible = lists.filter((row) => `${row.objective || ""} ${row.campaign_id} ${row.status}`.toLowerCase().includes(query)).sort((a, b) => (b.campaign_id === state.agenticFocus) - (a.campaign_id === state.agenticFocus) || Number(b.updated_at) - Number(a.updated_at));
+  listEl.innerHTML = visible.map((row) => `<button type="button" class="run-item${row.campaign_id === state.agenticFocus ? " active" : ""}" data-agentic-select="${esc(row.campaign_id)}" aria-pressed="${row.campaign_id === state.agenticFocus}"><span class="campaign-name"><span class="campaign-dot" aria-hidden="true"></span><span class="run-name" title="${esc(row.objective || row.campaign_id)}">${esc(row.objective || row.campaign_id)}</span></span><span class="run-meta">${esc(WORKSPACE_STATUS[row.status] || statusLabel(row.status))}${row.campaign_id === state.agenticFocus ? " · current" : ""}</span></button>`).join("") || `<p class="muted">${lists.length ? "No matching campaigns." : "No research campaigns yet."}</p>`;
+  if (camp) listEl.innerHTML += `<p class="nav-heading candidate-heading">CANDIDATES</p><div class="candidate-list">${(camp.candidates || []).map((row) => `<button type="button" class="${row.parent_candidate_id ? "tree-child " : ""}${row.candidate_id === state.selectedCandidate ? "active" : ""}" data-candidate="${esc(row.candidate_id)}"><strong>${esc(row.candidate_id)} · ${esc(statusLabel(row.status))}</strong><span class="run-meta">${row.parent_candidate_id ? `From ${esc(row.parent_candidate_id)}` : "Lineage not recorded"}${row.attempt_id ? ` / ${esc(row.attempt_id)}` : ""}</span></button>`).join("")}</div>`;
+  document.getElementById("side-context").innerHTML = camp ? `<strong>${esc(scopeLabel(camp).split(" / ")[0])}</strong><p>${esc(scopeLabel(camp).split(" / ").slice(1).join(" / "))}</p><p>Research metrics follow the recorded evaluation contract.</p>` : "";
+  document.getElementById("demo-indicator").hidden = !state.demo;
   if (!camp) {
-    main.innerHTML = `<section class="workspace"><div class="workspace-head"><h1>自主研究</h1></div><div class="workspace-center"><p>还没有代码级研究。用「新建研究」从本页创建，不必只用命令行。</p><button type="button" class="primary" id="empty-create">新建研究</button></div></section>`;
-    const empty = document.getElementById("empty-create");
-    if (empty) empty.addEventListener("click", () => setSurface("create"));
+    main.innerHTML = `<section class="workspace"><header class="workspace-head"><div class="workspace-heading"><p class="workspace-kicker">BRAIN DECODING LAB</p><h1>Autonomous research</h1><p class="workspace-protocol">Build, evaluate and understand your next experiment.</p></div></header><section class="panel"><h2>Start a research campaign</h2><p class="muted">Configure your data, protocol and budget in New research.</p><button type="button" class="primary" id="empty-create">+ New research</button></section></section>`;
+    document.getElementById("empty-create").onclick = () => setSurface("create");
     bindAgentic();
+    restoreWorkspace(saved);
     return;
   }
+  const events = state.timeline?.events || [];
+  const compactAll = processEvents(events);
+  const selected = events.find((row) => row.event_id === state.selectedStep) || defaultProcessEvent(events);
+  if (selected && !state.selectedStep) state.selectedStep = selected.event_id;
+  if (!state.selectedCandidate && selected?.candidate_id) state.selectedCandidate = selected.candidate_id;
+  const index = compactAll.findIndex((row) => row.event_id === selected?.event_id);
+  const start = index >= 0 ? Math.min(Math.max(0, index - 2), Math.max(0, compactAll.length - 4)) : Math.max(0, compactAll.length - 4);
+  const compact = compactAll.slice(start, start + 4);
+  const processRow = (row) => `<li class="${row.event_id === selected?.event_id ? "selected" : ""}"><button type="button" class="event ${esc(row.status)}" data-step="${esc(row.event_id)}" aria-pressed="${row.event_id === selected?.event_id}"><span class="event-dot" aria-hidden="true"></span><span class="event-copy"><strong>${esc(eventTitle(row))}</strong><span class="muted">${esc(statusLabel(row.status))}${row.candidate_id ? ` · ${esc(row.candidate_id)}` : ""}${row.job_id ? ` · ${esc(row.job_id)}` : ""}</span></span><span class="event-role">${esc(row.event_type === "training_job" ? "Training worker" : roleLabel(row.role))}</span><span class="event-time">${esc(agenticWhen(row.timestamp) || "—")}</span></button></li>`;
+  const budget = camp.budget || {};
   const best = camp.best_full;
-  const bestLine = best
-    ? (best.beats_control ? `${esc(best.candidate_id)} +${esc(best.delta_vs_control_pp)} pp` : `${esc(best.candidate_id)} ${esc(best.delta_vs_control_pp)} pp · ${esc(best.rank_note || "尚未优于对照")}`)
-    : "没有可比的完整结果";
-  const events = (state.timeline && state.timeline.events) || [];
-  const selected = events.find((row) => row.event_id === state.selectedStep) || events[events.length - 1];
-  const activity = (state.timeline && state.timeline.activity) || {};
-  const health = camp.health || {};
-  const roles = (activity.roles || []).map((row) => `<button type="button" class="role-chip${row.status === "active" ? " active" : ""}" data-role="${esc(row.role)}"><span>${esc(roleLabel(row.role))}</span><span class="role-status">${esc(roleStatusText(row.status))}</span></button>`).join("");
-  const timelineHtml = events.map((row) => `<li class="${row.event_id === (selected && selected.event_id) ? "selected" : ""}"><button type="button" class="event" data-step="${esc(row.event_id)}"><strong>${esc(row.summary || row.event_type)}</strong><span class="muted"> ${esc(roleLabel(row.role))} · ${esc(row.status || "")}</span></button></li>`).join("");
-  const more = state.timeline && state.timeline.has_more ? `<button type="button" id="load-more-events">加载更多事件</button>` : "";
-  main.innerHTML = `<section class="workspace">
-    <header class="workspace-head">
-      ${state.demo ? `<p class="demo-banner">DEMO 数据 · 不是实验结果</p>` : ""}
-      <h1>${esc(camp.objective || camp.campaign_id)}</h1>
-      <div class="workspace-controls">
-        <button type="button" data-agentic-action="pause" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy ? " disabled" : ""}>当前步骤后暂停</button>
-        <button type="button" data-agentic-action="stop" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy ? " disabled" : ""}>停止当前训练作业</button>
-        <button type="button" data-agentic-action="resume" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy ? " disabled" : ""}>继续</button>
-      </div>
-      <p class="workspace-rank">${bestLine}</p>
-      <div class="workspace-meta">
-        <span>${esc(camp.scope_zh || camp.research_scope || "协议未记录")}</span>
-        <span>${esc(AGENTIC_STATUS[camp.status] || camp.status || "")}</span>
-        <span>更新 ${esc(agenticWhen(camp.updated_at))}</span>
-        <span>${esc(healthLine(health))}</span>
-        <span>最后进展 ${esc(health.last_progress_at ? agenticWhen(health.last_progress_at) : "未知")}</span>
-      </div>
-      <details class="workspace-budget"><summary>预算</summary>
-        <p>训练 ${esc((camp.budget && camp.budget.training_jobs) ?? 0)}/${esc((camp.budget && camp.budget.max_training_jobs) ?? "—")} · 调用 ${esc((camp.budget && camp.budget.llm_calls) ?? 0)}/${esc((camp.budget && camp.budget.max_llm_calls) ?? "—")} · GPU 剩余 ${esc((camp.budget && camp.budget.gpu_seconds_left) ?? "—")} · 费用 ${(camp.budget && camp.budget.api_usd) == null ? "未记录" : esc(camp.budget.api_usd)}</p>
-      </details>
-    </header>
-    <div class="workspace-body">
-      <div class="workspace-center" id="workspace-center">
-        <div class="workspace-tabs">
-          <button type="button" data-tab="process" class="${state.agenticTab === "process" ? "active" : ""}">过程</button>
-          <button type="button" data-tab="experiments" class="${state.agenticTab === "experiments" ? "active" : ""}">实验</button>
-          <button type="button" data-tab="code" class="${state.agenticTab === "code" ? "active" : ""}">代码与产物</button>
-        </div>
-        <div class="role-strip">${roles || `<p class="missing">${activity.activity_available ? "没有角色事件" : "活动记录不可用"}</p>`}<span class="muted role-note">Training worker 不是 LLM 角色</span></div>
-        ${state.agenticTab === "process" ? `<ol class="timeline-list">${timelineHtml || "<li>还没有事件</li>"}</ol>${more}${jobCharts(camp)}<button type="button" class="new-events" id="jump-latest">新事件</button>` : ""}
-        ${state.agenticTab === "experiments" ? agenticBody(camp) : ""}
-        ${state.agenticTab === "code" ? (camp.candidates || []).map((row) => `<details data-keep="candidate-${esc(row.candidate_id)}"><summary>${esc(row.candidate_id)} ${row.source_truncated ? "· 预览已截断" : ""}</summary><pre class="agentic-source">${esc(row.source || "没有写出文件")}</pre>${row.source_truncated ? `<button type="button" data-load-source="${esc(row.candidate_id)}">加载完整内容</button>` : ""}</details>`).join("") : ""}
-      </div>
-      <aside class="workspace-detail${state.detailOpen ? " is-open" : ""}" id="workspace-detail">${eventDetail(selected)}</aside>
-    </div>
-  </section>`;
+  const bestLine = best ? `Best comparable Full: ${esc(best.candidate_id)} / ${best.delta_vs_control_pp > 0 ? "+" : ""}${esc(best.delta_vs_control_pp)} pp${best.beats_control ? " · confirmation tracked separately" : " · not yet above matched control"}` : "No comparable Full result recorded.";
+  const paused = ["paused", "interrupted", "blocked"].includes(camp.status);
+  const terminal = ["finished", "cancelled"].includes(camp.status);
+  const tabs = `<nav class="workspace-tabs" aria-label="Research view">${[["process", "Process"], ["experiments", "Experiments"], ["code", "Code & artifacts"]].map(([id, label]) => `<button type="button" data-tab="${id}" class="${state.agenticTab === id ? "active" : ""}" aria-pressed="${state.agenticTab === id}">${label}</button>`).join("")}</nav>`;
+  const codeRows = camp.candidates || [];
+  main.innerHTML = `<section class="workspace"><header class="workspace-head"><div class="workspace-heading"><p class="workspace-kicker">AUTONOMOUS RESEARCH / CODE LEVEL</p><h1>${esc(camp.objective || camp.campaign_id)}</h1><p class="workspace-protocol">${esc(scopeLabel(camp))}</p></div><div class="workspace-actions"><span class="status-chip ${esc(camp.status)}">${esc(WORKSPACE_STATUS[camp.status] || statusLabel(camp.status))}</span><div class="workspace-controls"><button type="button" data-agentic-action="${paused ? "resume" : "pause"}" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy || terminal ? " disabled" : ""}>${paused ? "Resume" : camp.pause_after_step ? "Pause requested" : "Pause after step"}</button><details class="workspace-settings" data-keep="settings"><summary>Settings</summary><div class="settings-popover"><h3>Research budget</h3><dl><dt>Training jobs</dt><dd>${esc(budget.training_jobs ?? "?")} / ${esc(budget.max_training_jobs ?? "?")}</dd><dt>LLM calls</dt><dd>${esc(budget.llm_calls ?? "?")} / ${esc(budget.max_llm_calls ?? "?")}</dd><dt>GPU seconds left</dt><dd>${esc(budget.gpu_seconds_left ?? "unknown")}</dd><dt>API cost (USD)</dt><dd>${esc(budget.api_usd ?? "not recorded")}</dd></dl><button type="button" data-agentic-action="stop" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy || !camp.live_job ? " disabled" : ""}>Stop current training job</button><p class="muted">Stops the selected campaign's live training job. The campaign is retained.</p></div></details></div></div>${tabs}</header><div class="workspace-body"><div class="workspace-center" id="workspace-center">${roleFlowHtml(state.timeline?.activity || {})}${state.agenticTab === "process" ? `<section class="panel process-panel"><div class="panel-heading"><h2>Research process</h2><span class="muted">${compactAll.length} recorded steps</span></div><ol class="process-list">${compact.map(processRow).join("") || `<li class="muted">No process steps recorded.</li>`}</ol></section>${jobCharts(camp)}<details class="all-events" data-keep="all-events"><summary>All events & call records (${state.timeline?.total ?? events.length})</summary><ol class="timeline-list">${events.map((row) => `<li class="${row.event_id === selected?.event_id ? "selected" : ""}"><button type="button" class="event" data-step="${esc(row.event_id)}"><strong>${esc(eventTitle(row))}</strong><span class="muted">${esc(roleLabel(row.role))} / ${esc(statusLabel(row.status))} / ${esc(agenticWhen(row.timestamp))}</span></button></li>`).join("")}</ol>${state.timeline?.has_more ? `<button type="button" id="load-more-events">Load more events</button>` : ""}${(state.timeline?.diagnostics || []).map((row) => `<p class="missing">${esc(JSON.stringify(row))}</p>`).join("")}</details><button type="button" class="new-events${state.pendingEvents ? " show" : ""}" id="jump-latest">${state.pendingEvents} new events</button>` : state.agenticTab === "experiments" ? agenticBody(camp) : codeRows.map((row) => `<details class="panel code-panel" data-keep="candidate-${esc(row.candidate_id)}"${row.candidate_id === state.selectedCandidate ? " open" : ""}><summary>${esc(row.candidate_id)} / ${esc(statusLabel(row.status))}${row.source_truncated ? " · preview truncated" : ""}</summary>${row.review_summary ? `<p class="agentic-prose">${renderProse(row.review_summary)}</p>` : ""}<pre class="agentic-source">${esc(state.sourceFull[`${camp.campaign_id}/${row.candidate_id}`] || row.source || (row.source_available ? "Source is available on request." : "No source recorded."))}</pre>${(row.source_truncated || (row.source_available && !row.source_loaded)) && !Object.prototype.hasOwnProperty.call(state.sourceFull, `${camp.campaign_id}/${row.candidate_id}`) ? `<button type="button" data-load-source="${esc(row.candidate_id)}">${row.source_truncated ? "Load full source" : "Load source"}</button>` : ""}</details>`).join("") || `<section class="panel">${missing("Candidate source")}</section>`}</div><aside class="workspace-detail${state.detailOpen ? " is-open" : ""}" id="workspace-detail" aria-label="Step details">${eventDetail(selected, camp)}</aside></div><p class="workspace-rank">${bestLine}</p>${camp.termination_reason ? `<p class="workspace-note">Termination: ${esc(camp.termination_reason)}</p>` : ""}</section>`;
   bindAgentic();
-  document.querySelectorAll("[data-tab]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.agenticTab = button.getAttribute("data-tab");
-      writeRoute();
-      paintWorkspaceShell();
-    });
+  main.querySelectorAll("[data-tab]").forEach((button) => button.onclick = () => { state.agenticTab = button.dataset.tab; state.detailOpen = false; writeRoute(); paintWorkspaceShell(); });
+  main.querySelectorAll("[data-step]").forEach((button) => button.onclick = async () => {
+    state.selectedStep = button.dataset.step;
+    state.detailOpen = isNarrowWorkspace();
+    const hit = events.find((row) => row.event_id === state.selectedStep);
+    if (hit?.job_id && hit.job_id !== state.selectedJob) await selectWorkspaceJob(hit.job_id);
+    writeRoute(); paintWorkspaceShell();
   });
-  document.querySelectorAll("[data-step]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.selectedStep = button.getAttribute("data-step") || "";
-      state.detailOpen = true;
-      writeRoute();
-      paintWorkspaceShell();
-    });
+  main.querySelectorAll("[data-role]").forEach((button) => button.onclick = () => {
+    const role = button.dataset.role;
+    const hit = [...events].reverse().find((row) => row.role === role);
+    if (hit) { state.selectedStep = hit.event_id; state.detailOpen = isNarrowWorkspace(); writeRoute(); paintWorkspaceShell(); }
   });
-  document.querySelectorAll("[data-role]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const role = button.getAttribute("data-role");
-      const hit = [...events].reverse().find((row) => row.role === role);
-      if (hit) {
-        state.selectedStep = hit.event_id;
-        state.detailOpen = true;
-        writeRoute();
-        paintWorkspaceShell();
-      }
-    });
-  });
-  document.querySelectorAll("[data-job]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const jobId = button.getAttribute("data-job") || "";
-      if (!jobId || jobId === state.selectedJob) return;
-      state.selectedJob = jobId;
-      writeRoute();
-      const jobRes = await fetch(apiUrl("/api/agentic_job", { campaign: state.agenticFocus, job: jobId }), { cache: "no-store" });
-      const metrics = await jobRes.json();
-      state.jobMetrics = metrics.ok ? metrics : null;
-      paintWorkspaceShell();
-    });
-  });
-  const closeDetail = document.getElementById("close-detail");
-  if (closeDetail) closeDetail.addEventListener("click", () => {
-    state.detailOpen = false;
-    paintWorkspaceShell();
-  });
-  const moreBtn = document.getElementById("load-more-events");
-  if (moreBtn) moreBtn.addEventListener("click", async () => {
-    const cursor = state.timeline && state.timeline.next_cursor;
-    if (cursor == null || cursor === "") return;
-    const pageRes = await fetch(apiUrl("/api/agentic_timeline", { campaign: state.agenticFocus, cursor: String(cursor), limit: "20" }), { cache: "no-store" });
-    const page = await pageRes.json();
-    const prev = (state.timeline && state.timeline.events) || [];
-    const seen = new Set(prev.map((row) => row.event_id));
-    const extra = (page.events || []).filter((row) => !seen.has(row.event_id));
-    state.timeline = { ...page, events: prev.concat(extra), has_more: page.has_more, next_cursor: page.next_cursor };
-    paintWorkspaceShell();
-  });
-  document.querySelectorAll("[data-candidate]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.selectedCandidate = button.getAttribute("data-candidate") || "";
-      state.agenticTab = "code";
-      writeRoute();
-      paintWorkspaceShell();
-    });
-  });
+  listEl.querySelectorAll("[data-candidate]").forEach((button) => button.onclick = () => { state.selectedCandidate = button.dataset.candidate; state.agenticTab = "code"; closeNavigation(); writeRoute(); paintWorkspaceShell(); });
+  const picker = document.getElementById("job-select");
+  if (picker) picker.onchange = async () => { await selectWorkspaceJob(picker.value); paintWorkspaceShell(); };
+  const close = document.getElementById("close-detail");
+  if (close) close.onclick = () => { state.detailOpen = false; paintWorkspaceShell(); };
   const top5 = document.getElementById("toggle-top5");
-  if (top5) top5.addEventListener("click", () => {
-    state.showTop5 = !state.showTop5;
-    paintWorkspaceShell();
+  if (top5) top5.onclick = () => { state.showTop5 = !state.showTop5; paintWorkspaceShell(); };
+  const more = document.getElementById("load-more-events");
+  if (more) more.onclick = async () => {
+    const campaign = state.agenticFocus;
+    const cursor = state.timeline.next_cursor;
+    more.disabled = true;
+    try {
+      const page = await workspaceJSON(apiUrl("/api/agentic_timeline", { campaign, cursor, limit: "40" }));
+      if (campaign !== state.agenticFocus) return;
+      const merged = new Map((state.timeline.events || []).map((row) => [row.event_id, row]));
+      (page.events || []).forEach((row) => merged.set(row.event_id, row));
+      state.timeline = { ...page, events: [...merged.values()].sort((a, b) => a.timestamp - b.timestamp || a.event_id.localeCompare(b.event_id)) };
+      paintWorkspaceShell();
+    } catch (err) { more.disabled = false; window.alert(err.message); }
+  };
+  main.querySelectorAll("[data-load-source]").forEach((button) => button.onclick = async () => {
+    const campaign = state.agenticFocus, id = button.dataset.loadSource;
+    button.disabled = true;
+    try { const payload = await workspaceJSON(apiUrl("/api/agentic_source", { campaign, candidate: id })); if (state.agenticFocus !== campaign) return; state.sourceFull[`${campaign}/${id}`] = payload.source || ""; paintWorkspaceShell(); }
+    catch (err) { button.disabled = false; window.alert(err.message); }
   });
-  document.querySelectorAll("[data-load-source]").forEach((button) => {
-    button.addEventListener("click", async () => {
-      const id = button.getAttribute("data-load-source");
-      const res = await fetch(apiUrl("/api/agentic_source", { campaign: state.agenticFocus, candidate: id }));
-      const payload = await res.json();
-      if (payload.ok) button.previousElementSibling.textContent = payload.source || "";
-      button.remove();
-    });
-  });
-  const center = document.getElementById("workspace-center");
-  if (center) {
-    center.addEventListener("scroll", () => {
-      const nearBottom = center.scrollHeight - center.scrollTop - center.clientHeight < 48;
-      state.stickBottom = nearBottom;
-    }, { once: false });
-    if (!state.stickBottom) {
-      const jump = document.getElementById("jump-latest");
-      if (jump) jump.classList.add("show");
-    }
-  }
   const jump = document.getElementById("jump-latest");
-  if (jump) jump.addEventListener("click", () => {
-    state.stickBottom = true;
-    const node = document.getElementById("workspace-center");
-    if (node) node.scrollTop = node.scrollHeight;
-    jump.classList.remove("show");
-  });
-  const active = document.querySelector(".run-item.active");
-  if (active && typeof active.scrollIntoView === "function") active.scrollIntoView({ block: "nearest" });
+  if (jump) jump.onclick = () => { state.pendingEvents = 0; state.selectedStep = ""; paintWorkspaceShell(); document.querySelector(".process-panel")?.scrollIntoView({ block: "start" }); };
+  restoreWorkspace(saved);
   writeRoute();
+}
+
+function statusLabel(status) {
+  return { ok: "Completed", pending: "Pending", running: "Running", active: "Active", completed: "Completed", finished: "Finished", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted", paused: "Paused", unknown: "Unknown" }[status] || String(status || "Unknown").replace(/_/g, " ");
+}
+
+function eventTitle(row) {
+  const actions = { inspect_data: "Inspect data and protocol", retrieve_methods: "Retrieve research methods", retrieve_memory: "Retrieve prior evidence", collect_diagnostics: "Collect training diagnostics", propose_experiment: "Propose an experiment", design_experiment: "Design an experiment", implement_candidate: "Implement candidate code", repair_candidate: "Repair candidate code", run_pilot: "Run matched pilot", diagnose_results: "Analyze experimental evidence", run_full: "Run full matched experiment", replicate: "Replicate with another seed", audit_result: "Audit research evidence", curate_memory: "Record research lessons", stop: "Stop research" };
+  if (row.action && actions[row.action]) return actions[row.action];
+  if (row.event_type === "training_job") return `Training worker · ${statusLabel(row.fidelity || "training")}`;
+  if (String(row.event_type || "").startsWith("llm_call_")) return `${roleLabel(row.role)} · ${statusLabel(row.status)}`;
+  if (String(row.event_type || "").startsWith("task_")) return `${roleLabel(row.role)} task · ${statusLabel(row.status)}`;
+  return row.summary || String(row.event_type || "Event").replace(/_/g, " ");
+}
+
+function scopeLabel(camp) {
+  return { pooled_subject_retrieval: "Pooled subjects / image holdout validation", cross_subject_retrieval: "Held-out subjects / cross-subject validation", within_subject_retrieval: "Within-subject retrieval" }[camp.research_scope] || camp.research_scope || camp.scope_zh || "Protocol not recorded";
+}
+
+function rememberWorkspace() {
+  const focused = document.activeElement;
+  return { scroll: main.scrollTop, sideScroll: document.getElementById("sidebar").scrollTop, detailScroll: document.getElementById("workspace-detail")?.scrollTop || 0, open: new Map([...document.querySelectorAll("details[data-keep]")].map((el) => [el.dataset.keep, el.open])), focus: focused && (main.contains(focused) || listEl.contains(focused)) ? { id: focused.id, data: { ...focused.dataset } } : null };
+}
+
+function restoreWorkspace(saved) {
+  document.querySelectorAll("details[data-keep]").forEach((el) => { if (saved.open.has(el.dataset.keep)) el.open = saved.open.get(el.dataset.keep); });
+  main.scrollTop = saved.scroll;
+  document.getElementById("sidebar").scrollTop = saved.sideScroll;
+  const detail = document.getElementById("workspace-detail");
+  if (detail) detail.scrollTop = saved.detailScroll;
+  if (saved.focus) {
+    const el = saved.focus.id ? document.getElementById(saved.focus.id) : [...document.querySelectorAll("button[data-step],button[data-tab],button[data-role],button[data-candidate],button[data-agentic-select]")].find((node) => Object.keys(saved.focus.data).length && Object.entries(saved.focus.data).every(([key, value]) => node.dataset[key] === value));
+    if (el) el.focus({ preventScroll: true });
+  }
+}
+
+function closeNavigation() {
+  document.getElementById("sidebar").classList.remove("open");
+  document.getElementById("toggle-side").setAttribute("aria-expanded", "false");
+}
+
+async function workspaceJSON(url, options = {}) {
+  const res = await fetch(url, { cache: "no-store", ...options });
+  const payload = await res.json();
+  if (!res.ok || payload.ok === false) throw new Error(payload.error || `Request failed (${res.status})`);
+  return payload;
+}
+
+async function selectWorkspaceJob(job) {
+  const campaign = state.agenticFocus;
+  state.selectedJob = job;
+  state.jobMetrics = null;
+  state.pollSeq += 1;
+  state.agenticAbort?.abort();
+  writeRoute();
+  try {
+    const metrics = await workspaceJSON(apiUrl("/api/agentic_job", { campaign, job }));
+    if (state.agenticFocus === campaign && state.selectedJob === job) state.jobMetrics = metrics;
+  } catch (err) { if (state.agenticFocus === campaign && state.selectedJob === job) window.alert(err.message); }
 }
 
 async function renderAgenticWorkspace() {
@@ -1471,8 +1428,9 @@ async function renderAgenticWorkspace() {
   if (route.job) state.selectedJob = route.job;
   if (route.step) state.selectedStep = route.step;
   if (route.candidate) state.selectedCandidate = route.candidate;
-  if (state.demo) {
+  if (state.demo && !state.demoInitialized) {
     await fetch("/api/agentic_demo", { method: "POST" }).catch(() => {});
+    state.demoInitialized = true;
   }
   await refreshAgentic();
 }
