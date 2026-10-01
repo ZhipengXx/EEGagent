@@ -241,17 +241,47 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
     trainable = set(observation.get("trainable_ids") or ["baseline"])
     eligible = observation.get("eligible_targets") if isinstance(observation.get("eligible_targets"), dict) else None
     reply = backend(observation)
-    parsed = _parse(reply, allowed, known, trainable, eligible)
+    parsed = _validate_reply(reply, observation, allowed, known, trainable, eligible)
     if parsed.get("ok"):
         return parsed
     if repairs >= 1:
-        return {"ok": False, "status": "blocked", "detail": parsed.get("detail")}
-    repaired = backend({"schema_error": parsed.get("detail"), "previous": reply, "available_actions": allowed})
-    second = _parse(repaired, allowed, known, trainable, eligible)
+        return _blocked_reply(parsed)
+    repaired = backend({**observation, "schema_error": parsed.get("detail"), "previous": reply})
+    second = _validate_reply(repaired, observation, allowed, known, trainable, eligible)
     if second.get("ok"):
         second["repairs"] = 1
         return second
-    return {"ok": False, "status": "blocked", "detail": second.get("detail"), "repairs": 1}
+    return {**_blocked_reply(second), "repairs": 1}
+
+
+def _blocked_reply(parsed: dict[str, Any]) -> dict[str, Any]:
+    result = {"ok": False, "status": "blocked", "detail": parsed.get("detail")}
+    if parsed.get("plan_update_error"):
+        result.update(detail="plan_update_blocks_action", plan_update_error=parsed["plan_update_error"])
+    return result
+
+
+def _validate_reply(
+    reply: Any,
+    observation: dict[str, Any],
+    allowed: list[str],
+    known: set[str],
+    trainable: set[str],
+    eligible: dict[str, Any] | None,
+) -> dict[str, Any]:
+    parsed = _parse(reply, allowed, known, trainable, eligible)
+    if not parsed.get("ok"):
+        return parsed
+    from react_agent.eeg_research.agentic.research_plan import PLAN_DEPENDENT_ACTIONS, PlanError, normalize_plan_update, validate_update
+
+    if reply.get("action_depends_on_plan_update") and parsed["action"] in PLAN_DEPENDENT_ACTIONS:
+        try:
+            update = normalize_plan_update(reply.get("plan_update"), reply, known_evidence_ids=known)
+            plan = (observation.get("research_plan") or {}).get("plan") or {}
+            validate_update(plan, update, known_evidence_ids=known)
+        except PlanError as exc:
+            return {"ok": False, "detail": f"plan_update:{exc}", "plan_update_error": str(exc)}
+    return parsed
 
 
 def _parse(
@@ -287,4 +317,4 @@ def _parse(
             return {"ok": False, "detail": "target_id_missing"}
         if allowed_targets and target not in allowed_targets:
             return {"ok": False, "detail": f"unknown_target:{target}"}
-    return {"ok": True, "action": action, "reason_zh": reply.get("reason_zh") or "", "raw": reply}
+    return {"ok": True, "action": action, "reason_zh": reply.get("reason_zh") or reply.get("decision_rationale") or reply.get("summary_zh") or "", "raw": reply}

@@ -17,6 +17,7 @@ from react_agent.eeg_research.agentic.memory import EpisodeStore, episode, query
 from react_agent.eeg_research.agentic.planner import STOP_REASONS, available_actions, decide, evidence_count
 from react_agent.eeg_research.agentic.promotion import promotion_decision
 from react_agent.eeg_research.agentic.research_plan import (
+    PLAN_DEPENDENT_ACTIONS,
     PlanError,
     apply_update,
     consume_for_planner,
@@ -272,6 +273,13 @@ def _decision_raw(camp: Path, decision_id: str) -> dict[str, Any]:
     payload = _read(camp / "decisions" / f"{decision_id}.json")
     raw = payload.get("raw")
     return raw if isinstance(raw, dict) else {}
+
+
+def _reject_plan_decision(camp: Path, record: dict[str, Any], detail: str) -> None:
+    """Keep a rejected decision in the audit trail without replaying its action."""
+    raw = _decision_raw(camp, str(record["decision_id"]))
+    record.update(ok=False, detail=detail, rejected_before_execution=True)
+    _write(camp / "decisions" / f"{record['decision_id']}.json", {"decision": record, "raw": raw})
 
 
 def _mark_executed(state: dict[str, Any]) -> None:
@@ -576,6 +584,10 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         _finish_step(camp, state)
         return state
     pending = _unexecuted_decision(state)
+    if pending is not None and (state.get("failure") or {}).get("phase") == "plan_update":
+        _reject_plan_decision(camp, pending, "plan_update_blocks_action")
+        save_state(camp, state)
+        pending = None
     if pending is not None and state.get("status") not in {"paused", "cancelled"}:
         _apply_action(camp, state, str(pending.get("action") or ""), pending, runner, services, observation(camp))
         _finish_step(camp, state)
@@ -630,10 +642,12 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         state["status"] = "blocked"
         state["detail"] = decision.get("detail")
         state["failure"] = {
-            "phase": "planner",
+            "phase": "plan_update" if decision.get("plan_update_error") else "planner",
             "recoverable": True,
-            "error_type": str(decision.get("detail") or "schema"),
+            "error_type": "plan_update_rejected" if decision.get("plan_update_error") else str(decision.get("detail") or "schema"),
         }
+        if decision.get("plan_update_error"):
+            event(camp, "plan_update_rejected", detail=decision["plan_update_error"], decision_id=record["decision_id"])
         save_state(camp, state)
         return state
     raw_decision = decision.get("raw") if isinstance(decision.get("raw"), dict) else {}
@@ -659,8 +673,8 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
                 decision_id=record["decision_id"],
             )
     depends = bool(raw_decision.get("action_depends_on_plan_update"))
-    dependent = {"design_experiment", "propose_experiment", "implement_candidate", "run_pilot", "run_full", "replicate", "stop"}
-    if update_failed and depends and str(decision.get("action") or "") in dependent:
+    if update_failed and depends and str(decision.get("action") or "") in PLAN_DEPENDENT_ACTIONS:
+        _reject_plan_decision(camp, record, "plan_update_blocks_action")
         persist_failure(
             camp,
             state,
@@ -672,6 +686,9 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         _finish_step(camp, state)
         return state
     mark_consumed(camp, record["decision_id"])
+    if (state.get("failure") or {}).get("phase") in {"planner", "plan_update"}:
+        state.pop("failure", None)
+        state.pop("detail", None)
     _apply_action(camp, state, str(decision.get("action") or ""), decision, runner, services, obs)
     _finish_step(camp, state)
     return state

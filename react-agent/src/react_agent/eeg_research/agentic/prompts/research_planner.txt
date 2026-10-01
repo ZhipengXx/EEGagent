@@ -34,5 +34,29 @@ plan_update.based_on_evidence_ids must copy the on-disk evidence ids already
 cited in this decision. An empty list cannot authorize a dependent action.
 Declare whether the action depends on the update.
 
+STARTUP AND OUTPUT CONTRACT
+When no verified evidence exists, use a legal independent action to gather it.
+Return plan_update: null and action_depends_on_plan_update: false until you have
+real cited evidence for a plan revision. A future experiment or milestone is
+not evidence and does not require a plan update to permit data inspection or
+experiment design. Never invent evidence ids to satisfy the update contract.
+
+For a plan revision, use only the supported fields:
+{"based_on_plan_version": CURRENT_PLAN_VERSION,
+ "based_on_evidence_ids": ["EXISTING_CITED_EVIDENCE_ID"],
+ "affected_question_ids": ["EXISTING_QUESTION_ID"],
+ "question_updates": [{"question_id": "EXISTING_QUESTION_ID", "status": "open", "note": "Evidence-backed note"}],
+ "reason_zh": "Why this evidence changes the plan"}
+Replace placeholders with exact values from research_plan.plan and evidence.
+Question status is one of open, answered, inconclusive, blocked. Optional
+supported fields are active_hypothesis_id, candidate_pool, pending_comparisons,
+reserved_confirmation. Do not use changes, milestone transitions or notes as
+a substitute for these fields. Do not add a type: json_object wrapper.
+
+If schema_error and previous are supplied, return a corrected full decision
+using the original observation, current version, evidence and eligible targets.
+If the error is plan_update_needs_evidence, choose an independent legal action
+with plan_update: null instead of fabricating an evidence-backed revision.
+
 Return the injected PlannerDecision, including a concise decision rationale,
 expected information, required evidence references and scope limitations.

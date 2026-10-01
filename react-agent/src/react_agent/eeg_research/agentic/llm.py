@@ -73,8 +73,18 @@ def _fail_row(row: dict[str, Any], exc: BaseException, started: float) -> dict[s
                 "output_tokens": usage.output_tokens,
                 "reasoning_tokens": usage.reasoning_tokens,
                 "finish_reason": usage.finish_reason,
+                "provider_error": usage.error,
             }
         )
+    causes = []
+    cause = exc.__cause__
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        causes.append(type(cause).__name__)
+        cause = cause.__cause__
+    if causes:
+        row["error_causes"] = causes
     raw = getattr(exc, "raw", None)
     if isinstance(raw, str):
         row["raw_excerpt"] = raw[:RAW_EXCERPT_LIMIT]

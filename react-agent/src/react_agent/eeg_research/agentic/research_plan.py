@@ -10,6 +10,7 @@ from react_agent.eeg_research.agentic.schemas import PLAN_VERSION_NAME, SCHEMA_V
 
 QUESTION_STATES = {"open", "answered", "inconclusive", "blocked"}
 PLAN_FILE = "plan.json"
+PLAN_DEPENDENT_ACTIONS = {"design_experiment", "propose_experiment", "implement_candidate", "run_pilot", "run_full", "replicate", "stop"}
 
 
 class PlanError(ValueError):
@@ -167,6 +168,18 @@ def apply_update(
 ) -> dict[str, Any]:
     """Validate and persist a planner plan_update. Concurrent versions are rejected."""
     plan = current or load_plan(camp)
+    next_plan = validate_update(plan, update, known_evidence_ids=known_evidence_ids)
+    _persist(camp, next_plan)
+    return next_plan
+
+
+def validate_update(
+    plan: dict[str, Any],
+    update: dict[str, Any],
+    *,
+    known_evidence_ids: set[str],
+) -> dict[str, Any]:
+    """Validate an update without writing, so planner repair uses the same rules."""
     if not plan:
         raise PlanError("plan_missing")
     if not isinstance(update, dict):
@@ -217,7 +230,6 @@ def apply_update(
         }
     )
     next_plan["accepted_evidence_ids"] = sorted(set(plan.get("accepted_evidence_ids") or []) | set(evidence_ids))
-    _persist(camp, next_plan)
     return next_plan
 
 
