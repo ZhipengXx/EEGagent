@@ -67,6 +67,11 @@ const state = {
   sourceFull: {},
   detailOpen: false,
   timelineAccum: null,
+  processFilter: "all",
+  workspaceNotice: "",
+  jobLoading: false,
+  jobError: "",
+  artifactPreview: null,
 };
 
 const main = document.getElementById("main");
@@ -1064,25 +1069,25 @@ async function refreshAgentic() {
     const camp = detail.campaigns?.[0];
     if (!camp || camp.campaign_id !== campaign) throw new Error("Campaign detail unavailable");
     const job = jobBefore || defaultJobId(camp);
-    const [page, metrics] = await Promise.all([
+    const [page, metricResult] = await Promise.all([
       workspaceJSON(apiUrl("/api/agentic_timeline", { campaign, cursor: "0", limit: "40" }), { signal }),
-      job ? workspaceJSON(apiUrl("/api/agentic_job", { campaign, job }), { signal }) : Promise.resolve(null),
+      job ? workspaceJSON(apiUrl("/api/agentic_job", { campaign, job }), { signal }).then(data => ({ data, error: "" })).catch(err => ({ data: null, error: err.name === "AbortError" ? "" : err.message })) : Promise.resolve({ data: null, error: "" }),
     ]);
     // Read the latest bounded page as well, so a long history cannot hide current work.
     const recent = page.has_more ? await workspaceJSON(apiUrl("/api/agentic_timeline", { campaign, cursor: String(Math.max(0, page.total - 40)), limit: "40" }), { signal }) : null;
+    const knownIds = new Set([...(page.events || []), ...(recent?.events || []), ...(state.timeline?.campaign_id === campaign ? state.timeline.events : [])].map(row => row.event_id));
+    const focused = state.selectedStep && !knownIds.has(state.selectedStep) ? await workspaceJSON(apiUrl("/api/agentic_timeline", { campaign, focus: state.selectedStep, limit: "20" }), { signal }).catch(() => null) : null;
     if (seq !== state.pollSeq || campaign !== state.agenticFocus || state.selectedJob !== jobBefore) return;
     const previous = state.timeline?.campaign_id === campaign ? state.timeline : null;
-    const merged = new Map((previous?.events || []).map((row) => [row.event_id, row]));
-    [...(page.events || []), ...(recent?.events || [])].forEach((row) => merged.set(row.event_id, row));
-    const timeline = { ...page, events: [...merged.values()].sort((a, b) => a.timestamp - b.timestamp || a.event_id.localeCompare(b.event_id)) };
-    timeline.has_more = merged.size < Number(page.total);
-    timeline.next_cursor = !timeline.has_more ? null : previous?.has_more ? previous.next_cursor : previous ? String(previous.total) : page.next_cursor;
+    const timeline = mergeTimeline([page, recent, focused].filter(Boolean), previous);
     if (previous && page.total > previous.total && state.selectedStep) state.pendingEvents += page.total - previous.total;
     state.agenticList = list;
     state.agentic = detail;
     state.timeline = timeline;
     state.selectedJob = job;
+    const metrics = metricResult.data;
     state.jobMetrics = metrics;
+    state.jobError = metricResult.error;
     state.connectionStatus = "Connected";
     const snapshot = JSON.stringify([list, detail, timeline, metrics, state.selectedJob, state.selectedStep, state.agenticTab]);
     if (state.surface === "agentic" && (snapshot !== state.workspaceSnapshot || !document.querySelector(".workspace"))) {
@@ -1114,6 +1119,9 @@ function bindAgentic() {
       state.jobMetrics = null;
       state.pendingEvents = 0;
       state.detailOpen = false;
+      state.workspaceNotice = "";
+      state.artifactPreview = null;
+      state.jobError = "";
       closeNavigation();
       main.scrollTop = 0;
       writeRoute();
@@ -1126,19 +1134,20 @@ function bindAgentic() {
       const action = button.getAttribute("data-agentic-action");
       if (action === "stop" && !window.confirm("Stop the current training job? The campaign and recorded results are retained.")) return;
       state.controlBusy = true;
-      button.disabled = true;
+      state.workspaceNotice = "Sending control request…";
+      paintWorkspaceShell();
       const body = new URLSearchParams({ action, campaign: button.getAttribute("data-campaign") || "" });
       if (state.demo) body.set("demo", "1");
       try {
         const res = await fetch("/api/agentic_control", { method: "POST", body });
-        if (!res.ok) {
-          const payload = await res.json().catch(() => ({}));
-          window.alert(payload.error || "控制请求失败");
-        }
-      } catch (_err) {
-        window.alert("控制请求失败");
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok || payload.ok === false) throw new Error(payload.error || "Control request failed");
+        state.workspaceNotice = { pause: "Pause requested. The current step will finish first.", resume: "Resume requested.", stop: "Training stop requested. Recorded results are retained." }[action] || "Request accepted.";
+      } catch (err) {
+        state.workspaceNotice = `Request failed: ${err.message}. Try again.`;
       }
       state.controlBusy = false;
+      paintWorkspaceShell();
       refreshAgentic();
     });
   });
@@ -1169,16 +1178,15 @@ function isNarrowWorkspace() {
 }
 
 function roleStatusText(status) {
-  return { not_called: "Not called", queued: "Queued", active: "Active", completed: "Completed", failed: "Failed", waiting: "Waiting for dependency", unknown: "Unknown" }[status] || statusLabel(status);
+  return { idle: "Idle", not_called: "Not used yet", queued: "Queued", active: "Working now", completed: "Completed", failed: "Failed", waiting: "Waiting for dependency", unknown: "Unknown" }[status] || statusLabel(status);
 }
 
 function defaultJobId(camp) {
   if (state.selectedJob) return state.selectedJob;
   if (camp && camp.live_job) return camp.live_job;
   const jobs = (camp && camp.jobs) || [];
-  const pilot = jobs.find((row) => row.fidelity === "pilot");
-  if (pilot && pilot.job_id) return pilot.job_id;
-  return (jobs[0] && jobs[0].job_id) || "";
+  const latest = [...jobs].sort((a, b) => Number(a.job_id?.match(/^j(\d+)_/)?.[1] || 0) - Number(b.job_id?.match(/^j(\d+)_/)?.[1] || 0));
+  return latest[latest.length - 1]?.job_id || "";
 }
 
 function recordedNext(reason) {
@@ -1187,13 +1195,14 @@ function recordedNext(reason) {
 }
 
 function processEvents(events) {
-  return (events || []).filter((row) => row.event_type === "decision" || row.event_type === "training_job" || (row.event_type || "").startsWith("tool_"));
+  return (events || []).filter((row) => row.event_type === "decision" || row.event_type === "training_job" || (row.event_type || "").startsWith("tool_") || row.event_type === "task_completed" || row.event_type === "task_failed");
 }
 
 function defaultProcessEvent(events) {
+  const open = new Set(state.timeline?.activity?.open_call_ids || []);
+  const active = [...(events || [])].reverse().find(row => (row.event_type === "llm_call_started" && open.has(row.call_id)) || (row.event_type === "training_job" && row.status === "running"));
   const decisions = processEvents(events);
-  const preferred = [...decisions].reverse().find((row) => row.action !== "stop" && row.status !== "failed");
-  return preferred || decisions[decisions.length - 1] || events[events.length - 1];
+  return active || decisions[decisions.length - 1] || events[events.length - 1];
 }
 
 function roleFlowHtml(activity) {
@@ -1202,10 +1211,12 @@ function roleFlowHtml(activity) {
   const byRole = new Map(rows.map((row) => [row.role, row]));
   const chip = (role) => {
     const row = byRole.get(role) || { status: "unknown" };
-    return `<button type="button" class="role-chip ${esc(row.status)}" data-role="${esc(role)}"><span class="role-dot" aria-hidden="true"></span><strong>${esc(roleLabel(role))}</strong><span class="role-status">${esc(roleStatusText(row.status))}</span></button>`;
+    return `<button type="button" class="role-chip ${esc(row.status)}" data-role="${esc(role)}"${!row.event_id ? " disabled" : ""} title="${esc(row.timestamp ? `Last activity: ${agenticWhen(row.timestamp)}` : "No activity recorded")} "><span class="role-dot" aria-hidden="true"></span><strong>${esc(roleLabel(role))}</strong><span class="role-status">${esc(roleStatusText(row.status))}</span>${row.last_status ? `<span class="role-last">Last: ${esc(statusLabel(row.last_status))}${row.timestamp ? ` · ${esc(agenticWhen(row.timestamp))}` : ""}</span>` : ""}</button>`;
   };
   const extras = ["research_librarian", "experiment_designer", "memory_curator", "result_auditor"];
-  return `<section class="panel activity-panel"><div class="panel-heading"><h2>AGENT ACTIVITY</h2><details class="role-more" data-keep="roles"><summary>4 more roles + training worker</summary><div class="extra-roles">${extras.map((role) => `<button type="button" data-role="${esc(role)}"><span>${esc(roleLabel(role))}</span><span>${esc(roleStatusText((byRole.get(role) || {}).status))}</span></button>`).join("")}<p class="worker-note">Training is a separate process.</p></div></details></div><div class="role-flow">${primaryRoles.map(chip).join("")}</div>${!activity.activity_available ? `<p class="worker-note">Live activity records unavailable; historical records shown.</p>` : ""}</section>`;
+  const working = rows.filter(row => row.status === "active");
+  const headline = working.length ? `${working.map(row => roleLabel(row.role)).join(", ")} working now` : activity.campaign_status === "training" ? "Training worker is running" : ["finished", "cancelled"].includes(activity.campaign_status) ? "Research ended · no active agents" : `${statusLabel(activity.campaign_status)} · no model call in progress`;
+  return `<section class="panel activity-panel"><div class="panel-heading"><h2>AGENT ACTIVITY</h2><details class="role-more" data-keep="roles"><summary>All roles</summary><div class="extra-roles">${extras.map((role) => `<button type="button" data-role="${esc(role)}"${!(byRole.get(role) || {}).event_id ? " disabled" : ""}><span>${esc(roleLabel(role))}</span><span>${esc(roleStatusText((byRole.get(role) || {}).status))}</span></button>`).join("")}<p class="worker-note">Training runs in a separate process.</p></div></details></div><p class="activity-now" role="status">${esc(headline)}</p><div class="role-flow">${primaryRoles.map(chip).join("")}</div>${!activity.activity_available ? `<p class="worker-note">Live call records unavailable; showing recorded history.</p>` : ""}</section>`;
 }
 
 function gapChart(title, points, field, caption) {
@@ -1220,12 +1231,13 @@ function gapChart(title, points, field, caption) {
   const maxX = Math.max(...rows.map((row) => row.epoch));
   const values = usable.map((row) => row.cell.value);
   const lo = Math.min(...values), hi = Math.max(...values);
-  const pad = Math.max((hi - lo) * .12, Math.abs(hi) * .03, .01);
+  const retrieval = field.startsWith("fixed_bank_");
+  const pad = Math.max((hi - lo) * .12, Math.abs(hi) * .03, retrieval ? .000001 : .01);
   const minY = lo >= 0 ? Math.max(0, lo - pad) : lo - pad;
   const maxY = hi + pad;
   const xOf = (epoch) => left + (maxX === minX ? (width - left - right) / 2 : (epoch - minX) / (maxX - minX) * (width - left - right));
   const yOf = (value) => top + (maxY - value) / (maxY - minY) * (height - top - bottom);
-  const tick = (value) => field.startsWith("fixed_bank_") ? `${(value * 100).toFixed(1)}%` : value.toFixed(2);
+  const tick = (value) => retrieval ? `${(value * 100).toFixed(hi < .01 ? 3 : 1)}%` : value.toFixed(2);
   const grid = [maxY, (maxY + minY) / 2, minY].map((v) => `<line x1="${left}" x2="${width - right}" y1="${yOf(v).toFixed(1)}" y2="${yOf(v).toFixed(1)}" stroke="var(--border-default)"/><text x="${left - 12}" y="${(yOf(v) + 5).toFixed(1)}" text-anchor="end" font-size="14" fill="var(--text-muted)">${tick(v)}</text>`).join("");
   const allEpochs = [...new Set(rows.map((row) => row.epoch))];
   const ticks = allEpochs.length <= 6 ? allEpochs : [allEpochs[0], allEpochs[Math.floor(allEpochs.length / 2)], allEpochs[allEpochs.length - 1]];
@@ -1251,6 +1263,8 @@ function jobPicker(camp) {
 function jobCharts(camp) {
   const metrics = state.jobMetrics;
   const picker = jobPicker(camp);
+  if (state.jobLoading) return `${picker}<section class="panel" role="status">Loading selected training curves…</section>`;
+  if (state.jobError) return `${picker}<section class="panel"><p class="error">${esc(state.jobError)}</p><button type="button" id="retry-job">Retry training curves</button></section>`;
   if (!metrics) return `${picker}<section class="panel">${missing("Selected training history")}</section>`;
   const cap = `${metrics.candidate_id || "Unassigned"} / ${metrics.fidelity || "unknown"} / seed ${metrics.seed ?? "unknown"} / ${metrics.epochs_completed ?? "?"} of ${metrics.epochs_budget ?? "?"} epochs · ${metrics.job_id} · ${statusLabel(metrics.status)}`;
   const field = state.showTop5 ? "fixed_bank_top5" : "fixed_bank_top1";
@@ -1262,18 +1276,88 @@ function healthLine(health) {
   return { alive: `Process alive${health.process_state ? ` (${health.process_state})` : ""}`, zombie: "Zombie process · interrupted view", exited: "Process exited", missing: "No research process", unknown: "Process state unknown" }[health.process_liveness] || "Process state unknown";
 }
 
+function recordedProse(text) {
+  const source = typeof text === "string" ? text : JSON.stringify(text);
+  if (source.length <= 360) return `<p>${esc(source)}</p>`;
+  return `<p>${esc(source.slice(0, 360))}…</p><details class="recorded-prose"><summary>Read full recorded text</summary><p>${esc(source)}</p></details>`;
+}
+
 function eventDetail(event, camp) {
   const close = `<button type="button" class="detail-close" id="close-detail">Close details</button>`;
-  if (!event) return `${close}<p class="detail-label">STEP DETAILS</p>${missing("Selected event")}`;
-  const reason = event.reason_zh || event.detail || "";
+  if (!event) return `${close}<p class="detail-label">STEP DETAILS</p><p>Select a recorded step to inspect its evidence and outcome.</p>`;
+  const reason = event.rationale || event.reason_zh || event.detail || "";
   const parts = decisionParts(typeof reason === "string" ? reason : "");
-  const observed = parts.find((row) => row.label === "观察");
-  const rationale = parts.filter((row) => !["观察", "下一步"].includes(row.label)).map((row) => row.body).join("\n");
+  const observed = event.observation || parts.find(row => row.label === "观察")?.body;
   const section = (title, body) => `<section class="detail-section"><h3>${title}</h3>${body}</section>`;
-  const refs = event.artifact_refs || [];
+  const evidence = event.evidence || [];
+  const evidenceHtml = evidence.map(row => `<div class="evidence-card"><strong>${esc(row.evidence_id)}</strong>${row.available === false ? `<p>The referenced record is unavailable.</p>` : `<p>${esc([row.candidate_id, row.fidelity, row.evaluation_valid === true ? "Valid evaluation" : row.kind].filter(Boolean).join(" / "))}</p>${typeof row.fixed_bank_top1 === "number" ? `<p>Fixed-gallery Top-1: ${(row.fixed_bank_top1 * 100).toFixed(3)}%</p>` : ""}${typeof row.delta_vs_control_pp === "number" ? `<p>Delta vs. control: ${esc(row.delta_vs_control_pp)} pp</p>` : ""}${row.job_id ? `<button type="button" class="text-action" data-inspect-job="${esc(row.job_id)}">View training curves →</button>` : ""}`}</div>`).join("");
+  const refs = [...new Set([...(event.artifact_refs || []), ...(event.required_artifact_refs || [])])];
+  const refsHtml = refs.map(ref => /^art_[a-zA-Z0-9]+$/.test(ref) ? `<button type="button" class="artifact-ref text-action" data-preview-artifact="${esc(ref)}">Open record · ${esc(ref)}</button>` : `<span class="artifact-ref" title="${esc(ref)}">${esc(String(ref).split("/").slice(-2).join("/"))}</span>`).join("");
+  const candidates = processEvents(state.timeline?.events || []);
+  const index = candidates.findIndex(row => row.event_id === event.event_id);
+  const previousId = event.event_type === "decision" ? event.previous_recorded_decision?.event_id : candidates[index - 1]?.event_id;
+  const nextId = event.event_type === "decision" ? event.next_recorded_decision?.event_id : candidates[index + 1]?.event_id;
+  const nav = `<nav class="detail-nav" aria-label="Step navigation"><button type="button" data-go-step="${esc(previousId || "")}"${!previousId ? " disabled" : ""}>← Previous</button><button type="button" data-go-step="${esc(nextId || "")}"${!nextId ? " disabled" : ""}>Next →</button></nav>`;
+  let outcome = event.error ? `<p class="error">${esc(event.error)}</p>` : event.executed === false ? `<p>This decision was recorded but has not been executed.</p>` : event.event_type === "decision" ? `<p>${event.executed === true ? "Action dispatched." : "Execution status was not recorded."}${event.stop_reason ? ` Termination reason: ${esc(event.stop_reason)}.` : ""}</p>` : `<p>${esc(statusLabel(event.status))}${event.elapsed_seconds != null ? ` · ${Number(event.elapsed_seconds).toFixed(1)} seconds` : ""}</p>`;
+  const next = event.next_recorded_decision;
+  const explicitNext = recordedNext(reason);
+  const nextHtml = explicitNext ? `<p>${esc(explicitNext)}</p>` : next ? `<button type="button" class="text-action" data-go-step="${esc(next.event_id)}">${esc(next.decision_id)} · ${esc(eventTitle(next))} →</button><p class="detail-note">Next recorded decision in this campaign.</p>` : ["finished", "cancelled"].includes(camp.status) ? `<p>Research ended: ${esc(camp.termination_reason || camp.status)}. No further decision is recorded.</p>` : `<p>No later decision recorded yet.</p>`;
+  const action = event.action ? `<p>${esc(eventTitle(event))}${event.candidate_id ? ` · ${esc(event.candidate_id)}` : ""}${event.question_id ? ` / ${esc(event.question_id)}` : ""}</p>` : event.tool ? `<p>${esc(event.tool)}</p>` : "";
+  const recordIdentity = [event.decision_id, event.task_id, event.call_id, event.job_id].filter(Boolean).map(id => `<span>${esc(id)}</span>`).join("");
   const health = camp.health || {};
-  const budget = camp.budget || {};
-  return `${close}<p class="detail-label">STEP DETAILS</p><h2>${esc(eventTitle(event))}</h2><span class="status-chip ${esc(event.status)}">${esc(statusLabel(event.status))}</span><div class="detail-identity"><span>${esc(roleLabel(event.role))} · ${esc(agenticWhen(event.timestamp))}</span>${event.candidate_id ? `<span>Candidate ${esc(event.candidate_id)}${event.attempt_id ? ` / attempt ${esc(event.attempt_id)}` : ""}</span>` : ""}</div>${section("Observed evidence", observed ? `<p>${esc(observed.body)}</p>` : missing("Observation"))}${section("Current question / rationale", reason ? `<p>${esc(rationale || (typeof reason === "string" ? reason : JSON.stringify(reason)))}</p>` : missing("Rationale"))}${section("Tools & changes", event.tool ? `<p>${esc(event.tool)}</p>` : missing("Tool record"))}${section("Execution / review result", event.error ? `<p class="error">${esc(event.error)}</p>` : `<p>${esc(statusLabel(event.status))}${event.executed === false ? " · Decision not executed" : ""}</p>`)}${section("Evidence & artifacts", refs.length ? refs.map((ref) => `<span class="artifact-ref">${esc(ref)}</span>`).join("") : missing("Artifact references"))}${section("Next decision", recordedNext(reason) ? `<p>${esc(recordedNext(reason))}</p>` : missing("Next-step condition"))}<footer class="detail-health"><span>${esc(healthLine(health))}</span><span>Last progress: ${esc(health.last_progress_at ? agenticWhen(health.last_progress_at) : "unknown")}</span><span>Page connection: ${esc(state.connectionStatus || "Connected")}</span><span>LLM calls: ${esc(budget.llm_calls ?? "?")} / ${esc(budget.max_llm_calls ?? "?")}</span><span>Updated: ${esc(agenticWhen(camp.updated_at) || "unknown")}</span></footer>`;
+  const preview = state.artifactPreview?.step === event.event_id ? artifactPreviewHtml(state.artifactPreview) : "";
+  return `${close}<p class="detail-label">STEP DETAILS</p>${nav}<h2>${esc(eventTitle(event))}</h2><span class="status-chip ${esc(event.status)}">${esc(statusLabel(event.status))}</span><div class="detail-identity"><span>${esc(event.event_type === "training_job" ? "Training worker" : roleLabel(event.role))} · ${esc(event.timestamp ? agenticWhen(event.timestamp) : "Time not recorded")}</span>${recordIdentity}</div>${observed || evidenceHtml ? section("Evidence used", `${observed ? `<p>${esc(observed)}</p>` : ""}${evidenceHtml}`) : ""}${reason ? section("Decision rationale", recordedProse(reason)) : ""}${action ? section("Action chosen", action) : ""}${event.expected_information ? section("Expected outcome", recordedProse(event.expected_information)) : ""}${section("Recorded outcome", outcome)}${refsHtml ? section("Linked records", refsHtml) : ""}${preview}${event.event_type === "decision" ? section("What happened next", nextHtml) : ""}${!reason && !evidenceHtml && !action && !refs.length ? `<p class="detail-note">This is a lifecycle record. The log records its identity and status; no decision rationale was attached.</p>` : ""}<footer class="detail-health"><span>${esc(healthLine(health))}</span><span>Page: ${esc(state.connectionStatus || "Connected")}</span><span>Last update: ${esc(agenticWhen(camp.updated_at) || "unknown")}</span></footer>`;
+}
+
+function artifactPreviewHtml(preview) {
+  const header = `<div class="record-heading"><h3>Record preview</h3><button type="button" class="text-action" id="close-record">Close</button></div>`;
+  if (preview.loading) return `<section class="detail-section" aria-live="polite">${header}<p>Loading recorded evidence…</p></section>`;
+  if (preview.error) return `<section class="detail-section">${header}<p class="error">${esc(preview.error)}</p></section>`;
+  const row = preview.data;
+  const summary = row.body?.summary_zh || row.body?.payload?.summary_zh;
+  return `<section class="detail-section record-preview">${header}<p>${esc(row.kind)} / ${esc(row.filename)} · ${esc(row.verification_status)}</p>${row.reason ? `<p class="missing">${esc(row.reason)}</p>` : ""}${summary ? `<p>${esc(summary)}</p>` : ""}${row.body ? `<details><summary>View recorded fields</summary><pre>${esc(JSON.stringify(row.body, null, 2))}</pre></details>` : ""}</section>`;
+}
+
+function mergeTimeline(pages, previous) {
+  const base = pages[0];
+  const merged = new Map((previous?.campaign_id === base.campaign_id ? previous.events : []).map(row => [row.event_id, row]));
+  pages.forEach(page => (page.events || []).forEach(row => merged.set(row.event_id, row)));
+  const events = [...merged.values()].sort((a, b) => a.timestamp - b.timestamp || a.event_id.localeCompare(b.event_id));
+  const positions = new Set(events.map(row => row.position).filter(Number.isInteger));
+  let next = 0;
+  while (positions.has(next) && next < Number(base.total)) next += 1;
+  return { ...base, events, has_more: merged.size < Number(base.total), next_cursor: merged.size < Number(base.total) ? String(next) : null };
+}
+
+async function selectWorkspaceEvent(id) {
+  if (!id) return;
+  const campaign = state.agenticFocus;
+  state.artifactPreview = null;
+  state.selectedStep = id;
+  state.resetDetailScroll = true;
+  state.detailOpen = isNarrowWorkspace();
+  if (!state.timeline?.events.some(row => row.event_id === id)) {
+    try {
+      const page = await workspaceJSON(apiUrl("/api/agentic_timeline", { campaign, focus: id, limit: "20" }));
+      if (campaign !== state.agenticFocus || state.selectedStep !== id) return;
+      state.timeline = mergeTimeline([page], state.timeline);
+    } catch (err) { state.workspaceNotice = `Step unavailable: ${err.message}`; }
+  }
+  const hit = state.timeline?.events.find(row => row.event_id === id);
+  writeRoute(); paintWorkspaceShell();
+  if (hit?.job_id && hit.job_id !== state.selectedJob) await selectWorkspaceJob(hit.job_id);
+}
+
+function workspaceHeading(camp) {
+  const objective = camp.objective || camp.campaign_id;
+  const short = firstClause(objective) || objective;
+  const title = short.length > 140 ? short.slice(0, 137) + "…" : short;
+  return `<h1 title="${esc(objective)}">${esc(title)}</h1>${objective !== title ? `<details class="full-objective" data-keep="objective"><summary>Read full objective</summary><p>${esc(objective)}</p></details>` : ""}`;
+}
+
+function campaignRecordsHtml() {
+  const rows = state.timeline?.artifact_index || [];
+  return `<section class="panel campaign-records"><h2>Research records</h2><p class="detail-note">Recorded analysis, audits and approved experiments. Records are verified when opened.</p><div class="record-list">${rows.map(row => `<button type="button" class="record-link" data-preview-artifact="${esc(row.artifact_id)}"${row.event_id ? ` data-record-step="${esc(row.event_id)}"` : ""}><strong>${esc(statusLabel(row.kind))}${row.candidate_id ? ` · ${esc(row.candidate_id)}` : ""}</strong><span>${esc(row.filename)}</span></button>`).join("") || `<p class="muted">No registered research records yet.</p>`}</div></section>`;
 }
 
 function paintWorkspaceShell() {
@@ -1286,7 +1370,7 @@ function paintWorkspaceShell() {
   search.placeholder = "Find a campaign…";
   const query = search.value.trim().toLowerCase();
   const visible = lists.filter((row) => `${row.objective || ""} ${row.campaign_id} ${row.status}`.toLowerCase().includes(query)).sort((a, b) => (b.campaign_id === state.agenticFocus) - (a.campaign_id === state.agenticFocus) || Number(b.updated_at) - Number(a.updated_at));
-  listEl.innerHTML = visible.map((row) => `<button type="button" class="run-item${row.campaign_id === state.agenticFocus ? " active" : ""}" data-agentic-select="${esc(row.campaign_id)}" aria-pressed="${row.campaign_id === state.agenticFocus}"><span class="campaign-name"><span class="campaign-dot" aria-hidden="true"></span><span class="run-name" title="${esc(row.objective || row.campaign_id)}">${esc(row.objective || row.campaign_id)}</span></span><span class="run-meta">${esc(WORKSPACE_STATUS[row.status] || statusLabel(row.status))}${row.campaign_id === state.agenticFocus ? " · current" : ""}</span></button>`).join("") || `<p class="muted">${lists.length ? "No matching campaigns." : "No research campaigns yet."}</p>`;
+  listEl.innerHTML = visible.map((row) => `<button type="button" class="run-item${row.campaign_id === state.agenticFocus ? " active" : ""}" data-agentic-select="${esc(row.campaign_id)}" aria-pressed="${row.campaign_id === state.agenticFocus}"><span class="campaign-name"><span class="campaign-dot" aria-hidden="true"></span><span class="run-name" title="${esc(row.objective || row.campaign_id)}">${esc(row.objective || row.campaign_id)}</span></span><span class="campaign-code">${esc(row.campaign_id)}</span><span class="run-meta">${esc(WORKSPACE_STATUS[row.status] || statusLabel(row.status))}${row.campaign_id === state.agenticFocus ? " · current" : ""}</span></button>`).join("") || `<p class="muted">${lists.length ? "No matching campaigns." : "No research campaigns yet."}</p>`;
   if (camp) listEl.innerHTML += `<p class="nav-heading candidate-heading">CANDIDATES</p><div class="candidate-list">${(camp.candidates || []).map((row) => `<button type="button" class="${row.parent_candidate_id ? "tree-child " : ""}${row.candidate_id === state.selectedCandidate ? "active" : ""}" data-candidate="${esc(row.candidate_id)}"><strong>${esc(row.candidate_id)} · ${esc(statusLabel(row.status))}</strong><span class="run-meta">${row.parent_candidate_id ? `From ${esc(row.parent_candidate_id)}` : "Lineage not recorded"}${row.attempt_id ? ` / ${esc(row.attempt_id)}` : ""}</span></button>`).join("")}</div>`;
   document.getElementById("side-context").innerHTML = camp ? `<strong>${esc(scopeLabel(camp).split(" / ")[0])}</strong><p>${esc(scopeLabel(camp).split(" / ").slice(1).join(" / "))}</p><p>Research metrics follow the recorded evaluation contract.</p>` : "";
   document.getElementById("demo-indicator").hidden = !state.demo;
@@ -1298,7 +1382,8 @@ function paintWorkspaceShell() {
     return;
   }
   const events = state.timeline?.events || [];
-  const compactAll = processEvents(events);
+  const allSteps = processEvents(events);
+  const compactAll = state.processFilter === "decisions" ? allSteps.filter(row => row.event_type === "decision") : state.processFilter === "training" ? allSteps.filter(row => row.event_type === "training_job") : state.processFilter === "roles" ? allSteps.filter(row => row.event_type.startsWith("task_")) : state.processFilter === "issues" ? events.filter(row => ["failed", "partial", "blocked", "interrupted"].includes(row.status) || row.error) : allSteps;
   const selected = events.find((row) => row.event_id === state.selectedStep) || defaultProcessEvent(events);
   if (selected && !state.selectedStep) state.selectedStep = selected.event_id;
   if (!state.selectedCandidate && selected?.candidate_id) state.selectedCandidate = selected.candidate_id;
@@ -1313,20 +1398,18 @@ function paintWorkspaceShell() {
   const terminal = ["finished", "cancelled"].includes(camp.status);
   const tabs = `<nav class="workspace-tabs" aria-label="Research view">${[["process", "Process"], ["experiments", "Experiments"], ["code", "Code & artifacts"]].map(([id, label]) => `<button type="button" data-tab="${id}" class="${state.agenticTab === id ? "active" : ""}" aria-pressed="${state.agenticTab === id}">${label}</button>`).join("")}</nav>`;
   const codeRows = camp.candidates || [];
-  main.innerHTML = `<section class="workspace"><header class="workspace-head"><div class="workspace-heading"><p class="workspace-kicker">AUTONOMOUS RESEARCH / CODE LEVEL</p><h1>${esc(camp.objective || camp.campaign_id)}</h1><p class="workspace-protocol">${esc(scopeLabel(camp))}</p></div><div class="workspace-actions"><span class="status-chip ${esc(camp.status)}">${esc(WORKSPACE_STATUS[camp.status] || statusLabel(camp.status))}</span><div class="workspace-controls"><button type="button" data-agentic-action="${paused ? "resume" : "pause"}" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy || terminal ? " disabled" : ""}>${paused ? "Resume" : camp.pause_after_step ? "Pause requested" : "Pause after step"}</button><details class="workspace-settings" data-keep="settings"><summary>Settings</summary><div class="settings-popover"><h3>Research budget</h3><dl><dt>Training jobs</dt><dd>${esc(budget.training_jobs ?? "?")} / ${esc(budget.max_training_jobs ?? "?")}</dd><dt>LLM calls</dt><dd>${esc(budget.llm_calls ?? "?")} / ${esc(budget.max_llm_calls ?? "?")}</dd><dt>GPU seconds left</dt><dd>${esc(budget.gpu_seconds_left ?? "unknown")}</dd><dt>API cost (USD)</dt><dd>${esc(budget.api_usd ?? "not recorded")}</dd></dl><button type="button" data-agentic-action="stop" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy || !camp.live_job ? " disabled" : ""}>Stop current training job</button><p class="muted">Stops the selected campaign's live training job. The campaign is retained.</p></div></details></div></div>${tabs}</header><div class="workspace-body"><div class="workspace-center" id="workspace-center">${roleFlowHtml(state.timeline?.activity || {})}${state.agenticTab === "process" ? `<section class="panel process-panel"><div class="panel-heading"><h2>Research process</h2><span class="muted">${compactAll.length} recorded steps</span></div><ol class="process-list">${compact.map(processRow).join("") || `<li class="muted">No process steps recorded.</li>`}</ol></section>${jobCharts(camp)}<details class="all-events" data-keep="all-events"><summary>All events & call records (${state.timeline?.total ?? events.length})</summary><ol class="timeline-list">${events.map((row) => `<li class="${row.event_id === selected?.event_id ? "selected" : ""}"><button type="button" class="event" data-step="${esc(row.event_id)}"><strong>${esc(eventTitle(row))}</strong><span class="muted">${esc(roleLabel(row.role))} / ${esc(statusLabel(row.status))} / ${esc(agenticWhen(row.timestamp))}</span></button></li>`).join("")}</ol>${state.timeline?.has_more ? `<button type="button" id="load-more-events">Load more events</button>` : ""}${(state.timeline?.diagnostics || []).map((row) => `<p class="missing">${esc(JSON.stringify(row))}</p>`).join("")}</details><button type="button" class="new-events${state.pendingEvents ? " show" : ""}" id="jump-latest">${state.pendingEvents} new events</button>` : state.agenticTab === "experiments" ? agenticBody(camp) : codeRows.map((row) => `<details class="panel code-panel" data-keep="candidate-${esc(row.candidate_id)}"${row.candidate_id === state.selectedCandidate ? " open" : ""}><summary>${esc(row.candidate_id)} / ${esc(statusLabel(row.status))}${row.source_truncated ? " · preview truncated" : ""}</summary>${row.review_summary ? `<p class="agentic-prose">${renderProse(row.review_summary)}</p>` : ""}<pre class="agentic-source">${esc(state.sourceFull[`${camp.campaign_id}/${row.candidate_id}`] || row.source || (row.source_available ? "Source is available on request." : "No source recorded."))}</pre>${(row.source_truncated || (row.source_available && !row.source_loaded)) && !Object.prototype.hasOwnProperty.call(state.sourceFull, `${camp.campaign_id}/${row.candidate_id}`) ? `<button type="button" data-load-source="${esc(row.candidate_id)}">${row.source_truncated ? "Load full source" : "Load source"}</button>` : ""}</details>`).join("") || `<section class="panel">${missing("Candidate source")}</section>`}</div><aside class="workspace-detail${state.detailOpen ? " is-open" : ""}" id="workspace-detail" aria-label="Step details">${eventDetail(selected, camp)}</aside></div><p class="workspace-rank">${bestLine}</p>${camp.termination_reason ? `<p class="workspace-note">Termination: ${esc(camp.termination_reason)}</p>` : ""}</section>`;
+  main.innerHTML = `<section class="workspace"><header class="workspace-head"><div class="workspace-heading"><p class="workspace-kicker">AUTONOMOUS RESEARCH / CODE LEVEL</p>${workspaceHeading(camp)}<p class="workspace-protocol">${esc(scopeLabel(camp))}</p></div><div class="workspace-actions"><span class="status-chip ${esc(camp.status)}">${esc(WORKSPACE_STATUS[camp.status] || statusLabel(camp.status))}</span><div class="workspace-controls"><button type="button" data-agentic-action="${paused ? "resume" : "pause"}" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy || terminal ? " disabled" : ""}>${paused ? "Resume" : camp.pause_after_step ? "Pause requested" : "Pause after step"}</button><details class="workspace-settings" data-keep="settings"><summary>Settings</summary><div class="settings-popover"><h3>Research budget</h3><dl><dt>Training jobs</dt><dd>${esc(budget.training_jobs ?? "?")} / ${esc(budget.max_training_jobs ?? "?")}</dd><dt>LLM calls</dt><dd>${esc(budget.llm_calls ?? "?")} / ${esc(budget.max_llm_calls ?? "?")}</dd><dt>GPU seconds left</dt><dd>${esc(budget.gpu_seconds_left ?? "unknown")}</dd><dt>API cost (USD)</dt><dd>${esc(budget.api_usd ?? "not recorded")}</dd></dl><button type="button" data-agentic-action="stop" data-campaign="${esc(camp.campaign_id)}"${state.controlBusy || !camp.live_job ? " disabled" : ""}>Stop current training job</button><p class="muted">Stops the selected campaign's live training job. The campaign is retained.</p></div></details></div></div>${tabs}</header>${state.workspaceNotice ? `<p class="workspace-feedback" role="status">${esc(state.workspaceNotice)}</p>` : ""}<div class="workspace-body"><div class="workspace-center" id="workspace-center">${roleFlowHtml(state.timeline?.activity || {})}${state.agenticTab === "process" ? `<section class="panel process-panel"><div class="panel-heading"><h2>Research process</h2><button type="button" class="text-action" id="view-latest">Latest step →</button></div><div class="process-toolbar"><label>Show <select id="process-filter">${[["all", "All steps"], ["decisions", "Decisions"], ["training", "Training"], ["roles", "Role outcomes"], ["issues", "Needs attention"]].map(([id, name]) => `<option value="${id}"${state.processFilter === id ? " selected" : ""}>${name}</option>`).join("")}</select></label><span>${compact.length ? `${start + 1}–${start + compact.length} of ${compactAll.length}` : "0"} loaded steps</span></div><ol class="process-list">${compact.map(processRow).join("") || `<li class="muted">No process steps recorded.</li>`}</ol><div class="process-pagination"><button type="button" data-go-step="${esc(compactAll[start - 1]?.event_id || "")}"${start <= 0 ? " disabled" : ""}>← Earlier steps</button><button type="button" data-go-step="${esc(compactAll[start + compact.length]?.event_id || "")}"${start + compact.length >= compactAll.length ? " disabled" : ""}>Later steps →</button>${state.timeline?.has_more ? `<button type="button" id="load-process-history">Load missing history</button>` : ""}</div></section>${jobCharts(camp)}<details class="all-events" data-keep="all-events"><summary>All events & call records (${state.timeline?.total ?? events.length})</summary><ol class="timeline-list">${events.map((row) => `<li class="${row.event_id === selected?.event_id ? "selected" : ""}"><button type="button" class="event" data-step="${esc(row.event_id)}"><strong>${esc(eventTitle(row))}</strong><span class="muted">${esc(roleLabel(row.role))} / ${esc(statusLabel(row.status))} / ${esc(agenticWhen(row.timestamp))}</span></button></li>`).join("")}</ol>${state.timeline?.has_more ? `<button type="button" id="load-more-events">Load more events</button>` : ""}${(state.timeline?.diagnostics || []).map((row) => `<p class="missing">${esc(JSON.stringify(row))}</p>`).join("")}</details><button type="button" class="new-events${state.pendingEvents ? " show" : ""}" id="jump-latest">${state.pendingEvents} new events</button>` : state.agenticTab === "experiments" ? agenticBody(camp) : campaignRecordsHtml() + (codeRows.map((row) => `<details class="panel code-panel" data-keep="candidate-${esc(row.candidate_id)}"${row.candidate_id === state.selectedCandidate ? " open" : ""}><summary>${esc(row.candidate_id)} / ${esc(statusLabel(row.status))}${row.source_truncated ? " · preview truncated" : ""}</summary>${row.review_summary ? `<p class="agentic-prose">${renderProse(row.review_summary)}</p>` : ""}<pre class="agentic-source">${esc(state.sourceFull[`${camp.campaign_id}/${row.candidate_id}`] || row.source || (row.source_available ? "Source is available on request." : "No source recorded."))}</pre>${(row.source_truncated || (row.source_available && !row.source_loaded)) && !Object.prototype.hasOwnProperty.call(state.sourceFull, `${camp.campaign_id}/${row.candidate_id}`) ? `<button type="button" data-load-source="${esc(row.candidate_id)}">${row.source_truncated ? "Load full source" : "Load source"}</button>` : ""}</details>`).join("") || `<section class="panel">${missing("Candidate source")}</section>`)}</div><aside class="workspace-detail${state.detailOpen ? " is-open" : ""}" id="workspace-detail" aria-label="Step details">${eventDetail(selected, camp)}</aside></div><p class="workspace-rank">${bestLine}</p>${camp.termination_reason ? `<p class="workspace-note">Termination: ${esc(camp.termination_reason)}</p>` : ""}</section>`;
   bindAgentic();
   main.querySelectorAll("[data-tab]").forEach((button) => button.onclick = () => { state.agenticTab = button.dataset.tab; state.detailOpen = false; writeRoute(); paintWorkspaceShell(); });
-  main.querySelectorAll("[data-step]").forEach((button) => button.onclick = async () => {
-    state.selectedStep = button.dataset.step;
-    state.detailOpen = isNarrowWorkspace();
-    const hit = events.find((row) => row.event_id === state.selectedStep);
-    if (hit?.job_id && hit.job_id !== state.selectedJob) await selectWorkspaceJob(hit.job_id);
-    writeRoute(); paintWorkspaceShell();
-  });
+  main.querySelectorAll("[data-step],[data-go-step]").forEach(button => button.onclick = () => selectWorkspaceEvent(button.dataset.step || button.dataset.goStep));
+  const processFilter = document.getElementById("process-filter");
+  if (processFilter) processFilter.onchange = event => { state.processFilter = event.target.value; paintWorkspaceShell(); };
+  const latest = document.getElementById("view-latest");
+  if (latest) latest.onclick = () => { state.processFilter = "all"; state.pendingEvents = 0; selectWorkspaceEvent(defaultProcessEvent(events)?.event_id); };
   main.querySelectorAll("[data-role]").forEach((button) => button.onclick = () => {
     const role = button.dataset.role;
-    const hit = [...events].reverse().find((row) => row.role === role);
-    if (hit) { state.selectedStep = hit.event_id; state.detailOpen = isNarrowWorkspace(); writeRoute(); paintWorkspaceShell(); }
+    const id = state.timeline?.activity?.roles.find(row => row.role === role)?.event_id;
+    if (id) selectWorkspaceEvent(id);
   });
   listEl.querySelectorAll("[data-candidate]").forEach((button) => button.onclick = () => { state.selectedCandidate = button.dataset.candidate; state.agenticTab = "code"; closeNavigation(); writeRoute(); paintWorkspaceShell(); });
   const picker = document.getElementById("job-select");
@@ -1335,20 +1418,17 @@ function paintWorkspaceShell() {
   if (close) close.onclick = () => { state.detailOpen = false; paintWorkspaceShell(); };
   const top5 = document.getElementById("toggle-top5");
   if (top5) top5.onclick = () => { state.showTop5 = !state.showTop5; paintWorkspaceShell(); };
-  const more = document.getElementById("load-more-events");
-  if (more) more.onclick = async () => {
+  main.querySelectorAll("#load-more-events,#load-process-history").forEach(more => more.onclick = async () => {
     const campaign = state.agenticFocus;
     const cursor = state.timeline.next_cursor;
     more.disabled = true;
     try {
       const page = await workspaceJSON(apiUrl("/api/agentic_timeline", { campaign, cursor, limit: "40" }));
       if (campaign !== state.agenticFocus) return;
-      const merged = new Map((state.timeline.events || []).map((row) => [row.event_id, row]));
-      (page.events || []).forEach((row) => merged.set(row.event_id, row));
-      state.timeline = { ...page, events: [...merged.values()].sort((a, b) => a.timestamp - b.timestamp || a.event_id.localeCompare(b.event_id)) };
+      state.timeline = mergeTimeline([page], state.timeline);
       paintWorkspaceShell();
-    } catch (err) { more.disabled = false; window.alert(err.message); }
-  };
+    } catch (err) { more.disabled = false; state.workspaceNotice = `History unavailable: ${err.message}`; paintWorkspaceShell(); }
+  });
   main.querySelectorAll("[data-load-source]").forEach((button) => button.onclick = async () => {
     const campaign = state.agenticFocus, id = button.dataset.loadSource;
     button.disabled = true;
@@ -1356,13 +1436,30 @@ function paintWorkspaceShell() {
     catch (err) { button.disabled = false; window.alert(err.message); }
   });
   const jump = document.getElementById("jump-latest");
-  if (jump) jump.onclick = () => { state.pendingEvents = 0; state.selectedStep = ""; paintWorkspaceShell(); document.querySelector(".process-panel")?.scrollIntoView({ block: "start" }); };
+  if (jump) jump.onclick = () => { state.pendingEvents = 0; state.processFilter = "all"; selectWorkspaceEvent(defaultProcessEvent(events)?.event_id); document.querySelector(".process-panel")?.scrollIntoView({ block: "start" }); };
+  main.querySelectorAll("[data-inspect-job]").forEach(button => button.onclick = async () => { await selectWorkspaceJob(button.dataset.inspectJob); document.querySelector(".job-picker")?.scrollIntoView({ block: "center" }); });
+  const retry = document.getElementById("retry-job");
+  if (retry) retry.onclick = () => selectWorkspaceJob(state.selectedJob);
+  main.querySelectorAll("[data-preview-artifact]").forEach(button => button.onclick = async () => {
+    const campaign = state.agenticFocus, id = button.dataset.previewArtifact;
+    if (button.dataset.recordStep) await selectWorkspaceEvent(button.dataset.recordStep);
+    if (campaign !== state.agenticFocus) return;
+    const step = state.selectedStep;
+    state.artifactPreview = { step, id, loading: true }; paintWorkspaceShell();
+    try {
+      const data = await workspaceJSON(apiUrl("/api/agentic_artifact", { campaign, artifact: id }));
+      if (campaign === state.agenticFocus && step === state.selectedStep && state.artifactPreview?.id === id) state.artifactPreview = { step, id, data };
+    } catch (err) { if (campaign === state.agenticFocus && step === state.selectedStep && state.artifactPreview?.id === id) state.artifactPreview = { step, id, error: err.message }; }
+    if (campaign === state.agenticFocus && step === state.selectedStep) paintWorkspaceShell();
+  });
+  const closeRecord = document.getElementById("close-record");
+  if (closeRecord) closeRecord.onclick = () => { state.artifactPreview = null; paintWorkspaceShell(); };
   restoreWorkspace(saved);
   writeRoute();
 }
 
 function statusLabel(status) {
-  return { ok: "Completed", pending: "Pending", running: "Running", active: "Active", completed: "Completed", finished: "Finished", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted", paused: "Paused", unknown: "Unknown" }[status] || String(status || "Unknown").replace(/_/g, " ");
+  return { executed: "Executed", idle: "Idle", not_called: "Not used yet", partial: "Partially completed", ok: "Accepted", pending: "Pending", running: "Running", active: "Active", completed: "Completed", finished: "Finished", failed: "Failed", cancelled: "Cancelled", interrupted: "Interrupted", paused: "Paused", unknown: "Unknown" }[status] || String(status || "Unknown").replace(/_/g, " ");
 }
 
 function eventTitle(row) {
@@ -1388,12 +1485,28 @@ function restoreWorkspace(saved) {
   main.scrollTop = saved.scroll;
   document.getElementById("sidebar").scrollTop = saved.sideScroll;
   const detail = document.getElementById("workspace-detail");
-  if (detail) detail.scrollTop = saved.detailScroll;
+  if (detail) detail.scrollTop = state.resetDetailScroll ? 0 : saved.detailScroll;
+  state.resetDetailScroll = false;
   if (saved.focus) {
-    const el = saved.focus.id ? document.getElementById(saved.focus.id) : [...document.querySelectorAll("button[data-step],button[data-tab],button[data-role],button[data-candidate],button[data-agentic-select]")].find((node) => Object.keys(saved.focus.data).length && Object.entries(saved.focus.data).every(([key, value]) => node.dataset[key] === value));
+    const el = saved.focus.id ? document.getElementById(saved.focus.id) : [...document.querySelectorAll("button[data-step],button[data-tab],button[data-role],button[data-candidate],button[data-agentic-select],button[data-go-step],button[data-inspect-job],button[data-preview-artifact]")].find((node) => Object.keys(saved.focus.data).length && Object.entries(saved.focus.data).every(([key, value]) => node.dataset[key] === value));
     if (el) el.focus({ preventScroll: true });
   }
 }
+
+document.addEventListener("keydown", event => {
+  if (!isNarrowWorkspace() || !state.detailOpen) return;
+  const panel = document.getElementById("workspace-detail");
+  if (event.key === "Escape") {
+    event.preventDefault(); state.detailOpen = false; paintWorkspaceShell();
+    [...main.querySelectorAll("[data-step]")].find(node => node.dataset.step === state.selectedStep)?.focus({ preventScroll: true });
+  } else if (event.key === "Tab" && panel) {
+    const nodes = [...panel.querySelectorAll("button:not(:disabled),summary,[tabindex='0']")].filter(node => node.getClientRects().length);
+    const first = nodes[0], last = nodes[nodes.length - 1];
+    if (!nodes.length) return;
+    if (event.shiftKey && (document.activeElement === first || !panel.contains(document.activeElement))) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && (document.activeElement === last || !panel.contains(document.activeElement))) { event.preventDefault(); first.focus(); }
+  }
+});
 
 function closeNavigation() {
   document.getElementById("sidebar").classList.remove("open");
@@ -1411,13 +1524,17 @@ async function selectWorkspaceJob(job) {
   const campaign = state.agenticFocus;
   state.selectedJob = job;
   state.jobMetrics = null;
+  state.jobError = "";
+  state.jobLoading = true;
+  if (state.surface === "agentic") paintWorkspaceShell();
   state.pollSeq += 1;
   state.agenticAbort?.abort();
   writeRoute();
   try {
     const metrics = await workspaceJSON(apiUrl("/api/agentic_job", { campaign, job }));
     if (state.agenticFocus === campaign && state.selectedJob === job) state.jobMetrics = metrics;
-  } catch (err) { if (state.agenticFocus === campaign && state.selectedJob === job) window.alert(err.message); }
+  } catch (err) { if (state.agenticFocus === campaign && state.selectedJob === job) state.jobError = err.message; }
+  finally { if (state.agenticFocus === campaign && state.selectedJob === job) { state.jobLoading = false; if (state.surface === "agentic") paintWorkspaceShell(); } }
 }
 
 async function renderAgenticWorkspace() {

@@ -584,12 +584,44 @@ body[data-surface="agentic"] main { padding: 28px; overflow: auto; }
 .role-chip:last-child::after { display: none; }
 .role-chip strong { font-size: 14px; overflow-wrap: anywhere; }
 .role-dot { height: 7px; width: 7px; border-radius: 50%; background: #a6b0ac; margin-top: 7px; }
-.role-chip.completed .role-dot, .role-chip.active .role-dot { background: var(--accent); }
+.role-chip.active .role-dot { background: var(--accent); }
+.role-chip.idle .role-dot { background: transparent; border: 1px solid #a6b0ac; }
+.role-chip.blocked .role-dot, .role-chip.partial .role-dot, .role-chip.interrupted .role-dot { background: var(--copper); }
 .role-chip.failed .role-dot { background: var(--copper); }
 .role-chip.active { border-color: var(--accent); background: var(--accent-subtle); }
 .role-chip.active .role-dot { box-shadow: 0 0 0 4px rgb(36 111 102 / 16%); }
 .role-status { grid-column: 2; font-size: 11px; color: var(--text-muted); }
 .role-chip.active .role-status { color: var(--accent); }
+.role-last { grid-column: 2; font-size: 10px; color: var(--text-muted); font-weight: 400; }
+.activity-now { font-size: 12px; color: var(--text-secondary); margin: -5px 0 12px; }
+.role-chip { min-height: 80px; }
+.campaign-code { display: block; font-size: 10px; color: var(--text-muted); overflow-wrap: anywhere; margin: 4px 0; }
+.full-objective { font-size: 12px; margin: 8px 0 12px; }
+.full-objective summary { color: var(--accent); cursor: pointer; }
+.full-objective p { color: var(--text-secondary); line-height: 1.65; white-space: pre-wrap; margin: 12px 0; }
+.workspace-heading h1 { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.workspace-feedback { border: 1px solid var(--border-default); border-radius: 6px; background: var(--accent-subtle); padding: 12px 16px; font-size: 12px; margin: 0 0 16px; }
+.process-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 12px; font-size: 11px; color: var(--text-muted); }
+.process-toolbar label { display: flex; align-items: center; gap: 8px; }
+.process-toolbar select { height: 30px; font-size: 12px; max-width: 170px; }
+.process-pagination { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border-default); }
+.process-pagination button, .detail-nav button { font-size: 11px; height: 30px; padding: 0 9px; }
+.detail-nav { display: flex; justify-content: space-between; gap: 8px; margin: 8px 0 18px; }
+.text-action { color: var(--accent); background: transparent; border: 0; height: auto; padding: 4px 0; font-size: 12px; text-align: left; line-height: 1.5; overflow-wrap: anywhere; }
+.text-action:hover { text-decoration: underline; background: transparent; }
+.evidence-card { background: #f8f9f6; border: 1px solid var(--border-default); border-radius: 5px; margin: 10px 0; padding: 10px; font-size: 11px; }
+.evidence-card strong { font-size: 11px; overflow-wrap: anywhere; }
+.detail-section .detail-note, .detail-note { font-size: 11px; color: var(--text-muted); line-height: 1.6; }
+.recorded-prose { font-size: 11px; margin-top: 8px; }
+.recorded-prose summary { cursor: pointer; color: var(--accent); margin-bottom: 8px; }
+.record-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.record-preview pre { font-size: 11px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 380px; overflow: auto; }
+.campaign-records { margin-bottom: 18px; }
+.record-list { display: grid; gap: 8px; margin-top: 12px; }
+.record-link { display: grid; gap: 4px; padding: 10px 12px; height: auto; text-align: left; }
+.record-link strong { font-size: 12px; }
+.record-link span { font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; }
+.workspace-detail { max-height: calc(100vh - 88px); overflow-y: auto; position: sticky; top: 0; align-self: start; }
 .role-more { position: relative; font-size: 11px; color: var(--text-muted); }
 .role-more > summary { cursor: pointer; }
 .extra-roles { position: absolute; right: 0; top: 24px; z-index: 2; width: 260px; padding: 12px; display: grid; gap: 8px; background: white; border: 1px solid var(--border-default); border-radius: 8px; }

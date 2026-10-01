@@ -54,7 +54,21 @@ def history_points(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return points
 
 
-def job_metrics(root: Path, campaign: str, job_id: str) -> dict[str, Any]:
+def _configuration_summary(value: Any) -> dict[str, Any] | None:
+    """Charts need evaluation identity, not hundreds of thousands of query IDs."""
+    if not isinstance(value, dict) or value.get("_unreadable"):
+        return None
+    result = {key: item for key, item in value.items()
+              if isinstance(item, (str, int, float, bool)) or item is None}
+    for key in ("train_image_ids", "validation_image_ids", "train_query_ids", "validation_query_ids",
+                "gallery_image_ids", "positive_map"):
+        if isinstance(value.get(key), (list, dict)):
+            result[key + "_count"] = len(value[key])
+    result["summary_only"] = True
+    return result
+
+
+def job_metrics(root: Path, campaign: str, job_id: str, *, include_configuration: bool = False) -> dict[str, Any]:
     camp = resolve_campaign(root, campaign)
     if camp is None:
         return {"ok": False, "error": "campaign_missing"}
@@ -92,7 +106,7 @@ def job_metrics(root: Path, campaign: str, job_id: str) -> dict[str, Any]:
             completed = None
     return {
         "ok": True,
-        "schema_version": "eeg_research.job_metrics.v1",
+        "schema_version": "eeg_research.job_metrics.v1" if include_configuration else "eeg_research.job_metrics.v2",
         "campaign_id": camp.name,
         "candidate_id": candidate_id,
         "attempt_id": attempt,
@@ -107,8 +121,8 @@ def job_metrics(root: Path, campaign: str, job_id: str) -> dict[str, Any]:
             "research_scope": contract.get("research_scope") if isinstance(contract, dict) else None,
             "final_test_enabled": contract.get("final_test_enabled") if isinstance(contract, dict) else None,
         },
-        "evaluation_identity": identity if isinstance(identity, dict) and not identity.get("_unreadable") else None,
-        "frozen_run_spec": frozen if isinstance(frozen, dict) and not frozen.get("_unreadable") else None,
+        "evaluation_identity": (identity if isinstance(identity, dict) and not identity.get("_unreadable") else None) if include_configuration else _configuration_summary(identity),
+        "frozen_run_spec": (frozen if isinstance(frozen, dict) and not frozen.get("_unreadable") else None) if include_configuration else _configuration_summary(frozen),
         "history": points,
         "history_diagnostics": history["diagnostics"],
         "history_empty": history["empty"],

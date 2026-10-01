@@ -21,7 +21,8 @@ def read_jsonl(
         return {"rows": [], "diagnostics": [], "empty": True, "truncated": False, "source": str(path.name)}
     size = path.stat().st_size
     truncated = size > max_bytes
-    raw = path.read_bytes()[:max_bytes]
+    with path.open("rb") as handle:
+        raw = handle.read(max_bytes)
     text = raw.decode("utf-8", errors="replace")
     lines = text.splitlines()
     diagnostics: list[dict[str, Any]] = []

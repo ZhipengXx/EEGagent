@@ -412,16 +412,26 @@ class WorkbenchHandler(BaseHTTPRequestHandler):
                 query.get("campaign", ""),
                 cursor=query.get("cursor", ""),
                 limit=int(query.get("limit") or 20) if str(query.get("limit") or "").isdigit() else 20,
+                focus=query.get("focus", ""),
             )
             code = 200 if payload.get("ok") else 404
             status, mime, body = _json_bytes(payload, code)
+            self._send(status, mime, body, store=False)
+            return
+        if path == "/api/agentic_artifact":
+            from react_agent.eeg_research.agentic.artifact_view import artifact_view
+
+            query = _query(self.path)
+            payload = artifact_view(_agentic_root(query), query.get("campaign", ""), query.get("artifact", ""))
+            status, mime, body = _json_bytes(payload, 200 if payload.get("ok") else 404)
             self._send(status, mime, body, store=False)
             return
         if path == "/api/agentic_job":
             from react_agent.eeg_research.agentic.job_metrics import job_metrics
 
             query = _query(self.path)
-            payload = job_metrics(_agentic_root(query), query.get("campaign", ""), query.get("job", ""))
+            payload = job_metrics(_agentic_root(query), query.get("campaign", ""), query.get("job", ""),
+                                  include_configuration=query.get("include_configuration") == "1")
             code = 200 if payload.get("ok") else 404
             status, mime, body = _json_bytes(payload, code)
             self._send(status, mime, body, store=False)

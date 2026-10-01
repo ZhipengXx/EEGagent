@@ -9,7 +9,8 @@ from typing import Any
 from react_agent.eeg_research.agentic.jsonl_read import read_jsonl
 from react_agent.eeg_research.agentic.paths import resolve_campaign
 from react_agent.eeg_research.agentic.ui_events import LLM_ROLES
-from react_agent.eeg_research.agentic.view import ACTION_ZH
+from react_agent.eeg_research.agentic.view import ACTION_ZH, worker_health
+from react_agent.eeg_research.agentic.paths import safe_name
 
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 100
@@ -79,42 +80,84 @@ def _collect(camp: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         items.append(row)
 
     state = _read(camp / "campaign_state.json") or {}
-    for row in state.get("decisions") or []:
+    events = read_jsonl(camp / "events.jsonl")
+    decision_events = {str(row["decision_id"]): row for row in events["rows"]
+                       if row.get("event") == "decision" and row.get("decision_id")}
+    evidence = {str(row["evidence_id"]): row for row in state.get("evidence") or [] if row.get("evidence_id")}
+    decisions = [row for row in state.get("decisions") or [] if isinstance(row, dict)]
+    for index, row in enumerate(decisions):
         if not isinstance(row, dict):
             continue
         decision_id = str(row.get("decision_id") or "")
         if not decision_id:
             continue
         action = str(row.get("action") or "")
+        raw_path = camp / "decisions" / (decision_id + ".json") if safe_name(decision_id) else None
+        saved = _read(raw_path) if raw_path and raw_path.resolve().is_relative_to(camp.resolve()) else None
+        raw = saved.get("raw") if isinstance(saved, dict) else None
+        raw = raw if isinstance(raw, dict) else {}
+        logged = decision_events.get(decision_id, {})
+        refs = raw.get("evidence_ids") or row.get("evidence_ids") or raw.get("evidence_refs") or []
+        refs = [ref for ref in refs if isinstance(ref, str)][:20] if isinstance(refs, list) else []
+        cited = []
+        for ref in refs:
+            found = evidence.get(ref)
+            if found:
+                cited.append({key: found.get(key) for key in ("evidence_id", "kind", "candidate_id", "job_id",
+                    "fidelity", "evaluation_valid", "fixed_bank_top1", "delta_vs_control_pp", "reason",
+                    "analysis_artifact_id", "summary") if key in found and key != "summary"})
+            else:
+                cited.append({"evidence_id": ref, "available": False})
+        next_row = decisions[index + 1] if index + 1 < len(decisions) else None
+        artifact_refs = list(row.get("artifact_refs") or [])
+        artifact_refs += [item["analysis_artifact_id"] for item in cited if item.get("analysis_artifact_id")]
+        required = raw.get("required_artifact_refs") or row.get("required_artifact_refs") or []
         add(
             _item(
                 event_id=f"decision:{decision_id}",
                 event_type="decision",
-                timestamp=_stamp(row, "at", "created_at", "started_at"),
+                timestamp=_stamp(logged, "at", "timestamp") or _stamp(row, "at", "created_at", "started_at"),
                 source="campaign_state.decisions",
                 role="research_planner",
-                status="ok" if row.get("ok") else "failed",
+                status="failed" if not row.get("ok") else "pending" if row.get("executed") is False else "executed" if row.get("executed") is True else "ok",
                 summary=ACTION_ZH.get(action, action),
                 action=action,
                 action_zh=ACTION_ZH.get(action, action),
                 decision_id=decision_id,
-                candidate_id=row.get("candidate_id"),
+                candidate_id=row.get("candidate_id") or raw.get("target_id"),
                 job_id=row.get("job_id"),
                 reason_zh=row.get("reason_zh"),
                 executed=row.get("executed"),
+                observation=raw.get("observed_gap") or raw.get("observation"),
+                rationale=raw.get("decision_rationale") or row.get("reason_zh"),
+                expected_information=raw.get("expected_information") or row.get("expected_information"),
+                question_id=raw.get("question_id") or row.get("question_id"),
+                stop_reason=raw.get("stop_reason"),
+                evidence=cited,
+                evidence_refs=refs,
+                artifact_refs=list(dict.fromkeys(ref for ref in artifact_refs if isinstance(ref, str))),
+                required_artifact_refs=required[:12] if isinstance(required, list) else [],
+                previous_recorded_decision=None if index == 0 else {"event_id": "decision:" + str(decisions[index - 1].get("decision_id")),
+                    "decision_id": decisions[index - 1].get("decision_id"), "action": decisions[index - 1].get("action")},
+                next_recorded_decision=None if next_row is None else {"event_id": "decision:" + str(next_row.get("decision_id")),
+                    "decision_id": next_row.get("decision_id"), "action": next_row.get("action")},
             )
         )
 
-    events = read_jsonl(camp / "events.jsonl")
     diagnostics.extend(events["diagnostics"])
     for index, row in enumerate(events["rows"]):
         kind = str(row.get("event") or row.get("kind") or "event")
+        if kind == "decision" and row.get("decision_id") in decision_events:
+            # The state and append-only event record share an actual decision ID.
+            # Project that decision once with its recorded timestamp and payload.
+            if any(str(item.get("decision_id")) == str(row["decision_id"]) for item in decisions):
+                continue
         stamp = _stamp(row, "at", "timestamp")
         identity = f"event:{kind}:{stamp}:{index}"
         add(
             _item(
                 event_id=identity,
-                event_type=kind,
+                event_type="decision_log" if kind == "decision" else kind,
                 timestamp=stamp,
                 source="events.jsonl",
                 status=row.get("status"),
@@ -151,23 +194,26 @@ def _collect(camp: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
 
     tasks = read_jsonl(camp / "task_ledger.jsonl")
     diagnostics.extend(tasks["diagnostics"])
+    task_identity: dict[str, dict[str, Any]] = {}
     for index, row in enumerate(tasks["rows"]):
         task_id = str(row.get("task_id") or "")
         status = str(row.get("status") or "")
         if not task_id:
             continue
+        identity = {**task_identity.get(task_id, {}), **row}
+        task_identity[task_id] = identity
         add(
             _item(
                 event_id=f"task:{task_id}:{status}:{index}",
                 event_type=f"task_{status}" if status else "task",
                 timestamp=_stamp(row, "at", "created_at", "timestamp"),
                 source="task_ledger.jsonl",
-                role=row.get("role"),
+                role=identity.get("role"),
                 status=status or None,
                 summary=f"{row.get('role') or 'task'} {status}".strip(),
                 task_id=task_id,
-                attempt_id=row.get("attempt_id"),
-                candidate_id=row.get("candidate_id"),
+                attempt_id=identity.get("attempt_id"),
+                candidate_id=identity.get("candidate_id"),
                 artifact_refs=[row["artifact_id"]] if row.get("artifact_id") else [],
             )
         )
@@ -226,63 +272,62 @@ def _collect(camp: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     return items, diagnostics
 
 
-def _role_activity(items: list[dict[str, Any]], *, live_starts: bool) -> dict[str, Any]:
+def _role_activity(items: list[dict[str, Any]], *, live_starts: bool,
+                   campaign_status: str = "", disconnected: bool = False) -> dict[str, Any]:
+    """Current calls and last outcomes are separate; completion is not activity."""
     latest: dict[str, dict[str, Any]] = {}
+    starts: dict[str, dict[str, Any]] = {}
+    closed: set[str] = set()
     for row in items:
         role = row.get("role")
-        if role not in LLM_ROLES:
-            continue
-        latest[str(role)] = row
-    open_calls: set[str] = set()
-    finished: set[str] = set()
-    for row in items:
+        if role in LLM_ROLES:
+            latest[str(role)] = row
         call_id = row.get("call_id")
         if not call_id:
             continue
         if row.get("event_type") == "llm_call_started":
-            open_calls.add(str(call_id))
-        if row.get("event_type") in {"llm_call_finished", "llm_call_failed"}:
-            finished.add(str(call_id))
-            open_calls.discard(str(call_id))
+            starts[str(call_id)] = row
+        elif row.get("event_type") in {"llm_call_finished", "llm_call_failed"}:
+            closed.add(str(call_id))
+    open_rows = {key: row for key, row in starts.items() if key not in closed}
+    terminal = campaign_status in {"finished", "cancelled", "failed"}
+    unexpected_disconnect = disconnected and campaign_status not in {"finished", "cancelled", "failed", "paused", "blocked"}
+    inactive = terminal or campaign_status in {"paused", "blocked", "interrupted"} or unexpected_disconnect
     roles = []
     for name in sorted(LLM_ROLES):
-        row = latest.get(name)
-        status = "not_called"
+        last = latest.get(name)
+        active = [row for row in open_rows.values() if row.get("role") == name]
+        running = max(active, key=lambda row: row["timestamp"]) if active else None
+        row = running or last
+        last_status = None if last is None else last.get("status")
+        if last_status == "ok" or (last and last.get("event_type") == "decision" and last_status != "failed"):
+            last_status = "completed"
         if row is None:
             status = "not_called"
-        elif row.get("event_type") == "llm_call_started" and live_starts:
+        elif running and live_starts and not inactive:
             status = "active"
-        elif row.get("event_type") in {"llm_call_failed", "task_failed"}:
-            status = "failed"
-        elif row.get("status") in {"pending"}:
-            status = "queued"
-        elif row.get("status") in {"partial", "blocked", "waiting_for_evidence", "superseded", "failed"}:
-            status = str(row["status"])
-        elif row.get("event_type") in {"llm_call_finished", "task_completed", "decision"}:
-            status = "completed"
-        elif row.get("status") in {"completed", "ok"}:
-            status = "completed"
+        elif running and (unexpected_disconnect or campaign_status == "interrupted"):
+            status = "interrupted"
+        elif running and not terminal:
+            status = "paused" if campaign_status == "paused" else "blocked" if campaign_status == "blocked" else "unknown"
+        elif terminal:
+            status = "idle"
+        elif last_status in {"pending", "running"}:
+            status = "queued" if last_status == "pending" else "unknown"
+        elif last_status in {"failed", "partial", "blocked", "waiting_for_evidence"}:
+            status = str(last_status)
         else:
-            status = "unknown" if not live_starts else str(row.get("status") or "unknown")
-        if not live_starts and status == "active":
-            status = "unknown"
-        roles.append(
-            {
-                "role": name,
-                "status": status,
-                "event_id": None if row is None else row.get("event_id"),
-                "call_id": None if row is None else row.get("call_id"),
-                "timestamp": None if row is None else row.get("timestamp"),
-            }
-        )
-    return {
-        "roles": roles,
-        "activity_available": live_starts,
-        "open_call_ids": sorted(open_calls - finished) if live_starts else [],
-    }
+            status = "idle"
+        roles.append({"role": name, "status": status, "last_status": last_status,
+                      "event_id": None if row is None else row.get("event_id"),
+                      "call_id": None if row is None else row.get("call_id"),
+                      "timestamp": None if row is None else row.get("timestamp")})
+    return {"roles": roles, "activity_available": live_starts,
+            "campaign_status": "interrupted" if unexpected_disconnect else campaign_status,
+            "open_call_ids": sorted(open_rows) if live_starts and not inactive else []}
 
 
-def campaign_timeline(root: Path, campaign: str, *, cursor: str = "", limit: int = DEFAULT_LIMIT) -> dict[str, Any]:
+def campaign_timeline(root: Path, campaign: str, *, cursor: str = "", limit: int = DEFAULT_LIMIT, focus: str = "") -> dict[str, Any]:
     camp = resolve_campaign(root, campaign)
     if camp is None:
         return {"ok": False, "error": "campaign_missing"}
@@ -297,8 +342,24 @@ def campaign_timeline(root: Path, campaign: str, *, cursor: str = "", limit: int
         offset = 0
     offset = max(0, offset)
     items, diagnostics = _collect(camp)
+    if focus:
+        position = next((index for index, row in enumerate(items) if row["event_id"] == focus), None)
+        if position is None:
+            return {"ok": False, "error": "event_missing"}
+        offset = max(0, position - size // 2)
     live_starts = any(row.get("event_type") == "llm_call_started" for row in items)
-    page = items[offset : offset + size]
+    registry = read_jsonl(camp / "artifact_registry.jsonl")
+    record_index = []
+    for row in registry["rows"][-48:]:
+        path = Path(str(row.get("path") or "")).resolve()
+        if path.suffix != ".json" or not path.is_relative_to(camp.resolve()):
+            continue
+        linked = next((item for item in reversed(items) if item.get("task_id") == row.get("producer_task_id")
+                       and row.get("producer_task_id") and row.get("artifact_id") in (item.get("artifact_refs") or [])), None)
+        record_index.append({"artifact_id": row.get("artifact_id"), "kind": row.get("kind"),
+            "filename": path.name, "candidate_id": row.get("candidate_id"),
+            "event_id": None if linked is None else linked["event_id"]})
+    page = [{**row, "position": offset + index} for index, row in enumerate(items[offset : offset + size])]
     next_offset = offset + size
     has_more = next_offset < len(items)
     return {
@@ -311,7 +372,10 @@ def campaign_timeline(root: Path, campaign: str, *, cursor: str = "", limit: int
         "has_more": has_more,
         "total": len(items),
         "diagnostics": diagnostics,
-        "activity": _role_activity(items, live_starts=live_starts),
+        "artifact_index": record_index,
+        "activity": _role_activity(items, live_starts=live_starts,
+            campaign_status=str((_read(camp / "campaign_state.json") or {}).get("status") or ""),
+            disconnected=worker_health(camp, _read(camp / "campaign_state.json") or {}).get("worker_disconnected") is True),
         "null_policy": {
             "missing": "field omitted or null",
             "unknown": "legacy record without a start event",
