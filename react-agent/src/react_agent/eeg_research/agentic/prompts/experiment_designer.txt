@@ -48,3 +48,65 @@ A hook with status=available is wired and may be requested. verified=false
 means that this campaign has no successful execution receipt yet; it does not
 mean that a framework extension is needed. Actual checks and job receipts must
 verify implementation before any scientific claim.
+
+VERIFIED POLICY AND DIAGNOSTIC CONTEXT
+Use verified_development_facts for all-query diagnostics and parent/control
+frozen_training_policy for the actual epoch and early-stop contract. These
+facts supersede interpretations based on a small diagnostic sample. A lower
+realized epoch count under an identical policy is an outcome, not a budget
+mismatch. Do not put a budget/scheduler change into a build_encoder-only spec.
+Keep the principal intervention scoped to hooks that implement it; list unchanged
+training policy as an invariant. A failed encoder candidate does not invalidate an
+independent baseline-derived objective, fitted-statistics or augmentation study.
+
+CANONICAL EXECUTABLE FIELDS
+Never use hooks/note/note_zh/description/reuse in model, objective or transform.
+Name required hooks in a nonempty required_capability_ids. For unchanged hooks,
+copy the parent's effective config; remove legacy descriptive metadata and
+state that removal is configuration cleanup, not a scientific intervention.
+Declare concrete parameter values and enabled/disabled switches for new hooks.
+For a controlled ablation use baseline as the supported runtime comparator,
+name the trained parent with parent_candidate_id and ablation_of_candidate_id,
+and change exactly one effective hook-config section. The paired parent result
+is a separate mechanism comparison, not a claim that the automatic comparator
+supports a non-baseline control. Bundled local method cards are runtime source
+context; do not treat them as a paid Librarian result or external literature.
+
+DESIGN FAILURE FEEDBACK
+If previous_design_failure is supplied, address its concrete schema diagnostics
+in the exact injected ExperimentDesignResult. A prior failed call is not a
+framework capability verdict and cannot approve an unchanged fallback draft.
+Use keys actually supported by the parent source. Read the exact transform
+implementation to find its enabled/disabled switch; never infer the key from a
+label or a different candidate. Disabling that hook is still a controlled transform intervention;
+declare build_training_transform in required_capability_ids along with retained
+hooks. Keep a multi-seed or causal conclusion pending until measured comparisons
+actually support it.
+
+TIED FROZEN IMAGE TARGETS
+When duplicate image IDs use identical frozen image vectors, check that
+condition against the supplied training target evidence. Symmetric
+averaged log-probability CE over same-image positives is algebraically equivalent
+to the baseline batch-diagonal CE when repeated image rows are identical. It
+does not change EEG/scale training gradients merely by making a mask. State a
+mathematically distinct objective and falsifiable gradient-level effect if
+designing another local multi-positive loss. Keep negative policy and frozen
+training recipe. Do not relabel or overwrite a trained candidate; use a new candidate.
+
+EXPLICIT PROBABILITY-LOSS SEMANTICS
+Read objective_semantics_probe / objective_semantic_findings when provided.
+A changed gradient proves only computation change. Positive-mass InfoNCE uses
+log(total local mass)-log(all same-ID positive mass), includes the diagonal, and
+specifies whether both directions are averaged. A negative-only denominator is
+a decoupled loss; it is a possible research alternative, not this normalized
+probability loss. EEG normalization changes the baseline logit geometry too.
+Do not call negative-only mass total mass or attribute a compound objective
+change solely to same-ID grouping. Preserve historical actual scores and code.
+For the prospective objective_variant="positive_mass_symmetric_infonce", the
+runtime checks this explicit definition: image-normalized but raw EEG logits;
+all same-ID positives including the diagonal; all local items in the denominator;
+symmetric directional mean. Unique IDs must reduce exactly to baseline, and an
+all-same-ID local batch has finite zero loss. This is a new precise variant,
+not a redefinition of a historical candidate. A different intended loss must state its
+formula, normalization, positive membership and symmetry explicitly. Keep the
+exact objective-off baseline callable and a new approved candidate identity.

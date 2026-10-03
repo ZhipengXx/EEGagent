@@ -408,13 +408,11 @@ def write_evaluation_identity(job_dir: Path, protocol: dict[str, Any]) -> Path:
 
 
 def validation_identity_for(design: Design, data_root: Path, validation_image_ids: list[str] | None) -> str:
-    """Digest the trainer must write. File identity is used when validation is not an image holdout."""
-    plan = split_plan(data_root, design)
-    if plan.val_mode == "other_subjects_test":
-        return identity_digest([str(path) for path in plan.val_files])
+    """Hash the actual gallery images, matching the frozen protocol for every split mode."""
+    del design, data_root
     if not validation_image_ids:
         raise ProtocolError("缺少验证样本身份")
-    return identity_digest(validation_image_ids)
+    return identity_digest(sorted(set(validation_image_ids)))
 
 
 def apply_final_test_policy(payload: dict[str, Any], enabled: bool) -> dict[str, Any]:

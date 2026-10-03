@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from typing import Any, TypedDict
 
-VALIDATOR_VERSION = "eeg_research.experiment_gate.v4"
+VALIDATOR_VERSION = "eeg_research.experiment_gate.v5"
 APPROVAL_SCHEMA = "eeg_research.approval_record.v1"
 SPEC_SCHEMA = "eeg_research.experiment_spec.v1"
 POLICY_VERSION = "eeg_research.confirmation_policy.v1"
@@ -277,6 +277,19 @@ def _stamp(copied: dict[str, Any], *, status: str, context: dict[str, Any] | Non
     return copied
 
 
+def executable_draft_problem(spec: dict[str, Any]) -> str | None:
+    """New approvals require hook configs and explicit capabilities."""
+    descriptive = {"hooks", "note", "note_zh", "description", "reuse", "change_summary"}
+    for section in ("model", "objective", "transform"):
+        config = spec.get(section) or {}
+        if descriptive.intersection(config):
+            return "config_metadata_not_executable:" + section
+    required = spec.get("required_capability_ids")
+    if not isinstance(required, list) or not required:
+        return "required_capability_ids_missing"
+    return None
+
+
 def approve_experiment(
     spec: dict[str, Any],
     *,
@@ -295,6 +308,12 @@ def approve_experiment(
         return _stamp(failed, status="blocked", context=context, producer=producer, allowed=[])
     copied.pop("approval_record", None)
     copied.pop("experiment_ref", None)
+    draft_problem = executable_draft_problem(copied)
+    if draft_problem:
+        copied["status"] = "blocked"
+        copied["blocked_reason"] = draft_problem
+        copied["allowed_actions"] = []
+        return _stamp(copied, status="blocked", context=context, producer=producer, allowed=[])
     if copied.get("role_status") in _ROLE_BLOCKED:
         copied["status"] = "draft"
         copied["blocked_reason"] = "experiment_not_approved"

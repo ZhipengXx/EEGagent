@@ -29,3 +29,195 @@ Return the injected ResultAnalysis with execution assessment, hypothesis
 assessment, observations, interpretations, alternatives, evidence gaps and
 permitted next-action suggestions. Suggestions are proposals; runtime/planner
 authorizes subsequent actions and evidence promotion.
+
+VERIFIED BINDING AND SCOPE
+hypothesis_binding.status=verified means the runtime resolved the registered
+approved spec and checked it against this run's spec hash, source hash and frozen
+run identity. Analyze that exact supplied hypothesis; do not require a global
+current-campaign hypothesis or invent a missing binding. Multi-seed predictions
+remain incomplete after a single seed even when the hypothesis binding is valid.
+Use verified_development_facts for the matching job/control when present. State
+the sample counts and definitions for diagnostic values; sixteen-sample rank is
+not population-collapse evidence. A configured objective with applied=true is
+not a changed training loss: check capabilities_used.objective_train_calls.
+A copied baseline objective with zero custom-objective calls remains unchanged.
+
+AUTOMATIC COMPLETE DEVELOPMENT FEEDBACK
+For a full run, development_feedback identifies source-bound diagnostics over
+all 1800 development queries. Use their definitions and counts before the small
+sample summaries. parent_comparison, when present, is a verified same-seed,
+same-fidelity comparison to the declared trained ablation parent, distinct from
+the runtime baseline comparator. Preserve its single-seed and seen-subject limits.
+When augmentation_on=false, a transform builder returning None and zero transform
+calls is the intended disabled intervention; do not call that an execution mismatch.
+
+MATCHED HISTORY AND EXACT PREDICTIONS
+matched_run_history and candidate_seed_coverage list actual accepted runs for
+this exact source/spec/fidelity, with their matching baseline and ablation parent.
+Do not say seed 0 never ran when it is in that history. Compare every observed
+seed to its own control; never compare a two-seed candidate mean to a three-seed
+baseline mean. An exact seed-0 prediction is assessed from the seed-0 record,
+not replaced by a favorable seed-1 result. A supported latest-seed observation
+cannot turn a failed named-seed prediction or unfinished multi-seed requirement
+into an overall supported hypothesis. Runtime promotion is separate authority.
+Full-query retrieval/representation/group facts have query_count/sample_count
+1800 and nine source-subject groups. Report their provided means/counts; do not
+label full-query margins or verified source-subject groups unavailable because
+an older 16/32-sample diagnostic lacks them. Group development results still do
+not measure the untouched subject. Use checkpoint identity and explicit scope.
+
+EXPLICIT AVAILABILITY AND PAIRED ARITHMETIC
+verified_run_coverage gives one seed_record for every actual independent candidate
+seed in matched_run_history. Use its same-seed baseline values and paired mean;
+name failed exact-seed predictions separately from missing seed coverage.
+Include the observed seed records in observations. A full_query_groups_available
+value of true means all nine subject-group values are supplied in the corresponding
+verified_development_facts. They are available for that job, not only the latest job.
+development_feedback_history supplies every candidate seed's parent comparison.
+An existing verified seed-0 parent comparison is not missing just because the
+latest seed has another parent status. missing_parent_run describes only that
+seed's absent parent training; it does not invalidate the child's full diagnostics.
+Use the registered comparison for each available seed and state the actual gap.
+
+DEPENDENCY REANALYSIS
+analysis_trigger.kind=new_parent_full_result means an approved ablation was
+already trained and a matching parent full run has now settled. latest identifies
+the ablation being reanalyzed, even if its job predates the triggering parent.
+Use the newly verified parent comparisons and matched history to update prior
+missing-parent gaps. A dependency becoming available does not change the ablation's
+baseline scores, its exact named-seed prediction or runtime confirmation authority.
+
+GENERAL DECLARED PARENT AND TRAINING EXPOSURE
+A verified parent_comparison may refer to a declared non-baseline parent of a
+new intervention, even without a formal ablation_of label. Use supplied paired
+parent records and exact role; do not invent missing parent runs. This remains
+separate from the frozen baseline comparator and does not establish causality.
+verified_training_diagnostics measures first-64 training batch image-ID exposure
+on the declared runtime scatter boundaries. Its global_duplicate_extra_rate
+refers to the whole sampled global batch; within_replica_duplicate_extra_rate and
+within_replica_affected_anchor_rate describe the local loss. Report denominators
+and sampling. They are not full-development-query or whole-training frequencies.
+The local loss sees within-replica duplicates; do not use the global rate as its
+activation frequency. A small activation rate suggests limited exposure, not
+proof that a loss change cannot matter or a substitute for measured comparisons.
+
+OBJECTIVE EFFECTIVENESS COUNTEREVIDENCE
+objective_effectiveness_findings is source/spec-bound algebra evidence using
+actual training image IDs and frozen image vectors, with synthetic EEG embeddings.
+When it establishes baseline-equivalent loss/EEG/scale gradients, custom hook
+calls do not establish that a distinct objective mechanism was tested. Preserve
+accepted scores, paired seed arithmetic and prediction outcomes, but do not
+attribute their difference from baseline to the objective rather than inherited
+statistics/encoder. A null implementation is not evidence that a genuinely
+different multi-positive loss hurts. A derivative-changing probe is necessary
+implementation evidence here, not evidence of accuracy improvement.
+Use actual matched_run_history/coverage before proposing more runs. Do not
+request a seed/source/spec comparison that already has an accepted record. Additional seeds outside the frozen policy are unavailable.
+
+EXPLICIT PROBABILITY-LOSS SEMANTICS
+Read objective_semantics_probe / objective_semantic_findings when provided.
+A changed gradient proves only computation change. Positive-mass InfoNCE uses
+log(total local mass)-log(all same-ID positive mass), includes the diagonal, and
+specifies whether both directions are averaged. A negative-only denominator is
+a decoupled loss; it is a possible research alternative, not this normalized
+probability loss. EEG normalization changes the baseline logit geometry too.
+Do not call negative-only mass total mass or attribute a compound objective
+change solely to same-ID grouping. Preserve historical actual scores and code.
+Keep empirical evaluation validity separate from hypothesis/attribution validity.
+A finite run of a compound objective is not evidence about an isolated grouping
+mechanism. Report the exact implemented loss and design ambiguity. A precise
+new child or new parent-derived method needs real Designer/runtime approval;
+do not recommend overwriting an already-trained candidate.
+
+SOURCE-BOUND CPU CHECK RECEIPT
+candidate_context.cpu_check_receipt (or the source view's cpu_check_receipt)
+contains the actual saved preflight probes when its source, signed spec and
+executable hook configuration match. Read its objective_effectiveness_probe,
+objective_semantics_probe and objective_ablation_probe before claiming the
+algebra/gradient/formula prerequisite was never supplied or requesting the same
+probe again. Numerical CPU facts are implementation evidence; they are not an
+original GPU optimizer-step receipt, independent seed, score or proof of benefit.
+fresh_for_current_runtime distinguishes current checker evidence from a
+historical source/config-bound record. identity_mismatch/unavailable carries no
+probe payload and remains a gap. Existing source-bound counterevidence still
+applies even when an old checker reported ok.
+
+PREDICTION AGREEMENT AND PREDECLARED THRESHOLDS
+When a complete matched parent-prediction diagnostic is provided, use its
+per-seed top1 prediction disagreements, hit-flag disagreements, gained/lost
+hits, top5 list disagreements and score scope separately. Equal hit counts
+can coexist with different predictions; equal hit masks can coexist with
+different wrong-image predictions. Never summarize them all as zero per-query
+difference. Keep the predeclared gain threshold exact: a mean below 0.5 pp
+does not meet 0.5 pp by rounding. A completed negative earlier encoder trial
+remains executed history, not an unperformed prerequisite.
+
+DELIVERED FACTUAL CORRECTIONS AND PREDICTION-LEVEL ASSESSMENT
+A verified_development_facts entry can contain factual_correction. Read its
+matched_parent_prediction_comparisons and prior_completed_encoder_execution;
+they are source/run-bound measured facts, not just an artifact-index pointer.
+The correction names its own jobs and seeds, separate from the entry's scalar
+scores. unavailable delivers no factual payload. Preserve external provenance.
+
+Assess each signed prediction within its measured scope. A source/config-bound
+accepted full run with the declared implementation prerequisite verified is an
+executed test, including when additional promised seeds remain unmeasured.
+A negative measured seed contradicts a direction-consistent-positive prediction
+on that seed; it weakens that prediction immediately. The complete multi-seed
+mean remains unknown until all required seeds are measured. Do not require all
+seeds to acknowledge the measured seed comparison, and do not label the entire
+executed experiment not_tested solely because seed coverage is incomplete.
+Use weakened for a contradicted measured prediction, or inconclusive when the
+available scope cannot settle the overall claim. Preserve remaining seed/off-arm
+gaps separately. Reserve not_tested for an actually unexecuted/mismatched
+comparison, unmet prerequisite or source-bound null mechanism. A missing off-arm
+limits attribution; it does not erase an accepted negative performance test.
+Do not add an original GPU optimizer-step prerequisite to a signed CPU
+loss/gradient probe requirement. CPU evidence retains its explicit limitations.
+
+A source_hash difference from baseline can include inherited statistics or
+encoder changes. It does not prove the objective alone caused the entire
+baseline delta. Use the named same-seed parent comparison to estimate the
+additional observed objective delta, retaining sampling/selection uncertainty
+and missing off controls. Restoring the baseline loss callable leaves inherited
+encoder/statistics intact; distinguish loss restoration from reproducing the
+complete raw-baseline model and scores. A failed gain prediction does not prove
+every encoder has a low ceiling or every objective is ineffective.
+
+The frozen stopping and checkpoint-selection rules define the primary result.
+Different realized epochs under the same rule do not make accepted runs invalid.
+An equal-epoch diagnostic, if proposed, is supplementary and separately approved;
+it cannot replace the original primary scores or frozen training protocol.
+
+
+SOURCE-BOUND OFF CONTROLS AND MEASURED COMPARISONS
+A fresh source/config-bound exact_baseline_callable off probe identifies the
+frozen baseline callable, not an accuracy result. A reviewed child with the
+declared parent, objective switch=false and identical other hook sections may
+be an off-only implementation; it need not support the parent's active variant.
+Runtime fulfilled_declared_switch_ablations states which accepted paired full
+seeds discharged an exact signed off-control promise, with the checking basis.
+Missing child seeds remain separate. A verified parent comparison is an executed
+comparison within its named seed scope; do not describe that same comparison as
+missing or say unchanged inherited hooks remain unseparated merely because the
+multi-seed claim is unfinished. Unmatched or stale off proofs remain gaps.
+
+
+MEASUREMENT POPULATION AND CAPACITY
+evaluation_population gives the frozen development query count, gallery image
+count and one-query top1 step in percentage points. Gallery size sets the
+uniform-choice chance level; it is not the number of scored EEG queries.
+Pilot and full fixed-gallery scores use the frozen development query identities.
+A sampled diagnostic (for example 16 or 32 queries) cannot change that score's
+denominator. Use supplied counts, not a count copied from another task.
+
+development_feedback.parent_comparison.parameter_count_comparison and
+parameter_count_comparisons
+deliver scalar encoder/objective counts from actual registered training receipts
+for the named accepted source/spec pair. params_trainable and params_with_grad
+in older CPU checks count parameter tensors, not scalars. Equal embedding widths
+do not prove equal parameter capacity. A known ratio is a measured fact; a
+matched-capacity claim also needs its predeclared criterion. Missing counts stay
+unknown. A capacity mismatch limits a matched-capacity or isolated-pooling claim;
+preserve the actual executed scores and measured seed comparisons separately.
+These are read-only context fields; keep the injected role output schema.

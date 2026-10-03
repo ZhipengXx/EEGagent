@@ -220,6 +220,15 @@ class ImplementationReview(DomainOutput):
     review_limits: Any = None
     summary_zh: str = ""
 
+    @model_validator(mode="after")
+    def status_matches_unresolved_issues(self):
+        blocking = [issue for issue in self.issues if issue.severity == "blocking"]
+        if self.status == "ready" and blocking:
+            raise ValueError("ready_review_cannot_have_blocking_issues: resolved allegations belong in verified_invariants_with_refs, not issues")
+        if self.status == "needs_fix" and not blocking:
+            raise ValueError("needs_fix_requires_an_unresolved_blocking_issue_and_concrete_correction")
+        return self
+
 
 class ResultAnalysis(DomainOutput):
     execution_assessment: Any = None

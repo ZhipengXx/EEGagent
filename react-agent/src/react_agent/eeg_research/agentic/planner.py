@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from typing import Any, Callable
 
 ACTIONS = (
@@ -98,6 +100,14 @@ def evidence_count(state: dict[str, Any]) -> int:
 
 def _seen_without_new_evidence(state: dict[str, Any], action: str) -> bool:
     """The same local action at the same substantive evidence count adds nothing."""
+    if action in {"design_experiment", "propose_experiment"} and state.get("experiment_failed"):
+        failure = state.get("design_failure") or {}
+        epoch = [row.get("evidence_id") for row in state.get("evidence") or []
+                 if row.get("evaluation_valid") is True and row.get("fidelity") in {"pilot", "full"}]
+        # Changed concrete schema/transport feedback is a new design input. It
+        # permits at most two follow-up attempts within one scientific epoch.
+        if failure.get("recoverable") is True and failure.get("scientific_epoch") == epoch and int(failure.get("attempts_in_epoch") or 0) < 3:
+            return False
     if action == "audit_result" and state.get("audit_status") == "stale":
         return False
     if action == "retrieve_memory" and state.get("_has_development_artifacts") and int(state.get("_read_remaining", 0)) > 0:
@@ -275,19 +285,77 @@ def route_next_research_action(observation: dict[str, Any]) -> dict[str, Any]:
     return {"action": actions[0] if actions else "stop", "reason_zh": "fallback", "evidence_ids": [], "stop_reason": "blocked"}
 
 
+def duplicate_option_feedback(reply: Any) -> dict[str, Any]:
+    """Explain the duplicate executable signatures without adding seed syntax."""
+    fields = ("action", "target_id", "question_id", "intervention")
+    groups: dict[str, dict[str, Any]] = {}
+    options = reply.get("options") if isinstance(reply, dict) else []
+    for option in options if isinstance(options, list) else []:
+        if not isinstance(option, dict):
+            continue
+        signature = {key: option.get(key) for key in fields}
+        if option.get("action") not in {"design_experiment", "propose_experiment"}:
+            signature["intervention"] = None
+        key = json.dumps(signature, sort_keys=True, ensure_ascii=False, default=str)
+        group = groups.setdefault(key, {"execution_signature": signature, "option_ids": []})
+        group["option_ids"].append(option.get("option_id"))
+    return {
+        "duplicate_groups": [group for group in groups.values() if len(group["option_ids"]) > 1],
+        "invalid_non_design_interventions": [
+            {"option_id": option.get("option_id"), "action": option.get("action"),
+             "intervention": option.get("intervention"), "required_intervention": None}
+            for option in options if isinstance(option, dict)
+            and option.get("action") not in {"design_experiment", "propose_experiment"}
+            and option.get("intervention") is not None
+        ] if isinstance(options, list) else [],
+        "instruction": "Merge each listed group into one option. replicate selects the next unused authorized frozen seed at execution; two replicate options for the same candidate/question with null intervention are identical even if their labels say seed 1 and seed 2. Mention all remaining seeds in one rationale. Different IDs, rationale, costs, future seed labels or invented seed parameters do not create distinct executable actions. Keep the top-level selected action/target/question consistent with the merged option. One option is permitted; compare a distinct legal design or control only when useful.",
+        "seed_selection": "runtime_next_unused_authorized_frozen_seed; no planner seed override",
+    }
+
+
+def _correction_view(reply: Any) -> dict[str, Any]:
+    """Bound narrative text while preserving the complete output schema shape."""
+    if not isinstance(reply, dict):
+        return {"invalid_reply_type": type(reply).__name__}
+    narrative = {"decision_rationale", "reason_zh", "summary_zh", "selection_rationale", "expected_information"}
+    view = {key: value[:600] if key in narrative and isinstance(value, str) else value
+            for key, value in reply.items()}
+    if isinstance(reply.get("options"), list):
+        view["options"] = [{key: value[:600] if key in {"value_rationale", "reason_zh"} and isinstance(value, str)
+                           else value for key, value in option.items()}
+                           if isinstance(option, dict) else option for option in reply["options"]]
+    return view
+
+
 def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -> dict[str, Any]:
-    """Ask once. One schema repair is allowed. A second failure blocks."""
+    """At most three attempts under the same immutable observation and gates."""
     allowed = observation.get("available_actions") or []
     known = set(observation.get("_known_evidence_ids") or [])
     trainable = set(observation.get("trainable_ids") or ["baseline"])
     eligible = observation.get("eligible_targets") if isinstance(observation.get("eligible_targets"), dict) else None
-    reply = backend(observation)
-    parsed = _validate_reply(reply, observation, allowed, known, trainable, eligible)
-    if parsed.get("ok"):
-        return parsed
-    if repairs >= 1:
-        return _blocked_reply(parsed, reply)
-    repair_payload = {**observation, "schema_error": parsed.get("detail"), "previous": reply}
+    from react_agent.eeg_research.agentic.planner_context import compact_planner_context, normalize_input_echoes
+    request = compact_planner_context(observation)
+    history = []
+    for attempt in range(max(0, min(int(repairs), 2)), 3):
+        reply, _ = normalize_input_echoes(backend(request), observation)
+        parsed = _validate_reply(reply, observation, allowed, known, trainable, eligible)
+        if parsed.get("ok"):
+            if attempt:
+                parsed["repairs"] = attempt
+            return parsed
+        history.append({"attempt": attempt + 1, "detail": parsed.get("detail"),
+                        "plan_update_error": parsed.get("plan_update_error")})
+        if attempt == 2:
+            return _blocked_reply(parsed, reply)
+        request = _repair_request(observation, parsed, reply)
+        request["repair_history"] = list(history)
+        request = compact_planner_context(request)
+    raise AssertionError("planner_attempt_bound_unreachable")
+
+
+def _repair_request(observation: dict[str, Any], parsed: dict[str, Any], reply: Any) -> dict[str, Any]:
+    known = set(observation.get("_known_evidence_ids") or [])
+    repair_payload = {**observation, "schema_error": parsed.get("detail"), "previous": _correction_view(reply)}
     if parsed.get("detail") in {"unknown_option_cost_basis", "option_cost_without_runtime_basis",
                               "option_cost_basis_missing", "option_cost_confidence_without_runtime_basis"}:
         cost_rows = observation.get("action_cost_estimates") or {}
@@ -314,6 +382,22 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
             "implementation_target_id": observation.get("implementation_target_id"),
         }
     context = repair_payload.setdefault("schema_repair_context", {})
+    if parsed.get("detail") in {"duplicate_option_action", "option_intervention_requires_design"}:
+        context["duplicate_option_feedback"] = duplicate_option_feedback(reply)
+    if parsed.get("detail") == "design_hypothesis_missing":
+        context["design_handoff_instruction"] = (
+            "Put the selected falsifiable hypothesis in hypothesis_draft, including the tentative statement, "
+            "verified motivating evidence refs, prediction and competing explanation. Prose in rationale or "
+            "expected_information is not delivered as a hypothesis to Designer. Use a cold_start_prior when appropriate; "
+            "do not invent effectiveness evidence. The API Designer will canonicalize the executable spec.")
+    if str(parsed.get("detail") or "").startswith("premature_stop:"):
+        context["continuation_instruction"] = (
+            "Authorized resources remain and requested scientific work is unfinished. "
+            "Empty run_pilot/run_full/replicate targets mean a fresh design is needed, not exhaustion. "
+            "Choose design_experiment or propose_experiment when legal. Approval precedes implementation. "
+            "Do not implement a merely eligible candidate unless implement_candidate is also available. "
+            "Use the runtime research_progress and verified_development_facts to design a new falsifiable mechanism.")
+        context["research_progress"] = observation.get("research_progress")
     context["option_constraints"] = {
         "unique_signature": ["action", "target_id", "question_id", "intervention"],
         "instruction": "Each option must have a different execution signature. Different option IDs or rationales do not make identical actions different. Remove redundant options; one option is valid. Preserve the intended legal selected action when repairing an unrelated field. intervention is an exact experiment_draft.intervention, never report-edit or training prose; use null outside experiment design. Do not repeat an already delivered artifact read.",
@@ -324,6 +408,17 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
     previous_options = reply.get("options") if isinstance(reply, dict) else []
     selected_previous = next((row for row in (previous_options or []) if isinstance(row, dict) and
         row.get("option_id") == reply.get("selected_option_id")), {})
+    if parsed.get("detail") == "selected_option_intervention_mismatch":
+        design_action = reply.get("action") in {"design_experiment", "propose_experiment"}
+        draft = reply.get("experiment_draft") if isinstance(reply.get("experiment_draft"), dict) else {}
+        context["selected_intervention_binding"] = {
+            "selected_option_id": reply.get("selected_option_id"),
+            "action": reply.get("action"),
+            "target_id": reply.get("target_id"),
+            "previous_intervention": selected_previous.get("intervention"),
+            "required_intervention": draft.get("intervention") if design_action else None,
+            "instruction": "For run_pilot/run_full/replicate/implement_candidate/repair_candidate of an approved target, set this selected option's intervention to null. This field introduces a NEW experiment_draft intervention, not a description of the existing method. Keep the intended action, target and question unchanged; describe the approved method in value_rationale. Do not create a new experiment_draft just to match training prose. For a design action copy the draft intervention exactly.",
+        }
     context["selected_reference_binding"] = {
         "previous_selected_evidence_refs": selected_previous.get("evidence_refs") or [],
         "allowed_evidence_ids": sorted(ref for ref in known if isinstance(ref, str)),
@@ -331,12 +426,7 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
             if row.get("verification_status") == "verified"),
         "instruction": "Use one identical complete list in top-level evidence_refs, top-level evidence_ids and selected-option evidence_refs. evidence_ids is an alias, never a subset or summary. Only use allowed_evidence_ids. required_artifact_refs in every option and at top level must contain only allowed_artifact_ids, never dataset/file paths or future outputs. An empty allowed_artifact_ids list means required_artifact_refs must be [] everywhere. Keep selected/top-level required_artifact_refs identical. Dataset paths may be described in prerequisites/rationale. Correct all copies in this reply.",
     }
-    repaired = backend(repair_payload)
-    second = _validate_reply(repaired, observation, allowed, known, trainable, eligible)
-    if second.get("ok"):
-        second["repairs"] = 1
-        return second
-    return {**_blocked_reply(second, repaired), "repairs": 1}
+    return repair_payload
 
 
 def _blocked_reply(parsed: dict[str, Any], reply: Any) -> dict[str, Any]:
@@ -357,11 +447,20 @@ def _validate_reply(
     parsed = _parse(reply, allowed, known, trainable, eligible)
     if not parsed.get("ok"):
         return parsed
+    if parsed["action"] == "design_experiment":
+        draft = reply.get("experiment_draft") if isinstance(reply.get("experiment_draft"), dict) else {}
+        existing = observation.get("experiment") if isinstance(observation.get("experiment"), dict) else {}
+        hypothesis = (reply.get("hypothesis_draft") or draft.get("hypothesis")
+                      or observation.get("hypothesis") or existing.get("hypothesis"))
+        if not hypothesis:
+            return {"ok": False, "detail": "design_hypothesis_missing"}
     detail = validate_comparison_and_reads(reply, observation)
     if detail:
         return {"ok": False, "detail": detail}
     if parsed["action"] == "stop":
-        reason = completion_block_reason(observation, reply.get("stop_reason"))
+        from react_agent.eeg_research.agentic.research_progress import stopping_block_reason
+        reason = (completion_block_reason(observation, reply.get("stop_reason"))
+                  or stopping_block_reason(observation, reply.get("stop_reason")))
         if reason:
             return {"ok": False, "detail": reason}
     from react_agent.eeg_research.agentic.research_plan import PLAN_DEPENDENT_ACTIONS, PlanError, normalize_plan_update, validate_update
@@ -494,6 +593,9 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
         return "selected_option_artifact_mismatch"
     if not set(parsed.resolves_issue_ids) <= set(selected.related_issue_ids):
         return "selected_option_issue_mismatch"
+    if any(option.action not in {"design_experiment", "propose_experiment"}
+           and option.intervention is not None for option in parsed.options):
+        return "option_intervention_requires_design"
     if selected.intervention and (parsed.experiment_draft or {}).get("intervention") != selected.intervention:
         return "selected_option_intervention_mismatch"
     signatures = {(option.action, option.target_id, option.question_id, option.intervention) for option in parsed.options}

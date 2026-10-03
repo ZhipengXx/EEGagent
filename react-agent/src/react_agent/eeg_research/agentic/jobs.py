@@ -90,6 +90,7 @@ def start_job(
     fidelity: str,
     root: Path,
     protocol_path: Path | None = None,
+    training_seed: int | None = None,
 ) -> dict[str, Any]:
     """Start one train_entry child. The candidate module comes from the job environment."""
     job_dir = job_dir.resolve()
@@ -110,7 +111,11 @@ def start_job(
     camp = job_dir.parent.parent
     state_path = camp / "campaign_state.json"
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
-    if state.get("pending_training_seed") is not None:
+    # The live scheduler state may not yet be persisted to campaign_state.json.
+    # Prefer its explicit seed over the saved campaign default.
+    if training_seed is not None:
+        run_design = replace(run_design, seed=int(training_seed))
+    elif state.get("pending_training_seed") is not None:
         run_design = replace(run_design, seed=int(state["pending_training_seed"]))
     env = research_env(extension)
     env["EEG_CANDIDATE_MODULE"] = "eeg_candidate" if extension is not None else BASELINE_MODULE

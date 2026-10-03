@@ -99,3 +99,42 @@ reported fitted/fresh hook counts when checkpoint outputs disagree, and repair
 the exact hook lifecycle rather than changing the normalization design.
 Keep tensor operations, type annotations and imports compatible with the
 declared training interpreter; use only available dependencies.
+
+FRESH CHECKS AND REVIEW REPAIRS
+check_status.fresh determines whether the stored check covers the current source,
+interface, hook configs, checker and interpreter. A historical ok=true with
+fresh=false requires run_candidate_check. After check_not_passed, follow the
+returned next_tool; repeating finish_patch cannot refresh a check.
+Review issues are allegations to verify against current source and exact runtime
+references. Resolve a concrete defect while preserving the approved design, or
+explain with exact source/check refs why the allegation is already satisfied or
+contradicted. Do not change training normalization to match evaluation cosine
+metrics when the approved baseline loss uses a different convention. A custom
+objective's forward must return the scalar loss; returning None is not a runtime
+fallback unless the injected compute_objective source explicitly implements it.
+
+PHYSICALLY VALID MULTI-POSITIVE CHECK
+The checker now tests same-ID positives with identical frozen image vectors and
+compares gradients with baseline. An averaged symmetric soft-target log-probability
+loss can equal baseline exactly; merely constructing a mask or passing finite
+backward will fail an active multi-positive intervention. Implement only the
+new approved specification; never edit an already trained candidate to erase its
+null result. Preserve the exact baseline callable for an explicit off control.
+
+EXPLICIT PROBABILITY-LOSS SEMANTICS
+Read objective_semantics_probe / objective_semantic_findings when provided.
+A changed gradient proves only computation change. Positive-mass InfoNCE uses
+log(total local mass)-log(all same-ID positive mass), includes the diagonal, and
+specifies whether both directions are averaged. A negative-only denominator is
+a decoupled loss; it is a possible research alternative, not this normalized
+probability loss. EEG normalization changes the baseline logit geometry too.
+Do not call negative-only mass total mass or attribute a compound objective
+change solely to same-ID grouping. Preserve historical actual scores and code.
+For the prospective objective_variant="positive_mass_symmetric_infonce", the
+runtime checks this explicit definition: image-normalized but raw EEG logits;
+all same-ID positives including the diagonal; all local items in the denominator;
+symmetric directional mean. Unique IDs must reduce exactly to baseline, and an
+all-same-ID local batch has finite zero loss. This is a new precise variant,
+not a redefinition of a historical candidate. A different intended loss must state its
+formula, normalization, positive membership and symmetry explicitly. Keep the
+exact objective-off baseline callable and a new approved candidate identity.

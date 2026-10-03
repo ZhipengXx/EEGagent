@@ -616,6 +616,7 @@ def observation(camp: Path) -> dict[str, Any]:
     from react_agent.eeg_research.agentic.interface import candidate_interface
 
     protocol = load_protocol(camp)
+    from react_agent.eeg_research.agentic.measurement_context import evaluation_population_context, verified_parameter_count_comparisons
     trainable = ["baseline"]
     for row in state.get("candidates") or []:
         if row.get("status") == "ready" and row.get("candidate_id") and row["candidate_id"] not in trainable:
@@ -632,7 +633,7 @@ def observation(camp: Path) -> dict[str, Any]:
     experiment = state.get("experiment") if isinstance(state.get("experiment"), dict) else {}
     parent_id = experiment.get("parent_candidate_id") or "baseline"
     control_id = experiment.get("control_candidate_id") or "baseline"
-    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views
+    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views, implementation_lifecycle_context, training_target_source_context, verified_encoder_structural_facts
 
     from react_agent.eeg_research.agentic.audit_context import audit_feedback
     from react_agent.eeg_research.agentic.handoffs import (
@@ -640,6 +641,8 @@ def observation(camp: Path) -> dict[str, Any]:
     )
     feedback = audit_feedback(camp, state)
     analysis_views = load_analysis_views(camp, state)
+    superseded_analysis_ids = {ref for view in analysis_views
+        for ref in view.get("superseded_analysis_evidence_ids") or []}
     index = artifact_index(camp, state)
     reads = read_history(camp)
     remaining_reads = max(0, READS_PER_EVIDENCE_EPOCH - sum(row.get("epoch") == read_epoch(state) for row in reads))
@@ -674,8 +677,10 @@ def observation(camp: Path) -> dict[str, Any]:
         "analyses": analysis_views,
         "method_evidence_packet": state.get("method_evidence_packet"),
         "contract": contract,
+        "evaluation_population": evaluation_population_context(protocol),
+        "parameter_count_comparisons": verified_parameter_count_comparisons(camp, state, protocol=protocol),
         "candidate_interface": candidate_interface(protocol),
-        "evidence": evidence,
+        "evidence": [row for row in evidence if row.get("evidence_id") not in superseded_analysis_ids],
         "candidates": state.get("candidates") or [],
         "hypothesis": state.get("hypothesis"),
         "experiment": state.get("experiment"),
@@ -684,6 +689,11 @@ def observation(camp: Path) -> dict[str, Any]:
         "available_actions": actions,
         "eligible_targets": eligible_targets(state),
         "implementation_target_id": state["_implementation_target"],
+        "repair_task": development_view(state.get("repair_task")),
+        "implementation_source": candidate_context(camp, str(state["_implementation_target"])) if state.get("_implementation_target") else None,
+        "implementation_lifecycle": implementation_lifecycle_context(camp, state, str(state["_implementation_target"]), actions),
+        "training_target_sources": training_target_source_context(camp, state, eligible_targets(state)),
+        "verified_encoder_structural_facts": verified_encoder_structural_facts(camp, state),
         "blocked_actions": blocked_actions(state),
         "trainable_ids": trainable,
         "budget": budget_snapshot(camp, state),
@@ -722,7 +732,9 @@ def observation(camp: Path) -> dict[str, Any]:
             continue
         assessment = {"artifact_id": view.get("artifact_id"), "content_hash": view.get("content_hash"),
                       "candidate_id": view.get("candidate_id"), "evidence_id": view.get("evidence_id"),
-                      "authority": "llm_interpretation", "hypothesis_assessment": payload.get("hypothesis_assessment"),
+                      "authority": "llm_interpretation", "run_evidence_id": view.get("run_evidence_id"),
+                      "superseded_analysis_evidence_ids": view.get("superseded_analysis_evidence_ids") or [],
+                      "hypothesis_assessment": payload.get("hypothesis_assessment"),
                       "evidence_refs": payload.get("evidence_refs") or [], "context_limits": {}}
         for key in ("prediction_checks", "competing_explanations", "evidence_gaps", "suggested_next_actions"):
             assessment[key], assessment["context_limits"][key] = bounded_history(payload.get(key) or [], budget=4000)
@@ -745,6 +757,9 @@ def observation(camp: Path) -> dict[str, Any]:
     public["context_limits"] = {"history": limits, "omitted_content": "use registered artifact_index IDs and read_requests", "control_identities_retained": True}
     from react_agent.eeg_research.agentic.planner import cost_estimates
     public["action_cost_estimates"] = cost_estimates(state, public, camp=camp)
+    from react_agent.eeg_research.agentic.research_progress import progress_context, verified_diagnostic_facts
+    public["research_progress"] = progress_context(camp, state, goal, public["budget"], public["available_actions"])
+    public["verified_development_facts"] = verified_diagnostic_facts(camp, state)
     return public
 
 
@@ -756,6 +771,11 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     services = services or {}
     state = load_state(camp)
     rebuild_campaign_projection(camp, state)
+    _apply_control(camp, state)
+    if state.get("pause_after_step") and not state.get("live_job") and state.get("status") not in _TERMINAL:
+        state["status"] = "paused"
+        save_state(camp, state)
+        return state
     if state.get("status") in _TERMINAL:
         if (state.get("failure") or {}).get("phase") == "recovery":
             save_state(camp, state)
@@ -962,6 +982,12 @@ def _apply_action(
     obs: dict[str, Any],
 ) -> None:
     """Run one already chosen action. Does not allocate a new decision id."""
+    # Control may change while the paid Planner request is in flight. Preserve
+    # the pending decision for resume; never launch another job after pause.
+    _apply_control(camp, state)
+    if state.get("status") in _TERMINAL or (state.get("pause_after_step") and not state.get("live_job")):
+        save_state(camp, state)
+        return
     state["status"] = "planning"
     raw = decision.get("raw") if isinstance(decision.get("raw"), dict) else _decision_raw(camp, str(decision.get("decision_id") or ""))
     if obs.get("planner_mode") == "compare_options" or any(raw.get(key) for key in ("options", "read_requests", "resolves_issue_ids", "report_revision")) or action == "revise_report":
@@ -1019,7 +1045,14 @@ def _apply_action(
         if detail is None:
             detail = validate_comparison_and_reads(candidate, live)
         if detail:
-            persist_failure(camp, state, phase="action", error_type="execution_revalidation_failed", detail=detail, recoverable=True)
+            # A rejected stale decision cannot remain a replayable instruction.
+            # Keep its raw bytes and refusal, then ask for a fresh plan using the
+            # current targets. No action from this decision has been executed.
+            record = (state.get("decisions") or [{}])[-1]
+            if record.get("decision_id") == decision.get("decision_id") and record.get("ok"):
+                _reject_plan_decision(camp, record, detail)
+            persist_failure(camp, state, phase="planner", error_type=detail, detail=detail, recoverable=True)
+            event(camp, "execution_decision_rejected", decision_id=decision.get("decision_id"), detail=detail)
             return
         if state.get("decisions"):
             state["decisions"][-1]["execution_budget_snapshot"] = live["budget"]
@@ -1044,9 +1077,13 @@ def _apply_action(
         refresh_audit_freshness(state)
         goal = _read(camp / "goal.json")
         gate = {**state, "require_audit_before_completion": bool(goal.get("require_audit_before_completion", False))}
-        if completion_block_reason(gate, reason):
-            persist_failure(camp, state, phase="stop", error_type="audit_required_before_goal_addressed",
-                            detail="audit_required_before_goal_addressed", recoverable=True)
+        from react_agent.eeg_research.agentic.research_progress import progress_context, stopping_block_reason
+        live = observation(camp)
+        gate["research_progress"] = progress_context(camp, state, goal, budget_snapshot(camp, state), live["available_actions"])
+        stop_error = completion_block_reason(gate, reason) or stopping_block_reason(gate, reason)
+        if stop_error:
+            persist_failure(camp, state, phase="stop", error_type="premature_research_stop",
+                            detail=stop_error, recoverable=True)
             return
         state["status"] = "finished"
         state["execution_status"] = "completed"
@@ -1079,7 +1116,7 @@ def _apply_action(
     elif action == "design_experiment":
         _design_experiment(camp, state, decision, raw, services)
     elif action == "propose_experiment":
-        _propose_experiment(camp, state, decision, raw)
+        _propose_experiment(camp, state, decision, raw, services)
     elif action == "repair_candidate":
         _repair_candidate(camp, state, services)
     elif action == "audit_result":
@@ -1096,7 +1133,7 @@ def _apply_action(
         repairing = bool(state.get("repair_task") and int((state.get("repair_task") or {}).get("remaining") or 0) > 0)
         spec = state.get("experiment") if isinstance(state.get("experiment"), dict) else None
         repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else {}
-        target_id = repair.get("candidate_id") if repairing else state.get("candidate_id")
+        target_id = repair.get("candidate_id") if repairing else candidate_implementation_target(camp, state)
         try:
             resolved = resolve_approved_experiment(
                 camp,
@@ -1110,6 +1147,7 @@ def _apply_action(
             if repairing:
                 state["execution_spec"] = resolved
             else:
+                state.pop("execution_spec", None)
                 state["experiment"] = resolved
         except ExperimentResolutionError as exc:
             persist_failure(
@@ -1137,7 +1175,7 @@ def _apply_action(
         _train(camp, state, action, runner, services, raw)
 
 
-def _propose_experiment(camp: Path, state: dict[str, Any], decision: dict[str, Any], raw: dict[str, Any]) -> None:
+def _propose_experiment(camp: Path, state: dict[str, Any], decision: dict[str, Any], raw: dict[str, Any], services: Services | None = None) -> None:
     path = camp / "hypotheses" / f"h{len(state.get('decisions') or [])}.json"
     if path.is_file():
         try:
@@ -1155,6 +1193,13 @@ def _propose_experiment(camp: Path, state: dict[str, Any], decision: dict[str, A
         state["hypothesis"] = saved.get("hypothesis")
         state["experiment"] = saved.get("experiment") or {}
     else:
+        # Fresh live proposals are hypotheses for Designer, not a shortcut
+        # from arbitrary planner prose to a scientific ApprovalRecord.
+        if services is not None and services.get("designer") is not None:
+            _design_experiment(camp, state, decision, raw, services)
+            _write(path, {"hypothesis": state.get("hypothesis"), "experiment": state.get("experiment"),
+                          "experiment_ref": state.get("experiment_ref"), "design_path": "api_designer"})
+            return
         from react_agent.eeg_research.agentic.experiment_gate import approve_experiment
 
         state["hypothesis"] = raw.get("hypothesis_draft") or {"mechanism": decision.get("reason_zh")}
@@ -1176,7 +1221,14 @@ def _retrieve_methods(camp: Path, state: dict[str, Any], raw: dict[str, Any], se
     from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
     from react_agent.eeg_research.agentic.schemas import ROLE_RESULT_VERSION
 
-    query = str(raw.get("query") or (state.get("hypothesis") or {}).get("mechanism") or "")
+    hypothesis = state.get("hypothesis")
+    if isinstance(hypothesis, dict):
+        fallback_query = hypothesis.get("mechanism") or hypothesis.get("hypothesis") or hypothesis.get("falsifiable_statement") or ""
+    elif isinstance(hypothesis, str):
+        fallback_query = hypothesis
+    else:
+        fallback_query = ""
+    query = str(raw.get("query") or fallback_query)
     packed = retrieve_methods(query)
     packed["local_only"] = True
     packed["online"] = False
@@ -1237,7 +1289,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     from react_agent.eeg_research.agentic.confirmation_policy import load_confirmation_policy
 
     missing: list[str] = []
-    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views, matched_diagnostics
+    from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views, matched_diagnostics, verified_encoder_structural_facts
 
     parent = str(spec.get("parent_candidate_id") or "baseline")
     control = str(spec.get("control_candidate_id") or "baseline")
@@ -1245,6 +1297,13 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     if diagnostics is None:
         missing.append("diagnostics")
     methods = state.get("method_hits") or []
+    method_origin = "campaign_retrieval"
+    if not methods:
+        # These are actual bundled local method cards, not an invented paid
+        # Librarian result or a claim of online literature retrieval.
+        from react_agent.eeg_research.agentic.knowledge import retrieve_methods
+        methods = retrieve_methods("").get("hits") or []
+        method_origin = "runtime_bundled_local_cards"
     if not methods:
         missing.append("method_evidence")
     contract_path = camp / "evaluation_contract.json"
@@ -1253,7 +1312,11 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
         missing.append("evaluation_contract")
     from react_agent.eeg_research.agentic.audit_context import audit_feedback
     from react_agent.eeg_research.agentic.handoffs import selected_read_context
+    from react_agent.eeg_research.agentic.research_progress import verified_diagnostic_facts
     return development_view({
+        "verified_development_facts": verified_diagnostic_facts(camp, state, target_ids={parent, control}, max_facts=12),
+        "verified_encoder_structural_facts": verified_encoder_structural_facts(camp, state),
+        "previous_design_failure": state.get("design_failure"),
         "artifact_reads": selected_read_context(camp, state),
         "audit_issues": [row for row in audit_feedback(camp, state)["issues"] if row["issue_id"] in (state.get("active_issue_ids") or [])],
         "hypothesis": spec.get("hypothesis") or state.get("hypothesis"),
@@ -1261,6 +1324,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
         "confirmation_policy": load_confirmation_policy(camp),
         "diagnostics": diagnostics,
         "method_evidence": methods,
+        "method_evidence_origin": method_origin,
         "method_evidence_packet": state.get("method_evidence_packet"),
         "parent_candidate_id": spec.get("parent_candidate_id"),
         "control_candidate_id": spec.get("control_candidate_id") or "baseline",
@@ -1310,6 +1374,7 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     payload: dict[str, Any] = {"status": "completed", "experiment_spec": spec, "summary_zh": "已写出 ExperimentSpec"}
     blocked = False
     design_failed = False
+    design_failure = None
     if designer is not None:
         try:
             from react_agent.eeg_research.agentic.handoffs import record_read_delivery
@@ -1344,9 +1409,13 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
                     spec_reply["status"] = "draft"
                 spec_reply.pop("approval_record", None)
                 spec = {**spec, **spec_reply}
-        except LlmUnavailable:
+        except LlmUnavailable as exc:
+            design_failure = {"error_type": str(exc), "diagnostics": getattr(exc, "diagnostics", {}),
+                "task_id": task["task_id"], "input_digest": task["input_digest"],
+                "recoverable": str(exc) in {"domain_schema_invalid", "DeepSeekParseError", "TimeoutError", "APIConnectionError", "APITimeoutError"}}
+            payload["design_failure"] = design_failure
             payload["status"] = "partial"
-            payload["summary_zh"] = "设计角色不可用，草稿未批准"
+            payload["summary_zh"] = "设计调用未完成：" + str(exc) + "；草稿未批准"
             spec["role_status"] = "partial"
             spec["status"] = "draft"
             design_failed = True
@@ -1367,6 +1436,7 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     if not isinstance(stored, dict):
         inner = envelope.get("payload")
         stored = inner.get("experiment_spec") if isinstance(inner, dict) else spec
+    state.pop("execution_spec", None)
     state["experiment"] = stored
     state["experiment_ref"] = (
         (stored.get("experiment_ref") if isinstance(stored, dict) else None)
@@ -1376,6 +1446,19 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     state["hypothesis"] = stored.get("hypothesis") if isinstance(stored, dict) else state.get("hypothesis")
     state["candidate_ready"] = False
     state["experiment_failed"] = blocked
+    if design_failure:
+        scientific_epoch = [row.get("evidence_id") for row in state.get("evidence") or []
+                            if row.get("evaluation_valid") is True and row.get("fidelity") in {"pilot", "full"}]
+        previous = state.get("design_failure") or {}
+        design_failure["scientific_epoch"] = scientific_epoch
+        design_failure["attempts_in_epoch"] = (int(previous.get("attempts_in_epoch") or 0) + 1
+            if previous.get("scientific_epoch") == scientific_epoch else 1)
+        design_failure["artifact_ref"] = (envelope.get("artifact_refs") or [None])[-1]
+        state["design_failure"] = design_failure
+    else:
+        # A scientific/capability block is not the previous recoverable API
+        # failure and must not inherit its retry permission.
+        state.pop("design_failure", None)
     _write(
         camp / "hypotheses" / f"h{len(state.get('decisions') or [])}.json",
         {"hypothesis": state["hypothesis"], "experiment": stored, "experiment_ref": state["experiment_ref"]},
@@ -2088,6 +2171,16 @@ def _record_job(camp: Path, state: dict[str, Any], record: dict[str, Any]) -> No
     event(camp, "job_settled", job_id=record.get("job_id"), status=record.get("status"), valid=result.get("evaluation_valid"))
 
 
+
+def _clear_recovered_training_failure(camp: Path, state: dict[str, Any], job_id: str) -> None:
+    """A verified running job resolves the prior active training failure."""
+    failure = state.get("failure") or {}
+    if failure.get("phase") == "train":
+        state.pop("failure", None)
+        state.pop("detail", None)
+        event(camp, "training_failure_recovered", job_id=job_id,
+              previous_failure_type=failure.get("error_type"))
+
 def _launch(
     camp: Path,
     state: dict[str, Any],
@@ -2137,6 +2230,7 @@ def _launch(
         state["training_jobs"] = job_index
         state["live_job"] = job_id
         state["status"] = "training"
+        _clear_recovered_training_failure(camp, state, job_id)
         return
     if training_seed is not None:
         state["pending_training_seed"] = training_seed
@@ -2157,6 +2251,7 @@ def _launch(
     state["training_jobs"] = job_index
     state["live_job"] = record["job_id"]
     state["status"] = "training"
+    _clear_recovered_training_failure(camp, state, record["job_id"])
     event(camp, "job_started", job_id=record["job_id"], candidate_id=candidate_id, fidelity=fidelity, seed=training_seed)
 
 

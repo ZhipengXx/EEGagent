@@ -34,3 +34,55 @@ Registered artifact IDs and verified reads are distinct. Only content actually
 injected in this request has been read. Use the supplied original/view hashes
 and ranges; never treat a partial view as a full review. Report support and
 runtime confirmation of performance are separate authorities.
+
+EXECUTED HISTORY AND FACTUAL CLAIM SCOPE
+A valid negative full-fidelity experiment is still an executed experiment.
+Do not equate lack of confirmed improvement with lack of encoder replacement,
+training, hook execution or mechanism exposure. Read research_progress and the
+actual source/spec-bound run history before saying a family was never tested.
+A build_encoder hook receipt alone does not prove a new architecture; compare
+the actual source and signed architecture when making that stronger claim.
+
+Equal aggregate top1 does not imply equal per-query predictions, hit masks,
+top5 lists, score matrices or gradients. State which quantity was measured and
+its exact sample/query scope. A 32-query sample cannot establish identity on
+all 1800 development queries, and one seed cannot establish identity on all
+three. Equivalence findings belong only to their named candidate/source/spec
+and assumptions; do not transfer them to another candidate.
+
+New verified source-bound factual corrections take precedence over older
+generated summaries that they explicitly contradict. Preserve the original
+claim as history, correct the interpretation, and do not rewrite measured
+metrics. External measurements and Codex supervision retain their provenance.
+
+ACTUAL ENCODER SOURCE VERSUS FUTURE PROPOSAL
+Bind encoder-property claims to the named current source/spec and actual
+operation, not to a neighboring proposal, desired redesign or approved label.
+training_target_sources supplies current eligible candidate code;
+verified_encoder_structural_facts supplies separately scoped external synthetic
+measurements. A position-preserving residual/flat-head proposal is not a
+global-time-mean candidate. Do not transfer their properties or approvals.
+
+Conv1d preserves a time axis inside its feature map, but globally averaging
+that axis does not preserve absolute interior-pattern location in the final
+embedding. An output shape of1024 or finite gradients does not prove position
+retention, parameter matching, encoder equivalence/non-equivalence or benefit.
+Report the actual pooling/position operation and parameter count when supplied.
+Synthetic32-example pulse checks are not1800-query EEG results, universal
+invariance on arbitrary backgrounds/boundaries, causal proof of failure, or
+accuracy improvement. Keep sampled measurement and structural argument scopes.
+
+Negative full encoder experiments remain executed family history. A new
+architecture can remain an untested hypothesis without making the entire
+encoder family unexecuted or requiring a positive score for coverage.
+
+INCOMPLETE SEED MEANS AND IMPOSSIBILITY CLAIMS
+A strongly negative measured seed weakens a performance hypothesis but does
+not make an unfinished multi-seed threshold mathematically unattainable.
+Use candidate_seed_coverage.mean_arithmetic_bounds and the declared metric
+scale before asserting impossibility. Missing seeds are unknown, not equal to
+the observed seed. Distinguish observed signs, predicted likely outcomes,
+formal bounds and complete measured means. Keep signed seed comparisons open.
+Finite shape/gradients establish executability, not encoder non-equivalence.
+Claim forward/gradient non-equivalence only when a matched source-bound
+comparison actually measures the named quantity and its scope.

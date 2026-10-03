@@ -792,6 +792,10 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                     loss, _top1, _top5 = model(eeg, img, codes)
                 else:
                     loss, _top1, _top5 = model(eeg, img)
+                # LocalRetrieval checked each scalar objective; gather adds one
+                # loss per replica while preserving the local negative batches.
+                if isinstance(model, torch.nn.DataParallel):
+                    loss = loss.mean()
                 loss = scalar_loss(loss)
             losses.append(float(loss))
             optimizer.zero_grad(set_to_none=True)

@@ -37,12 +37,23 @@ def _check_fingerprint(workspace: Path, python: str | None) -> str:
     from react_agent.eeg_training.protocol import torch_python
 
     spec = workspace / "input_spec.json"
+    approved = workspace / "spec.json"
+    assigned = json.loads(approved.read_text(encoding="utf-8")) if approved.is_file() else {}
+    config = assigned.get("experiment") or assigned
+    # check_entry consumes only these hook configs. Repair prose and artifact
+    # receipts do not change the computation checked by this fingerprint.
+    hook_config = {key: config.get(key) or {} for key in ("model", "objective", "transform")}
     payload = {
+        "fingerprint_version": 3,
         "source": file_sha256(workspace / "extension" / "eeg_candidate.py"),
-        "input_spec": spec.read_text(encoding="utf-8") if spec.is_file() else "eeg",
-        "approved_spec": (workspace / "spec.json").read_text(encoding="utf-8") if (workspace / "spec.json").is_file() else None,
+        "input_spec": json.loads(spec.read_text(encoding="utf-8")) if spec.is_file() else "eeg",
+        "approved_hook_config": hook_config,
         "python": python or torch_python(),
         "checker": file_sha256(Path(__file__).with_name("check_entry.py")),
+        "objective_effectiveness_probe": file_sha256(Path(__file__).with_name("objective_effectiveness.py")),
+        "objective_semantic_probe": file_sha256(Path(__file__).with_name("objective_semantics.py")),
+        "baseline_loss_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "model.py"),
+        "objective_dispatch_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "hooks.py"),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
@@ -260,6 +271,15 @@ def implement(
             "last_check": last_check,
             "history": history[-8:],
         }
+        current_fingerprint = _check_fingerprint(workspace, python) if entry.is_file() else ""
+        check_fresh = bool(current and last_hash == current["sha256"] and last_check_fingerprint == current_fingerprint)
+        request["check_status"] = {
+            "passed": bool(last_check and last_check.get("ok")),
+            "fresh": check_fresh,
+            "current_fingerprint": current_fingerprint,
+            "checked_fingerprint": last_check_fingerprint,
+            "next_tool": "run_candidate_check" if last_check and not check_fresh else None,
+        }
         location = (last_check or {}).get("location") or {}
         if entry.is_file() and isinstance(location.get("line"), int):
             line = location["line"]
@@ -273,8 +293,10 @@ def implement(
             recent_reads = sum(item.get("tool") == "read_code" and bool(item.get("result", {}).get("ok")) for item in history[-2:])
             if recent_reads == 2:
                 request["runtime_note"] += " Two source ranges were just supplied. Use those ranges and the exact diagnostic now; do not spend another call rereading overlapping lines."
+        elif last_check is not None and last_check.get("ok") and not check_fresh:
+            request["runtime_note"] = "The stored check passed for an older fingerprint. Call run_candidate_check before finish_patch; rereading source or repeating finish cannot refresh the check."
         elif last_check is not None and last_check.get("ok"):
-            request["runtime_note"] = "The check passed. Call finish_patch unless a required change is missing."
+            request["runtime_note"] = "The current check passed. Call finish_patch unless a required source change is missing."
         reply = backend(request)
         tool, args, request_error = validate_tool_request(reply)
         started = time.time()
@@ -287,7 +309,7 @@ def implement(
             if fresh and last_check_fingerprint:
                 fresh = _check_fingerprint(workspace, python) == last_check_fingerprint
             if not (fresh and last_check and last_check.get("ok")):
-                result = {"ok": False, "error": "check_not_passed", "detail": "The current source must pass its interface check before finish_patch."}
+                result = {"ok": False, "error": "check_not_passed", "detail": "The current source and executable config must have a fresh passing check. Call run_candidate_check before finish_patch.", "next_tool": "run_candidate_check", "check_fresh": fresh}
             else:
                 result = _execute(workspace, tool, args, last_check, python)
         elif tool == "run_candidate_check" and entry.is_file() and last_check is not None and _check_fingerprint(workspace, python) == last_check_fingerprint:

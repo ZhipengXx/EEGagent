@@ -31,7 +31,8 @@ def training_semantics() -> list[dict[str, Any]]:
     import ast
     root = Path(__file__).resolve().parents[2] / "eeg_training"
     views = []
-    for name, selected in (("model.py", {"LocalRetrieval"}), ("train_entry.py", {
+    for name, selected in (("model.py", {"LocalRetrieval", "contrastive_loss"}),
+                           ("hooks.py", {"compute_objective", "scalar_loss", "is_custom_objective"}), ("train_entry.py", {
         "_build_hook", "_logit_scale", "_instantiate_candidate", "train_channel_statistics",
         "unique_trainable_parameters", "placed_retrieval", "rebuild_encoder", "fit",
     })):
@@ -76,6 +77,48 @@ def development_view(value: Any) -> Any:
     return value
 
 
+def candidate_cpu_check(camp: Path, target: str, binding: dict[str, Any],
+                        current_source_hash: str | None) -> dict[str, Any]:
+    """Expose actual CPU receipts only for the source and config they checked."""
+    if target == "baseline":
+        return {"status":"runtime_frozen_baseline_reference","checks":None}
+    workspace = camp / "candidates" / target
+    path = workspace / "checks.json"
+    view = {"status":"unavailable","check_ref":str(path),"checks":None,"missing_inputs":[]}
+    try:
+        checks = json.loads(path.read_text(encoding="utf-8"))
+        assigned = json.loads((workspace / "spec.json").read_text(encoding="utf-8"))
+        experiment = assigned.get("experiment") or assigned
+    except (OSError, ValueError) as exc:
+        view["missing_inputs"] = ["cpu_check_or_assigned_spec_unreadable:"+type(exc).__name__]
+        return view
+    if not isinstance(checks,dict) or not isinstance(experiment,dict):
+        view["missing_inputs"] = ["cpu_check_or_spec_not_object"]
+        return view
+    expected = {key:binding.get(key) or {} for key in ("model","objective","transform")}
+    identity_ok = (current_source_hash and current_source_hash == binding.get("source_hash")
+                   and checks.get("source_sha256") == current_source_hash
+                   and experiment.get("spec_hash") == binding.get("spec_hash")
+                   and checks.get("approved_hook_config") == expected)
+    if not identity_ok:
+        view["status"] = "identity_mismatch"
+        view["missing_inputs"] = ["cpu_receipt_does_not_match_current_approved_source_and_config"]
+        return view
+    from react_agent.eeg_research.agentic.native_patch import _check_fingerprint
+    try:
+        current_fingerprint = _check_fingerprint(workspace,None)
+    except (OSError, ValueError, KeyError):
+        current_fingerprint = None
+    view.update(status="verified_source_config_bound_cpu_receipt",source_hash=current_source_hash,
+                spec_hash=binding.get("spec_hash"),check_sha256=file_digest(path),
+                check_fingerprint=checks.get("check_fingerprint"),
+                current_checker_fingerprint=current_fingerprint,
+                fresh_for_current_runtime=bool(current_fingerprint and checks.get("check_fingerprint")==current_fingerprint),
+                checks=development_view(checks),
+                scope="Actual saved synthetic CPU interface/gradient/formula/off/checkpoint probes for this source/config. Freshness is explicit. This is not an original GPU optimizer-step receipt, training score, benefit or runtime authorization.")
+    return view
+
+
 def candidate_context(camp: Path, target: str) -> dict[str, Any]:
     """Use target-bound source/config; baseline has concrete behavior too."""
     protocol = load_protocol(camp) or {}
@@ -113,6 +156,7 @@ def candidate_context(camp: Path, target: str) -> dict[str, Any]:
         "source_truncated": source is not None and len(source) > SOURCE_CHARS,
         "source_range": None if source is None else [0, min(len(source), SOURCE_CHARS)],
         "encoder_reference": encoder_reference,
+        "cpu_check_receipt": candidate_cpu_check(camp,target,binding,current_hash),
         "approval_ref": approval_ref,
         "spec_hash": binding.get("spec_hash"),
         "model": binding.get("model") or {},
@@ -122,8 +166,110 @@ def candidate_context(camp: Path, target: str) -> dict[str, Any]:
         "recipe": {key: protocol.get(key) for key in ("full_epochs", "batch_size", "lr", "weight_decay",
                    "negative_sampling_policy", "training_seeds", "input_geometry")},
         "negative_sampling_policy": binding.get("negative_sampling_policy") or protocol.get("negative_sampling_policy"),
+        "frozen_training_policy": {"full_epochs": protocol.get("full_epochs"),
+            "fidelity_overrides": protocol.get("fidelity_overrides"),
+            "training_seeds": protocol.get("training_seeds"),
+            "interpretation": "Maximum epochs and early-stop rules are frozen runtime invariants. A build_encoder hook cannot change them. Fewer realized epochs does not prove unequal budgets."},
         "missing_inputs": missing,
     })
+
+
+def implementation_lifecycle_context(camp: Path, state: dict[str, Any], target: str,
+                                     available: list[str]) -> dict[str, Any]:
+    """Explain the existing implementation gate without materializing a candidate."""
+    from react_agent.eeg_research.agentic.experiment_gate import (
+        ExperimentResolutionError, resolve_approved_experiment,
+    )
+    repair = state.get('repair_task') if isinstance(state.get('repair_task'), dict) else {}
+    repairing = bool(repair.get('candidate_id') == target and int(repair.get('remaining') or 0) > 0)
+    view = {'target_id': target, 'available': 'implement_candidate' in available,
+            'stage': 'repair_existing_candidate' if repairing else 'implement_registered_design',
+            'authority': 'Read-only explanation of the existing resolver. Execution revalidates all gates; this view grants no approval.'}
+    if not view['available']:
+        return {**view, 'status': 'implementation_not_currently_available'}
+    assigned = state.get('experiment') if isinstance(state.get('experiment'), dict) else {}
+    try:
+        resolved = resolve_approved_experiment(camp, spec_ref=state.get('experiment_ref'),
+            expected_hash=assigned.get('spec_hash') if not repairing else None,
+            target_id=target, attempt_id=repair.get('attempt_id'), state=state,
+            action='repair' if repairing else 'implement')
+    except ExperimentResolutionError as exc:
+        return {**view, 'status': 'design_resolution_failed', 'reason': exc.reason}
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return {**view, 'status': 'design_resolution_failed', 'reason': type(exc).__name__}
+    workspace = camp / 'candidates' / target
+    source_exists = (workspace / 'extension/eeg_candidate.py').is_file()
+    binding_exists = load_approved_binding(camp, target) is not None
+    expected_absence = []
+    if not repairing:
+        if not source_exists: expected_absence.append('source_not_yet_generated_by_implement_candidate')
+        if not binding_exists: expected_absence.append('candidate_binding_materialized_by_worker_from_resolved_registered_design')
+    return development_view({**view, 'status': 'registered_design_verified_for_existing_implementation_gate',
+        'spec_hash': resolved.get('spec_hash'), 'experiment_ref': state.get('experiment_ref'),
+        'approval_record': resolved.get('approval_record'),
+        'source_exists': source_exists, 'candidate_binding_exists': binding_exists,
+        'expected_preimplementation_absence': expected_absence,
+        'parent_candidate_id': resolved.get('parent_candidate_id'),
+        'control_candidate_id': resolved.get('control_candidate_id'),
+        'workflow': ['The registered approved design authorizes the implementation gate, not training.',
+            'The worker creates the candidate workspace and binding, materializes parent source, and invokes the real Coder.',
+            'CPU checks and Reviewer must pass before the candidate becomes eligible for training.',
+            'A new candidate source cannot be required before the action whose purpose is to create that source.'],
+        'limits': ['An available implementation action can compete with other useful actions; this view does not force a selection.',
+            'Existing repair/training source binding, registered spec hashes, review, capability and budget gates remain unchanged.']})
+
+
+def training_target_source_context(camp: Path, state: dict[str, Any], eligible: dict[str, list[str]]) -> dict[str, Any]:
+    """Expose actual sources of current training targets, separately from proposals."""
+    names = sorted({str(target) for action in ('run_pilot', 'run_full', 'replicate')
+                    for target in eligible.get(action, [])})
+    current = str(state.get('candidate_id') or '')
+    if current in names:
+        names.remove(current); names.insert(0, current)
+    selected = names[:4]
+    return {'by_candidate': {name: candidate_context(camp, name) for name in selected},
+            'omitted_target_ids': names[4:], 'source_limit': 4,
+            'scope': 'Current source/spec-bound candidate code for eligible training targets. A research proposal or pending design is not this source. Missing/truncated source remains explicit.'}
+
+
+def verified_encoder_structural_facts(camp: Path, state: dict[str, Any], *, target_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    """Deliver registered source/checkpoint-bound synthetic encoder facts."""
+    from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
+    facts = []; seen = set(); protocol = load_protocol(camp) or {}
+    for evidence in reversed(state.get('evidence') or []):
+        if evidence.get('kind') != 'diagnostic_bundle' or evidence.get('status') != 'verified': continue
+        for ref in evidence.get('artifact_refs') or []:
+            if ref in seen: continue
+            try:
+                record = resolve_verified_artifact(camp, ref)
+                report = json.loads(Path(record['path']).read_text())
+                if report.get('schema_version') != 'eeg_research.c8_actual_pooling_factual_audit.v1': continue
+                target = report.get('candidate_id')
+                if target_ids is not None and target not in target_ids: continue
+                binding = load_approved_binding(camp, str(target)) or {}
+                if (report.get('final_test_accessed') is not False or report.get('gpu_seconds') != 0
+                        or report.get('execution_fingerprint') != protocol.get('fingerprint')
+                        or report.get('sample_count_per_position') != 32
+                        or binding.get('source_hash') != report.get('source_hash')
+                        or binding.get('spec_hash') != report.get('spec_hash')): continue
+                current_source = camp / 'candidates' / str(target) / 'extension/eeg_candidate.py'
+                if file_digest(current_source) != report['source_hash']: continue
+                for path, digest in report['artifact_hashes'].items():
+                    p = Path(path)
+                    if not p.resolve().is_relative_to(camp.resolve()) or file_digest(p) != digest:
+                        raise ValueError('encoder_structural_artifact_binding_changed')
+                run = next(e for e in state.get('evidence') or [] if e.get('job_id') == report.get('job_id')
+                           and e.get('evaluation_valid') is True and e.get('source_hash') == report['source_hash']
+                           and e.get('spec_hash') == report['spec_hash'] and e.get('seed') == report['seed'])
+                seen.add(ref)
+                facts.append(development_view({'evidence_id': evidence['evidence_id'], 'artifact_id': ref,
+                    'artifact_sha256': record['sha256'], 'run_evidence_id': run['evidence_id'],
+                    **{key: report[key] for key in ('candidate_id', 'source_hash', 'spec_hash', 'job_id', 'seed',
+                        'scope', 'sample_count_per_position', 'positions', 'measurements', 'actual_encoder_parameters',
+                        'source_pooling_expression', 'corrections', 'limitations', 'provenance')},
+                    'authority': 'Verified external synthetic measurement/correction; no new EEG score or training authorization.'}))
+            except (OSError, ValueError, KeyError, TypeError, StopIteration): continue
+    return facts
 
 
 def matched_diagnostics(state: dict[str, Any], target: str) -> dict[str, Any] | None:
@@ -143,8 +289,28 @@ def load_analysis_views(camp: Path, state: dict[str, Any], *, target: str | None
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
 
     views = []
+    latest_completed = {}
+    superseded = {}
     for row in state.get("evidence") or []:
         if row.get("kind") != "analysis" or (target and row.get("candidate_id") != target):
+            continue
+        key = row.get("run_evidence_id")
+        if key and row.get("status") == "completed" and row.get("analysis_artifact_id"):
+            try:
+                registered = resolve_verified_artifact(camp, row["analysis_artifact_id"])
+                body = json.loads(Path(registered["path"]).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if registered.get("kind") == "analysis" and body.get("status") == "completed":
+                previous = latest_completed.get(key)
+                if previous:superseded.setdefault(key, []).append(previous.get("evidence_id"))
+                latest_completed[key] = row
+    for row in state.get("evidence") or []:
+        if row.get("kind") != "analysis" or (target and row.get("candidate_id") != target):
+            continue
+        key = row.get("run_evidence_id")
+        current = latest_completed.get(key)
+        if row.get("status") == "completed" and current and current.get("evidence_id") != row.get("evidence_id"):
             continue
         ref = row.get("analysis_artifact_id")
         if not ref:
@@ -161,7 +327,8 @@ def load_analysis_views(camp: Path, state: dict[str, Any], *, target: str | None
         payload = body.get("payload") or body.get("reply") or body
         views.append(development_view({"evidence_id": row.get("evidence_id"), "candidate_id": row.get("candidate_id"),
             "artifact_id": ref, "content_hash": registered["sha256"], "verification_status": "verified",
-            "completion_status": body.get("status"),
+            "completion_status": body.get("status"), "run_evidence_id": key,
+            "superseded_analysis_evidence_ids": superseded.get(key, []) if current is row else [],
             "authority": "llm_interpretation", "input_digest": body.get("input_digest"), "payload": payload}))
     return views[-8:]
 
@@ -588,3 +755,41 @@ def selected_read_context(camp: Path, state: dict[str, Any]) -> list[dict[str, A
     """A worker receives only explicitly cited artifacts/pages, with visible gaps."""
     return verified_read_context(camp, state, artifact_refs=list(state.get("active_artifact_refs") or []),
                                  request_digests=list(state.get("active_read_digests") or []))
+
+
+def analysis_experiment_binding(camp: Path, latest: dict[str, Any]) -> dict[str, Any]:
+    """Bind analysis to the approved spec and source of this exact accepted run."""
+    from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
+    from react_agent.eeg_research.agentic.experiment_gate import _spec_hash, experiment_is_approved
+    target=str(latest.get("candidate_id") or "")
+    if target=="baseline":return {"status":"frozen_baseline", "missing_inputs":[]}
+    binding=load_approved_binding(camp,target) or {}
+    try:
+        if not target or not binding:raise ValueError("approved_binding_missing")
+        registry=resolve_verified_artifact(camp,str(binding.get("spec_ref") or ""))
+        artifact=json.loads(Path(registry["path"]).read_text(encoding="utf-8"))
+        spec=artifact.get("experiment_spec") or artifact.get("experiment") or artifact
+        if not isinstance(spec,dict):raise ValueError("approved_spec_missing")
+        if not experiment_is_approved(spec):raise ValueError("spec_not_approved")
+        expected=latest.get("spec_hash")
+        if not expected or _spec_hash(spec)!=expected or binding.get("spec_hash")!=expected:
+            raise ValueError("run_spec_hash_mismatch")
+        if binding.get("target_id")!=target or binding.get("source_hash")!=latest.get("source_hash"):
+            raise ValueError("run_source_binding_mismatch")
+        job=Path(str(latest.get("job_dir") or ""))
+        if not job.resolve().is_relative_to(camp.resolve()):raise ValueError("run_outside_campaign")
+        frozen=json.loads((job/"frozen_run_spec.json").read_text())
+        source=json.loads((job/"source_binding.json").read_text())
+        if frozen.get("spec_hash")!=expected or frozen.get("candidate_id", frozen.get("target_id"))!=target:
+            raise ValueError("frozen_run_spec_mismatch")
+        path=Path(str(source.get("class_file") or ""));path=path if path.is_absolute() else job/path
+        if source.get("file_sha256")!=latest.get("source_hash") or file_digest(path)!=latest.get("source_hash"):
+            raise ValueError("loaded_source_changed")
+        hypothesis=spec.get("hypothesis")
+        if not hypothesis:raise ValueError("approved_hypothesis_missing")
+        return {"status":"verified", "hypothesis":hypothesis, "experiment":spec,
+                "spec_hash":expected,"source_hash":latest.get("source_hash"),
+                "artifact_ref":registry["artifact_id"],"artifact_sha256":registry["sha256"],
+                "missing_inputs":[]}
+    except (OSError,ValueError,KeyError,TypeError) as exc:
+        return {"status":"unavailable","missing_inputs":[str(exc)]}

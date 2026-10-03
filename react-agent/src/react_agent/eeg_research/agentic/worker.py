@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+
 import fcntl
 import json
 import os
@@ -209,14 +211,13 @@ def build_services(camp: Path) -> dict[str, Any]:
             fidelity=fidelity,
             root=root,
             protocol_path=camp_dir / "execution_protocol.json",
+            training_seed=state.get("pending_training_seed"),
         )
 
     def settle(camp_dir: Path, job_id: str) -> dict[str, Any]:
         return jobs.reconcile(camp_dir / "jobs" / job_id)
 
     def do_implement(camp_dir: Path, state: dict[str, Any]) -> None:
-        coder = role_backend(camp, "candidate_coder")
-        reviewer = role_backend(camp, "candidate_reviewer")
         if state.get("status") in {"paused", "cancelled"}:
             return
         repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else None
@@ -228,7 +229,23 @@ def build_services(camp: Path) -> dict[str, Any]:
                             detail="implementation_target_changed", recoverable=True)
             return
         workspace = camp_dir / "candidates" / candidate_id
-        spec = {"hypothesis": state.get("hypothesis"), "experiment": state.get("experiment")}
+        # A repair cache from another candidate cannot authorize this target.
+        from react_agent.eeg_research.agentic.experiment_gate import ExperimentResolutionError, resolve_approved_experiment
+        try:
+            assigned = resolve_approved_experiment(
+                camp_dir, target_id=candidate_id,
+                spec_ref=state.get("experiment_ref") if not repairing else None,
+                expected_hash=(state.get("experiment") or {}).get("spec_hash") if not repairing else None,
+                attempt_id=(repair or {}).get("attempt_id"), state=state,
+                action="repair" if repairing else "implement",
+            )
+        except ExperimentResolutionError as exc:
+            _block_phase(camp_dir, state, phase="implement_candidate",
+                         error_type=exc.reason, detail=exc.reason, recoverable=True)
+            return
+        coder = role_backend(camp, "candidate_coder")
+        reviewer = role_backend(camp, "candidate_reviewer")
+        spec = {"hypothesis": assigned.get("hypothesis"), "experiment": assigned}
         from react_agent.eeg_research.agentic.audit_context import audit_feedback
         from react_agent.eeg_research.agentic.handoffs import selected_read_context
         spec["audit_issues"] = [row for row in audit_feedback(camp_dir, state)["issues"]
@@ -241,7 +258,6 @@ def build_services(camp: Path) -> dict[str, Any]:
         workspace.mkdir(parents=True, exist_ok=True)
         from react_agent.eeg_research.agentic.run_context import load_approved_binding, persist_approved_binding
         from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
-        assigned = state.get("execution_spec") if repairing and isinstance(state.get("execution_spec"), dict) else state.get("experiment")
         if load_approved_binding(camp_dir, candidate_id) is None and experiment_is_approved(assigned):
             persist_approved_binding(camp_dir, candidate_id, assigned,
                 spec_ref=assigned.get("experiment_ref") or state.get("experiment_ref"))
@@ -252,7 +268,7 @@ def build_services(camp: Path) -> dict[str, Any]:
             encoding="utf-8",
         )
         try:
-            materialize(camp_dir, workspace, state.get("experiment") or {})
+            materialize(camp_dir, workspace, assigned)
         except LineageError as exc:
             _block_phase(
                 camp_dir,
@@ -408,7 +424,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                 state["candidate_id"] = candidate_id
                 state["repair_task"] = None
                 row["status"] = "ready"
-                bound = state.get("execution_spec") if repairing and isinstance(state.get("execution_spec"), dict) else state.get("experiment")
+                bound = assigned
                 if isinstance(bound, dict):
                     from react_agent.eeg_research.agentic.run_context import persist_approved_binding
 
@@ -474,15 +490,13 @@ def build_services(camp: Path) -> dict[str, Any]:
             state["evidence"].append(evidence_row)
         event(camp_dir, "implemented", **row)
 
-    def analyze(camp_dir: Path, state: dict[str, Any]) -> None:
-        latest = next((row for row in reversed(state.get("evidence") or [])
-                       if row.get("fidelity") and row.get("candidate_id") and "evaluation_valid" in row), None)
-        if latest is None:
-            return
+    def _analyze_run(camp_dir: Path, state: dict[str, Any], latest: dict[str, Any], *, trigger: dict[str, Any]) -> None:
         comparison = latest.get("comparison")
         diagnostics = latest.get("diagnostics")
         if not latest.get("evaluation_valid"):
             return
+        from react_agent.eeg_research.agentic.development_feedback import ensure_development_feedback
+        feedback = ensure_development_feedback(camp_dir, state, latest)
         bound_hypothesis = latest.get("hypothesis")
         bound_experiment = latest.get("experiment")
         if bound_hypothesis is None:
@@ -491,6 +505,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                     bound_hypothesis = row.get("hypothesis")
                     bound_experiment = row.get("experiment")
         payload = {
+            "analysis_trigger": trigger,
             "latest": {key: latest.get(key) for key in ("evidence_id", "job_id", "candidate_id", "fidelity", "fixed_bank_top1", "gallery_size", "delta_vs_control_pp", "control_id", "seed",
                 "evaluation_valid", "reason", "execution_succeeded", "implementation_failure", "job_status", "checkpoint_id", "source_hash", "config_hash", "spec_hash", "contract_fingerprint")},
             "comparison": comparison,
@@ -498,6 +513,7 @@ def build_services(camp: Path) -> dict[str, Any]:
             "hypothesis": bound_hypothesis,
             "experiment": bound_experiment,
             "hypothesis_binding_missing": bound_hypothesis is None,
+            "development_feedback": feedback,
             "controls": [
                 {key: row.get(key) for key in ("evidence_id", "candidate_id", "fidelity", "fixed_bank_top1", "seed")}
                 for row in state["evidence"]
@@ -513,12 +529,105 @@ def build_services(camp: Path) -> dict[str, Any]:
             "job_id", "source_hash", "config_hash", "spec_hash", "checkpoint_id", "contract_fingerprint", "result_hash")}
         from react_agent.eeg_research.agentic.handoffs import candidate_context
         payload["candidate_context"] = candidate_context(camp_dir, str(latest["candidate_id"]))
+        from react_agent.eeg_research.agentic.measurement_context import evaluation_population_context
+        payload["evaluation_population"] = evaluation_population_context(load_protocol(camp_dir))
+        from react_agent.eeg_research.agentic.handoffs import verified_encoder_structural_facts
+        payload["verified_encoder_structural_facts"] = verified_encoder_structural_facts(camp_dir, state,
+            target_ids={str(latest["candidate_id"])})
+        from react_agent.eeg_research.agentic.research_progress import verified_training_diagnostic_facts
+        payload["verified_training_diagnostics"] = verified_training_diagnostic_facts(camp_dir, state,
+            str(latest["candidate_id"]), str(latest.get("source_hash")), str(latest.get("spec_hash")))
+        from react_agent.eeg_research.agentic.research_progress import objective_effectiveness_findings
+        payload["objective_effectiveness_findings"] = objective_effectiveness_findings(camp_dir,state,
+            str(latest["candidate_id"]),str(latest.get("source_hash")),str(latest.get("spec_hash")))
+        from react_agent.eeg_research.agentic.research_progress import objective_semantic_findings
+        payload["objective_semantic_findings"] = objective_semantic_findings(camp_dir,state,
+            str(latest["candidate_id"]),str(latest.get("source_hash")),str(latest.get("spec_hash")))
         payload["is_frozen_baseline"] = latest["candidate_id"] == "baseline"
+        from react_agent.eeg_research.agentic.handoffs import analysis_experiment_binding
+        from react_agent.eeg_research.agentic.research_progress import verified_diagnostic_facts
+        binding = analysis_experiment_binding(camp_dir, latest)
+        payload["hypothesis_binding"] = binding
+        if not payload["is_frozen_baseline"]:
+            payload["hypothesis"] = binding.get("hypothesis")
+            payload["experiment"] = binding.get("experiment")
+            payload["hypothesis_binding_missing"] = binding.get("status") != "verified"
+        same_revision = [row for row in state.get("evidence") or []
+            if row.get("evaluation_valid") is True and row.get("candidate_id") == latest["candidate_id"]
+            and row.get("fidelity") == latest["fidelity"] and row.get("source_hash") == latest.get("source_hash")
+            and row.get("spec_hash") == latest.get("spec_hash")
+            and row.get("execution_fingerprint") == latest.get("execution_fingerprint")]
+        # Repeated runs of the same actual seed are not independent seeds.
+        same_revision = list({row.get("seed"):row for row in same_revision}.values())
+        control_ids = {row.get("control_id") for row in same_revision if row.get("control_id")}
+        parent_experiment = binding.get("experiment") or {}
+        parent_id = parent_experiment.get("ablation_of_candidate_id") or parent_experiment.get("parent_candidate_id")
+        if parent_id == "baseline":
+            parent_id = None
+        parent_binding = None
+        if parent_id:
+            from react_agent.eeg_research.agentic.run_context import load_approved_binding
+            parent_binding = load_approved_binding(camp_dir, str(parent_id)) or {}
+        paired_seeds = {row.get("seed") for row in same_revision}
+        matched = list(same_revision)
+        for row in state.get("evidence") or []:
+            if row.get("evaluation_valid") is not True or row.get("fidelity") != latest["fidelity"]:
+                continue
+            if row.get("execution_fingerprint") != latest.get("execution_fingerprint"):
+                continue
+            if row.get("evidence_id") in control_ids:
+                matched.append(row)
+            elif (parent_binding and row.get("candidate_id") == parent_id and row.get("seed") in paired_seeds
+                  and row.get("source_hash") == parent_binding.get("source_hash")
+                  and row.get("spec_hash") == parent_binding.get("spec_hash")):
+                matched.append(row)
+        from react_agent.eeg_research.agentic.development_feedback import _ensure_report
+        payload["matched_run_history"] = []
+        for row in matched:
+            if latest["fidelity"] == "full":
+                try:
+                    _ensure_report(camp_dir, state, row)
+                except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                    pass  # An unavailable diagnostic is explicit in supplied coverage.
+            payload["matched_run_history"].append({key:row.get(key) for key in (
+                "evidence_id", "job_id", "candidate_id", "fidelity", "seed", "source_hash", "spec_hash", "checkpoint_id",
+                "execution_fingerprint", "evaluation_valid", "fixed_bank_top1", "control_id", "comparison", "promotion")})
+        declared = [int(seed) for seed in (state.get("training_seeds") or json.loads((camp_dir / "goal.json").read_text()).get("training_seeds") or [])]
+        observed = sorted(seed for seed in paired_seeds if isinstance(seed,int))
+        payload["candidate_seed_coverage"] = {"fidelity":latest["fidelity"], "source_hash":latest.get("source_hash"),
+            "spec_hash":latest.get("spec_hash"), "observed_training_seeds":observed,
+            "declared_training_seeds":declared,"missing_training_seeds":[seed for seed in declared if seed not in observed]}
+        # Fixed-gallery top1 is a bounded fraction. Missing seeds have not been
+        # measured; a negative observed seed is not a bound on their outcomes.
+        import math
+        required = sorted(set(declared))
+        values = {row["seed"]: float(row["fixed_bank_top1"]) for row in same_revision
+                  if row.get("seed") in required and isinstance(row.get("fixed_bank_top1"), (int, float))
+                  and math.isfinite(row["fixed_bank_top1"]) and 0 <= row["fixed_bank_top1"] <= 1}
+        absent = [seed for seed in required if seed not in values]
+        payload["candidate_seed_coverage"]["mean_arithmetic_bounds"] = {
+            "metric": "fixed_bank_top1", "metric_range": [0.0, 1.0],
+            "required_seed_count": len(required), "measured_scores_by_seed": values,
+            "unmeasured_seed_ids": absent, "unmeasured_count": len(absent),
+            "current_observed_mean": sum(values.values()) / len(values) if values else None,
+            "minimum_possible_complete_mean": sum(values.values()) / len(required) if required else None,
+            "maximum_possible_complete_mean": (sum(values.values()) + len(absent)) / len(required) if required else None,
+            "complete_mean_measured": bool(required) and not absent,
+            "scope": "Read-only arithmetic bounds from measured same-source/spec/fidelity seeds and top1 range. Missing-seed performance is unknown; bounds are not forecasts, measurements, promotion or authorization."
+        }
+        payload["verified_development_facts"] = verified_diagnostic_facts(camp_dir, state,
+            job_ids={str(row["job_id"]) for row in matched if row.get("job_id")},max_facts=12)
+        payload["development_feedback_history"] = [
+            {"job_id":row.get("job_id"), "training_seed":row.get("seed"),
+             **ensure_development_feedback(camp_dir, state, row)} for row in same_revision]
+        from react_agent.eeg_research.agentic.analysis_coverage import coverage_summary
+        payload["verified_run_coverage"] = coverage_summary(same_revision, matched,
+            payload["verified_development_facts"], payload["development_feedback_history"])
         payload["run_artifacts"] = []
         job_dir = Path(str(latest.get("job_dir") or ""))
         if latest.get("job_dir") and job_dir.resolve().is_relative_to(camp_dir.resolve()):
             from react_agent.eeg_research.agentic.artifacts import file_digest
-            for name in ("run_record.json", "metrics.json", "selected_checkpoint.json", "hook_consumed.json", "source_binding.json", "frozen_run_spec.json"):
+            for name in ("run_record.json", "metrics.json", "selected_checkpoint.json", "hook_consumed.json", "capabilities_used.json", "source_binding.json", "frozen_run_spec.json"):
                 path = job_dir / name
                 if path.is_file():
                     content = path.read_text(encoding="utf-8")
@@ -631,6 +740,17 @@ def build_services(camp: Path) -> dict[str, Any]:
         if not (camp_dir / "cost.json").is_file():
             state["llm_calls"] = int(state.get("llm_calls", 0)) + billed
             state["llm_calls_left"] = int(state.get("llm_calls_left", 0)) - billed
+
+    def analyze(camp_dir: Path, state: dict[str, Any]) -> None:
+        latest = next((row for row in reversed(state.get("evidence") or [])
+                       if row.get("fidelity") and row.get("candidate_id") and "evaluation_valid" in row), None)
+        if latest is None:
+            return
+        from react_agent.eeg_research.agentic.analysis_dependencies import analysis_targets
+        for row in analysis_targets(camp_dir, state, latest):
+            trigger = {"kind":"settled_run" if row["evidence_id"] == latest["evidence_id"] else "new_parent_full_result",
+                       "upstream_evidence_id":latest["evidence_id"], "upstream_job_id":latest.get("job_id")}
+            _analyze_run(camp_dir, state, row, trigger=trigger)
 
     def _lazy(role: str):
         def call(payload: dict[str, Any]) -> dict[str, Any]:

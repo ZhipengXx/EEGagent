@@ -32,7 +32,9 @@ RAW_EXCERPT_LIMIT = 2048
 
 
 class LlmUnavailable(RuntimeError):
-    """No key, or the call failed. Callers must not substitute a scripted reply."""
+    def __init__(self, message: str, *, diagnostics: dict[str, Any] | None = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics or {}
 
 
 def system_prompt(role: str) -> str:
@@ -60,6 +62,56 @@ def _ledger(camp: Path, row: dict[str, Any]) -> None:
     cost["cost_status"] = "unpriced"
     cost.setdefault("gpu_seconds_used", 0.0)
     cost_path.write_text(json.dumps(cost, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
+                   user: str, max_tokens: int) -> dict[str, Any]:
+    """Persist the exact application-level role input before its API attempt.
+
+    Transport configuration and credentials are deliberately not serialized.
+    This is the complete_json input, not a claim about raw HTTP wire bytes.
+    """
+    folder = camp / "llm_requests"
+    folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = folder / (str(row["call_id"]) + ".json")
+    system_sha = hashlib.sha256(system.encode("utf-8")).hexdigest()
+    user_sha = hashlib.sha256(user.encode("utf-8")).hexdigest()
+    identity = {key: row.get(key) for key in
+                ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_hash", "requested_model")}
+    record = {**identity, "system": system, "user": user,
+              "system_sha256": system_sha, "user_sha256": user_sha,
+              "profile": "fast", "max_tokens": max_tokens,
+              "status": "prepared_before_transport", "recorded_at": time.time(),
+              "scope": "Exact application-level system/user strings supplied to complete_json; no transport credentials or HTTP wire-body claim."}
+    temp = path.with_suffix(".json.tmp")
+    descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False, indent=2))
+        temp.replace(path)
+    finally:
+        if temp.exists():
+            temp.unlink()
+    return {"request_trace_ref": str(path), "request_system_sha256": system_sha,
+            "request_user_sha256": user_sha}
+
+
+def _response_trace(camp: Path, row: dict[str, Any], reply: Any, *, validation: str,
+                    schema_errors: Any = None, normalization: Any = None) -> None:
+    """Keep the exact model response and validation outcome, without credentials."""
+    folder = camp / "llm_responses"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / (str(row["call_id"]) + ".json")
+    identity = {key: row.get(key) for key in
+                ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_hash",
+                 "request_trace_ref", "request_system_sha256", "request_user_sha256")}
+    record = {**identity, "reply": reply, "validation": validation,
+              "schema_errors": schema_errors, "recorded_at": time.time()}
+    if normalization:
+        record["normalization"] = normalization
+    temp = path.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(record, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    temp.replace(path)
 
 
 def _fail_row(row: dict[str, Any], exc: BaseException, started: float) -> dict[str, Any]:
@@ -132,6 +184,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
         last: DeepSeekParseError | None = None
         schema_error = None
         previous_domain = None
+        schema_feedback = None
         for _attempt in range(PARSE_ATTEMPTS):
             call_payload = payload
             if last is not None:
@@ -143,9 +196,10 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                         "instruction": "Return one complete JSON object matching OUTPUT_SCHEMA. Escape Python newlines and quotes inside content. Keep the implementation concise; do not omit requested interventions.",
                     },
                 }
-            elif schema_error is not None:
-                call_payload = {**payload, "schema_error": schema_error, "previous": previous_domain,
-                                "correction_instruction": "Return the exact injected domain JSON Schema. Keep this task and business context unchanged."}
+            if schema_error is not None:
+                call_payload = {**call_payload, "schema_error": schema_error, "previous": previous_domain,
+                                "schema_repair_context": schema_feedback,
+                                "correction_instruction": "Return a complete corrected JSON object using only OUTPUT_SCHEMA fields. Input metadata is read-only, not output. Remove every reported forbidden field; correct every reported missing/invalid field. Keep the task, legal actions, evidence identities and business context unchanged."}
             goal_path = camp / "goal.json"
             if goal_path.is_file():
                 try:
@@ -182,10 +236,13 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 status="active",
             )
             try:
+                user_text = json.dumps(call_payload, ensure_ascii=False, default=str, separators=(",", ":"))
+                row.update(_request_trace(camp, row, system=system, user=user_text,
+                                          max_tokens=int(config.fast.max_tokens)))
                 reply, usage = loop.run_until_complete(
                     client.complete_json(
                         system=system,
-                        user=json.dumps(call_payload, ensure_ascii=False, default=str),
+                        user=user_text,
                         profile="fast",
                         role=role,
                     )
@@ -193,6 +250,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             except DeepSeekParseError as exc:
                 last = exc
                 _ledger(camp, _fail_row(row, exc, started))
+                _response_trace(camp, row, getattr(exc, "raw", None), validation="invalid_json")
                 append_ui_event(
                     camp,
                     "llm_parse_retry",
@@ -227,13 +285,23 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 }
             )
             _ledger(camp, row)
+            _response_trace(camp, row, reply, validation="pending")
             parsed = reply if isinstance(reply, dict) else {"_not_object": reply}
+            normalization = None
+            if role == "research_planner":
+                from react_agent.eeg_research.agentic.planner_context import normalize_input_echoes
+                parsed, removed = normalize_input_echoes(parsed, payload)
+                if removed:
+                    normalization = {"kind": "identical_read_only_input_echoes_removed",
+                                     "removed_fields": removed, "normalized_reply": parsed,
+                                     "raw_model_reply_preserved": True}
             bound_reply = None
             if role in ENVELOPE_ROLES:
                 from react_agent.eeg_research.agentic.roles import RoleResultError, bind_role_output
                 try:
                     bound_reply = bind_role_output(parsed, task=task, prompt_hash=prompt_hash)
                 except RoleResultError as exc:
+                    _response_trace(camp, row, reply, validation="role_identity_invalid", schema_errors=str(exc))
                     append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
                                     status="failed", error=str(exc))
                     raise LlmUnavailable(str(exc)) from exc
@@ -251,18 +319,29 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                         domain_model.model_validate(body)
                     except ValidationError as exc:
                         schema_error = json.dumps(exc.errors(include_input=False), ensure_ascii=False, default=str)[:3000]
+                        _response_trace(camp, row, reply, validation="domain_schema_invalid",
+                                        schema_errors=exc.errors(include_input=False))
                         previous_domain = body
+                        errors = exc.errors(include_input=False)
+                        schema_feedback = {
+                            "allowed_top_level_fields": sorted(domain_model.model_fields),
+                            "forbidden_field_paths": [list(row["loc"]) for row in errors if row["type"] == "extra_forbidden"],
+                            "missing_field_paths": [list(row["loc"]) for row in errors if row["type"] == "missing"],
+                            "validation_errors": errors[:12],
+                        }
                         last = None
                         append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
                                         status="failed", error="domain_schema_invalid")
                         continue
+            _response_trace(camp, row, reply, validation="valid", normalization=normalization)
             append_ui_event(camp, "llm_call_finished", role=role, call_id=row.get("call_id"),
                             candidate_id=bound.get("candidate_id"), status="completed")
             if bound_reply is not None:
                 return bound_reply
             return parsed
         raise LlmUnavailable("domain_schema_invalid" if schema_error is not None else
-                             (type(last).__name__ if last is not None else "DeepSeekParseError")) from last
+                             (type(last).__name__ if last is not None else "DeepSeekParseError"),
+                             diagnostics={"domain_schema_errors": schema_error} if schema_error is not None else {}) from last
 
     call.model = config.fast.model  # type: ignore[attr-defined]
     call.bind = bind  # type: ignore[attr-defined]

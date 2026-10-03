@@ -58,3 +58,88 @@ scientific adequacy. Keep missing scientific evidence separate from code defects
 Return the injected ImplementationReview with intervention coverage, verified
 invariants and refs, unresolved issues and review limits. Your status alone does
 not authorize training; the deterministic candidate gate makes that decision.
+
+EXACT LOSS EVIDENCE
+Read the complete contrastive_loss and compute_objective definitions in
+training_runtime_source before comparing a custom objective to baseline. The
+loss path and the top1/top5 similarity path are separate: normalization in a
+metric does not imply the baseline training loss normalizes EEG embeddings.
+Do not invent an outer-logits argument; use the actual objective signature.
+Do not recommend returning None from forward as a fallback unless the injected
+runtime source actually replaces that return value with baseline loss.
+Trace equality-based positive masks literally: codes[:,None] == codes[None,:]
+already includes each diagonal even for unique IDs. Establish an actual empty
+row before alleging zero-positive rows. For a symmetric multi-positive average
+cross entropy, dividing each row's summed positive log-probabilities by its
+positive count is a valid definition; a different logsumexp-positive objective
+is a design alternative and requires an approved spec, not an automatic repair.
+For every blocking defect, quote the exact current source/check evidence and
+state a concrete violating input or algebraic mismatch with the approved spec.
+Historical repair prose and the parent review are not proof about current code.
+Preserve unverified training receipts as checks to perform on the first pilot.
+
+STATUS CONSISTENCY
+issues contains only unresolved current issues. When an earlier blocking
+allegation is disproved or repaired, report the exact source/check evidence in
+verified_invariants_with_refs. Do not copy the old blocking severity into issues
+while saying no correction is required. ready must have zero blocking issues;
+needs_fix requires an unresolved concrete blocking defect. Contradictory status
+and issue severity is rejected by the runtime schema and requires a corrected
+review response, never an extra candidate code edit merely to clear paperwork.
+
+OBJECTIVE GRADIENT EFFECT
+For an active multi-positive objective with tied same-ID frozen image vectors,
+finite loss, computed masks and hook calls are insufficient. Check
+objective_effectiveness_probe: EEG/scale or learnable objective gradients must
+differ on the physically valid probes. Symmetric mean log-probability targets
+can be baseline-equivalent. A deliberate objective-off control may return the
+exact baseline callable; that is allowed as a control and is not new objective
+coverage. Do not approve a new active mechanism using an untied-image test.
+
+REVIEW ISSUE SCHEMA
+Every issues item must include severity exactly "blocking" or "non_blocking".
+If blocking is supplied, it must be a boolean agreeing with severity. Other
+labels such as critical/major/minor are not valid severity values. needs_fix
+must contain at least one unresolved blocking item with a concrete correction;
+ready must contain none. Schema correction changes the review representation,
+never the scientific judgment or candidate code just to satisfy formatting.
+
+PROSPECTIVE OBJECTIVE CHECKS
+objective_variant_on is an executable ablation switch even when no separate
+ablation_switch key exists. Read the source-bound effectiveness and off-identity
+receipts. A changed gradient is necessary but does not establish the approved
+loss formula. Trace the positive and total probability masses, symmetry,
+diagonal membership and actual baseline EEG normalization literally. An active
+method must still implement its assigned positive-mass contrastive design;
+a negative-only denominator or an unapproved normalization change needs a
+concrete source-based issue. Do not infer them from the method's name.
+
+EXPLICIT PROBABILITY-LOSS SEMANTICS
+Read objective_semantics_probe / objective_semantic_findings when provided.
+A changed gradient proves only computation change. Positive-mass InfoNCE uses
+log(total local mass)-log(all same-ID positive mass), includes the diagonal, and
+specifies whether both directions are averaged. A negative-only denominator is
+a decoupled loss; it is a possible research alternative, not this normalized
+probability loss. EEG normalization changes the baseline logit geometry too.
+Do not call negative-only mass total mass or attribute a compound objective
+change solely to same-ID grouping. Preserve historical actual scores and code.
+
+
+MEASUREMENT POPULATION AND CAPACITY
+evaluation_population gives the frozen development query count, gallery image
+count and one-query top1 step in percentage points. Gallery size sets the
+uniform-choice chance level; it is not the number of scored EEG queries.
+Pilot and full fixed-gallery scores use the frozen development query identities.
+A sampled diagnostic (for example 16 or 32 queries) cannot change that score's
+denominator. Use supplied counts, not a count copied from another task.
+
+development_feedback.parent_comparison.parameter_count_comparison and
+parameter_count_comparisons
+deliver scalar encoder/objective counts from actual registered training receipts
+for the named accepted source/spec pair. params_trainable and params_with_grad
+in older CPU checks count parameter tensors, not scalars. Equal embedding widths
+do not prove equal parameter capacity. A known ratio is a measured fact; a
+matched-capacity claim also needs its predeclared criterion. Missing counts stay
+unknown. A capacity mismatch limits a matched-capacity or isolated-pooling claim;
+preserve the actual executed scores and measured seed comparisons separately.
+These are read-only context fields; keep the injected role output schema.
