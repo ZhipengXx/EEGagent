@@ -108,6 +108,14 @@ original content hash, view hash, actual range, status and next_range. Respect
 artifact_read_budget and context_limits. Read a new artifact/page when needed;
 identical requests are idempotent and cannot count as experimental evidence.
 Use exact registered IDs in required_artifact_refs, never arbitrary paths.
+For an exact page selection, copy request_digest values from artifact_read_index
+into required_read_digests, identically at top level and in the selected option.
+The legacy refs-only form selects verified completed pages for those artifacts.
+Each request has at most 3 fragments, at most 3 unique artifacts and 8000 total
+characters. Inspect each supplied start/end, delivery_complete and missing_inputs;
+required refs alone do not prove complete delivery. next_range is one legal page.
+A receipt proves reading only. Delivery records describe constructed consumer
+requests, and do not infer that earlier workers saw an unselected receipt.
 Missing/invalid/unavailable/holdout content cannot authorize an action. Keep
 current control identities, legal actions, candidate identities and unresolved
 issues while requesting omitted historical details only as needed.

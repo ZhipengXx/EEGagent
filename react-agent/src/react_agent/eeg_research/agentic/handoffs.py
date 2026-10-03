@@ -246,11 +246,32 @@ def read_epoch(state: dict[str, Any]) -> str:
     return str(evidence_count(state))
 
 
-def read_history(camp: Path) -> list[dict[str, Any]]:
+def _read_journal_records(camp: Path) -> list[dict[str, Any]]:
     path = camp / READ_JOURNAL
     if not path.is_file():
         return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    records = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise ValueError(f"artifact_read_journal_invalid:{number}") from exc
+        if not isinstance(row, dict) or row.get("record_type", "read") not in {"read", "delivery"}:
+            raise ValueError(f"artifact_read_journal_invalid:{number}")
+        if row.get("record_type") == "delivery":
+            body = {key: value for key, value in row.items() if key != "delivery_id"}
+            expected = "delivery_" + hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+            if (row.get("delivery_id") != expected or not isinstance(row.get("reads"), list)
+                    or not row.get("consumer") or not row.get("consumer_request_id") or row.get("receipt_id")):
+                raise ValueError(f"artifact_delivery_journal_invalid:{number}")
+        records.append(row)
+    return records
+
+
+def read_history(camp: Path) -> list[dict[str, Any]]:
+    return [row for row in _read_journal_records(camp) if row.get("record_type", "read") == "read"]
 
 
 def read_digest(request: dict[str, Any], content_hash: str | None) -> str:
@@ -260,33 +281,132 @@ def read_digest(request: dict[str, Any], content_hash: str | None) -> str:
                                   "content_hash": content_hash, "scope": "development_view"})
 
 
-def consume_artifact_reads(camp: Path, state: dict[str, Any], requests: list[dict[str, Any]],
-                           decision_id: str | None) -> dict[str, Any]:
-    """Journal one bounded read, not scientific evidence or an experimental confirmation."""
+def _receipt_id(row: dict[str, Any]) -> str:
+    keys = ("artifact_id", "request_digest", "request", "decision_id", "epoch", "status", "sha256",
+            "view_sha256", "range_scope", "start", "end", "missing_inputs")
+    identity = {key: row.get(key) for key in keys}
+    identity["text_sha256"] = hashlib.sha256((row.get("text") or "").encode("utf-8")).hexdigest()
+    return "read_" + hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def _append_read_record(camp: Path, row: dict[str, Any]) -> None:
+    import os
+    with (camp / READ_JOURNAL).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def verify_read_receipt(camp: Path, saved: dict[str, Any]) -> dict[str, Any]:
+    """Recompute source, request, filtered view, range and actual bytes before reuse."""
     from react_agent.eeg_research.agentic.artifacts import lookup, read_verified_range
     from react_agent.eeg_research.agentic.schemas import ArtifactReadRequest
-    epoch = read_epoch(state)
+    if saved.get("receipt_id") and saved["receipt_id"] != _receipt_id(saved):
+        raise ValueError("artifact_read_receipt_identity_changed")
+    registered = lookup(camp, str(saved.get("artifact_id") or ""))
+    source_hash = saved.get("sha256") if saved.get("status") == "read" else (registered or {}).get("sha256")
+    request = saved.get("request")
+    if request is None:
+        path = camp / "decisions" / f"{saved.get('decision_id')}.json"
+        raw = json.loads(path.read_text()).get("raw") or {} if path.is_file() else {}
+        candidates = list(raw.get("read_requests") or [])
+        candidates += [{"artifact_id": saved.get("artifact_id"), "start": saved.get("start", 0), "end": end}
+                       for end in (None, saved.get("end"), int(saved.get("start") or 0) + READ_RANGE_CHARS)]
+        request = next((row for row in candidates if isinstance(row, dict)
+                        and read_digest(row, source_hash) == saved.get("request_digest")), None)
+    if not isinstance(request, dict) or read_digest(request, source_hash) != saved.get("request_digest"):
+        raise ValueError("artifact_read_request_identity_changed")
+    parsed = ArtifactReadRequest.model_validate(request)
+    if parsed.artifact_id != saved.get("artifact_id") or (parsed.end is not None and parsed.end - parsed.start > READ_RANGE_CHARS):
+        raise ValueError("artifact_read_request_identity_changed")
+    if saved.get("status") != "read":
+        # Failed receipts authorize no text. Their original request still binds
+        # replay identity and preserves the existing charged-attempt policy.
+        if saved.get("text") is not None:
+            raise ValueError("artifact_read_failed_receipt_has_text")
+        return {**saved, "content_injected": False}
+    current = development_artifact(camp, parsed.artifact_id)
+    if current["sha256"] != saved.get("sha256"):
+        raise ValueError("artifact_read_hash_changed")
+    start, end = saved.get("start"), saved.get("end")
+    if (not isinstance(start, int) or not isinstance(end, int) or start != parsed.start
+            or end < start or end - start > READ_RANGE_CHARS or (parsed.end is not None and end > parsed.end)
+            or saved.get("range_scope") != "development_view"):
+        raise ValueError("artifact_read_range_identity_changed")
+    view = read_verified_range(camp, parsed.artifact_id, start=start, end=end,
+                               json_view=development_view, page_chars=READ_RANGE_CHARS)
+    if view["view_sha256"] != saved.get("view_sha256") or view["text"] != saved.get("text") or view["end"] != end:
+        raise ValueError("artifact_read_view_changed")
+    return {**saved, **view, "content_injected": False, "delivery_status": "prepared"}
+
+
+def rebuild_read_projection(camp: Path, state: dict[str, Any]) -> None:
+    history = read_history(camp)
+    state["artifact_read_history"] = [{key: row.get(key) for key in
+        ("artifact_id", "request_digest", "receipt_id", "decision_id", "epoch", "status")} for row in history]
+    if not history:
+        return
+    latest_id = history[-1].get("decision_id")
+    if latest_id is None:
+        # Optional direct callers have no persisted batch identity. Preserve a
+        # still-verifiable latest projection, rather than guess a history-wide
+        # default batch. Explicit artifact/page selection remains available.
+        saved = state.get("artifact_read_results") or []
+        rows = [row for item in saved for row in history if row.get("decision_id") is None
+                and row.get("request_digest") == item.get("request_digest")]
+        if not rows:
+            state["artifact_read_results"] = [{"status": "missing_input", "text": None,
+                "missing_inputs": ["artifact_read_batch_identity_missing"], "content_injected": False}]
+            return
+    else:
+        rows = [row for row in history if row.get("decision_id") == latest_id]
+    results = []
+    for row in rows:
+        try:
+            results.append(verify_read_receipt(camp, row))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            results.append({"artifact_id": row.get("artifact_id"), "request_digest": row.get("request_digest"),
+                            "status": "missing_input", "missing_inputs": [str(exc)], "text": None})
+    state["artifact_read_results"] = results
+
+
+def consume_artifact_reads(camp: Path, state: dict[str, Any], requests: list[dict[str, Any]],
+                           decision_id: str | None) -> dict[str, Any]:
+    """Journal bounded attempts once; verified replay of the same decision is free."""
+    from react_agent.eeg_research.agentic.artifacts import lookup, read_verified_range
+    from react_agent.eeg_research.agentic.schemas import ArtifactReadRequest
+    record = next((row for row in state.get("decisions") or [] if row.get("decision_id") == decision_id), {})
+    epoch = str(record["evidence_count"]) if "evidence_count" in record else read_epoch(state)
     history = read_history(camp)
     results = []
     used = sum(row.get("epoch") == epoch and not row.get("replayed") for row in history)
     remaining = READ_TOTAL_CHARS
     if len(requests) > READ_MAX_IDS:
-        return {"status": "limited", "missing_inputs": ["artifact_read_id_limit"], "results": []}
+        return {"status": "limited", "missing_inputs": ["artifact_read_request_limit"], "results": []}
     for raw in requests:
         ref = raw.get("artifact_id") if isinstance(raw, dict) else None
         registered = lookup(camp, str(ref)) if ref else None
         digest = read_digest(raw, None if registered is None else registered.get("sha256"))
-        previous = next((row for row in history if row.get("request_digest") == digest), None)
+        prior = [row for row in history if row.get("request_digest") == digest]
+        previous = next((row for row in prior if row.get("decision_id") == decision_id), None)
         if previous:
-            amount = len(previous.get("text") or "")
-            if amount > remaining:
-                results.append({"artifact_id": ref, "status": "limited", "missing_inputs": ["artifact_read_total_limit"], "replayed": True})
-            else:
-                remaining -= amount
-                results.append({**previous, "replayed": True})
+            try:
+                view = verify_read_receipt(camp, previous)
+                if len(view.get("text") or "") > remaining:
+                    raise ValueError("artifact_read_total_limit")
+                remaining -= len(view.get("text") or "")
+                results.append({**view, "replayed": True})
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                results.append({"artifact_id": ref, "status": "missing_input", "text": None,
+                                "missing_inputs": [str(exc)], "replayed": True})
             continue
-        result = {"artifact_id": ref, "request_digest": digest, "decision_id": decision_id,
-                  "epoch": epoch, "status": "missing_input", "missing_inputs": [], "text": None}
+        if prior:
+            results.append({"artifact_id": ref, "status": "missing_input", "text": None,
+                            "missing_inputs": ["artifact_read_replayed"]})
+            continue
+        result = {"artifact_id": ref, "request_digest": digest, "request": raw,
+                  "decision_id": decision_id, "record_type": "read", "epoch": epoch,
+                  "status": "missing_input", "missing_inputs": [], "text": None, "content_injected": False}
         if used >= READS_PER_EVIDENCE_EPOCH or remaining <= 0:
             result.update(status="limited", missing_inputs=["artifact_read_epoch_or_context_limit"])
             results.append(result)
@@ -299,51 +419,111 @@ def consume_artifact_reads(camp: Path, state: dict[str, Any], requests: list[dic
                 raise ValueError("artifact_read_total_limit")
             development_artifact(camp, request.artifact_id)
             view = read_verified_range(camp, request.artifact_id, start=request.start, end=request.end,
-                                       json_view=development_view, max_chars=min(READ_RANGE_CHARS, remaining))
-            result.update(view, status="read", content_injected=False)
+                                       json_view=development_view, max_chars=min(READ_RANGE_CHARS, remaining),
+                                       page_chars=READ_RANGE_CHARS)
+            result.update(view, status="read")
             remaining -= len(view["text"])
         except (OSError, ValueError, KeyError) as exc:
             result["missing_inputs"] = [str(exc)]
-        with (camp / READ_JOURNAL).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+        result["receipt_id"] = _receipt_id(result)
+        _append_read_record(camp, result)
         history.append(result)
         used += 1
         results.append(result)
-    state["artifact_read_history"] = [{key: row.get(key) for key in ("artifact_id", "request_digest", "epoch", "status")}
-                                      for row in history]
+    state["artifact_read_history"] = [{key: row.get(key) for key in
+        ("artifact_id", "request_digest", "receipt_id", "decision_id", "epoch", "status")} for row in history]
     state["artifact_read_results"] = results
     return {"status": "completed", "results": results, "remaining_reads": max(0, READS_PER_EVIDENCE_EPOCH - used)}
 
 
-def verified_read_context(camp: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
-    """Only journaled, still-current development views enter the next provider request."""
+def verified_read_context(camp: Path, state: dict[str, Any], *, artifact_refs: list[str] | None = None,
+                          request_digests: list[str] | None = None) -> list[dict[str, Any]]:
+    """One verifier serves default latest-batch and explicitly selected history."""
     from react_agent.eeg_research.agentic.artifacts import read_verified_range
-    rows = []
-    chars = READ_TOTAL_CHARS
-    journal = {row.get("request_digest"): row for row in read_history(camp)}
-    for saved in (state.get("artifact_read_results") or [])[:READ_MAX_IDS]:
-        if saved.get("status") != "read":
-            rows.append(saved)
-            continue
+    history = read_history(camp)
+    explicit = artifact_refs is not None or request_digests is not None
+    if explicit:
+        refs, digests = artifact_refs or [], request_digests or []
+        if digests:
+            selected = [next((row for row in history if row.get("request_digest") == digest
+                             and (not refs or row.get("artifact_id") in refs)),
+                            {"request_digest": digest, "status": "missing_input", "missing_inputs": ["artifact_page_not_read"]})
+                        for digest in digests]
+        else:
+            selected = [row for row in history if row.get("artifact_id") in refs]
+        missing = [ref for ref in refs if not any(row.get("artifact_id") == ref for row in selected)]
+        selected += [{"artifact_id": ref, "status": "missing_input", "missing_inputs": ["artifact_not_read"]} for ref in missing]
+    else:
+        selected = state.get("artifact_read_results") or []
+        if not selected and history:
+            latest_id = history[-1].get("decision_id")
+            selected = ([row for row in history if row.get("decision_id") == latest_id] if latest_id is not None else
+                        [{"status": "missing_input", "missing_inputs": ["artifact_read_batch_identity_missing"]}])
+    rows, unique, chars, fragments = [], set(), READ_TOTAL_CHARS, 0
+    for saved in selected:
         try:
-            recorded = journal.get(saved.get("request_digest")) or {}
-            if recorded.get("status") != "read" or any(recorded.get(key) != saved.get(key)
-                    for key in ("artifact_id", "sha256", "start", "end", "view_sha256", "decision_id")):
+            matching = [row for row in history if row.get("request_digest") == saved.get("request_digest")
+                        and row.get("decision_id") == saved.get("decision_id")]
+            if not matching or any(row != matching[0] for row in matching[1:]):
                 raise ValueError("artifact_read_journal_binding_missing")
-            current = development_artifact(camp, saved["artifact_id"])
-            if current["sha256"] != saved.get("sha256"):
-                raise ValueError("artifact_read_hash_changed")
-            view = read_verified_range(camp, saved["artifact_id"], start=saved["start"], end=saved["end"],
-                                       json_view=development_view)
-            if view.get("view_sha256") != saved.get("view_sha256"):
-                raise ValueError("artifact_read_view_changed")
-            if len(view["text"]) > chars:
-                raise ValueError("artifact_read_context_limit")
-            chars -= len(view["text"])
-            rows.append({**saved, **view, "content_injected": True})
-        except (OSError, ValueError, KeyError) as exc:
-            rows.append({"artifact_id": saved.get("artifact_id"), "status": "missing_input", "missing_inputs": [str(exc)]})
+            recorded = matching[0]
+            if any(recorded.get(key) != saved.get(key) for key in
+                   ("artifact_id", "sha256", "start", "end", "view_sha256", "receipt_id", "text")):
+                raise ValueError("artifact_read_journal_binding_missing")
+            view = verify_read_receipt(camp, recorded)
+            if view.get("status") == "read":
+                if len(unique | {view["artifact_id"]}) > READ_MAX_IDS:
+                    raise ValueError("artifact_read_unique_artifact_limit")
+                if fragments >= READ_MAX_IDS:
+                    raise ValueError("artifact_read_fragment_limit")
+                if chars <= 0:
+                    raise ValueError("artifact_read_context_limit")
+                unique.add(view["artifact_id"])
+                fragments += 1
+                if len(view["text"]) > chars:
+                    partial = read_verified_range(camp, view["artifact_id"], start=view["start"], end=view["start"] + chars,
+                                                  json_view=development_view, page_chars=READ_RANGE_CHARS)
+                    view = {**view, **partial, "receipt_range": [view["start"], view["end"]],
+                            "delivery_complete": False, "missing_inputs": ["artifact_read_context_truncated"]}
+                else:
+                    view["delivery_complete"] = True
+                chars -= len(view["text"])
+            rows.append(view)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            rows.append({"artifact_id": saved.get("artifact_id"), "request_digest": saved.get("request_digest"),
+                         "receipt_id": saved.get("receipt_id"), "status": "missing_input", "text": None,
+                         "content_injected": False, "delivery_complete": False,
+                         "missing_inputs": saved.get("missing_inputs") or [str(exc)]})
     return rows
+
+
+def prepare_read_delivery(rows: list[dict[str, Any]]) -> None:
+    """Mark the prepared request before its task input digest is calculated."""
+    for row in rows:
+        if row.get("status") == "read":
+            row["content_injected"] = True
+            row["delivery_status"] = "request_constructed"
+
+
+def record_read_delivery(camp: Path, rows: list[dict[str, Any]], *, consumer: str,
+                         request_id: str, input_digest: str | None = None) -> None:
+    """Record constructed consumer requests, never infer past delivery from a receipt."""
+    prepare_read_delivery(rows)
+    delivered = []
+    for row in rows:
+        if row.get("status") != "read":
+            continue
+        row["content_injected"] = True
+        row["delivery_status"] = "request_constructed"
+        delivered.append({key: row.get(key) for key in ("artifact_id", "request_digest", "receipt_id", "sha256",
+                         "view_sha256", "range_scope", "start", "end", "receipt_range", "delivery_complete")})
+    if not delivered:
+        return
+    body = {"record_type": "delivery", "consumer": consumer, "consumer_request_id": request_id,
+            "consumer_input_digest": input_digest, "delivery_phase": "request_constructed", "reads": delivered}
+    body["delivery_id"] = "delivery_" + hashlib.sha256(json.dumps(body, sort_keys=True).encode()).hexdigest()
+    if not any(row.get("delivery_id") == body["delivery_id"] for row in _read_journal_records(camp)):
+        _append_read_record(camp, body)
 
 
 def bounded_control_view(value: Any, *, budget: int = CONTROL_TEXT_CHARS) -> tuple[Any, dict[str, Any]]:
@@ -405,6 +585,6 @@ def bounded_history(value: Any, *, budget: int = HISTORY_CHARS) -> tuple[Any, di
 
 
 def selected_read_context(camp: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
-    """A selected worker gets cited reads, not the controller's complete history."""
-    refs = set(state.get("active_artifact_refs") or [])
-    return [row for row in verified_read_context(camp, state) if row.get("artifact_id") in refs]
+    """A worker receives only explicitly cited artifacts/pages, with visible gaps."""
+    return verified_read_context(camp, state, artifact_refs=list(state.get("active_artifact_refs") or []),
+                                 request_digests=list(state.get("active_read_digests") or []))

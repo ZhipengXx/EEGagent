@@ -214,6 +214,9 @@ def begin_role_task(
     artifacts: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Open a ledger task whose digest covers the business request and input files."""
+    if request is not None and request.get("artifact_reads"):
+        from react_agent.eeg_research.agentic.handoffs import prepare_read_delivery
+        prepare_read_delivery(request["artifact_reads"])
     digest = (
         request_digest(request=request, artifacts=artifacts, paths=inputs)
         if request is not None or artifacts

@@ -69,6 +69,9 @@ class PlannerOption(DomainOutput):
         "Top-level and selected-option target_id must match exactly."))
     question_id: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)
+    required_read_digests: list[str] = Field(default_factory=list, description=(
+        "Optional exact request_digest page identities from artifact_read_index. Select only these completed pages; "
+        "legacy required_artifact_refs selects the verified pages for those artifacts. Match selected/top-level lists."))
     required_artifact_refs: list[str] = Field(default_factory=list, description=(
         "Exact verified artifact_index artifact_id values only, never dataset paths or prospective files. "
         "Use [] if no verified registered artifacts are needed. Top-level and selected-option lists must be identical."))
@@ -119,6 +122,9 @@ class PlannerDecision(DomainOutput):
     reason_zh: str = ""
     summary_zh: str = ""
     expected_information: Any = None
+    required_read_digests: list[str] = Field(default_factory=list, description=(
+        "Optional exact request_digest page identities from artifact_read_index. Select only these completed pages; "
+        "legacy required_artifact_refs selects the verified pages for those artifacts. Match selected/top-level lists."))
     required_artifact_refs: list[str] = Field(default_factory=list, description=(
         "Exact verified artifact_index artifact_id values only, never dataset paths or prospective files. "
         "Use [] if no verified registered artifacts are needed. Top-level and selected-option lists must be identical."))

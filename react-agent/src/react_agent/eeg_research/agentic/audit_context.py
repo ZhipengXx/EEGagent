@@ -94,6 +94,93 @@ def _issue(view: dict[str, Any], finding: Any, correction: Any, index: int, *, k
         "status": "open", "resolution_evidence_refs": [], "resolution_audit_artifact_id": None}
 
 
+def _normalized_requirements(view: dict[str, Any], *, known: dict[str, set[str]]) -> list[dict[str, Any]]:
+    """Keep every correction; only explicit links or exact inline echoes associate it."""
+    payload = view.get("payload") or {}
+    findings = payload.get("open_issues") or []
+    corrections = payload.get("required_corrections") or []
+    findings = findings if isinstance(findings, list) else [findings]
+    corrections = corrections if isinstance(corrections, list) else [corrections]
+    items = [_issue(view, finding, None, index, known=known) for index, finding in enumerate(findings)]
+    for index, item in enumerate(items):
+        item["correction_provenance"] = ["open_issues/" + str(index) + "/required_correction"] if item.get("required_correction") is not None else []
+
+    def value(raw):
+        if isinstance(raw, dict):
+            for key in ("required_correction", "correction", "text", "statement"):
+                if key in raw:
+                    return raw[key]
+        return raw
+
+    def canonical(raw):
+        raw = raw.strip() if isinstance(raw, str) else raw
+        return json.dumps(raw, sort_keys=True, ensure_ascii=False, default=str)
+
+    for index, correction in enumerate(corrections):
+        text = value(correction)
+        raw = correction if isinstance(correction, dict) else {}
+        linked = []
+        finding_id = raw.get("finding_id")
+        if finding_id:
+            linked = [i for i, finding in enumerate(findings) if isinstance(finding, dict)
+                      and finding.get("finding_id") == finding_id]
+        if not linked and raw.get("claim_id") and raw["claim_id"] in known["claim_id"]:
+            linked = [i for i, item in enumerate(items[:len(findings)]) if item.get("claim_id") == raw["claim_id"]]
+        # String corrections have no positional association. An exact inline echo
+        # can be deduplicated only when its corresponding requirement is unique.
+        matches = [item for i, item in enumerate(items) if item.get("required_correction") is not None
+                   and canonical(value(item["required_correction"])) == canonical(text)
+                   and (not linked or i in linked or item.get("parent_issue_id") in {items[j]["issue_id"] for j in linked})
+                   and all(raw.get(key) is None or raw.get(key) == item.get(key)
+                           for key in ("claim_id", "question_id", "candidate_id"))
+                   and all(value == item.get(key, (item.get("correction_details") or {}).get(key))
+                           for key, value in raw.items() if key not in {
+                               "required_correction", "correction", "text", "statement", "severity",
+                               "claim_id", "question_id", "candidate_id", "finding_id"})]
+        if len(matches) == 1:
+            item = matches[0]
+            item["correction_provenance"].append("required_corrections/" + str(index))
+            if not findings:
+                legacy = _issue(view, {"problem": correction, "required_correction": correction}, correction, index, known=known)
+                if legacy["issue_id"] not in item.setdefault("legacy_issue_ids", []):
+                    item["legacy_issue_ids"].append(legacy["issue_id"])
+            if raw.get("severity") == "blocking":
+                item.update(severity="blocking", blocking=True)
+            elif "severity" in raw and raw["severity"] not in ("warning", "non_blocking"):
+                # A duplicate cannot hide an explicitly unclassified severity
+                # behind an inline warning. Keep the conservative requirement.
+                if item.get("severity") != "blocking":
+                    item.update(severity="unknown", blocking=True)
+            elif raw.get("severity") == "warning" and item.get("severity") == "non_blocking":
+                item["severity"] = "warning"
+            continue
+        parent = items[linked[0]] if len(linked) == 1 else None
+        details = {**({key: parent.get(key) for key in ("claim_id", "question_id", "candidate_id", "severity", "category")}
+                       if parent else {}), **raw, "problem": str(text), "required_correction": text}
+        item = _issue(view, details, text, index, known=known)
+        identity = [view["artifact_id"], "required_correction", canonical(text),
+                    {key: raw.get(key) for key in ("finding_id", "claim_id", "question_id", "candidate_id")},
+                    None if parent is None else parent["issue_id"],
+                    {key: value for key, value in raw.items() if key not in {
+                        "required_correction", "correction", "text", "statement", "severity"}}]
+        item["issue_id"] = "issue_" + hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16]
+        item["parent_issue_id"] = None if parent is None else parent["issue_id"]
+        item["correction_details"] = dict(raw)
+        item["correction_provenance"] = ["required_corrections/" + str(index)]
+        # Old corrections-only projections had positional IDs. Retain verified
+        # aliases for their historical resolutions, without editing the source.
+        if not findings:
+            legacy = _issue(view, {"problem": correction, "required_correction": correction}, correction, index, known=known)
+            item["legacy_issue_ids"] = [legacy["issue_id"]]
+        existing = next((previous for previous in items if previous["issue_id"] == item["issue_id"]), None)
+        if existing:
+            existing["correction_provenance"].extend(item["correction_provenance"])
+            existing.setdefault("legacy_issue_ids", []).extend(item.get("legacy_issue_ids") or [])
+        else:
+            items.append(item)
+    return items
+
+
 def _resolution_evidence_valid(camp: Path, row: dict[str, Any], issue: dict[str, Any]) -> bool:
     if development_view(row) is None or row.get("kind") == "audit":
         return False
@@ -122,33 +209,25 @@ def project_issues(camp: Path, state: dict[str, Any], views: list[dict[str, Any]
     """Only covered, evidence-backed resolutions close their corresponding issues."""
     views = audit_views(camp) if views is None else views
     from react_agent.eeg_research.agentic.research_plan import load_plan
+    reconstructed = {view.get("artifact_id") for view in views if view.get("verification_status") == "verified"}
     issues: dict[str, dict[str, Any]] = {row["issue_id"]: {**row, "status": "open",
         "resolution_evidence_refs": [], "resolution_audit_artifact_id": None}
-        for row in (load_plan(camp).get("audit_issues") or []) if isinstance(row, dict) and row.get("issue_id")}
+        for row in (load_plan(camp).get("audit_issues") or []) if isinstance(row, dict) and row.get("issue_id")
+        and row.get("source_audit_artifact_id") not in reconstructed}
     evidence = {row.get("evidence_id"): row for row in state.get("evidence") or [] if row.get("evidence_id")}
     revisions = state.get("report_claim_revisions") or {}
     for view in views:
         payload = view.get("payload")
         if view.get("verification_status") != "verified" or not isinstance(payload, dict):
             continue
-        findings = payload.get("open_issues") or []
-        corrections = payload.get("required_corrections") or []
-        if not isinstance(findings, list):
-            findings = [findings]
-        if not isinstance(corrections, list):
-            corrections = [corrections]
-        if not findings and corrections:
-            findings = [{"problem": item, "required_correction": item} for item in corrections]
-        for index, finding in enumerate(findings):
-            correction = corrections[index] if index < len(corrections) else None
-            known = {
-                "claim_id": {row.get("claim_id") for row in payload.get("report_claims") or [] if isinstance(row, dict)},
-                "question_id": {row.get("question_id") for row in load_plan(camp).get("research_questions") or []},
-                "candidate_id": {"baseline", *[row.get("candidate_id") for row in state.get("candidates") or []],
-                                 *[row.get("candidate_id") for row in evidence.values()]},
-                "evidence_refs": set(evidence), "artifact_refs": {row.get("artifact_id") for row in _registry_rows(camp)},
-            }
-            item = _issue(view, finding, correction, index, known=known)
+        known = {
+            "claim_id": {row.get("claim_id") for row in payload.get("report_claims") or [] if isinstance(row, dict)},
+            "question_id": {row.get("question_id") for row in load_plan(camp).get("research_questions") or []},
+            "candidate_id": {"baseline", *[row.get("candidate_id") for row in state.get("candidates") or []],
+                             *[row.get("candidate_id") for row in evidence.values()]},
+            "evidence_refs": set(evidence), "artifact_refs": {row.get("artifact_id") for row in _registry_rows(camp)},
+        }
+        for item in _normalized_requirements(view, known=known):
             issues.setdefault(item["issue_id"], item)
         # A complete bound audit can resolve one issue while other findings
         # keep the overall report at REVISE/BLOCK. Coverage is checked below.
@@ -159,7 +238,11 @@ def project_issues(camp: Path, state: dict[str, Any], views: list[dict[str, Any]
             if not isinstance(resolution, dict):
                 continue
             item = issues.get(resolution.get("issue_id"))
-            if not item or item["status"] != "open" or item["source_audit_artifact_id"] == view["artifact_id"]:
+            if item is None:
+                aliases = [row for row in issues.values() if resolution.get("issue_id") in (row.get("legacy_issue_ids") or [])]
+                item = aliases[0] if len(aliases) == 1 else None
+            if (not item or item["status"] != "open" or item["source_audit_artifact_id"] == view["artifact_id"]
+                    or item["source_audit_artifact_id"] not in reconstructed):
                 continue
             refs = resolution.get("evidence_refs") or []
             if not isinstance(refs, list) or any(ref not in evidence for ref in refs):
@@ -230,9 +313,16 @@ def audit_feedback(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
             "supported_is_confirmed_improvement": False}
 
 
-def reusable_audit(camp: Path, *, report_hash: str, manifest_hash: str) -> dict[str, Any] | None:
+def reusable_audit(camp: Path, *, report_hash: str, manifest_hash: str,
+                   report_ref: str | None = None, dependency_hash: str | None = None) -> dict[str, Any] | None:
+    """Only the same verified object and independently computed snapshot can replay."""
+    if not report_ref or not dependency_hash:
+        return None
     for view in reversed(audit_views(camp)):
         payload = view.get("payload") or {}
-        if view.get("identity_verified") and payload.get("report_hash") == report_hash and payload.get("dependency_manifest_hash") == manifest_hash:
+        if (view.get("identity_verified") and payload.get("report_hash") == report_hash
+                and payload.get("dependency_manifest_hash") == manifest_hash
+                and payload.get("audited_report_ref") == report_ref
+                and payload.get("audited_dependency_hash") == dependency_hash):
             return view
     return None

@@ -55,8 +55,21 @@ def _read(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _write(path: Path, payload: dict[str, Any]) -> None:
+def _write(path: Path, payload: dict[str, Any], *, exclusive: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if exclusive:
+        import os
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            tmp_path = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp_path, path)  # atomic create; never replace an existing decision
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
@@ -107,7 +120,7 @@ def report_dependency_hash(state: dict[str, Any]) -> str:
 def refresh_audit_freshness(state: dict[str, Any]) -> str:
     current = report_dependency_hash(state)
     audited = state.get("audited_report_hash")
-    if audited and audited != current and state.get("audit_status") in {"pass", "revise", "block", "partial", "failed", "blocked"}:
+    if audited != current and state.get("audit_status") in {"pass", "revise", "block", "partial", "failed", "blocked"}:
         state["audit_status"] = "stale"
         state["audit_fresh"] = False
     return current
@@ -350,8 +363,131 @@ def _result_hash(result: dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(body, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
+def _next_decision_id(camp: Path, state: dict[str, Any]) -> str:
+    numbers = [_decision_number(str(row.get("decision_id") or "")) for row in state.get("decisions") or []]
+    numbers += [_decision_number(path.stem) for path in (camp / "decisions").glob("d*.json")]
+    return "d" + str(max(numbers, default=0) + 1)
+
+
+def _recover_decision_reads(camp: Path, state: dict[str, Any]) -> None:
+    """Coordinate verified persisted decisions and append-only read receipts."""
+    from react_agent.eeg_research.agentic.artifacts import lookup, request_digest
+    from react_agent.eeg_research.agentic.handoffs import read_history, read_digest, verify_read_receipt, rebuild_read_projection, _receipt_id
+    from react_agent.eeg_research.agentic.schemas import PlannerDecision
+    history = read_history(camp)
+    known = {row.get("decision_id"): row for row in state.get("decisions") or []}
+    if len(known) != len(state.get("decisions") or []) or None in known:
+        raise ValueError("decision_state_identity_conflict")
+    paths = sorted((camp / "decisions").glob("d*.json"), key=lambda path: _decision_number(path.stem))
+    persisted_ids = {path.stem for path in paths} | set(known)
+    for receipt in history:
+        if receipt.get("receipt_id"):
+            if receipt["receipt_id"] != _receipt_id(receipt):
+                raise ValueError("artifact_read_receipt_identity_changed")
+            if receipt.get("decision_id") and receipt["decision_id"] not in persisted_ids:
+                raise ValueError("artifact_read_receipt_decision_missing")
+    for path in paths:
+        if _decision_number(path.stem) < 1:
+            continue
+        body = _read(path)
+        record, raw = body.get("decision"), body.get("raw")
+        if not isinstance(record, dict) or record.get("decision_id") != path.stem:
+            raise ValueError("decision_file_identity_conflict:" + path.stem)
+        previous = known.get(path.stem)
+        if previous:
+            keys = ("action", "ok", "read_requests", "required_artifact_refs", "required_read_digests",
+                    "selected_option_id", "resolves_issue_ids", "raw_digest", "campaign_id")
+            if any(previous[key] != record.get(key) for key in keys if key in previous):
+                raise ValueError("decision_state_identity_conflict:" + path.stem)
+        if record.get("decision_schema_version"):
+            if (record.get("decision_schema_version") != "eeg_research.decision.v2"
+                    or record.get("campaign_id") != state.get("goal_id")
+                    or record.get("raw_digest") != request_digest(request=raw)):
+                raise ValueError("decision_content_identity_conflict:" + path.stem)
+        legacy_completion = None
+        validation_raw = raw
+        if not record.get("decision_schema_version"):
+            # V1 non-read resumes already have independent local completion /
+            # workspace markers. Reuse those two existing recovery paths; a
+            # bare JSON decision still cannot authorize an orphan action.
+            if record.get("action") == "propose_experiment":
+                marker = camp / "hypotheses" / ("h" + str(_decision_number(path.stem)) + ".json")
+                saved = _read(marker) if marker.is_file() and marker.resolve().is_relative_to(camp.resolve()) else {}
+                if isinstance(saved.get("hypothesis"), dict) and isinstance(saved.get("experiment"), dict):
+                    legacy_completion = marker
+                    validation_raw = {**(raw or {}), "action": "propose_experiment"}
+            elif record.get("action") == "implement_candidate" and record.get("executed") is not False:
+                candidate = incomplete_candidate_id(camp, state)
+                marker = camp / "candidates" / str(candidate) / "spec.json"
+                if (candidate and marker.is_file() and marker.resolve().is_relative_to(camp.resolve())
+                        and isinstance(_read(marker), dict) and state.get("hypothesis") and state.get("experiment")):
+                    legacy_completion = marker
+                    validation_raw = {"action": "implement_candidate"}
+        if record.get("ok"):
+            if not isinstance(validation_raw, dict):
+                if previous is None and state.get("status") in _TERMINAL:
+                    limit = "legacy_decision_raw_missing:" + path.stem
+                    if limit not in state.setdefault("decision_recovery_limits", []):
+                        state["decision_recovery_limits"].append(limit)
+                    continue
+                raise ValueError("decision_raw_missing:" + path.stem)
+            # The existing single_action parser accepts opaque inline-coder
+            # extension fields. Their full bytes remain bound by raw_digest;
+            # validate the shared control schema without discarding the raw body.
+            parsed = PlannerDecision.model_validate({key: value for key, value in validation_raw.items()
+                                                     if key in PlannerDecision.model_fields})
+            if parsed.action != record.get("action") or record.get("read_requests", []) != validation_raw.get("read_requests", []):
+                raise ValueError("decision_action_identity_conflict:" + path.stem)
+        if previous is None:
+            row = dict(record)
+            if legacy_completion is not None:
+                from react_agent.eeg_research.agentic.artifacts import file_digest
+                row["legacy_recovery_source"] = {"path": str(legacy_completion), "sha256": file_digest(legacy_completion)}
+            if row.get("ok") and row.get("executed") is False and not (row.get("action") == "retrieve_memory" and raw.get("read_requests")) and legacy_completion is None and not record.get("decision_schema_version"):
+                if state.get("status") not in _TERMINAL:
+                    raise ValueError("orphan_non_read_decision_requires_reconciliation:" + path.stem)
+            state.setdefault("decisions", []).append(row)
+            known[path.stem] = row
+            previous = row
+            if row.get("executed") is True and row.get("action") == "retrieve_memory" and raw.get("read_requests"):
+                state["_recovered_completed_read_id"] = path.stem
+        elif record.get("executed") is True and previous.get("executed") is False:
+            previous["executed"] = True
+            if previous.get("action") == "retrieve_memory" and raw and raw.get("read_requests"):
+                state["_recovered_completed_read_id"] = path.stem
+        if record.get("action") != "retrieve_memory" or not raw or not raw.get("read_requests"):
+            continue
+        expected = {read_digest(request, (lookup(camp, str(request.get("artifact_id"))) or {}).get("sha256"))
+                    for request in raw["read_requests"]}
+        receipts = [row for row in history if row.get("decision_id") == path.stem]
+        seen = set()
+        for receipt in receipts:
+            digest = receipt.get("request_digest")
+            if digest not in expected or digest in seen or str(receipt.get("epoch")) != str(record.get("evidence_count")):
+                raise ValueError("decision_read_receipt_identity_conflict:" + path.stem)
+            seen.add(digest)
+            # Completed historical reads may become unavailable. Revalidate all
+            # pending or state-lagged reads before they can authorize recovery.
+            if previous.get("executed") is False or state.get("_recovered_completed_read_id") == path.stem:
+                verify_read_receipt(camp, receipt)
+    state["decisions"] = sorted(state.get("decisions") or [], key=lambda row: _decision_number(str(row.get("decision_id") or "")))
+    rebuild_read_projection(camp, state)
+    if state.get("_recovered_completed_read_id"):
+        for row in state.get("artifact_read_results") or []:
+            row["replayed"] = True
+
+
 def rebuild_campaign_projection(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
     """Rebuild evidence/memory/counts from on-disk RunRecords when outer state lagged."""
+    try:
+        _recover_decision_reads(camp, state)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        if state.get("status") in _TERMINAL:
+            state["decision_recovery_error"] = str(exc)
+        else:
+            persist_failure(camp, state, phase="recovery", error_type="decision_read_recovery_failed",
+                            detail=str(exc), recoverable=False)
+        return state
     jobs_root = Path(camp) / "jobs"
     if not jobs_root.is_dir():
         return state
@@ -389,38 +525,13 @@ def rebuild_campaign_projection(camp: Path, state: dict[str, Any]) -> dict[str, 
 
 
 def align_interrupt(camp: Path) -> dict[str, Any]:
-    """Merge decision files the state does not yet list. Does not call the planner or touch the ledger.
-
-    paused, cancelled, and finished stay as they are. Stop and pause are not rewritten here.
-    """
+    """Use the same verified recovery entry point without replaying an action."""
     state = load_state(camp)
-    status = state.get("status")
-    known = {row.get("decision_id") for row in state.get("decisions") or []}
-    folder = camp / "decisions"
-    added = False
-    if folder.is_dir():
-        paths = sorted(folder.glob("d*.json"), key=lambda path: _decision_number(path.stem))
-        for path in paths:
-            payload = _read(path)
-            record = payload.get("decision") if isinstance(payload.get("decision"), dict) else {}
-            if not record:
-                continue
-            decision_id = str(record.get("decision_id") or path.stem)
-            if decision_id in known:
-                continue
-            row = dict(record)
-            row["decision_id"] = decision_id
-            state.setdefault("decisions", []).append(row)
-            known.add(decision_id)
-            added = True
+    previous_status = state.get("status")
     rebuild_campaign_projection(camp, state)
-    if added:
-        state["status"] = status
-        save_state(camp, state)
-        state = load_state(camp)
-        if status in {"paused", "cancelled", "finished"}:
-            state["status"] = status
-            _write(camp / "campaign_state.json", state)
+    if previous_status in _TERMINAL:
+        state["status"] = previous_status
+    save_state(camp, state)
     return load_state(camp)
 
 
@@ -548,6 +659,8 @@ def observation(camp: Path) -> dict[str, Any]:
         "artifact_reads": verified_read_context(camp, state),
         "artifact_read_budget": {"remaining_reads": remaining_reads, "epoch": read_epoch(state)},
         "_artifact_read_digests": [row.get("request_digest") for row in reads],
+        "artifact_read_index": [{key: row.get(key) for key in ("artifact_id", "request_digest", "receipt_id", "start", "end", "status")}
+                                for row in reads],
 
         "require_audit_before_completion": bool(goal.get("require_audit_before_completion", False)),
         "audit_status": state.get("audit_status") or "pending",
@@ -644,6 +757,11 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     state = load_state(camp)
     rebuild_campaign_projection(camp, state)
     if state.get("status") in _TERMINAL:
+        if (state.get("failure") or {}).get("phase") == "recovery":
+            save_state(camp, state)
+        return state
+    if state.pop("_recovered_completed_read_id", None):
+        _finish_step(camp, state)
         return state
     if state.get("live_job"):
         settle = services.get("settle")
@@ -701,7 +819,20 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         return state
     obs = observation(camp)
     try:
-        decision = decide(obs, backend)
+        from react_agent.eeg_research.agentic.handoffs import record_read_delivery, prepare_read_delivery, _read_journal_records
+        from react_agent.eeg_research.agentic.artifacts import request_digest
+        reserved_id = _next_decision_id(camp, state)
+        def planner_request(request):
+            rows = request.get("artifact_reads") or []
+            prepare_read_delivery(rows)
+            prefix = reserved_id + ":planner_call:"
+            attempt = 1 + sum(row.get("consumer") == "research_planner" and
+                              str(row.get("consumer_request_id") or "").startswith(prefix)
+                              for row in _read_journal_records(camp))
+            record_read_delivery(camp, rows, consumer="research_planner", request_id=prefix + str(attempt),
+                                 input_digest=request_digest(request=request))
+            return backend(request)
+        decision = decide(obs, planner_request)
     except LlmUnavailable as exc:
         _sync_ledger(camp, state)
         persist_failure(camp, state, phase="planner", error_type=str(exc), detail=str(exc), recoverable=True)
@@ -722,12 +853,16 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     raw_decision = decision.get("raw") if isinstance(decision.get("raw"), dict) else {}
     cited = raw_decision.get("evidence_ids") or raw_decision.get("evidence_refs") or []
     record = {
-        "decision_id": f"d{len(state.get('decisions') or []) + 1}",
+        "decision_id": _next_decision_id(camp, state),
+        "decision_schema_version": "eeg_research.decision.v2",
+        "campaign_id": state["goal_id"],
+        "raw_digest": request_digest(request=decision.get("raw")),
         "action": decision.get("action"),
         "ok": decision.get("ok"),
         "reason_zh": decision.get("reason_zh"),
         "expected_information": raw_decision.get("expected_information"),
         "required_artifact_refs": raw_decision.get("required_artifact_refs") or [],
+        "required_read_digests": raw_decision.get("required_read_digests") or [],
         "options": raw_decision.get("options") or [],
         "selected_option_id": raw_decision.get("selected_option_id"),
         "selection_rationale": raw_decision.get("selection_rationale"),
@@ -741,7 +876,7 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         "executed": bool(decision.get("ok")) is False,
     }
     state.setdefault("decisions", []).append(record)
-    _write(camp / "decisions" / f"{record['decision_id']}.json", {"decision": record, "raw": decision.get("raw")})
+    _write(camp / "decisions" / f"{record['decision_id']}.json", {"decision": record, "raw": decision.get("raw")}, exclusive=True)
     event(camp, "decision", **record)
     if not decision.get("ok"):
         state["status"] = "blocked"
@@ -801,6 +936,17 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
 def _finish_step(camp: Path, state: dict[str, Any]) -> None:
     _sync_ledger(camp, state)
     _mark_executed(state)
+    if state.get("decisions"):
+        record = state["decisions"][-1]
+        path = camp / "decisions" / f"{record['decision_id']}.json"
+        if path.is_file() and record.get("executed") is True:
+            body = _read(path)
+            from react_agent.eeg_research.agentic.artifacts import request_digest
+            if ((body.get("decision") or {}).get("decision_id") != record["decision_id"]
+                    or (record.get("raw_digest") and request_digest(request=body.get("raw")) != record["raw_digest"])):
+                raise ValueError("decision_content_identity_conflict:" + record["decision_id"])
+            body["decision"] = dict(record)
+            _write(path, body)
     if state.get("pause_after_step") and state.get("status") not in _TERMINAL and not state.get("live_job"):
         state["status"] = "paused"
     save_state(camp, state)
@@ -848,18 +994,27 @@ def _apply_action(
         parsed = _parse(candidate, live["available_actions"], set(live.get("_known_evidence_ids") or []),
                         set(live.get("trainable_ids") or []), live.get("eligible_targets"))
         if action == "retrieve_memory" and raw.get("read_requests"):
-            from react_agent.eeg_research.agentic.handoffs import read_history, read_digest
+            from react_agent.eeg_research.agentic.handoffs import read_history, read_digest, verify_read_receipt, READS_PER_EVIDENCE_EPOCH
             current_id = decision.get("decision_id") or (state.get("decisions") or [{}])[-1].get("decision_id")
             same_decision = [row for row in read_history(camp) if row.get("decision_id") == current_id]
-            stored_digests = {row.get("request_digest") for row in same_decision}
             by_id = {row["artifact_id"]: row for row in live.get("artifact_index") or []}
             requested = {read_digest(row, (by_id.get(row.get("artifact_id")) or {}).get("content_hash")) for row in raw["read_requests"]}
-            if requested and requested <= stored_digests:
+            try:
+                stored_digests = {verify_read_receipt(camp, row)["request_digest"] for row in same_decision}
+                if not stored_digests <= requested:
+                    raise ValueError("decision_read_receipt_identity_conflict")
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                persist_failure(camp, state, phase="recovery", error_type="decision_read_recovery_failed", detail=str(exc), recoverable=False)
+                return
+            if stored_digests:
                 live["_artifact_read_digests"] = [digest for digest in live["_artifact_read_digests"] if digest not in stored_digests]
-                live["artifact_read_budget"]["remaining_reads"] = max(len(raw["read_requests"]), live["artifact_read_budget"]["remaining_reads"])
+                epoch = str((state.get("decisions") or [{}])[-1].get("evidence_count"))
+                used = sum(str(row.get("epoch")) == epoch for row in read_history(camp))
+                live["artifact_read_budget"]["remaining_reads"] = max(0, READS_PER_EVIDENCE_EPOCH - used) + len(stored_digests)
                 if "retrieve_memory" not in live["available_actions"]:
                     live["available_actions"].append("retrieve_memory")
-                parsed = {"ok": True}
+                parsed = _parse(candidate, live["available_actions"], set(live.get("_known_evidence_ids") or []),
+                                set(live.get("trainable_ids") or []), live.get("eligible_targets"))
         detail = None if parsed.get("ok") else parsed.get("detail")
         if detail is None:
             detail = validate_comparison_and_reads(candidate, live)
@@ -870,6 +1025,7 @@ def _apply_action(
             state["decisions"][-1]["execution_budget_snapshot"] = live["budget"]
     state["active_issue_ids"] = list(raw.get("resolves_issue_ids") or [])
     state["active_artifact_refs"] = list(raw.get("required_artifact_refs") or [])
+    state["active_read_digests"] = list(raw.get("required_read_digests") or [])
     state["active_implementation_target_id"] = raw.get("target_id") if action in {"implement_candidate", "repair_candidate"} else None
     if action == "stop":
         reason = raw.get("stop_reason") or decision.get("stop_reason")
@@ -1156,6 +1312,9 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     design_failed = False
     if designer is not None:
         try:
+            from react_agent.eeg_research.agentic.handoffs import record_read_delivery
+            record_read_delivery(camp, context.get("artifact_reads") or [], consumer="experiment_designer",
+                                 request_id=task["task_id"], input_digest=task["input_digest"])
             reply = designer(
                 {
                     "task_id": task["task_id"],
@@ -1365,7 +1524,9 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
     state["report_draft"] = report_draft
 
     from react_agent.eeg_research.agentic.audit_context import AUDIT_SCHEMA, IDENTITY_KEYS, reusable_audit, sync_issues
-    cached = reusable_audit(camp, report_hash=report_draft["report_hash"], manifest_hash=report_draft["dependency_manifest_hash"])
+    dependency_snapshot = report_dependency_hash(state)
+    cached = reusable_audit(camp, report_hash=report_draft["report_hash"], manifest_hash=report_draft["dependency_manifest_hash"],
+                            report_ref=report_draft["report_ref"], dependency_hash=dependency_snapshot)
     if cached is not None:
         _accept_audit_projection(camp, state, cached["artifact_id"], cached["payload"])
         sync_issues(camp, state)
@@ -1398,7 +1559,8 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
                                 "claims": claims, "scope": "development"},
         "dependency_manifest": manifest, "analyses": report_draft["analyses"], "claims": report_claims,
         "report_hash": report_hash, "dependency_manifest_hash": report_draft["dependency_manifest_hash"],
-        "audited_report_ref": report_draft["report_ref"], "audit_feedback": feedback_view,
+        "audited_report_ref": report_draft["report_ref"], "audited_dependency_hash": dependency_snapshot,
+        "audit_feedback": feedback_view,
         "context_limits": {"audit_feedback": feedback_limits},
     }
     task = begin_role_task(camp, role="result_auditor", inputs=[camp / "goal.json"], request=request)
@@ -1450,11 +1612,9 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
         "evidence_refs": [claim["ref"]] if claim.get("ref") else []}
         for claim in claims if claim.get("status") == "unsupported"]
     payload["open_issues"] = deterministic_issues + list(payload.get("open_issues") or [])
-    # Predict the dependency snapshot including this derived row, then write the
-    # envelope exactly once. No post-registration hash mutation is allowed.
-    projected = {**state, "evidence": [*(state.get("evidence") or []),
-                  {"evidence_id": evidence_id, "kind": "audit"}]}
-    payload["audited_dependency_hash"] = report_dependency_hash(projected)
+    # Cache comparison and the immutable result bind the same pre-call snapshot.
+    # Derived audit rows are excluded by report_dependency_hash.
+    payload["audited_dependency_hash"] = dependency_snapshot
     path = camp / "audits" / f"{task['task_id']}.json"
     envelope = finish_role_task(camp, task, payload, kind="audit", path=path)
     _accept_audit_projection(camp, state, envelope["artifact_refs"][-1], payload)
@@ -1474,7 +1634,8 @@ def _accept_audit_projection(camp: Path, state: dict[str, Any], artifact_id: str
             "audit_artifact_id": artifact_id, "summary": {key: payload.get(key) for key in (
                 "verdict", "claims", "auditor_claims", "report_hash", "model_verdict_ignored",
                 "open_issues", "required_corrections", "review_limits", "identity_verified", "model_audit_status")}})
-    state["audited_report_hash"] = payload.get("audited_dependency_hash") or report_dependency_hash(state)
+    state["audited_report_hash"] = payload.get("audited_dependency_hash")
+    state["audit_fresh"] = bool(state["audited_report_hash"] and state["audited_report_hash"] == report_dependency_hash(state))
     refresh_audit_freshness(state)
 
 

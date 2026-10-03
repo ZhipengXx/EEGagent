@@ -302,6 +302,15 @@ def build_services(camp: Path) -> dict[str, Any]:
         if impl_path.is_file() and not repairing:
             outcome = json.loads(impl_path.read_text(encoding="utf-8"))
         else:
+            from react_agent.eeg_research.agentic.handoffs import record_read_delivery, prepare_read_delivery
+            prepare_read_delivery(spec.get("artifact_reads") or [])
+            digest = request_digest(request=spec)
+            if spec.get("artifact_reads"):
+                _attach(coder, candidate_id=candidate_id, attempt_id=attempt["attempt_id"],
+                        phase="implement_candidate", operation_id=operation_id(workspace, candidate_id, "implement_candidate"),
+                        input_hash=source_hash(workspace), input_digest=digest)
+                record_read_delivery(camp_dir, spec["artifact_reads"], consumer="candidate_coder",
+                                     request_id=attempt["attempt_id"], input_digest=digest)
             last_llm: LlmUnavailable | None = None
             for _attempt in range(IMPLEMENT_ATTEMPTS):
                 try:

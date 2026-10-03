@@ -436,6 +436,12 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
     artifacts = {row["artifact_id"]: row for row in observation.get("artifact_index") or [] if row.get("verification_status") == "verified"}
     if any(ref not in artifacts for ref in parsed.required_artifact_refs):
         return "unknown_artifact"
+    pages = {row.get("request_digest"): row for row in observation.get("artifact_read_index") or [] if row.get("status") == "read"}
+    def valid_pages(digests, refs):
+        return all(digest in pages and pages[digest].get("artifact_id") in artifacts
+                   and (not refs or pages[digest].get("artifact_id") in refs) for digest in digests)
+    if len(set(parsed.required_read_digests)) != len(parsed.required_read_digests) or not valid_pages(parsed.required_read_digests, parsed.required_artifact_refs):
+        return "unknown_or_duplicate_artifact_page"
     known = set(observation.get("_known_evidence_ids") or [])
     if parsed.report_revision:
         if parsed.action != "revise_report" or not parsed.resolves_issue_ids:
@@ -482,6 +488,8 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
         return "selected_option_evidence_alias_mismatch"
     if set(parsed.evidence_refs or parsed.evidence_ids) != set(selected.evidence_refs):
         return "selected_option_evidence_mismatch"
+    if parsed.required_read_digests != selected.required_read_digests:
+        return "selected_option_read_page_mismatch"
     if set(parsed.required_artifact_refs) != set(selected.required_artifact_refs):
         return "selected_option_artifact_mismatch"
     if not set(parsed.resolves_issue_ids) <= set(selected.related_issue_ids):
@@ -505,6 +513,8 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
             return "unknown_option_target"
         if any(ref not in known for ref in option.evidence_refs):
             return "unknown_option_evidence"
+        if not valid_pages(option.required_read_digests, option.required_artifact_refs):
+            return "unknown_option_artifact_page"
         if any(ref not in artifacts for ref in option.required_artifact_refs):
             return "unknown_option_artifact"
         if any(ref not in issues for ref in option.related_issue_ids):

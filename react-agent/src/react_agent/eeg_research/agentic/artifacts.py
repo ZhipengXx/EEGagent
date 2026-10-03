@@ -154,7 +154,7 @@ def resolve_verified_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
 
 def read_verified_range(camp: Path, artifact_id: str, *, start: int = 0, end: int | None = None,
                         json_view: Callable[[Any], Any] | None = None,
-                        max_chars: int | None = None) -> dict[str, Any]:
+                        max_chars: int | None = None, page_chars: int | None = None) -> dict[str, Any]:
     """Read a bounded slice of one registered artifact. Unknown ids are refused."""
     row = resolve_verified_artifact(camp, artifact_id)
     text = Path(str(row["path"])).read_text(encoding="utf-8")
@@ -174,6 +174,10 @@ def read_verified_range(camp: Path, artifact_id: str, *, start: int = 0, end: in
             end = min(end, start + max_chars)
     stop = len(text) if end is None else max(start, end)
     chunk = text[start:stop]
+    actual_end = start + len(chunk)
+    if page_chars is not None and page_chars <= 0:
+        raise ValueError("artifact_page_size_invalid")
+    next_end = len(text) if page_chars is None else min(len(text), actual_end + page_chars)
     return {
         "artifact_id": artifact_id,
         "sha256": row.get("sha256"),
@@ -182,7 +186,8 @@ def read_verified_range(camp: Path, artifact_id: str, *, start: int = 0, end: in
         "start": start,
         "end": start + len(chunk),
         "truncated": start + len(chunk) < len(text),
-        "next_range": None if start + len(chunk) >= len(text) else [start + len(chunk), len(text)],
+        "next_range": None if actual_end >= len(text) else [actual_end, next_end],
+        "total_view_chars": len(text),
         "text": chunk,
     }
 
