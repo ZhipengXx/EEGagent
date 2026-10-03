@@ -18,6 +18,7 @@ ACTIONS = (
     "run_full",
     "replicate",
     "audit_result",
+    "revise_report",
     "stop",
 )
 
@@ -97,9 +98,13 @@ def evidence_count(state: dict[str, Any]) -> int:
 
 def _seen_without_new_evidence(state: dict[str, Any], action: str) -> bool:
     """The same local action at the same substantive evidence count adds nothing."""
+    if action == "audit_result" and state.get("audit_status") == "stale":
+        return False
+    if action == "retrieve_memory" and state.get("_has_development_artifacts") and int(state.get("_read_remaining", 0)) > 0:
+        return False
     count = evidence_count(state)
     for row in reversed(state.get("decisions") or []):
-        if row.get("action") == action and row.get("ok"):
+        if row.get("action") == action and row.get("ok") and row.get("executed") is not False:
             return row.get("evidence_count") == count
     return False
 
@@ -118,7 +123,11 @@ def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
             names.append(str(row["candidate_id"]))
     if "baseline" not in names and any(row.get("candidate_id") == "baseline" for row in evidence):
         names.append("baseline")
-    targets: dict[str, list[str]] = {"run_pilot": [], "run_full": [], "replicate": []}
+    repair = state.get("repair_task") or {}
+    implementation_target = state.get("_implementation_target") or repair.get("candidate_id") or state.get("candidate_id")
+    targets: dict[str, list[str]] = {"run_pilot": [], "run_full": [], "replicate": [],
+        "implement_candidate": [str(implementation_target)] if implementation_target else [],
+        "repair_candidate": [str(repair["candidate_id"])] if repair.get("candidate_id") else []}
     permitted = training_actions(state)
     if not room:
         return targets
@@ -187,7 +196,11 @@ def available_actions(state: dict[str, Any]) -> list[str]:
         and calls_left >= IMPLEMENT_CALLS
     ):
         actions.append("implement_candidate")
+    if state.get("_has_open_report_issues"):
+        actions.append("revise_report")
     actions = [name for name in actions if name not in _LOCAL or not _seen_without_new_evidence(state, name)]
+    if state.get("_has_development_artifacts") and int(state.get("_read_remaining", 0)) <= 0:
+        actions = [name for name in actions if name != "retrieve_memory"]
     if audit_completed(state):
         actions = [name for name in actions if name != "audit_result"]
     targets = eligible_targets(state)
@@ -274,7 +287,51 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
         return parsed
     if repairs >= 1:
         return _blocked_reply(parsed, reply)
-    repaired = backend({**observation, "schema_error": parsed.get("detail"), "previous": reply})
+    repair_payload = {**observation, "schema_error": parsed.get("detail"), "previous": reply}
+    if parsed.get("detail") in {"unknown_option_cost_basis", "option_cost_without_runtime_basis",
+                              "option_cost_basis_missing", "option_cost_confidence_without_runtime_basis"}:
+        cost_rows = observation.get("action_cost_estimates") or {}
+        options = reply.get("options") if isinstance(reply, dict) else []
+        details = []
+        for option in (options if isinstance(options, list) else [])[:4]:
+            if not isinstance(option, dict):
+                continue
+            key = f"{option.get('action')}:{option.get('target_id') or ''}"
+            estimate = cost_rows.get(key) or {}
+            details.append({"option_id": option.get("option_id"), "cost_estimate_key": key,
+                            "allowed_cost_basis": estimate.get("cost_basis") or [],
+                            "allowed_estimated_cost": estimate.get("estimated_cost") or {
+                                "llm_calls": None, "gpu_seconds": None, "training_jobs": None},
+                            "cost_confidence": estimate.get("cost_confidence") or "unknown"})
+        repair_payload["schema_repair_context"] = {
+            "instruction": "Copy these exact cost_basis strings without explanation, translation or path prefixes. Empty means []. Put explanations in value_rationale. Unknown numeric costs are null.",
+            "option_costs": details,
+        }
+    if parsed.get("detail") in {"unknown_option_target", "selected_option_execution_mismatch"}:
+        repair_payload["schema_repair_context"] = {
+            "instruction": "Artifact IDs are read_requests/required_artifact_refs, not candidate target IDs. For retrieve_memory, set target_id=null in BOTH top-level and selected option unless filtering an existing candidate. Keep top-level action/target_id/question_id identical to the selected option. Fix every copy together.",
+            "eligible_targets": observation.get("eligible_targets") or {},
+            "implementation_target_id": observation.get("implementation_target_id"),
+        }
+    context = repair_payload.setdefault("schema_repair_context", {})
+    context["option_constraints"] = {
+        "unique_signature": ["action", "target_id", "question_id", "intervention"],
+        "instruction": "Each option must have a different execution signature. Different option IDs or rationales do not make identical actions different. Remove redundant options; one option is valid. Preserve the intended legal selected action when repairing an unrelated field. intervention is an exact experiment_draft.intervention, never report-edit or training prose; use null outside experiment design. Do not repeat an already delivered artifact read.",
+    }
+    context["report_claims"] = [row.get("claim_id") for row in
+        (observation.get("report_draft") or {}).get("claims") or [] if row.get("claim_id")]
+    context["report_revision_instruction"] = "Revise only these exact existing claim IDs with matching open issues. Withdraw unsupported phrases within that claim's statement; never create universal_superiority or causal_mechanism subclaim IDs."
+    previous_options = reply.get("options") if isinstance(reply, dict) else []
+    selected_previous = next((row for row in (previous_options or []) if isinstance(row, dict) and
+        row.get("option_id") == reply.get("selected_option_id")), {})
+    context["selected_reference_binding"] = {
+        "previous_selected_evidence_refs": selected_previous.get("evidence_refs") or [],
+        "allowed_evidence_ids": sorted(ref for ref in known if isinstance(ref, str)),
+        "allowed_artifact_ids": sorted(row["artifact_id"] for row in observation.get("artifact_index") or []
+            if row.get("verification_status") == "verified"),
+        "instruction": "Use one identical complete list in top-level evidence_refs, top-level evidence_ids and selected-option evidence_refs. evidence_ids is an alias, never a subset or summary. Only use allowed_evidence_ids. required_artifact_refs in every option and at top level must contain only allowed_artifact_ids, never dataset/file paths or future outputs. An empty allowed_artifact_ids list means required_artifact_refs must be [] everywhere. Keep selected/top-level required_artifact_refs identical. Dataset paths may be described in prerequisites/rationale. Correct all copies in this reply.",
+    }
+    repaired = backend(repair_payload)
     second = _validate_reply(repaired, observation, allowed, known, trainable, eligible)
     if second.get("ok"):
         second["repairs"] = 1
@@ -300,6 +357,9 @@ def _validate_reply(
     parsed = _parse(reply, allowed, known, trainable, eligible)
     if not parsed.get("ok"):
         return parsed
+    detail = validate_comparison_and_reads(reply, observation)
+    if detail:
+        return {"ok": False, "detail": detail}
     if parsed["action"] == "stop":
         reason = completion_block_reason(observation, reply.get("stop_reason"))
         if reason:
@@ -351,6 +411,236 @@ def _parse(
             allowed_targets = trainable or set()
         if not isinstance(target, str) or not target:
             return {"ok": False, "detail": "target_id_missing"}
-        if allowed_targets and target not in allowed_targets:
+        if (eligible is not None or allowed_targets) and target not in allowed_targets:
             return {"ok": False, "detail": f"unknown_target:{target}"}
     return {"ok": True, "action": action, "reason_zh": reply.get("reason_zh") or reply.get("decision_rationale") or reply.get("summary_zh") or "", "raw": reply}
+
+
+def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, Any]) -> str | None:
+    """The existing decide/schema-repair path validates every executable option."""
+    from pydantic import ValidationError
+    from react_agent.eeg_research.agentic.schemas import PlannerDecision
+    from react_agent.eeg_research.agentic.handoffs import READ_MAX_IDS, READ_RANGE_CHARS, READ_TOTAL_CHARS, read_digest
+    compare = observation.get("planner_mode", (observation.get("goal") or {}).get("planner_mode", "single_action")) == "compare_options"
+    extended = compare or any(reply.get(key) for key in ("options", "read_requests", "resolves_issue_ids", "report_revision"))
+    if not extended:
+        return None
+    try:
+        parsed = PlannerDecision.model_validate(reply)
+    except ValidationError as exc:
+        return "planner_domain_invalid:" + str(exc.errors(include_input=False)[0].get("type"))
+    feedback = observation.get("audit_feedback") or {}
+    issues = {row["issue_id"]: row for row in feedback.get("issues") or []}
+    if any(ref not in issues or issues[ref].get("status") != "open" for ref in parsed.resolves_issue_ids):
+        return "unknown_or_closed_issue"
+    artifacts = {row["artifact_id"]: row for row in observation.get("artifact_index") or [] if row.get("verification_status") == "verified"}
+    if any(ref not in artifacts for ref in parsed.required_artifact_refs):
+        return "unknown_artifact"
+    known = set(observation.get("_known_evidence_ids") or [])
+    if parsed.report_revision:
+        if parsed.action != "revise_report" or not parsed.resolves_issue_ids:
+            return "report_revision_requires_existing_open_issue"
+        claims = {row.get("claim_id") for row in (observation.get("report_draft") or {}).get("claims") or []}
+        for revision in parsed.report_revision:
+            if revision.claim_id not in claims or any(ref not in known for ref in revision.evidence_refs):
+                return "report_revision_unknown_claim_or_evidence"
+            if not any(issues[ref].get("claim_id") == revision.claim_id for ref in parsed.resolves_issue_ids):
+                return "report_revision_issue_claim_mismatch"
+    elif parsed.action == "revise_report":
+        return "report_revision_missing"
+    if parsed.read_requests:
+        if parsed.action != "retrieve_memory":
+            return "artifact_read_requires_retrieve_memory"
+        if len(parsed.read_requests) > min(READ_MAX_IDS, (observation.get("artifact_read_budget") or {}).get("remaining_reads", 0)):
+            return "artifact_read_limit"
+        digests = []
+        total = 0
+        for request in parsed.read_requests:
+            if request.artifact_id not in artifacts:
+                return "unknown_artifact"
+            amount = READ_RANGE_CHARS if request.end is None else request.end - request.start
+            total += amount
+            if amount > READ_RANGE_CHARS or total > READ_TOTAL_CHARS:
+                return "artifact_read_range_limit"
+            digest = read_digest(request.model_dump(), artifacts[request.artifact_id].get("content_hash"))
+            if digest in digests or digest in (observation.get("_artifact_read_digests") or []):
+                return "artifact_read_replayed"
+            digests.append(digest)
+    if compare and (not parsed.options or not parsed.selected_option_id or not parsed.selection_rationale.strip()):
+        return "comparison_required"
+    if not parsed.options:
+        return None
+    options = {option.option_id: option for option in parsed.options}
+    if len(options) != len(parsed.options):
+        return "option_id_duplicate"
+    selected = options.get(parsed.selected_option_id)
+    if selected is None or not selected.executable:
+        return "selected_option_missing_or_nonexecutable"
+    if (parsed.action, parsed.target_id, parsed.question_id) != (selected.action, selected.target_id, selected.question_id):
+        return "selected_option_execution_mismatch"
+    if parsed.evidence_refs and parsed.evidence_ids and set(parsed.evidence_refs) != set(parsed.evidence_ids):
+        return "selected_option_evidence_alias_mismatch"
+    if set(parsed.evidence_refs or parsed.evidence_ids) != set(selected.evidence_refs):
+        return "selected_option_evidence_mismatch"
+    if set(parsed.required_artifact_refs) != set(selected.required_artifact_refs):
+        return "selected_option_artifact_mismatch"
+    if not set(parsed.resolves_issue_ids) <= set(selected.related_issue_ids):
+        return "selected_option_issue_mismatch"
+    if selected.intervention and (parsed.experiment_draft or {}).get("intervention") != selected.intervention:
+        return "selected_option_intervention_mismatch"
+    signatures = {(option.action, option.target_id, option.question_id, option.intervention) for option in parsed.options}
+    if len(signatures) != len(parsed.options):
+        return "duplicate_option_action"
+    question_ids = {row.get("question_id") for row in ((observation.get("research_plan") or {}).get("plan") or {}).get("research_questions") or []}
+    candidates = {"baseline", *[row.get("candidate_id") for row in observation.get("candidates") or []]}
+    if observation.get("candidate_id"):
+        candidates.add(observation["candidate_id"])
+    if observation.get("implementation_target_id"):
+        candidates.add(observation["implementation_target_id"])
+    eligible = observation.get("eligible_targets") or {}
+    for option in parsed.options:
+        if option.question_id is not None and option.question_id not in question_ids:
+            return "unknown_option_question"
+        if option.target_id is not None and option.target_id not in candidates:
+            return "unknown_option_target"
+        if any(ref not in known for ref in option.evidence_refs):
+            return "unknown_option_evidence"
+        if any(ref not in artifacts for ref in option.required_artifact_refs):
+            return "unknown_option_artifact"
+        if any(ref not in issues for ref in option.related_issue_ids):
+            return "unknown_option_issue"
+        if option.executable:
+            if option.action not in (observation.get("available_actions") or []):
+                return "option_action_unavailable:" + option.action
+            if option.action in {"run_pilot", "run_full", "replicate"} and option.target_id not in eligible.get(option.action, []):
+                return "option_target_unavailable"
+            if option.action in {"implement_candidate", "repair_candidate"} and option.target_id not in eligible.get(option.action, []):
+                return "option_target_unavailable"
+        estimate = (observation.get("action_cost_estimates") or {}).get(f"{option.action}:{option.target_id or ''}") or {}
+        expected_cost = estimate.get("estimated_cost") or {}
+        for key, value in option.estimated_cost.model_dump().items():
+            if value is not None and (expected_cost.get(key) is None or abs(value - expected_cost[key]) > 1e-6):
+                return "option_cost_without_runtime_basis"
+        if any(ref not in (estimate.get("cost_basis") or []) for ref in option.cost_basis):
+            return "unknown_option_cost_basis"
+        if any(value is not None for value in option.estimated_cost.model_dump().values()):
+            if not option.cost_basis:
+                return "option_cost_basis_missing"
+            if option.cost_confidence != estimate.get("cost_confidence"):
+                return "option_cost_confidence_without_runtime_basis"
+    return None
+
+
+def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=None) -> dict[str, Any]:
+    """Cost of the next mandatory pipeline, with conditional follow-ups explicit.
+
+    Settled same-target/fidelity/protocol records support rough GPU averages.
+    Job counts come from the actual matched-baseline rule. Review/repair,
+    analysis retries and later confirmation remain separately unknown; these
+    estimates never reserve resources or modify the cost ledger.
+    """
+    import json
+    import math
+    from pathlib import Path
+    from react_agent.eeg_research.agentic.execution_protocol import load_protocol, next_unused_training_seed
+    estimates = {}
+    protocol = load_protocol(camp) if camp else {}
+    protocol = protocol or {}
+    policy = observation.get("confirmation_policy") or {}
+    if policy.get("seeds_declared"):
+        protocol = {**protocol, "training_seeds": policy.get("training_seeds") or []}
+    fingerprint = state.get("execution_fingerprint")
+    evidence = state.get("evidence") or []
+
+    def samples_for(target, fidelity):
+        samples, seen = [], set()
+        expected_source = next((row.get("source_hash") for row in state.get("candidates") or []
+                                if row.get("candidate_id") == target), None)
+        for row in evidence:
+            if row.get("candidate_id") != target or row.get("fidelity") != fidelity or row.get("evaluation_valid") is not True:
+                continue
+            if not fingerprint or (row.get("execution_fingerprint") or row.get("contract_fingerprint")) != fingerprint:
+                continue
+            if expected_source and row.get("source_hash") != expected_source:
+                continue
+            directory = Path(str(row.get("job_dir") or "")).resolve()
+            if camp and not directory.is_relative_to(Path(camp).resolve()):
+                continue
+            record = None
+            for name in ("run_record.json", "job.json"):
+                try:
+                    saved = json.loads((directory / name).read_text(encoding="utf-8"))
+                    record = saved.get("result", saved)
+                    if isinstance(record, dict) and record.get("gpu_seconds") is not None:
+                        break
+                except (OSError, ValueError, TypeError):
+                    continue
+            if not isinstance(record, dict):
+                continue
+            if record.get("candidate_id", target) != target or record.get("fidelity", fidelity) != fidelity:
+                continue
+            seconds = record.get("gpu_seconds")
+            job_id = record.get("job_id") or row.get("job_id") or directory.name
+            if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0 or job_id in seen:
+                continue
+            seen.add(job_id)
+            samples.append({"evidence_id": row.get("evidence_id"), "job_id": job_id, "gpu_seconds": seconds,
+                            "candidate_id": target, "fidelity": fidelity, "execution_fingerprint": fingerprint})
+        return samples[-8:]
+
+    for action in observation.get("available_actions") or []:
+        targets = (observation.get("eligible_targets") or {}).get(action) or [None]
+        for target in targets:
+            costs = {"llm_calls": None, "gpu_seconds": None, "training_jobs": None}
+            components, basis, samples, unknown = {}, [], [], []
+            if action in {"run_pilot", "run_full", "replicate"}:
+                fidelity = "pilot" if action == "run_pilot" else "full"
+                seed = int(protocol.get("training_seed", protocol.get("seed") or 0))
+                if action == "replicate":
+                    used = {int(row.get("seed") or 0) for row in evidence if row.get("candidate_id") == target
+                            and row.get("fidelity") == fidelity and row.get("evaluation_valid")}
+                    seed = next_unused_training_seed(protocol, used)
+                matched = target == "baseline" or any(row.get("candidate_id") == "baseline" and row.get("fidelity") == fidelity
+                    and row.get("evaluation_valid") is True and int(row.get("seed") or 0) == seed
+                    and (row.get("execution_fingerprint") or row.get("contract_fingerprint")) == fingerprint for row in evidence)
+                required_targets = [target] + ([] if matched else ["baseline"])
+                totals = []
+                for name in required_targets:
+                    history = samples_for(name, fidelity)
+                    samples.extend(history)
+                    seconds = sum(row["gpu_seconds"] for row in history) / len(history) if len(history) >= 2 else None
+                    components["candidate" if name == target else "matched_baseline"] = {
+                        "candidate_id": name, "fidelity": fidelity, "training_seed": seed,
+                        "gpu_seconds": seconds, "training_jobs": 1 if seed is not None else None,
+                        "cost_confidence": "rough" if seconds is not None else "unknown",
+                        "cost_basis": [row["evidence_id"] for row in history if row.get("evidence_id")]}
+                    totals.append(seconds)
+                costs["gpu_seconds"] = sum(totals) if totals and all(value is not None for value in totals) else None
+                costs["training_jobs"] = len(required_targets) if seed is not None else None
+                basis = [row["evidence_id"] for row in samples if row.get("evidence_id")]
+                basis.append("runtime:matched_training_seed_rule")
+                components["review_or_repair"] = {"llm_calls": None, "condition": "only_if_source_or_hooks_fail"}
+                components["analysis"] = {"llm_calls": None, "condition": "result_analysis_and_curator_with_paid_retries"}
+                components["followup_confirmation"] = {
+                    "llm_calls": None, "gpu_seconds": None, "training_jobs": None,
+                    "target_pairs": policy.get("target_pairs"), "training_seeds": policy.get("training_seeds"),
+                    "policy_hash": policy.get("policy_hash"), "condition": "depends_on_observed_result_and_remaining_pairs"}
+                unknown = ["review_or_repair_calls", "analysis_retries", "conditional_followup_confirmation"]
+                if costs["gpu_seconds"] is None:
+                    unknown.append("comparable_gpu_history_missing")
+            elif action in {"inspect_data", "retrieve_memory", "collect_diagnostics", "diagnose_results", "revise_report", "stop"}:
+                costs = {"llm_calls": 0, "gpu_seconds": 0.0, "training_jobs": 0}
+                basis = ["runtime:local_action:" + action]
+                components["local_consumer"] = {"model_calls": False, "training_jobs": 0}
+            else:
+                unknown = ["model_retries", "review_or_repair", "future_experiments_and_confirmation"]
+            estimates[f"{action}:{target or ''}"] = {
+                "estimated_cost": costs, "cost_basis": list(dict.fromkeys(basis)),
+                "cost_confidence": "rough" if costs["gpu_seconds"] and samples else "runtime_bound" if costs["gpu_seconds"] == 0 else "unknown",
+                "historical_samples": samples, "components": components, "unknown_components": unknown,
+                "cost_scope": "next_action_and_required_matched_baseline; conditional_followups_listed_separately",
+                "full_followup_pipeline_cost": {"llm_calls": None, "gpu_seconds": None, "training_jobs": None},
+                "api_usd": None, "usd_status": "unpriced", "estimates_are_execution_authority": False,
+                "planner_call_already_in_budget_ledger": True,
+            }
+    return estimates

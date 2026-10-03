@@ -76,6 +76,7 @@ def init_plan(camp: Path, goal: dict[str, Any], *, protocol: dict[str, Any] | No
         "revisions": [],
         "last_consumed_decision_id": None,
         "accepted_evidence_ids": [],
+        "audit_issues": [],
     }
     _persist(camp, plan)
     return plan
@@ -275,6 +276,7 @@ def consume_for_planner(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
                 "candidate_pool",
                 "pending_comparisons",
                 "reserved_confirmation",
+                "audit_issues",
                 "stopping_policy",
             )
         },

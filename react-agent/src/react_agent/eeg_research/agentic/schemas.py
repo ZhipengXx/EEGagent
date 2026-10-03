@@ -36,20 +36,92 @@ class DomainOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class PlannerDecision(DomainOutput):
-    action: Literal["inspect_data", "retrieve_memory", "retrieve_methods", "diagnose_results",
-                    "collect_diagnostics", "design_experiment", "propose_experiment",
-                    "implement_candidate", "repair_candidate", "run_pilot", "run_full",
-                    "replicate", "audit_result", "stop"]
-    target_id: str | None = None
+PlannerAction = Literal["inspect_data", "retrieve_memory", "retrieve_methods", "diagnose_results",
+                        "collect_diagnostics", "design_experiment", "propose_experiment",
+                        "implement_candidate", "repair_candidate", "run_pilot", "run_full",
+                        "replicate", "audit_result", "revise_report", "stop"]
+
+
+class ArtifactReadRequest(DomainOutput):
+    artifact_id: str = Field(min_length=1)
+    start: int = Field(default=0, ge=0)
+    end: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def ordered_range(self):
+        if self.end is not None and self.end <= self.start:
+            raise ValueError("artifact_read_range_invalid")
+        return self
+
+
+class EstimatedCost(DomainOutput):
+    llm_calls: int | None = Field(default=None, ge=0)
+    gpu_seconds: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    training_jobs: int | None = Field(default=None, ge=0)
+
+
+class PlannerOption(DomainOutput):
+    option_id: str = Field(min_length=1)
+    action: PlannerAction
+    target_id: str | None = Field(default=None, description=(
+        "Exact runtime candidate/action target ID or null. Artifact IDs belong in read_requests and "
+        "required_artifact_refs, never target_id. For retrieve_memory use null unless an existing candidate filter is requested. "
+        "Top-level and selected-option target_id must match exactly."))
     question_id: str | None = None
     evidence_refs: list[str] = Field(default_factory=list)
-    evidence_ids: list[str] = Field(default_factory=list)
+    required_artifact_refs: list[str] = Field(default_factory=list, description=(
+        "Exact verified artifact_index artifact_id values only, never dataset paths or prospective files. "
+        "Use [] if no verified registered artifacts are needed. Top-level and selected-option lists must be identical."))
+    related_issue_ids: list[str] = Field(default_factory=list)
+    observed_gap: str = Field(min_length=1)
+    expected_information: str = Field(min_length=1)
+    prerequisites: list[str] = Field(default_factory=list)
+    interpretation_of_outcomes: dict[str, str] = Field(default_factory=dict)
+    estimated_cost: EstimatedCost = Field(default_factory=EstimatedCost)
+    cost_basis: list[str] = Field(default_factory=list, description=(
+        "Exact cost_basis strings copied verbatim from action_cost_estimates for this action:target. "
+        "Use [] when the runtime list is empty or missing. Never include prose, paths, translations or invented references."))
+    cost_confidence: Literal["unknown", "rough", "runtime_bound"] = "unknown"
+    value_level: Literal["high", "medium", "low", "unknown"] = "unknown"
+    value_rationale: str = Field(min_length=1)
+    executable: bool = True
+    intervention: str | None = Field(default=None, description=(
+        "Exact experiment_draft.intervention for an experiment design option. Use null for stop, "
+        "retrieval, report revision and running an already approved candidate. Describe expected changes in value_rationale."))
+
+
+class ReportClaimRevision(DomainOutput):
+    claim_id: str = Field(min_length=1, description="Exact existing report_draft.claims claim_id with an open matching issue. Never invent subclaim IDs.")
+    operation: Literal["withdraw", "narrow"]
+    statement: str | None = None
+    scope_limits: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def narrowing_needs_text(self):
+        if self.operation == "narrow" and (not self.statement or not self.scope_limits):
+            raise ValueError("claim_narrowing_needs_statement_and_scope")
+        return self
+
+
+class PlannerDecision(DomainOutput):
+    action: PlannerAction
+    target_id: str | None = Field(default=None, description=(
+        "Exact runtime candidate/action target ID or null. Artifact IDs belong in read_requests and "
+        "required_artifact_refs, never target_id. For retrieve_memory use null unless an existing candidate filter is requested. "
+        "Top-level and selected-option target_id must match exactly."))
+    question_id: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list, description=(
+        "Exact evidence IDs matching the selected option evidence_refs. If evidence_ids is supplied, copy this identical list there."))
+    evidence_ids: list[str] = Field(default_factory=list, description=(
+        "Legacy alias of evidence_refs; use [] or copy the exact same complete list. Never a summary or subset."))
     decision_rationale: str = ""
     reason_zh: str = ""
     summary_zh: str = ""
     expected_information: Any = None
-    required_artifact_refs: list[str] = Field(default_factory=list)
+    required_artifact_refs: list[str] = Field(default_factory=list, description=(
+        "Exact verified artifact_index artifact_id values only, never dataset paths or prospective files. "
+        "Use [] if no verified registered artifacts are needed. Top-level and selected-option lists must be identical."))
     hypothesis_draft: dict[str, Any] | None = None
     experiment_draft: dict[str, Any] | None = None
     plan_update: dict[str, Any] | None = None
@@ -57,6 +129,13 @@ class PlannerDecision(DomainOutput):
     stop_reason: Literal["goal_addressed", "no_supported_next_experiment", "no_progress",
                          "budget_exhausted", "blocked", "user_cancelled"] | None = None
     scope_limits: list[str] = Field(default_factory=list)
+    observed_gap: str | None = None
+    options: list[PlannerOption] = Field(default_factory=list, max_length=4)
+    selected_option_id: str | None = None
+    selection_rationale: str = ""
+    resolves_issue_ids: list[str] = Field(default_factory=list)
+    read_requests: list[ArtifactReadRequest] = Field(default_factory=list)
+    report_revision: list[ReportClaimRevision] = Field(default_factory=list)
 
 
 class MethodEvidencePacket(DomainOutput):
@@ -155,9 +234,20 @@ class LessonProposal(DomainOutput):
     summary_zh: str = ""
 
 
+class AuditIssueResolution(DomainOutput):
+    issue_id: str = Field(min_length=1)
+    resolution_kind: Literal["new_evidence", "claim_withdrawn", "claim_narrowed"]
+    claim_id: str | None = None
+    evidence_refs: list[str] = Field(default_factory=list)
+    rationale: str = Field(min_length=1)
+
+
 class AuditReport(DomainOutput):
     verdict: Literal["PASS", "REVISE", "BLOCK"]
-    audited_report_ref: str | None = None
+    audited_report_ref: str = Field(min_length=1)
+    report_hash: str = Field(min_length=1)
+    dependency_manifest_hash: str = Field(min_length=1)
+    resolved_issues: list[AuditIssueResolution] = Field(default_factory=list)
     claims: list[dict[str, Any]] = Field(default_factory=list)
     open_issues: list[Any] = Field(default_factory=list)
     required_corrections: list[Any] = Field(default_factory=list)
@@ -200,6 +290,7 @@ class GoalSpec(BaseModel):
     max_api_usd: float | None = None
     max_repairs_per_candidate: int = 2
     require_audit_before_completion: bool = False
+    planner_mode: Literal["single_action", "compare_options"] = "compare_options"
     allowed_training_actions: list[Literal["run_pilot", "run_full", "replicate"]] = Field(
         default_factory=lambda: ["run_pilot", "run_full", "replicate"]
     )

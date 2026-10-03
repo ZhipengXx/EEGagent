@@ -73,3 +73,106 @@ For stop, stop_reason must be an exact enum from OUTPUT_SCHEMA. Put any detailed
 prerequisite explanation in decision_rationale, never in stop_reason.
 If require_audit_before_completion is true, goal_addressed is permitted only with a fresh completed audit (audit_status pass/revise/block and audited_report_hash present). Select audit_result first when this gate is unsatisfied. Partial, pending and stale audits do not meet it. Budget exhaustion and user cancellation remain valid termination reasons. A completed REVISE/BLOCK audit does not establish scientific success; preserve its limitations.
 completion_audit_ready is the runtime's authoritative completion check. A fresh REVISE or BLOCK satisfies audit completion while retaining its limitations. audited_report_hash hashes the report dependencies; report_hash hashes the report body. They are different identities and must not be compared for equality. Do not repeat an unchanged completed audit to seek a PASS verdict.
+
+BOUND AUDIT FEEDBACK AND CORRECTIONS
+Read audit_feedback: a fresh, fully identified audit may support the exact
+report; partial, stale, invalid and legacy feedback is historical only. Link
+correction actions with existing resolves_issue_ids. Executing a correction does
+not close an issue. A later audit must explicitly cover it with new evidence or
+a verified claim withdrawal/narrowing. Use revise_report only for existing
+claim wording, scope or references, and provide report_revision; it never edits
+metrics or confirmation. Budget/blocked stopping retains unresolved issues.
+
+SINGLE-CALL OPTION COMPARISON
+planner_mode=compare_options requires options, selected_option_id and
+selection_rationale in this same response. Usually compare 2–4 materially
+different legal options. One is allowed when only one is reasonable; explain
+why. Each option states the exact target/question, evidence and registered
+artifact IDs, related issues, observed gap, expected information, prerequisites,
+outcome interpretations, cost basis and qualitative value. Nonexecutable
+alternatives must say executable=false and cannot be selected. Top-level
+action/target_id/question_id and evidence references must match the selected
+option. Runtime still checks the latest gates and budget before executing one
+action. Copy numeric costs only from action_cost_estimates and cite its basis;
+unknown components stay null, not zero. Historical samples are rough estimates,
+not reservations or permission. reserved_confirmation is plan information only;
+API dollars remain unpriced. Keep frozen policy/seeds unchanged.
+planner_mode=single_action accepts the legacy single-action interface.
+
+BOUNDED CONTENT READS
+artifact_index means a registered file exists; it does not mean you read it.
+Use retrieve_memory with read_requests [{artifact_id, start, end}] to request a
+verified development view. Ranges are character offsets in the filtered view,
+not raw JSON. The next planning observation carries artifact_reads with the
+original content hash, view hash, actual range, status and next_range. Respect
+artifact_read_budget and context_limits. Read a new artifact/page when needed;
+identical requests are idempotent and cannot count as experimental evidence.
+Use exact registered IDs in required_artifact_refs, never arbitrary paths.
+Missing/invalid/unavailable/holdout content cannot authorize an action. Keep
+current control identities, legal actions, candidate identities and unresolved
+issues while requesting omitted historical details only as needed.
+
+Cost estimates cover the next mandatory action and any required matched baseline.
+Inspect their components and unknown_components for conditional review/repair,
+analysis retries and later confirmation. A numeric next-action estimate is not
+a known total campaign cost; full_followup_pipeline_cost remains unknown.
+Use the exact implementation_target_id for a new implementation and the eligible
+repair target for a repair. Match selected required_artifact_refs with the top
+level refs; resolves_issue_ids must be among the selected related_issue_ids.
+Truncated prose has explicit paths/ranges in context_limits. All control and
+issue identities remain present; request the registered artifact to see omitted
+text. A partial excerpt never counts as a complete review.
+
+EXACT COST REFERENCES
+cost_basis is a list of runtime reference strings, never an explanation.
+For an option, find action_cost_estimates[action + ":" + (target_id or "")].
+Copy that row's cost_basis strings verbatim: no path prefix, translation,
+quoting of the enclosing dictionary key, or descriptive sentence. If the row
+or its cost_basis is absent/empty, return cost_basis: [] and unknown costs as
+null. Explain missing history or conditional components in value_rationale.
+When returning known numeric costs, copy that exact row's estimated_cost and
+cost_confidence. Local action costs can be zero only with the exact supplied
+runtime:local_action reference. schema_repair_context.option_costs supplies
+the literal allowed values after a cost-field rejection. Apply it directly;
+do not rewrite those reference strings as explanations.
+
+ACTION TARGETS VERSUS ARTIFACT READS
+An artifact ID is not a candidate/action target. Put it only in read_requests
+and required_artifact_refs. For retrieve_memory, target_id is null unless an
+existing candidate filter is explicitly requested. The top-level target_id
+and the selected option target_id must be the same, including null. When
+repairing unknown_option_target or selected_option_execution_mismatch, change
+BOTH copies of action/target_id/question_id together; fixing one leaves the
+other invalid. Copy selected evidence/artifact refs to the top level too.
+
+OPTION EXECUTION SIGNATURES AND REPORT CLAIM IDENTITIES
+Each option must have a distinct (action, target_id, question_id, intervention).
+Different stop reasons or prose do not make two identical stop options distinct.
+Remove redundant options. A single stop option is valid when the requested task
+is complete. Goal completion is scoped to the user's objective, not a claim that
+unperformed research or a pending calibration succeeded. Preserve a correct
+selected action while repairing unrelated comparison fields. An already delivered
+artifact_read must not be requested again; cite its delivered text and hashes.
+intervention is an exact experiment_draft.intervention for designing an experiment.
+Use null for reading, stopping, revising report text or running an already approved
+candidate; describe these activities in observed_gap/value_rationale instead.
+report_revision.claim_id must be an exact existing report_draft.claims ID with a
+matching open issue. Never invent subclaim IDs for superiority or causality.
+Withdraw those unsupported phrases within the original claim's narrowed statement.
+
+EVIDENCE ALIASES
+Top-level evidence_refs and evidence_ids name the same evidence list. When both
+are supplied they must be identical, and they must match the selected option's
+evidence_refs. evidence_ids is not a subset, summary, latest-evidence field or
+list limited to the audit. For example, if evidence_refs lists both run and audit
+IDs, copy ALL those same IDs to evidence_ids and selected-option evidence_refs.
+Alternatively leave the legacy evidence_ids empty. Never put an artifact ID in
+any evidence list. A schema repair must correct every copy in the same response.
+
+REGISTERED ARTIFACT REFERENCES
+required_artifact_refs contains only exact verified artifact_index artifact_id
+values, never train_dir, train.pt, feature-cache paths, goal.json or prospective
+outputs. If artifact_index has no verified IDs, return [] at top level AND in
+every option. Dataset paths already supplied by the contract are runtime inputs;
+mention them in prerequisites or rationale when useful. They do not become
+registered artifact IDs. Keep the selected option and top-level lists identical.

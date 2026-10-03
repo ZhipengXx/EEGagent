@@ -38,6 +38,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--reopen-reason", default="", help="Reopen a finished campaign after a framework fix; the reason is logged")
     parser.add_argument("--goal", type=Path, default=None, help="GoalSpec YAML. validate-goal prints it and does not start a worker.")
+    parser.add_argument("--planner-mode", choices=["single_action", "compare_options"], default=None,
+                        help="New campaign controller mode; persisted goals are authoritative on resume.")
     parser.add_argument("--pack", type=Path, default=None, help="Candidate pack directory for evaluate-export")
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
@@ -64,6 +66,7 @@ def goal(campaign: str, design=None) -> dict:
         gpu = float(chosen)
     return {
         "goal_id": campaign,
+        "planner_mode": "compare_options",
         "objective": "改进指定数据与协议下的 EEG 到图像检索",
         "task_type": "eeg_image_retrieval",
         "research_scope": scope,
@@ -266,6 +269,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.goal is not None:
             submitted = {**submitted, **load_goal_file(args.goal)}
             submitted["goal_id"] = args.campaign
+        if args.planner_mode is not None:
+            submitted["planner_mode"] = args.planner_mode
         try:
             protocol = build_execution_protocol(
                 design,

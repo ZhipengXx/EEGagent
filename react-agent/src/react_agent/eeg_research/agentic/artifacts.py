@@ -7,7 +7,7 @@ import json
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 REGISTRY = "artifact_registry.jsonl"
 
@@ -152,15 +152,33 @@ def resolve_verified_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
     return row
 
 
-def read_verified_range(camp: Path, artifact_id: str, *, start: int = 0, end: int | None = None) -> dict[str, Any]:
+def read_verified_range(camp: Path, artifact_id: str, *, start: int = 0, end: int | None = None,
+                        json_view: Callable[[Any], Any] | None = None,
+                        max_chars: int | None = None) -> dict[str, Any]:
     """Read a bounded slice of one registered artifact. Unknown ids are refused."""
     row = resolve_verified_artifact(camp, artifact_id)
     text = Path(str(row["path"])).read_text(encoding="utf-8")
+    view_hash = None
+    if json_view is not None:
+        value = json_view(json.loads(text))
+        if value is None:
+            raise ValueError("artifact_scope_forbidden")
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2)
+        view_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if start < 0 or start > len(text) or (end is not None and end < start):
+            raise ValueError("artifact_read_range_invalid")
+        # Callers know the read budget, not the length of the filtered view.
+        # Return the available prefix and bind the actual range in the receipt.
+        end = min(len(text), len(text) if end is None else end)
+        if max_chars is not None:
+            end = min(end, start + max_chars)
     stop = len(text) if end is None else max(start, end)
     chunk = text[start:stop]
     return {
         "artifact_id": artifact_id,
         "sha256": row.get("sha256"),
+        "view_sha256": view_hash,
+        "range_scope": "development_view" if json_view is not None else "original_artifact",
         "start": start,
         "end": start + len(chunk),
         "truncated": start + len(chunk) < len(text),

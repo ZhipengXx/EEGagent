@@ -26,6 +26,7 @@ ACTION_ZH = {
     "run_full": "完整训练",
     "replicate": "重复 seed",
     "audit_result": "审计结果",
+    "revise_report": "修订报告",
     "stop": "停止",
 }
 
@@ -282,6 +283,8 @@ def campaign_view(camp: Path, *, include_source: bool = True) -> dict[str, Any]:
 
     refresh_audit_freshness(state)
     audit_status = state.get("audit_status") or "pending"
+    from react_agent.eeg_research.agentic.audit_context import audit_feedback
+    feedback = audit_feedback(camp, state)
     health = worker_health(camp, state)
     return {
         "campaign_id": camp.name,
@@ -296,6 +299,8 @@ def campaign_view(camp: Path, *, include_source: bool = True) -> dict[str, Any]:
         "execution_status": state.get("execution_status") or view["status"],
         "research_outcome": state.get("research_outcome") or "not_evaluated",
         "audit_status": audit_status,
+        "report_support_status": feedback["report_support_status"],
+        "unresolved_audit_issues": [row for row in feedback["issues"] if row["status"] == "open"],
         "termination_reason": state.get("termination_reason") or state.get("stop_reason"),
         "stop_reason": state.get("stop_reason"),
         "pause_after_step": state.get("pause_after_step"),

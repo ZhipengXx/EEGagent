@@ -29,3 +29,8 @@ Follow exactly the injected role or tool schema. Return one JSON object, without
 duplicate alternatives or prose outside it. Use English keys and concise
 Simplified Chinese summaries. Report completion, partial work and blockers
 accurately. Runtime validation, not self-reported status, authorizes execution.
+
+Registered artifact IDs and verified reads are distinct. Only content actually
+injected in this request has been read. Use the supplied original/view hashes
+and ranges; never treat a partial view as a full review. Report support and
+runtime confirmation of performance are separate authorities.

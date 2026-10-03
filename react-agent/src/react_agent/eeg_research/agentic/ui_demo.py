@@ -27,7 +27,7 @@ def write_demo_campaign(root: Path) -> Path:
         camp / "goal.json",
         {
             "goal_id": DEMO_CAMPAIGN,
-            "objective": "Improve EEG–image retrieval under a matched protocol (demo)",
+            "objective": "Improve EEG–image retrieval (demo)",
             "max_training_jobs": 8,
             "max_llm_calls": 40,
             "max_gpu_seconds": 3600,
@@ -66,7 +66,7 @@ def write_demo_campaign(root: Path) -> Path:
                 "executed": True,
                 "at": now + index,
                 "candidate_id": "c01",
-                "reason_zh": f"观察：步骤 {index}。假设：时序池化。下一步：继续。",
+                "reason_zh": f"Observation: Synthetic step {index}.\nHypothesis: Temporal pooling.\nNext step: Continue.",
             }
         )
     state = {
@@ -78,9 +78,13 @@ def write_demo_campaign(root: Path) -> Path:
         "live_job": None,
         "training_jobs": 2,
         "llm_calls": 8,
+        "max_training_jobs": 8,
+        "max_llm_calls": 40,
+        "max_gpu_seconds": 3600,
+        "gpu_seconds_reserved": 88,
         "gpu_seconds_left": 3500,
         "pause_after_step": False,
-        "hypothesis": {"mechanism": "temporal pooling", "statement": "时序池化是否改善固定 gallery Top-1"},
+        "hypothesis": {"mechanism": "temporal pooling", "statement": "Does temporal pooling improve fixed-gallery Top-1?"},
         "candidates": [{"candidate_id": "c01", "status": "pilot_complete"}],
         "decisions": decisions,
         "evidence": [
@@ -163,7 +167,7 @@ def write_demo_campaign(root: Path) -> Path:
     _write(workspace / "spec.json", {"parent_candidate_id": "baseline"})
     _write(workspace / "lineage.json", {"parent_candidate_id": "baseline", "parent_is_not_control": True})
     _write(workspace / "attempt.json", {"attempt_id": "att_demo", "candidate_id": "c01"})
-    _write(workspace / "review.json", {"summary_zh": "演示审查通过"})
+    _write(workspace / "review.json", {"summary_zh": "Synthetic review accepted"})
     job = camp / "jobs" / "j_pilot"
     _write(
         job / "job.json",

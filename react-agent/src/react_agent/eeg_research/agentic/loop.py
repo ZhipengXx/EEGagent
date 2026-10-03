@@ -91,7 +91,7 @@ def report_dependency_hash(state: dict[str, Any]) -> str:
                 "confirmation": row.get("promotion") or row.get("confirmation"),
                 "result_hash": row.get("result_hash"),
             }
-            for row in state.get("evidence") or []
+            for row in state.get("evidence") or [] if row.get("kind") != "audit"
         ],
         "report_hash": report.get("report_hash") or state.get("audit_report_hash"),
         "dependency_manifest_hash": report.get("dependency_manifest_hash"),
@@ -138,7 +138,12 @@ def create_campaign(
         known[request_id] = str(camp)
         _write(index, known)
         return existing
+    goal = dict(goal)
+    goal.setdefault("planner_mode", "compare_options")
+    if goal["planner_mode"] not in {"single_action", "compare_options"}:
+        raise ValueError("planner_mode_invalid")
     state = {
+        "planner_mode": goal["planner_mode"],
         "goal_id": goal["goal_id"],
         "request_id": request_id,
         "status": "created",
@@ -438,6 +443,8 @@ def _apply_control(camp: Path, state: dict[str, Any]) -> None:
 
 def save_state(camp: Path, state: dict[str, Any]) -> None:
     _apply_control(camp, state)
+    from react_agent.eeg_research.agentic.audit_context import audit_feedback
+    state["report_support_status"] = audit_feedback(camp, state)["report_support_status"]
     if state.get("pause_after_step") and state.get("status") not in _TERMINAL and not state.get("live_job"):
         state["status"] = "paused"
     _write(camp / "campaign_state.json", state)
@@ -474,13 +481,26 @@ def _dev_row(row: dict[str, Any]) -> dict[str, Any]:
     return {key: row.get(key) for key in keep if key in row}
 
 
+def candidate_implementation_target(camp: Path, state: dict[str, Any]) -> str:
+    """Reuse the worker's actual candidate allocation for planner target binding."""
+    repair = pending_repair(state)
+    if repair:
+        return str(repair["candidate_id"])
+    unfinished = incomplete_candidate_id(camp, state)
+    if unfinished:
+        return unfinished
+    index = len(state.get("candidates") or []) + 1
+    while (camp / "candidates" / f"c{index}").exists():
+        index += 1
+    return f"c{index}"
+
+
 def observation(camp: Path) -> dict[str, Any]:
     state = load_state(camp)
     refresh_audit_freshness(state)
     contract = public_contract(_read(camp / "evaluation_contract.json"))
     from react_agent.eeg_research.agentic.planner import blocked_actions, eligible_targets
 
-    actions = available_actions(state)
     evidence = [_dev_row(row) for row in state.get("evidence") or []]
     from react_agent.eeg_research.agentic.interface import candidate_interface
 
@@ -503,8 +523,32 @@ def observation(camp: Path) -> dict[str, Any]:
     control_id = experiment.get("control_candidate_id") or "baseline"
     from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views
 
-    return development_view({
+    from react_agent.eeg_research.agentic.audit_context import audit_feedback
+    from react_agent.eeg_research.agentic.handoffs import (
+        artifact_index, bounded_history, bounded_control_view, verified_read_context, read_history, read_epoch, READS_PER_EVIDENCE_EPOCH,
+    )
+    feedback = audit_feedback(camp, state)
+    analysis_views = load_analysis_views(camp, state)
+    index = artifact_index(camp, state)
+    reads = read_history(camp)
+    remaining_reads = max(0, READS_PER_EVIDENCE_EPOCH - sum(row.get("epoch") == read_epoch(state) for row in reads))
+    state["_has_development_artifacts"] = any(row["verification_status"] == "verified" for row in index)
+    state["_read_remaining"] = remaining_reads
+    state["_has_open_report_issues"] = bool((state.get("report_draft") or {}).get("claims") and any(
+        row["status"] == "open" and row.get("claim_id") for row in feedback["issues"]))
+    state["_implementation_target"] = candidate_implementation_target(camp, state)
+    actions = available_actions(state)
+    public = development_view({
         "goal": _planner_goal(goal),
+        "planner_mode": goal.get("planner_mode", "single_action"),
+        "audit_feedback": feedback,
+        "report_support_status": feedback["report_support_status"],
+        "report_draft": {key: (state.get("report_draft") or {}).get(key) for key in ("report_hash", "report_ref", "dependency_manifest_hash", "claims")},
+        "artifact_index": index,
+        "artifact_reads": verified_read_context(camp, state),
+        "artifact_read_budget": {"remaining_reads": remaining_reads, "epoch": read_epoch(state)},
+        "_artifact_read_digests": [row.get("request_digest") for row in reads],
+
         "require_audit_before_completion": bool(goal.get("require_audit_before_completion", False)),
         "audit_status": state.get("audit_status") or "pending",
         "audit_fresh": state.get("audit_fresh") is True,
@@ -514,7 +558,7 @@ def observation(camp: Path) -> dict[str, Any]:
         "confirmation_policy_hash": (policy or {}).get("policy_hash") or state.get("confirmation_policy_hash"),
         "parent_source": candidate_context(camp, str(parent_id)),
         "control_source": candidate_context(camp, str(control_id)),
-        "analyses": load_analysis_views(camp, state),
+        "analyses": analysis_views,
         "method_evidence_packet": state.get("method_evidence_packet"),
         "contract": contract,
         "candidate_interface": candidate_interface(protocol),
@@ -523,8 +567,10 @@ def observation(camp: Path) -> dict[str, Any]:
         "hypothesis": state.get("hypothesis"),
         "experiment": state.get("experiment"),
         "candidate_ready": state.get("candidate_ready"),
+        "candidate_id": state.get("candidate_id"),
         "available_actions": actions,
         "eligible_targets": eligible_targets(state),
+        "implementation_target_id": state["_implementation_target"],
         "blocked_actions": blocked_actions(state),
         "trainable_ids": trainable,
         "budget": budget_snapshot(camp, state),
@@ -548,6 +594,45 @@ def observation(camp: Path) -> dict[str, Any]:
         "latest_diagnostics": None if latest_job is None else latest_job.get("diagnostics"),
         "_known_evidence_ids": [row.get("evidence_id") for row in evidence],
     })
+    limits = {}
+    for key in ("evidence", "memory", "lessons", "analyses"):
+        public[key], limits[key] = bounded_history(public[key])
+    public["evidence_index"] = [{key: row.get(key) for key in ("evidence_id", "candidate_id", "kind", "fidelity", "evaluation_valid")}
+                                for row in evidence]
+    public["memory_index"] = [{key: row.get(key) for key in ("episode_id", "candidate_id", "artifact", "retrieval")}
+                              for row in retrieve(state.get("memory") or [], task_hash=str(state.get("goal_id")), fingerprint=str(state.get("contract_fingerprint")))]
+    plan = (public.get("research_plan") or {}).get("plan") or {}
+    hypothesis_evidence = []
+    for view in analysis_views:
+        payload = view.get("payload")
+        if view.get("verification_status") != "verified" or view.get("completion_status") != "completed" or not isinstance(payload, dict):
+            continue
+        assessment = {"artifact_id": view.get("artifact_id"), "content_hash": view.get("content_hash"),
+                      "candidate_id": view.get("candidate_id"), "evidence_id": view.get("evidence_id"),
+                      "authority": "llm_interpretation", "hypothesis_assessment": payload.get("hypothesis_assessment"),
+                      "evidence_refs": payload.get("evidence_refs") or [], "context_limits": {}}
+        for key in ("prediction_checks", "competing_explanations", "evidence_gaps", "suggested_next_actions"):
+            assessment[key], assessment["context_limits"][key] = bounded_history(payload.get(key) or [], budget=4000)
+        hypothesis_evidence.append(assessment)
+    public["controller_state"] = {
+        "research_questions": plan.get("research_questions") or [],
+        "hypothesis": development_view(state.get("hypothesis")),
+        "hypothesis_evidence": hypothesis_evidence,
+        "candidate_states": [{key: row.get(key) for key in ("candidate_id", "status", "parent_id", "attempt_id")}
+                             for row in state.get("candidates") or []],
+        "next_comparisons": plan.get("pending_comparisons") or [],
+        "open_audit_issue_ids": feedback["unresolved_issue_ids"],
+        "remaining_resources": public["budget"],
+        "reserved_confirmation": {"plan": plan.get("reserved_confirmation"), "resource_status": "plan_information_only"},
+        "interpretation_authority": "analyst_interpretation_is_not_runtime_confirmation",
+    }
+    for key in ("audit_feedback", "hypothesis", "experiment", "latest_diagnostics", "latest_comparison",
+                "method_evidence_packet", "recent_decisions", "last_local_result", "research_plan", "report_draft", "controller_state"):
+        public[key], limits[key] = bounded_control_view(public[key])
+    public["context_limits"] = {"history": limits, "omitted_content": "use registered artifact_index IDs and read_requests", "control_identities_retained": True}
+    from react_agent.eeg_research.agentic.planner import cost_estimates
+    public["action_cost_estimates"] = cost_estimates(state, public, camp=camp)
+    return public
 
 
 Services = dict[str, Callable[..., Any]]
@@ -643,6 +728,12 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         "reason_zh": decision.get("reason_zh"),
         "expected_information": raw_decision.get("expected_information"),
         "required_artifact_refs": raw_decision.get("required_artifact_refs") or [],
+        "options": raw_decision.get("options") or [],
+        "selected_option_id": raw_decision.get("selected_option_id"),
+        "selection_rationale": raw_decision.get("selection_rationale"),
+        "resolves_issue_ids": raw_decision.get("resolves_issue_ids") or [],
+        "read_requests": raw_decision.get("read_requests") or [],
+        "budget_snapshot": obs.get("budget"),
         "question_id": raw_decision.get("question_id"),
         "evidence_ids": [item for item in cited if isinstance(item, str)] if isinstance(cited, list) else [],
         "detail": decision.get("detail"),
@@ -727,6 +818,59 @@ def _apply_action(
     """Run one already chosen action. Does not allocate a new decision id."""
     state["status"] = "planning"
     raw = decision.get("raw") if isinstance(decision.get("raw"), dict) else _decision_raw(camp, str(decision.get("decision_id") or ""))
+    if obs.get("planner_mode") == "compare_options" or any(raw.get(key) for key in ("options", "read_requests", "resolves_issue_ids", "report_revision")) or action == "revise_report":
+        from react_agent.eeg_research.agentic.planner import _parse, validate_comparison_and_reads
+        live = observation(camp)
+        # Reconcile paid calls and persisted resource/target changes before
+        # execution. A smaller remaining budget is never overwritten by a stale
+        # in-memory planning snapshot.
+        current = load_state(camp)
+        if current.get("status") in _TERMINAL:
+            state["status"] = current["status"]
+            state["detail"] = "execution_stopped_by_current_campaign_state"
+            return
+        for key in ("max_llm_calls", "max_training_jobs", "max_gpu_seconds", "gpu_seconds_left"):
+            if current.get(key) is not None and state.get(key) is not None:
+                state[key] = min(state[key], current[key])
+        state["training_jobs"] = max(int(state.get("training_jobs") or 0), int(current.get("training_jobs") or 0))
+        _sync_ledger(camp, state)
+        live["budget"] = budget_snapshot(camp, state)
+        scope = {**current, **{key: state.get(key) for key in ("max_llm_calls", "llm_calls", "llm_calls_left",
+                    "max_training_jobs", "training_jobs", "max_gpu_seconds", "gpu_seconds_left")},
+                 "_implementation_target": live.get("implementation_target_id"),
+                 "_has_development_artifacts": any(row.get("verification_status") == "verified" for row in live.get("artifact_index") or []),
+                 "_read_remaining": live["artifact_read_budget"]["remaining_reads"],
+                 "_has_open_report_issues": "revise_report" in live["available_actions"]}
+        live["available_actions"] = available_actions(scope)
+        from react_agent.eeg_research.agentic.planner import eligible_targets
+        live["eligible_targets"] = eligible_targets(scope)
+        candidate = {**raw, "action": action}
+        parsed = _parse(candidate, live["available_actions"], set(live.get("_known_evidence_ids") or []),
+                        set(live.get("trainable_ids") or []), live.get("eligible_targets"))
+        if action == "retrieve_memory" and raw.get("read_requests"):
+            from react_agent.eeg_research.agentic.handoffs import read_history, read_digest
+            current_id = decision.get("decision_id") or (state.get("decisions") or [{}])[-1].get("decision_id")
+            same_decision = [row for row in read_history(camp) if row.get("decision_id") == current_id]
+            stored_digests = {row.get("request_digest") for row in same_decision}
+            by_id = {row["artifact_id"]: row for row in live.get("artifact_index") or []}
+            requested = {read_digest(row, (by_id.get(row.get("artifact_id")) or {}).get("content_hash")) for row in raw["read_requests"]}
+            if requested and requested <= stored_digests:
+                live["_artifact_read_digests"] = [digest for digest in live["_artifact_read_digests"] if digest not in stored_digests]
+                live["artifact_read_budget"]["remaining_reads"] = max(len(raw["read_requests"]), live["artifact_read_budget"]["remaining_reads"])
+                if "retrieve_memory" not in live["available_actions"]:
+                    live["available_actions"].append("retrieve_memory")
+                parsed = {"ok": True}
+        detail = None if parsed.get("ok") else parsed.get("detail")
+        if detail is None:
+            detail = validate_comparison_and_reads(candidate, live)
+        if detail:
+            persist_failure(camp, state, phase="action", error_type="execution_revalidation_failed", detail=detail, recoverable=True)
+            return
+        if state.get("decisions"):
+            state["decisions"][-1]["execution_budget_snapshot"] = live["budget"]
+    state["active_issue_ids"] = list(raw.get("resolves_issue_ids") or [])
+    state["active_artifact_refs"] = list(raw.get("required_artifact_refs") or [])
+    state["active_implementation_target_id"] = raw.get("target_id") if action in {"implement_candidate", "repair_candidate"} else None
     if action == "stop":
         reason = raw.get("stop_reason") or decision.get("stop_reason")
         if reason in {None, ""}:
@@ -760,6 +904,16 @@ def _apply_action(
         _append_derived(state, {"evidence_id": f"ev_audit_{len(state['evidence']) + 1}", "kind": "data_audit", "summary": state["data_audit"]})
     elif action == "retrieve_memory":
         state["memory_hits"] = [row.get("candidate_id") for row in obs.get("memory") or []]
+        if raw.get("read_requests"):
+            from react_agent.eeg_research.agentic.handoffs import consume_artifact_reads
+            state["last_local_result"] = consume_artifact_reads(camp, state, raw["read_requests"],
+                decision.get("decision_id") or (state.get("decisions") or [{}])[-1].get("decision_id"))
+    elif action == "revise_report":
+        try:
+            _revise_report(camp, state, raw)
+        except (OSError, ValueError, KeyError) as exc:
+            persist_failure(camp, state, phase="report_revision", error_type=type(exc).__name__,
+                            detail=str(exc), recoverable=True)
     elif action == "retrieve_methods":
         _retrieve_methods(camp, state, raw, services)
     elif action == "diagnose_results":
@@ -941,7 +1095,11 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     contract = _read(contract_path) if contract_path.is_file() else {}
     if not contract:
         missing.append("evaluation_contract")
+    from react_agent.eeg_research.agentic.audit_context import audit_feedback
+    from react_agent.eeg_research.agentic.handoffs import selected_read_context
     return development_view({
+        "artifact_reads": selected_read_context(camp, state),
+        "audit_issues": [row for row in audit_feedback(camp, state)["issues"] if row["issue_id"] in (state.get("active_issue_ids") or [])],
         "hypothesis": spec.get("hypothesis") or state.get("hypothesis"),
         "goal": _planner_goal(_read(camp / "goal.json")),
         "confirmation_policy": load_confirmation_policy(camp),
@@ -990,6 +1148,8 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
         role="experiment_designer",
         inputs=inputs,
         request={"draft": spec, **context},
+        artifacts=[{"artifact_id": row["artifact_id"], "kind": "selected_development_read", "sha256": row.get("sha256")}
+                   for row in context.get("artifact_reads") or [] if row.get("status") == "read"],
     )
     payload: dict[str, Any] = {"status": "completed", "experiment_spec": spec, "summary_zh": "已写出 ExperimentSpec"}
     blocked = False
@@ -1184,19 +1344,44 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
         if path.is_file():
             manifest.append({"path": str(path), "kind": name.removesuffix(".json"), "content_hash": file_digest(path),
                 "scope": "development", "payload": development_view(json.loads(path.read_text()))})
+    for claim in claims:
+        claim["claim_id"] = claim.get("claim_id") or claim["claim"]
+    report_claims = [dict(claim) for claim in claims]
+    for claim in report_claims:
+        revision = (state.get("report_claim_revisions") or {}).get(claim["claim_id"])
+        if revision:
+            claim.update(revision_operation=revision["operation"], statement=revision.get("statement"),
+                         scope_limits=revision.get("scope_limits") or [], evidence_refs=revision.get("evidence_refs") or [])
     report_draft = {
         "schema_version": "eeg_research.report_draft.v1", "scope": "development",
-        "claims": claims, "latest": development_view(latest),
+        "claims": report_claims, "latest": development_view(latest),
         "analyses": load_analysis_views(camp, state),
         "scope_limits": ["pilot evidence is not confirmed superiority", "final holdout excluded", "same-provider audit is not independent replication"],
         "dependency_manifest": manifest,
     }
     report_draft["dependency_manifest_hash"] = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     report_draft["report_hash"] = hashlib.sha256(json.dumps(report_draft, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    report_draft["report_ref"] = "report:" + report_draft["report_hash"]
     state["report_draft"] = report_draft
 
+    from react_agent.eeg_research.agentic.audit_context import AUDIT_SCHEMA, IDENTITY_KEYS, reusable_audit, sync_issues
+    cached = reusable_audit(camp, report_hash=report_draft["report_hash"], manifest_hash=report_draft["dependency_manifest_hash"])
+    if cached is not None:
+        _accept_audit_projection(camp, state, cached["artifact_id"], cached["payload"])
+        sync_issues(camp, state)
+        state["last_local_result"] = {"kind": "audit", "new_information": False, "reason": "verified_audit_recovered"}
+        return
     report_hash = report_draft["report_hash"]
+    evidence_id = f"ev_audit_result_{len(state['evidence']) + 1}"
     payload = {
+        "audit_schema_version": AUDIT_SCHEMA,
+        "audited_report_ref": report_draft["report_ref"],
+        "dependency_manifest_hash": report_draft["dependency_manifest_hash"],
+        "report_claims": report_claims,
+        "source_evidence_ids": [row.get("evidence_id") for row in state.get("evidence") or [] if row.get("evidence_id")],
+        "evidence_id": evidence_id,
+        "model_audit_status": "not_run", "identity_verified": False,
+        "model_audit_missing_inputs": ["auditor_not_run"],
         "status": "completed",
         "verdict": verdict,
         "deterministic_verdict": verdict,
@@ -1204,70 +1389,127 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
         "report_hash": report_hash,
         "summary_zh": "审计基于已落盘的 comparison/diagnostics，未训练模型",
     }
-    task = begin_role_task(
-        camp,
-        role="result_auditor",
-        inputs=[camp / "goal.json"],
-        request={"report_draft": report_draft},
-    )
+    from react_agent.eeg_research.agentic.audit_context import audit_feedback
+    from react_agent.eeg_research.agentic.handoffs import bounded_control_view
+    feedback_view, feedback_limits = bounded_control_view(audit_feedback(camp, state))
+    request = {
+        "latest": development_view(latest), "draft": report_draft, "report_draft": report_draft,
+        "deterministic_audit": {"authority": "runtime_integrity_precheck", "verdict": verdict,
+                                "claims": claims, "scope": "development"},
+        "dependency_manifest": manifest, "analyses": report_draft["analyses"], "claims": report_claims,
+        "report_hash": report_hash, "dependency_manifest_hash": report_draft["dependency_manifest_hash"],
+        "audited_report_ref": report_draft["report_ref"], "audit_feedback": feedback_view,
+        "context_limits": {"audit_feedback": feedback_limits},
+    }
+    task = begin_role_task(camp, role="result_auditor", inputs=[camp / "goal.json"], request=request)
+    request = {**request, "task_id": task["task_id"], "attempt_id": task["attempt_id"], "input_digest": task["input_digest"]}
     auditor = services.get("auditor")
     if auditor is not None:
+        from react_agent.eeg_research.agentic.roles import bind_role_output, RoleResultError
+        from react_agent.eeg_research.agentic.schemas import AuditReport
+        from pydantic import ValidationError
         try:
-            reply = auditor(
-                {
-                    "task_id": task["task_id"],
-                    "attempt_id": task["attempt_id"],
-                    "input_digest": task["input_digest"],
-                    "latest": latest,
-                    "draft": payload,
-                    "report_draft": report_draft,
-                    "dependency_manifest": manifest,
-                    "analyses": report_draft["analyses"],
-                    "claims": claims,
-                    "report_hash": report_hash,
-                }
-            )
-            if isinstance(reply, dict):
-                model_verdict = reply.get("verdict") or (reply.get("payload") or {}).get("verdict")
-                reply_status = str(reply.get("status") or "completed")
-                if reply_status in {"partial", "failed", "blocked"}:
-                    payload["status"] = reply_status
-                payload["auditor_claims"] = reply.get("claims") or (reply.get("payload") or {}).get("claims") or []
-                payload["open_issues"] = reply.get("open_issues") or []
-                payload["required_corrections"] = reply.get("required_corrections") or []
-                payload["summary_zh"] = str(reply.get("summary_zh") or payload["summary_zh"])
-                if verdict in {"REVISE", "BLOCK"} and model_verdict == "PASS":
-                    payload["verdict"] = verdict
-                    payload["model_verdict_ignored"] = "PASS"
-                elif model_verdict in {"REVISE", "BLOCK", "PASS"}:
-                    payload["verdict"] = model_verdict
-        except LlmUnavailable:
-            payload["status"] = "partial"
-            payload["summary_zh"] = "审计角色不可用，保留确定性核查"
+            reply = auditor(request)
+            bound = bind_role_output(reply, task=task)
+            body = bound.get("payload") if isinstance(bound.get("payload"), dict) else bound
+            wrapper_statuses = {str(bound.get("status") or "completed")}
+            while isinstance(body.get("payload"), dict) and not body.get("verdict"):
+                wrapper_statuses.add(str(body.get("status") or "completed"))
+                body = body["payload"]
+            model_verdict = body.get("verdict")
+            payload["auditor_claims"] = body.get("claims") or []
+            for key in ("open_issues", "required_corrections", "review_limits", "resolved_issues"):
+                payload[key] = body.get(key) or []
+            payload["summary_zh"] = str(body.get("summary_zh") or payload["summary_zh"])
+            payload["model_identity"] = {key: body.get(key) for key in IDENTITY_KEYS}
+            missing = [key for key in IDENTITY_KEYS if body.get(key) != payload[key]]
+            statuses = wrapper_statuses | {str(body.get("status") or "completed")}
+            if statuses != {"completed"}:
+                missing.append("model_audit_not_completed")
+            domain = {key: value for key, value in body.items() if key in AuditReport.model_fields}
+            try:
+                AuditReport.model_validate(domain)
+            except ValidationError:
+                missing.append("audit_domain_invalid")
+            payload["identity_verified"] = not missing
+            payload["model_audit_missing_inputs"] = missing
+            payload["model_audit_status"] = "partial" if missing else "completed"
+            if missing:
+                payload["status"] = "partial"
+            if verdict in {"REVISE", "BLOCK"} and model_verdict == "PASS":
+                payload["model_verdict_ignored"] = "PASS"
+            if not missing and model_verdict in {"PASS", "REVISE", "BLOCK"}:
+                ranking = {"PASS": 0, "REVISE": 1, "BLOCK": 2}
+                payload["verdict"] = max((verdict, model_verdict), key=ranking.__getitem__)
+        except (LlmUnavailable, RoleResultError, ValueError, TypeError) as exc:
+            payload.update(status="partial", model_audit_status="partial", identity_verified=False,
+                           model_audit_missing_inputs=[str(exc)])
+    deterministic_issues = [{"claim_id": claim["claim_id"], "category": "integrity", "severity": "blocking",
+        "problem": "Deterministic check failed: " + claim["claim"],
+        "required_correction": "Supply valid development evidence for this check; a model verdict cannot override it",
+        "evidence_refs": [claim["ref"]] if claim.get("ref") else []}
+        for claim in claims if claim.get("status") == "unsupported"]
+    payload["open_issues"] = deterministic_issues + list(payload.get("open_issues") or [])
+    # Predict the dependency snapshot including this derived row, then write the
+    # envelope exactly once. No post-registration hash mutation is allowed.
+    projected = {**state, "evidence": [*(state.get("evidence") or []),
+                  {"evidence_id": evidence_id, "kind": "audit"}]}
+    payload["audited_dependency_hash"] = report_dependency_hash(projected)
     path = camp / "audits" / f"{task['task_id']}.json"
-    finish_role_task(camp, task, payload, kind="audit", path=path)
-    state["audit_status"] = (
-        str(payload["status"]) if payload.get("status") in {"partial", "failed", "blocked"}
-        else {"PASS": "pass", "REVISE": "revise", "BLOCK": "block"}.get(str(payload["verdict"]), "unavailable")
-    )
-    state["audit_report_hash"] = report_hash
-    state["audit_claims"] = claims
+    envelope = finish_role_task(camp, task, payload, kind="audit", path=path)
+    _accept_audit_projection(camp, state, envelope["artifact_refs"][-1], payload)
+    sync_issues(camp, state)
+
+
+def _accept_audit_projection(camp: Path, state: dict[str, Any], artifact_id: str, payload: dict[str, Any]) -> None:
+    """Recover the immutable result without another task, write or charge."""
+    state["audit_status"] = str(payload["status"]) if payload.get("status") in {"partial", "failed", "blocked"} else {
+        "PASS": "pass", "REVISE": "revise", "BLOCK": "block"}.get(str(payload["verdict"]), "unavailable")
+    state["audit_report_hash"] = payload["report_hash"]
+    state["audit_claims"] = payload.get("claims") or []
     state["audit_fresh"] = True
-    _append_derived(
-        state,
-        {
-            "evidence_id": f"ev_audit_result_{len(state['evidence']) + 1}",
-            "kind": "audit",
-            "summary": {
-                "verdict": payload["verdict"],
-                "claims": claims,
-                "auditor_claims": payload.get("auditor_claims") or [],
-                "report_hash": report_hash,
-                "model_verdict_ignored": payload.get("model_verdict_ignored"),
-            },
-        },
-    )
-    state["audited_report_hash"] = report_dependency_hash(state)
+    state["latest_audit_artifact_id"] = artifact_id
+    if not any(row.get("audit_artifact_id") == artifact_id for row in state.get("evidence") or []):
+        state.setdefault("evidence", []).append({"evidence_id": payload["evidence_id"], "kind": "audit",
+            "audit_artifact_id": artifact_id, "summary": {key: payload.get(key) for key in (
+                "verdict", "claims", "auditor_claims", "report_hash", "model_verdict_ignored",
+                "open_issues", "required_corrections", "review_limits", "identity_verified", "model_audit_status")}})
+    state["audited_report_hash"] = payload.get("audited_dependency_hash") or report_dependency_hash(state)
+    refresh_audit_freshness(state)
+
+
+def _revise_report(camp: Path, state: dict[str, Any], raw: dict[str, Any]) -> None:
+    """Revise only claim wording/scope/refs; immutable measurements stay untouched."""
+    from react_agent.eeg_research.agentic.schemas import ReportClaimRevision
+    from react_agent.eeg_research.agentic.audit_context import audit_feedback
+    claims = {row.get("claim_id"): row for row in (state.get("report_draft") or {}).get("claims") or []}
+    known = {row.get("evidence_id") for row in state.get("evidence") or []}
+    issues = audit_feedback(camp, state)["issues"]
+    linked = set(raw.get("resolves_issue_ids") or [])
+    if not raw.get("report_revision") or not linked or not linked <= {row["issue_id"] for row in issues if row["status"] == "open"}:
+        raise ValueError("report_revision_requires_existing_open_issue")
+    revisions = [ReportClaimRevision.model_validate(row).model_dump() for row in raw["report_revision"]]
+    for row in revisions:
+        if row["claim_id"] not in claims or not set(row["evidence_refs"]) <= known:
+            raise ValueError("report_revision_unknown_claim_or_evidence")
+        if not any(issue["issue_id"] in linked and issue.get("claim_id") == row["claim_id"] for issue in issues):
+            raise ValueError("report_revision_issue_claim_mismatch")
+    state.setdefault("report_claim_revisions", {}).update({row["claim_id"]: row for row in revisions})
+    draft = json.loads(json.dumps(state["report_draft"]))
+    for row in draft["claims"]:
+        revision = state["report_claim_revisions"].get(row.get("claim_id"))
+        if revision:
+            row.update(revision_operation=revision["operation"], statement=revision.get("statement"),
+                       scope_limits=revision["scope_limits"], evidence_refs=revision["evidence_refs"])
+    import hashlib
+    material = {key: value for key, value in draft.items() if key not in {"report_hash", "report_ref"}}
+    draft["report_hash"] = hashlib.sha256(json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()
+    draft["report_ref"] = "report:" + draft["report_hash"]
+    state["report_draft"] = draft
+    refresh_audit_freshness(state)
+    state["last_local_result"] = {"kind": "report_revision", "claim_ids": [row["claim_id"] for row in revisions],
+                                  "issues_closed": False, "requires_reaudit": True}
+    event(camp, "report_claims_revised", claim_ids=[row["claim_id"] for row in revisions], issue_ids=sorted(linked))
 
 
 def _append_derived(state: dict[str, Any], row: dict[str, Any]) -> None:
@@ -1368,7 +1610,7 @@ def _implement_inline(camp: Path, state: dict[str, Any], decision: dict[str, Any
     from react_agent.eeg_research.agentic.interface import candidate_interface
     from react_agent.eeg_research.agentic.lineage import materialize
 
-    candidate_id = f"c{len(state.get('candidates') or []) + 1}"
+    candidate_id = candidate_implementation_target(camp, state)
     workspace = camp / "candidates" / candidate_id
     raw = decision.get("raw") or {}
     content = raw.get("content")

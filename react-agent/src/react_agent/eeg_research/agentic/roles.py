@@ -220,6 +220,7 @@ def begin_role_task(
         else input_digest(inputs)
     )
     refs = [str(path) for path in inputs]
+    refs.extend(str(row["artifact_id"]) for row in artifacts or [] if isinstance(row, dict) and row.get("artifact_id"))
     return create_task(
         camp,
         role=role,

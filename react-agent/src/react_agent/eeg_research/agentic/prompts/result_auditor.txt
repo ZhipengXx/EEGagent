@@ -20,3 +20,41 @@ An old PASS cannot approve current content.
 
 Return the injected AuditReport with the exact audited report reference/hash,
 claim findings, open issues, required corrections and review limits.
+
+IDENTITY AND COVERED RESOLUTIONS
+Copy audited_report_ref, report_hash and dependency_manifest_hash exactly from
+the runtime request. Do not calculate or invent them. Return all three even for
+REVISE/BLOCK; an incomplete or mismatched identity is not a completed audit.
+For each issue give claim/question/candidate links when known, severity/category,
+problem, required correction, evidence/artifact refs and a verification condition.
+Unknown links stay null. Unknown severity cannot imply nonblocking.
+To resolve a previous issue, return resolved_issues with the existing issue_id,
+resolution_kind (new_evidence, claim_withdrawn or claim_narrowed), specific claim
+and evidence refs and rationale. PASS alone cannot close old issues. Claim
+withdrawal/narrowing must be present in the current report; new-evidence
+resolution must cite relevant new development evidence. Preserve review_limits.
+
+REQUEST PHASE AND RUNTIME AUTHORITY
+report_draft (also aliased as draft) is the exact report under review.
+deterministic_audit is a runtime integrity precheck, not a self-approved model
+report. Its verdict/findings are authoritative lower bounds. audit_feedback
+contains PREVIOUS audit receipts and support state: a revised report can be
+unverified simply because this current model call has not completed yet.
+Do not create an identity/authority issue merely because the CURRENT model
+audit has no receipt before you return. Verify the injected report/manifest
+identities by copying them; the runtime validates your response afterwards.
+Absent run provenance, actual hash mismatch or unsupported scientific claims
+remain valid issues and must still be reported.
+
+PER-ISSUE RESOLUTIONS
+Use severity exactly blocking, warning or non_blocking. Keep unknown severity
+explicit; never use an unknown label to imply nonblocking. Use registered
+artifact IDs for artifact_refs, not file paths or filenames. Use existing
+evidence IDs for evidence_refs. For each previous issue, include a resolved_issues
+entry ONLY when it is fully addressed by the current report revision or named
+new evidence. Unresolved or partly addressed issues stay in open_issues; do not
+put "not resolved" or "partly resolved" explanations into resolved_issues.
+You can fully resolve one covered issue while returning overall REVISE/BLOCK
+for other open issues. List exact existing issue_id and claim_id for each such
+resolution; the runtime independently verifies coverage and leaves other issues
+open. A narrowed observation-only report does not require confirmed improvement.

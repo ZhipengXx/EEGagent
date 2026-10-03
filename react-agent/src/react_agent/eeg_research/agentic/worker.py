@@ -20,7 +20,7 @@ from react_agent.eeg_research.agentic.loop import (
     _sync_ledger,
     align_interrupt,
     event,
-    incomplete_candidate_id,
+    candidate_implementation_target,
     load_state,
     persist_failure,
     save_state,
@@ -221,18 +221,19 @@ def build_services(camp: Path) -> dict[str, Any]:
             return
         repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else None
         repairing = bool(repair and int(repair.get("remaining") or 0) > 0 and repair.get("candidate_id"))
-        candidate_id = None
-        if repairing:
-            candidate_id = str(repair["candidate_id"])
-        if candidate_id is None:
-            candidate_id = incomplete_candidate_id(camp_dir, state)
-        if candidate_id is None:
-            index = len(state.get("candidates") or []) + 1
-            while (camp_dir / "candidates" / f"c{index}").exists():
-                index += 1
-            candidate_id = f"c{index}"
+        candidate_id = candidate_implementation_target(camp_dir, state)
+        selected_target = state.get("active_implementation_target_id")
+        if selected_target and selected_target != candidate_id:
+            persist_failure(camp_dir, state, phase="implement_candidate", error_type="implementation_target_changed",
+                            detail="implementation_target_changed", recoverable=True)
+            return
         workspace = camp_dir / "candidates" / candidate_id
         spec = {"hypothesis": state.get("hypothesis"), "experiment": state.get("experiment")}
+        from react_agent.eeg_research.agentic.audit_context import audit_feedback
+        from react_agent.eeg_research.agentic.handoffs import selected_read_context
+        spec["audit_issues"] = [row for row in audit_feedback(camp_dir, state)["issues"]
+                                if row["issue_id"] in (state.get("active_issue_ids") or [])]
+        spec["artifact_reads"] = selected_read_context(camp_dir, state)
         if repairing:
             spec["repair_issues"] = repair.get("issues") or []
             spec["repair_intervention_coverage"] = repair.get("intervention_coverage")
@@ -286,6 +287,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                 save_state(camp_dir, state)
         else:
             attempt = ensure_attempt(workspace, candidate_id)
+        from react_agent.eeg_research.agentic.artifacts import request_digest
         _attach(
             coder,
             candidate_id=candidate_id,
@@ -293,6 +295,8 @@ def build_services(camp: Path) -> dict[str, Any]:
             phase="implement_candidate",
             operation_id=operation_id(workspace, candidate_id, "implement_candidate"),
             input_hash=source_hash(workspace),
+            **({"input_digest": request_digest(request=spec)}
+               if spec.get("artifact_reads") or spec.get("audit_issues") else {}),
         )
         outcome: dict[str, Any] | None = None
         if impl_path.is_file() and not repairing:

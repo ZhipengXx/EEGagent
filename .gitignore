@@ -25,3 +25,7 @@ react-agent/src/react_agent/version/
 .cursor/
 .agents/
 skills-lock.json
+
+# Local validation files; publish runtime files only
+react-agent/tests/
+**/.pytest_cache/

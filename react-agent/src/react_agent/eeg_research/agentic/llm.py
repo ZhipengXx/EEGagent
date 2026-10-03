@@ -122,6 +122,13 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
         bound.update({key: value for key, value in fields.items() if value is not None})
 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
+        task = None
+        if role in ENVELOPE_ROLES:
+            from react_agent.eeg_research.agentic.roles import task_identity_from_payload
+
+            task = task_identity_from_payload(payload, bound)
+            if task is None:
+                raise LlmUnavailable("role_result_task_missing")
         last: DeepSeekParseError | None = None
         schema_error = None
         previous_domain = None
@@ -223,12 +230,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             parsed = reply if isinstance(reply, dict) else {"_not_object": reply}
             bound_reply = None
             if role in ENVELOPE_ROLES:
-                from react_agent.eeg_research.agentic.roles import RoleResultError, bind_role_output, task_identity_from_payload
-                task = task_identity_from_payload(payload, bound)
-                if task is None:
-                    append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
-                                    status="failed", error="role_result_task_missing")
-                    raise LlmUnavailable("role_result_task_missing")
+                from react_agent.eeg_research.agentic.roles import RoleResultError, bind_role_output
                 try:
                     bound_reply = bind_role_output(parsed, task=task, prompt_hash=prompt_hash)
                 except RoleResultError as exc:
