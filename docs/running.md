@@ -13,9 +13,19 @@ uv sync --group dev
 cp .env.example .env
 ```
 
-### Run the offline numeric demo
+### Open the research workbench
 
-This example uses the rule policy and requires neither an LLM API call nor TRIBE generation:
+```bash
+uv run python -m react_agent.fmri.workbench
+```
+
+Open [http://127.0.0.1:8765](http://127.0.0.1:8765). The default entry is autonomous code-level research, with process, experiment and code / artifact views. The fMRI screening and standalone comparison workflows remain available in navigation.
+
+For an interface preview, open [the explicit platform demo](http://127.0.0.1:8765/?demo=1#research/demo_ui_workspace). It writes synthetic records under `runs/eeg_research_ui_demo/`, without an LLM call or training job. Demo values are not experimental evidence. The [platform gallery](platform.md) distinguishes the checked-in screenshots from the latest interface.
+
+### Run the offline numeric screening demo
+
+This fMRI example uses the rule policy and requires neither an LLM API call nor TRIBE generation:
 
 ```bash
 uv run python -m react_agent.fmri.cli make-demo --out examples/fmri_demo
@@ -27,13 +37,7 @@ uv run python -m react_agent.fmri.cli check \
   --out runs/rule_ok
 ```
 
-### Open the workbench
-
-```bash
-uv run python -m react_agent.fmri.workbench
-```
-
-Open [http://127.0.0.1:8765](http://127.0.0.1:8765) to inspect screening runs and configure retrieval experiments. The code-level research view exposes campaign state, decisions, candidate code, comparable results and run controls.
+Inspect the report in the workbench's fMRI screening view.
 
 ## Run a workflow
 
@@ -97,6 +101,8 @@ uv run python -m react_agent.eeg_research.agentic.cli status \
 
 `create` freezes the protocol and writes state; `start` launches the worker and can consume API and GPU budget. Use `pause`, `resume` or `stop` with the same campaign name to control it. A lock prevents a second worker for that campaign.
 
+New goals default to `planner_mode=compare_options`: the planner normally compares 2–4 next-action options in one response and records the alternatives, selected option and rationale. One is allowed when only one is reasonable. Runtime checks precede dispatch of the selected action. Use `--planner-mode single_action` on `create` only when the legacy interface is intended. An existing campaign's persisted goal remains authoritative when resumed.
+
 ### Inspect an exported candidate pack
 
 ```bash
@@ -133,20 +139,21 @@ The native code-level worker requires the configured LLM backend. Offline rule s
 | Evaluation | Frozen split, query/gallery, metric and image-feature identities; research decisions use validation evidence |
 | Confirmation | Matched full-run seed pairs and an explicit policy; a short pilot does not confirm improvement |
 | Memory | Episodes and conditional lessons; requested evidence levels cannot replace runtime evidence |
-| Audit context | Claim draft and latest-result summary; a complete structured report/dependency manifest is not currently injected into the auditor call |
+| Planner | Single-call next-action comparisons with exact targets, evidence, prerequisites and resource estimates; runtime gates still determine executability |
+| Artifact reads | Bounded development views with verified hashes, page identities and recorded consumer delivery; a read receipt is not experimental evidence |
+| Audit context | Structured report draft, development dependency manifest and verified analyses; identity / dependency freshness checks govern reusable feedback and tracked corrections |
 | Other tasks | Classification, image reconstruction, raw preprocessing and foundation-model adapters are currently unavailable |
 | Cost | Calls and tokens are recorded; unknown API dollar cost remains unpriced |
 
 Implementation and offline tests are separate from demonstrated real-data gains. The [canonical acceptance record](../react-agent/docs/revision_acceptance_canonical.md) documents offline/CPU checks and marks fresh live-role and GPU confirmation runs as not run in that revision. It does not establish a new retrieval benchmark result.
 
-## Development checks
+## Local checks and historical validation
 
-From `react-agent/`, run the offline suites:
+The current public tree does not include the earlier `tests/` suites. For a public checkout, begin with the offline numeric screening example above and validate the example retrieval goal without launching a worker:
 
 ```bash
-uv run python -m pytest \
-  tests/unit_tests tests/fmri tests/eeg_research tests/eeg_training \
-  --ignore=tests/eeg_research/test_live_roles.py
+uv run python -m react_agent.eeg_research.agentic.cli validate-goal \
+  --goal configs/goals/eeg_retrieval_v1_9.yaml
 ```
 
-Live-role and integration checks require separate prerequisites. [Canonical acceptance](../react-agent/docs/revision_acceptance_canonical.md) records what earlier checks establish. See the [architecture map](architecture.md) for implementation details and the current audit context.
+These commands inspect configuration and numeric screening behavior; they do not replace a full regression suite, live-role validation or a GPU retrieval study. Historical acceptance documents retain the commands and outcomes for their recorded revisions. See the [architecture map](architecture.md) for the current runtime and audit context.

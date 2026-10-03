@@ -1,0 +1,41 @@
+Use case: text-localization.
+Asset type: English-localized documentation screenshot.
+Edit target: the supplied EEGagent workbench screenshot. Replace ALL Chinese text visible in this screenshot with clear, accurate English. This is a localization edit only. Preserve the three-column layout, proportions, warm off-white backgrounds, ink-blue type, muted teal dots and outlines, copper notes, thin rules and exact same content, numbers, IDs, statuses, timestamps and event order. Output the full uncropped wide screenshot at its original approximately 1440 by 814 proportions. Keep crisp, straight UI typography. Small text/button width adjustments to fit English are allowed. Do not invent results, change a failed step into success, add curves or add any extra UI.
+Text specification, reading from top to bottom:
+Top brand unchanged "EEGagent" and "Brain Decoding Lab". Navigation: "Research", "New study", "fMRI screening", "Baseline experiments".
+Left sidebar: "Studies"; placeholder "Search studies"; button "+ New study"; section "Studies". Preserve existing English campaign title and "other demo campaign". Translate statuses to "Analyzing results" and "Paused". Lower section "Candidates". Card: "c01 · pilot_complete"; "Parent baseline · attempt"; "att_demo".
+Main top copper note: "DEMO DATA · NOT EXPERIMENTAL RESULTS".
+Main headline EXACTLY: "Improve EEG–image retrieval under a matched protocol (demo)".
+Controls: "Pause after step", "Stop training job", "Resume".
+Copper comparison line: "c01 0 pp · No gain over control".
+Metadata: "Multi-subject training · Image-holdout validation (not unseen-subject testing)"; "Analyzing results"; "Updated 9/30 23:20"; "Process unknown"; "Last progress unknown".
+Collapsed item "Budget".
+Main tabs "Process", "Experiments", "Code & artifacts".
+The eight small role boxes in SAME source order: "Coder" / "Not called"; "Reviewer" / "Not called"; "Designer" / "Completed"; "Memory" / "Not called"; "Librarian" / "Not called"; "Planner" / "Completed"; "Analyst" / "Completed"; "Auditor" / "Not called".
+Note "Training worker is not an LLM role".
+Timeline rows, same order, same dots:
+"Created —";
+"LLM call started" with "Analyst · active";
+"LLM call finished" with "Designer · completed";
+"Inspect data" with "Planner · ok";
+"Retrieve method cards" with "Planner · ok";
+"Design experiment" with "Planner · ok";
+"Experiment design" with "Designer · completed";
+"Implement candidate code" with "Planner · ok";
+"Repair candidate" with "Planner · ok";
+"Run pilot" with "Planner · ok".
+Right detail panel:
+"Step details";
+"Stop";
+"Planner · failed";
+"Observation / evidence";
+"Observation: step 12";
+"Hypothesis / rationale";
+"Observation: step 12. Hypothesis: temporal pooling. Next step: continue.";
+"Tool / change";
+"Tool: not provided";
+"Execution / review outcome";
+"failed";
+"Next-step condition";
+"Not provided".
+Use ONLY English everywhere, no remaining Chinese glyphs. Preserve IDs and actual synthetic values; this is not a new app run.

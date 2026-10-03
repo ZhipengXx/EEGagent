@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="828" viewBox="0 0 1440 828" role="img" aria-labelledby="title desc">
+<title id="title">Planning over alternatives</title>
+<desc id="desc">Illustrative next-action options in one planner response; one selected action passes runtime checks before dispatch.</desc>
+<defs>
+<marker id="arrow-ink" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#203744"/></marker>
+<marker id="arrow-teal" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#35756E"/></marker>
+<marker id="arrow-rust" markerWidth="9" markerHeight="9" refX="7" refY="4" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L8 4 L0 8" fill="#AE663B"/></marker>
+</defs>
+<rect width="1440" height="828" fill="#F7F4EE"/>
+<text x="54" y="47" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="2">EEGagent  /  BRAIN DECODING RESEARCH</text>
+<text x="1385" y="47" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="18" font-weight="normal" text-anchor="end" letter-spacing="0">04</text>
+<text x="54" y="109" fill="#203744" font-family="DejaVu Serif" font-size="43" font-weight="normal" text-anchor="start" letter-spacing="0">Compare before committing.</text>
+<text x="54" y="150" fill="#5C6C70" font-family="DejaVu Sans" font-size="23" font-weight="normal" text-anchor="start" letter-spacing="0">2–4 candidate next actions, one selected research decision.</text>
+<text x="54" y="207" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="1.6">RESEARCH CONTEXT</text>
+<text x="330" y="207" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="1.6">CANDIDATE NEXT ACTIONS</text>
+<text x="1386" y="207" fill="#35756E" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="end" letter-spacing="1.4">ONE PLANNER CALL</text>
+<rect x="54" y="230" width="236" height="366" rx="0" fill="#FFFDFA" stroke="#CCCFC7" stroke-width="1.2"/>
+<text x="76" y="270" fill="#203744" font-family="DejaVu Sans" font-size="26" font-weight="bold" text-anchor="start" letter-spacing="0">Current study</text>
+<text x="76" y="302" fill="#35756E" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">EEG / MEG retrieval</text>
+<path d="M78 342 H101 L113 329 L126 361 L139 317 L151 350 L164 338 H264" fill="none" stroke="#35756E" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<circle cx="80" cy="384" r="3" fill="#AE663B" stroke="none" stroke-width="1"/>
+<text x="94" y="389" fill="#203744" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">Question + evidence</text>
+<circle cx="80" cy="426" r="3" fill="#AE663B" stroke="none" stroke-width="1"/>
+<text x="94" y="431" fill="#203744" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">Eligible targets</text>
+<circle cx="80" cy="468" r="3" fill="#AE663B" stroke="none" stroke-width="1"/>
+<text x="94" y="473" fill="#203744" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">Remaining budget</text>
+<circle cx="80" cy="510" r="3" fill="#AE663B" stroke="none" stroke-width="1"/>
+<text x="94" y="515" fill="#203744" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">Frozen protocol</text>
+<text x="76" y="563" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="0">Development scope</text>
+<rect x="316" y="230" width="686" height="366" rx="0" fill="#FFFDFA" stroke="#CCCFC7" stroke-width="1.2"/>
+<rect x="330" y="242" width="658" height="73" rx="5" fill="#F7F4EE" stroke="#CCCFC7" stroke-width="1"/>
+<circle cx="354" cy="273" r="13" fill="#FFFDFA" stroke="#CCCFC7" stroke-width="1"/>
+<text x="354" y="279" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="16" font-weight="normal" text-anchor="middle" letter-spacing="0">A</text>
+<text x="380" y="271" fill="#203744" font-family="DejaVu Sans" font-size="22" font-weight="bold" text-anchor="start" letter-spacing="0">Read registered evidence</text>
+<text x="380" y="296" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="0">Resolve a specific missing record or page.</text>
+<rect x="330" y="327" width="658" height="73" rx="5" fill="#F7F4EE" stroke="#CCCFC7" stroke-width="1"/>
+<circle cx="354" cy="358" r="13" fill="#FFFDFA" stroke="#CCCFC7" stroke-width="1"/>
+<text x="354" y="364" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="16" font-weight="normal" text-anchor="middle" letter-spacing="0">B</text>
+<text x="380" y="356" fill="#203744" font-family="DejaVu Sans" font-size="22" font-weight="bold" text-anchor="start" letter-spacing="0">Diagnose a result</text>
+<text x="380" y="381" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="0">Distinguish an unresolved decoding explanation.</text>
+<rect x="330" y="412" width="658" height="73" rx="5" fill="#EAF2EE" stroke="#35756E" stroke-width="1.6"/>
+<circle cx="354" cy="443" r="13" fill="#35756E" stroke="#35756E" stroke-width="1"/>
+<text x="354" y="449" fill="#FFFDFA" font-family="DejaVu Sans Mono" font-size="16" font-weight="normal" text-anchor="middle" letter-spacing="0">C</text>
+<text x="380" y="441" fill="#35756E" font-family="DejaVu Sans" font-size="22" font-weight="bold" text-anchor="start" letter-spacing="0">Design a new experiment</text>
+<text x="380" y="466" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="0">Specify a controlled encoder or loss change.</text>
+<rect x="330" y="497" width="658" height="73" rx="5" fill="#F7F4EE" stroke="#CCCFC7" stroke-width="1"/>
+<circle cx="354" cy="528" r="13" fill="#FFFDFA" stroke="#CCCFC7" stroke-width="1"/>
+<text x="354" y="534" fill="#AE663B" font-family="DejaVu Sans Mono" font-size="16" font-weight="normal" text-anchor="middle" letter-spacing="0">D</text>
+<text x="380" y="526" fill="#203744" font-family="DejaVu Sans" font-size="22" font-weight="bold" text-anchor="start" letter-spacing="0">Replicate an eligible Full run</text>
+<text x="380" y="551" fill="#5C6C70" font-family="DejaVu Sans" font-size="16" font-weight="normal" text-anchor="start" letter-spacing="0">Follow the frozen seed and confirmation policy.</text>
+<path d="M290 414 H316" fill="none" stroke="#AE663B" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#arrow-rust)"/>
+<path d="M1002 448 H1042" fill="none" stroke="#35756E" stroke-width="2.0" stroke-linecap="round" stroke-linejoin="round" opacity="1" marker-end="url(#arrow-teal)"/>
+<rect x="1042" y="230" width="344" height="366" rx="5" fill="#FFFDFA" stroke="#35756E" stroke-width="1.6"/>
+<text x="1064" y="260" fill="#35756E" font-family="DejaVu Sans" font-size="14" font-weight="normal" text-anchor="start" letter-spacing="1">SELECTED OPTION / EXAMPLE</text>
+<text x="1064" y="300" fill="#203744" font-family="DejaVu Sans" font-size="26" font-weight="bold" text-anchor="start" letter-spacing="0">Design experiment</text>
+<text x="1064" y="333" fill="#5C6C70" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="0">Target, evidence and</text>
+<text x="1064" y="359" fill="#5C6C70" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="0">selection rationale recorded.</text>
+<path d="M1064 382 H1364" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="1064" y="415" fill="#203744" font-family="DejaVu Sans" font-size="22" font-weight="bold" text-anchor="start" letter-spacing="0">Runtime validates</text>
+<text x="1064" y="445" fill="#5C6C70" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">Legal action / eligible target</text>
+<text x="1064" y="470" fill="#5C6C70" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">Evidence / required gates</text>
+<text x="1064" y="495" fill="#5C6C70" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">Remaining budget</text>
+<rect x="1064" y="523" width="300" height="51" rx="5" fill="#35756E" stroke="#35756E" stroke-width="1.2"/>
+<text x="1214" y="556" fill="#FFFDFA" font-family="DejaVu Sans" font-size="22" font-weight="bold" text-anchor="middle" letter-spacing="0">Dispatch one action</text>
+<path d="M1214 596 V617 H172 V596" fill="none" stroke="#35756E" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" opacity="1" stroke-dasharray="7 7" marker-end="url(#arrow-teal)"/>
+<rect x="517" y="603" width="405" height="28" rx="0" fill="#F7F4EE" stroke="#F7F4EE" stroke-width="1.2"/>
+<text x="720" y="623" fill="#35756E" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="middle" letter-spacing="0">Update the study record</text>
+<rect x="54" y="650" width="1332" height="85" rx="0" fill="#FFFDFA" stroke="#CCCFC7" stroke-width="1.2"/>
+<text x="76" y="687" fill="#203744" font-family="DejaVu Sans" font-size="24" font-weight="bold" text-anchor="start" letter-spacing="0">After the action</text>
+<text x="336" y="687" fill="#35756E" font-family="DejaVu Sans" font-size="22" font-weight="normal" text-anchor="start" letter-spacing="0">Observed evidence informs the next planning decision.</text>
+<text x="336" y="717" fill="#5C6C70" font-family="DejaVu Sans" font-size="17" font-weight="normal" text-anchor="start" letter-spacing="0">Compare evidence gaps, expected information, prerequisites and resource estimates.</text>
+<path d="M54 758 H1386" fill="none" stroke="#CCCFC7" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="1"/>
+<text x="54" y="795" fill="#5C6C70" font-family="DejaVu Sans" font-size="18" font-weight="normal" text-anchor="start" letter-spacing="0">Illustrative planning example. Usually 2–4 options; one is allowed when only one is reasonable.</text>
+</svg>
