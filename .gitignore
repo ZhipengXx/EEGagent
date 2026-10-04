@@ -29,3 +29,13 @@ skills-lock.json
 # Local validation files; publish runtime files only
 react-agent/tests/
 **/.pytest_cache/
+
+# Local plan, acceptance, API, and validation notes
+react-agent/docs/
+docs/agentic_workspace_*.md
+docs/eegagent_*
+docs/coder-reliability-evidence/
+docs/coder_reliability_verification.md
+docs/figures/ui-workspace/english-localization.md
+docs/figures/ui-workspace/english-localization-prompt.txt
+docs/figures/ui-workspace/ui-svg-*.png

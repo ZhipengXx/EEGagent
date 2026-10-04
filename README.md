@@ -154,7 +154,7 @@ uv run python -m react_agent.eeg_research.agentic.cli start \
 | Role models | Eight role-specific calls currently use the same DeepSeek fast profile |
 | Planning and evidence reads | Default `compare_options`: usually **2–4 next-action alternatives**, one selected action and a saved rationale; bounded, verified artifact reads support selected role requests |
 | Result audit | Structured report and dependency context, identity / freshness checks and tracked corrections; same-provider review does not establish independent replication |
-| Demonstrated results | Platform DEMO values are synthetic. Historical [acceptance records](react-agent/docs/revision_acceptance_canonical.md) describe their own revisions and do not establish a new retrieval benchmark gain |
+| Demonstrated results | Platform DEMO values are synthetic. Historical acceptance records describe their own revisions and do not establish a new retrieval benchmark gain |
 
 The brain-decoding illustrations explain the workflow; their signals and activity colors are conceptual. Platform screenshots are rendered application views with synthetic DEMO records. Neither is a measured research result.
 
@@ -171,7 +171,7 @@ The brain-decoding illustrations explain the workflow; their signals and activit
 | [Screening and workbench](react-agent/src/react_agent/fmri/) | fMRI tools, generation, reports and the local interface |
 | [Runtime entry points](react-agent/README.md) | CLI modules and LangGraph views |
 
-Historical notes under `react-agent/docs/` describe their own revisions. Use the current source map when interpreting the runtime.
+Use the current source map when interpreting the runtime.
 
 ## Acknowledgments
 
