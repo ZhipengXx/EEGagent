@@ -116,6 +116,10 @@ instead of reporting a successful MiniLM result. Index reports contain
 `indexed/reused/pending/failed`; indexing errors leave accepted source records
 intact for a later backfill.
 
+For strictly offline use after preparing the model cache, set
+`HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` for the memory command. This also prevents
+optional processor/config probes by the installed Transformers version.
+
 The new sidecar is `CAMPAIGN_DIR/semantic_memory.sqlite`. It contains `skills`,
 `embedding_cache` and `frozen_delivery`; it does not duplicate the existing
 `memory.sqlite` episodes, lessons or curation tables. Vectors are 384-dimensional,
@@ -127,7 +131,13 @@ reuse stale output; explicit rebuild replaces invalid vectors.
 
 Existing lesson applicability rules group candidates before cosine ranking.
 Lessons and procedural hints share one total Top-k and one serialized context
-budget. Compatible lessons have priority over analogy/unknown items; similarity
+budget. The budget counts the compact JSON (`ensure_ascii=False`, separators
+`,:`) of the actual added model-input fields: Planner `lessons` plus
+`retrieved_memory`, or Designer/Coder `retrieved_memory`. Legacy fallback counts
+only its new metadata and preserves the original lessons. The reported
+`context_chars_used` includes its own serialized digits. Zero or insufficient
+budget omits the new field; complete records are omitted rather than shortening
+their procedures. Compatible lessons have priority over analogy/unknown items; similarity
 never upgrades evidence strength. Oversized bodies are omitted with truncation
 metadata. An empty result is valid. Original lesson languages are retained;
 MiniLM is English-focused and there is no automatic translation.
@@ -148,8 +158,27 @@ in-flight attempts without semantic input are not retrofitted. Indexing or skill
 storage failure does not rerun the paid curator or invalidate a completed
 analysis.
 
+Corrupt or locked snapshot storage blocks implementation with a recoverable
+`MemorySnapshotError`, before coder tools or model calls. The sidecar is retained
+for diagnosis; it is not automatically replaced because it also stores skills
+and frozen input. Existing snapshots retain their identity/body. A forbidden
+scope or a snapshot exceeding the applicable delivery budget is an explicit
+snapshot failure, rather than permission to regenerate or trim it.
+
+Retrieval queries read the current campaign's persisted `plan.json` without
+writing or consuming it. A matching explicit question ID selects its unresolved
+question; otherwise up to three open/inconclusive questions are labeled as
+unresolved. Answered, foreign or unreadable plans are ignored. Questions,
+objective, hypothesis and verified diagnostics each have bounded space within
+4000 characters. Query changes reuse the existing corpus vectors and never
+replace an already frozen coder context.
+
 To disable the hooks, use `"memory": {"enabled": false,"skills_enabled": false}`.
 This stops new memory delivery; it does not erase stored skills or vectors. This
 version searches only the current EEG/MEG campaign. Cross-campaign sharing and
 semantic method-card retrieval are outside its scope. Final-test/final-holdout,
 fMRI and foreign-campaign sources are excluded before indexing or skill delivery.
+The source check also covers nested `role`, `scope`, `data_role` and `partition`
+markers for `held_out_unused` and `secret`, including registered artifacts and
+existing skills. Ordinary descriptions of unit tests or held-out validation do
+not constitute these scope markers. Historical excluded rows remain stored.

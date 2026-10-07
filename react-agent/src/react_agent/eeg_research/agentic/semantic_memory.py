@@ -29,10 +29,12 @@ def read_json(path: Path) -> dict:
 
 
 def unsafe_source(value: Any) -> bool:
+    from react_agent.eeg_research.agentic.handoffs import _PRIVATE_SCOPES
+
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in {"scope", "data_role", "partition", "modality", "namespace"} and isinstance(item, str):
-                if item.lower() in {"final_test", "final_holdout", "test", "fmri", "eeg_task_validation"}:
+            if key in {"role", "scope", "data_role", "partition", "modality", "namespace"} and isinstance(item, str):
+                if item.lower() in _PRIVATE_SCOPES | {"test", "fmri", "eeg_task_validation"}:
                     return True
             if str(key).startswith(("final_test", "final_holdout", "test_result")) and key not in {"final_test_enabled", "final_test_accessed"}:
                 return True
@@ -43,6 +45,15 @@ def unsafe_source(value: Any) -> bool:
     elif isinstance(value, list):
         return any(unsafe_source(item) for item in value)
     return False
+
+
+def unsafe_source_path(path: Path) -> bool:
+    from react_agent.eeg_research.agentic.handoffs import _PRIVATE_SCOPES
+
+    return any(part.lower() in _PRIVATE_SCOPES | {"fmri"}
+               or any(part.lower().startswith(scope + suffix)
+                      for scope in _PRIVATE_SCOPES for suffix in ("_", "-", "."))
+               for part in path.parts)
 
 
 def require_eeg_campaign(camp: Path) -> None:
@@ -142,8 +153,12 @@ class SidecarStore:
             payload = json.loads(row["payload"])
             if content_hash(payload) != row["content_hash"]:
                 raise ValueError("frozen_memory_hash_mismatch")
+            if unsafe_source(payload):
+                raise ValueError("frozen_memory_scope_forbidden")
             return payload
         payload = build()  # Includes encoding; always outside the transaction.
+        if unsafe_source(payload):
+            raise ValueError("frozen_memory_scope_forbidden")
         with self.connect() as conn:
             conn.execute("INSERT OR IGNORE INTO frozen_delivery VALUES (?,?,?,?,?)",
                          (self.namespace, key, content_hash(payload), canonical(payload), time.time()))
@@ -152,6 +167,8 @@ class SidecarStore:
         saved = json.loads(row["payload"])
         if content_hash(saved) != row["content_hash"]:
             raise ValueError("frozen_memory_hash_mismatch")
+        if unsafe_source(saved):
+            raise ValueError("frozen_memory_scope_forbidden")
         return saved
 
 
@@ -170,7 +187,7 @@ def episode_source(camp: Path, episode: dict) -> dict:
             path = camp / path
     if not path.is_file() or not path.resolve().is_relative_to(camp.resolve()):
         raise ValueError("episode_artifact_unavailable")
-    if unsafe_source(read_json(path)) or any(part.lower() in {"fmri", "final_test", "final_holdout"} for part in path.parts):
+    if unsafe_source(read_json(path)) or unsafe_source_path(path):
         raise ValueError("episode_artifact_not_development")
     return {"episode_id": episode["episode_id"], "content_hash": content_hash(episode),
             "artifact_path": str(path.resolve()), "artifact_sha256": file_digest(path)}
@@ -207,23 +224,60 @@ def build_context(camp: Path, *, state: dict | None = None, experiment: dict | N
 
 def build_query(camp: Path, *, state: dict | None = None, experiment: dict | None = None) -> str:
     from react_agent.eeg_research.agentic.research_progress import verified_diagnostic_facts
+    from react_agent.eeg_research.agentic.research_plan import load_plan
 
     goal = read_json(camp / "goal.json")
     state = state if state is not None else read_json(camp / "campaign_state.json")
     experiment = experiment if experiment is not None else state.get("experiment") or {}
     hypothesis = experiment.get("hypothesis") or state.get("hypothesis")
-    parts = [str(goal.get("objective") or "")]
+    questions = []
+    try:
+        plan = load_plan(camp)
+        version = plan.get("plan_version")
+        if (plan.get("goal_id") != goal.get("goal_id") or not goal.get("goal_id")
+                or not isinstance(version, int) or isinstance(version, bool) or version <= 0):
+            plan = {}
+        rows = plan.get("research_questions") or []
+        if isinstance(rows, list):
+            questions = [row for row in rows if isinstance(row, dict)
+                         and isinstance(row.get("question_id"), str)
+                         and isinstance(row.get("text"), str)
+                         and row.get("status") in {"open", "inconclusive"} and not unsafe_source(row)]
+    except (OSError, ValueError, TypeError):
+        plan = {}
+    active = next((qid for qid in (experiment.get("question_id"), state.get("active_question_id"),
+                                  plan.get("active_question_id"))
+                   if isinstance(qid, str) and any(row["question_id"] == qid for row in questions)), None)
+    selected = [row for row in questions if row["question_id"] == active] if active else questions[:3]
+    question_lines = list(dict.fromkeys(
+        row["text"].strip()[:250] + (" — " + row["note"][:100] if isinstance(row.get("note"), str) else "")
+        for row in selected if row["text"].strip()))
+    sections = []
+    if question_lines:
+        label = "Current plan question" if active else "Unresolved plan questions (no active selection)"
+        sections.append((label + ": " + "\n".join(question_lines))[:1100])
+    sections.append(("Objective: " + str(goal.get("objective") or ""))[:800])
+    parts = []
     if isinstance(hypothesis, str):
         parts.append(hypothesis)
     elif isinstance(hypothesis, dict):
         parts.extend(str(hypothesis[k]) for k in ("question", "statement", "mechanism", "prediction", "intervention") if hypothesis.get(k))
+    if parts:
+        sections.append(("Hypothesis: " + "\n".join(dict.fromkeys(parts)))[:1100])
     targets = {str(experiment[k]) for k in ("parent_candidate_id", "control_candidate_id") if experiment.get(k)}
     facts = verified_diagnostic_facts(camp, state, target_ids=targets or None, max_facts=3)
+    diagnoses = []
     for fact in facts:
         diagnostic = {k: fact[k] for k in ("representation", "mean_direction_norm", "mean_margin", "realized_training") if fact.get(k) is not None}
         if diagnostic and not unsafe_source(diagnostic):
-            parts.append("Verified development diagnosis: " + canonical(diagnostic)[:800])
-    return "\n".join(part for part in parts if part.strip())[:4000]
+            diagnoses.append(canonical(diagnostic)[:210])
+    if diagnoses:
+        sections.append(("Verified development diagnosis: " + "\n".join(dict.fromkeys(diagnoses)))[:700])
+    context = build_context(camp, state=state, experiment=experiment)
+    scope = {key: context[key] for key in ("modality", "regime", "dataset") if key in context}
+    if scope:
+        sections.append(("Verified task scope: " + canonical(scope))[:200])
+    return "\n".join(dict.fromkeys(section for section in sections if section.strip()))[:4000]
 
 
 def _search_text(kind: str, body: dict) -> str:
@@ -290,6 +344,72 @@ def index_records(store: SidecarStore, records: list[dict], backend, *, rebuild:
     return stats
 
 
+def _delivery_fields(bundle: dict, *, standalone: bool) -> dict:
+    """Serialize the exact added request fields, including the size statistic itself."""
+    metadata = {key: copy.deepcopy(value) for key, value in bundle.items() if key != "lessons"}
+    fields = {"retrieved_memory": metadata}
+    if bundle["backend"] == "minilm":
+        if standalone:
+            for item in metadata["items"]:
+                if item["record_type"] == "lesson":
+                    item["body"] = copy.deepcopy(next(
+                        row for row in bundle["lessons"][item["applicability"]]
+                        if row["lesson_id"] == item["record_id"]))
+        else:
+            fields["lessons"] = copy.deepcopy(bundle["lessons"])
+    metadata["context_chars_used"] = 0
+    while True:
+        size = len(canonical(fields))
+        if size == metadata["context_chars_used"]:
+            return fields
+        metadata["context_chars_used"] = size
+
+
+def _fit_delivery(bundle: dict, *, standalone: bool = False) -> tuple[dict | None, dict]:
+    """One whole-record budget rule for Planner and standalone role requests."""
+    budget = bundle["context_chars_budget"]
+    if budget <= 0 or bundle.get("delivery_available") is False or bundle.get("reason") == "disabled":
+        return None, {}
+    source_items = bundle["items"] if bundle["backend"] == "minilm" else []
+    selected = copy.deepcopy(bundle)
+    selected.update(items=[], lessons={key: [] for key in GROUPS}, hit_count=0)
+    omitted = int(bundle.get("omitted_count", 0))
+
+    def measure(candidate):
+        candidate["omitted_count"] = omitted + len(source_items) - len(candidate["items"])
+        candidate["truncated"] = bool(bundle.get("truncated") or candidate["omitted_count"])
+        fields = _delivery_fields(candidate, standalone=standalone)
+        candidate["context_chars_used"] = fields["retrieved_memory"]["context_chars_used"]
+        return fields
+
+    fields = measure(selected)
+    if selected["context_chars_used"] > budget:
+        return None, {}
+    for item in source_items:
+        trial = copy.deepcopy(selected)
+        trial["items"].append(copy.deepcopy(item))
+        if item["record_type"] == "lesson":
+            body = next(row for row in bundle["lessons"][item["applicability"]]
+                        if row["lesson_id"] == item["record_id"])
+            trial["lessons"][item["applicability"]].append(copy.deepcopy(body))
+        trial["hit_count"] = len(trial["items"])
+        trial_fields = measure(trial)
+        if trial["context_chars_used"] <= budget:
+            selected, fields = trial, trial_fields
+    fields = measure(selected)
+    return selected, fields
+
+
+def _finalize_bundle(bundle: dict) -> dict:
+    fitted, _ = _fit_delivery(bundle)
+    if fitted is not None:
+        return fitted
+    return {**bundle, "items": [], "lessons": {key: [] for key in GROUPS}, "hit_count": 0,
+            "context_chars_used": 0, "delivery_available": False,
+            "truncated": bool(bundle.get("truncated") or bundle["items"]),
+            "omitted_count": int(bundle.get("omitted_count", 0)) + len(bundle["items"])}
+
+
 def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
              experiment: dict | None = None, config: MemoryConfig | None = None,
              require_embedding: bool = False, rebuild: bool = False) -> dict:
@@ -318,8 +438,7 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
                       text_builder_version=TEXT_BUILDER_VERSION, indexing=stats,
                       candidate_count=len(records), language_limit="Original lesson language; no translation. MiniLM is English-focused.")
         if not query.strip() or config.top_k <= 0 or not records:
-            bundle["context_chars_used"] = len(canonical(bundle))
-            return bundle
+            return _finalize_bundle(bundle)
         query_vectors, query_metadata = backend.encode([query])
         query_vector = query_vectors[0]
         vector_blob(query_vector)
@@ -337,45 +456,29 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
                                (row["record_type"], row["record_id"], str(row["version"])), row, score))
         ranked.sort(key=lambda item: item[:3])
         bundle["matched_count"] = len(ranked)
-        for _, _, _, row, score in ranked:
-            if len(bundle["items"]) >= max(0, config.top_k):
-                break
+        for _, _, _, row, score in ranked[:max(0, config.top_k)]:
             item = {k: copy.deepcopy(v) for k, v in row.items() if k not in {"search_text", "text_hash", "body"}}
             item["cosine_score"] = score
             if row["record_type"] == "skill":
                 item["body"] = copy.deepcopy(row["body"])
-            trial = copy.deepcopy(bundle)
-            trial["items"].append(item)
+            bundle["items"].append(item)
             if row["record_type"] == "lesson":
-                trial["lessons"][row["applicability"]].append(copy.deepcopy(row["body"]))
-            trial["hit_count"] = len(trial["items"])
-            # Include all metadata and both lesson/skill bodies in the same budget.
-            trial["context_chars_used"] = 0
-            used = len(canonical(trial)) + 10
-            if used <= config.context_chars_budget:
-                trial["context_chars_used"] = used
-                bundle = trial
-            else:
-                bundle["truncated"] = True
+                bundle["lessons"][row["applicability"]].append(copy.deepcopy(row["body"]))
         bundle["hit_count"] = len(bundle["items"])
-        bundle["context_chars_used"] = len(canonical(bundle)) + 10
-        return bundle
+        return _finalize_bundle(bundle)
     except Exception as exc:
         if require_embedding:
             raise EmbeddingUnavailable(str(exc)) from exc
         # Do not pretend structured applicability is a lexical/embedding hit.
-        bundle.update(backend="legacy", degraded=True, reason=str(exc) if isinstance(exc, EmbeddingUnavailable) else type(exc).__name__, items=[], hit_count=0)
-        return bundle
+        bundle.update(backend="legacy", degraded=True, reason=str(exc) if isinstance(exc, EmbeddingUnavailable) else type(exc).__name__,
+                      items=[], lessons={key: [] for key in GROUPS}, hit_count=0)
+        return _finalize_bundle(bundle)
 
 
 def apply_memory(request: dict, bundle: dict) -> dict:
     result = copy.deepcopy(request)
-    metadata = {k: copy.deepcopy(v) for k, v in bundle.items() if k != "lessons"}
-    if bundle["backend"] == "minilm":
-        if bundle.get("context_chars_used", 0) > bundle["context_chars_budget"]:
-            return result  # A budget too small for identities cannot deliver a body.
-        result["lessons"] = copy.deepcopy(bundle["lessons"])
-    result["retrieved_memory"] = metadata
+    _, fields = _fit_delivery(bundle)
+    result.update(fields)
     return result
 
 
@@ -384,14 +487,10 @@ def role_memory(camp: Path, *, state: dict | None = None, experiment: dict | Non
     return retrieve(camp, state=state, experiment=experiment, config=config) if config.enabled else None
 
 
-def standalone_delivery(bundle: dict) -> dict:
+def standalone_delivery(bundle: dict) -> dict | None:
     """Designer/coder lack the planner's legacy lessons view: include each body once."""
-    result = copy.deepcopy(bundle)
-    result.pop("lessons", None)
-    for item in result["items"]:
-        if item["record_type"] == "lesson":
-            item["body"] = next(row for row in bundle["lessons"][item["applicability"]] if row["lesson_id"] == item["record_id"])
-    return result
+    _, fields = _fit_delivery(bundle, standalone=True)
+    return fields.get("retrieved_memory")
 
 
 def coder_delivery(camp: Path, workspace: Path, attempt_id: str, spec: dict, *, state: dict,
@@ -409,11 +508,25 @@ def coder_delivery(camp: Path, workspace: Path, attempt_id: str, spec: dict, *, 
             body = None
         else:
             bundle = role_memory(camp, state=state, experiment=spec["experiment"])
-            body = standalone_delivery(bundle) if bundle and bundle.get("context_chars_used", 0) <= config.context_chars_budget else None
+            body = standalone_delivery(bundle) if bundle else None
         return {"spec_hash": spec_hash, "retrieved_memory": body}
     frozen = SidecarStore(camp).freeze("coder:" + workspace.name + ":" + attempt_id, build)
+    if not isinstance(frozen, dict) or "spec_hash" not in frozen or "retrieved_memory" not in frozen:
+        raise ValueError("frozen_memory_payload_invalid")
     if frozen["spec_hash"] != spec_hash:
         raise ValueError("frozen_memory_experiment_changed")
+    body = frozen["retrieved_memory"]
+    if body is not None:
+        if not isinstance(body, dict):
+            raise ValueError("frozen_memory_payload_invalid")
+        stored_budget = body.get("context_chars_budget", config.context_chars_budget)
+        if not isinstance(stored_budget, int) or isinstance(stored_budget, bool) or stored_budget < 0:
+            raise ValueError("frozen_memory_budget_invalid")
+        size = len(canonical({"retrieved_memory": body}))
+        if size > min(config.context_chars_budget, stored_budget):
+            raise ValueError(f"frozen_memory_budget_exceeded:{size}")
+        if not isinstance(body.get("items"), list):
+            raise ValueError("frozen_memory_payload_invalid")
     return frozen["retrieved_memory"]
 
 

@@ -1348,8 +1348,10 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     })
     from react_agent.eeg_research.agentic.semantic_memory import role_memory, standalone_delivery
     bundle = role_memory(camp, state=state, experiment=spec)
-    if bundle is not None and bundle.get("context_chars_used", 0) <= bundle["context_chars_budget"]:
-        context["retrieved_memory"] = standalone_delivery(bundle)
+    if bundle is not None:
+        delivery = standalone_delivery(bundle)
+        if delivery is not None:
+            context["retrieved_memory"] = delivery
     return context
 
 

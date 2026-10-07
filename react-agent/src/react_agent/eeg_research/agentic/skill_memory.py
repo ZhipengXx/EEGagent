@@ -33,12 +33,12 @@ class SkillLessonProposal(LessonProposal):
 
 def artifact_source(camp: Path, artifact_id: str) -> dict:
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
-    from react_agent.eeg_research.agentic.semantic_memory import read_json, unsafe_source
+    from react_agent.eeg_research.agentic.semantic_memory import read_json, unsafe_source, unsafe_source_path
 
     row = resolve_verified_artifact(camp, artifact_id)
     path = Path(row["path"])
     if (not path.resolve().is_relative_to(camp.resolve()) or unsafe_source(read_json(path))
-            or any(part.lower() in {"fmri", "final_test", "final_holdout"} for part in path.parts)):
+            or unsafe_source_path(path)):
         raise ValueError("artifact_not_campaign_development")
     return {"artifact_id": artifact_id, "sha256": row["sha256"],
             "producer_task_id": row.get("producer_task_id"), "kind": row.get("kind")}
@@ -111,7 +111,7 @@ def validated_sources(camp: Path, proposal: SkillProposal, allowed: dict) -> dic
     from react_agent.eeg_research.agentic.memory import EpisodeStore
     from react_agent.eeg_research.agentic.semantic_memory import episode_source, unsafe_source
 
-    if allowed.get("origin_campaign_id") != camp.name or unsafe_source(proposal.model_dump()):
+    if allowed.get("origin_campaign_id") != camp.name or unsafe_source(proposal.model_dump()) or unsafe_source(allowed):
         raise ValueError("skill_not_campaign_development")
     if not all(step.strip() for step in proposal.procedure):
         raise ValueError("empty_procedure_step")

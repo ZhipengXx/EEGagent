@@ -7,6 +7,7 @@ import subprocess
 import fcntl
 import json
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
@@ -310,9 +311,9 @@ def build_services(camp: Path) -> dict[str, Any]:
         try:
             memory = coder_delivery(camp_dir, workspace, attempt["attempt_id"], spec, state=state,
                                     previous_spec=previous_spec, previous_attempt_id=previous_attempt_id)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, sqlite3.Error) as exc:
             _block_phase(camp_dir, state, phase="implement_candidate", error_type="MemorySnapshotError",
-                         detail=str(exc), recoverable=True)
+                         detail=f"{type(exc).__name__}: {exc}", recoverable=True)
             return
         if memory is not None:
             spec["retrieved_memory"] = memory
