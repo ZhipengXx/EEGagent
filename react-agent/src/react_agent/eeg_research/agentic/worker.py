@@ -41,7 +41,7 @@ def _lesson_proposal(reply: Any) -> dict[str, Any]:
     if not isinstance(reply, dict):
         return {}
     inner = reply.get("payload")
-    if isinstance(inner, dict) and ("proposed_lessons" in inner or "summary_zh" in inner):
+    if isinstance(inner, dict) and ("proposed_lessons" in inner or "proposed_skills" in inner or "summary_zh" in inner):
         return inner
     return reply
 
@@ -246,6 +246,9 @@ def build_services(camp: Path) -> dict[str, Any]:
         coder = role_backend(camp, "candidate_coder")
         reviewer = role_backend(camp, "candidate_reviewer")
         spec = {"hypothesis": assigned.get("hypothesis"), "experiment": assigned}
+        from react_agent.eeg_research.agentic.semantic_memory import read_json
+        previous_spec = read_json(workspace / "spec.json")
+        previous_attempt_id = read_json(workspace / "attempt.json").get("attempt_id")
         from react_agent.eeg_research.agentic.audit_context import audit_feedback
         from react_agent.eeg_research.agentic.handoffs import selected_read_context
         spec["audit_issues"] = [row for row in audit_feedback(camp_dir, state)["issues"]
@@ -303,6 +306,17 @@ def build_services(camp: Path) -> dict[str, Any]:
                 save_state(camp_dir, state)
         else:
             attempt = ensure_attempt(workspace, candidate_id)
+        from react_agent.eeg_research.agentic.semantic_memory import coder_delivery
+        try:
+            memory = coder_delivery(camp_dir, workspace, attempt["attempt_id"], spec, state=state,
+                                    previous_spec=previous_spec, previous_attempt_id=previous_attempt_id)
+        except (OSError, ValueError) as exc:
+            _block_phase(camp_dir, state, phase="implement_candidate", error_type="MemorySnapshotError",
+                         detail=str(exc), recoverable=True)
+            return
+        if memory is not None:
+            spec["retrieved_memory"] = memory
+            (workspace / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
         from react_agent.eeg_research.agentic.artifacts import request_digest
         _attach(
             coder,
@@ -312,7 +326,7 @@ def build_services(camp: Path) -> dict[str, Any]:
             operation_id=operation_id(workspace, candidate_id, "implement_candidate"),
             input_hash=source_hash(workspace),
             **({"input_digest": request_digest(request=spec)}
-               if spec.get("artifact_reads") or spec.get("audit_issues") else {}),
+               if spec.get("artifact_reads") or spec.get("audit_issues") or spec.get("retrieved_memory") else {}),
         )
         outcome: dict[str, Any] | None = None
         if impl_path.is_file() and not repairing:
@@ -702,6 +716,14 @@ def build_services(camp: Path) -> dict[str, Any]:
                 "missing_inputs": ["confirmation"] if not (latest.get("promotion") or {}).get("confirmation") else [],
                 "related_lessons": store.list_lessons()[-8:],
             })
+            from react_agent.eeg_research.agentic.embedding import memory_config
+            memory = memory_config(camp_dir)
+            if memory.enabled and memory.skills_enabled and role_status == "completed":
+                from react_agent.eeg_research.agentic.skill_memory import extend_curation_context
+                try:
+                    curation_context = extend_curation_context(camp_dir, curation_context, envelope, state=state)
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    curation_context["skills_unavailable_reason"] = type(exc).__name__
             task = begin_role_task(camp_dir, role="memory_curator", inputs=[camp_dir / "goal.json"], request=curation_context)
             try:
                 proposal = curator(
@@ -723,12 +745,30 @@ def build_services(camp: Path) -> dict[str, Any]:
                 if proposal_status not in {"completed", "partial", "failed", "blocked"}:
                     proposal_status = "partial"
                 accepted = store.accept_lessons(_lesson_proposal(proposal)) if proposal_status == "completed" else {"accepted": [], "rejected": []}
+                skills_metadata = {}
+                if memory.enabled and memory.skills_enabled:
+                    skills_result = {"accepted": [], "rejected": []}
+                    body = _lesson_proposal(proposal)
+                    if (proposal_status == "completed" and role_status == "completed"
+                            and body.get("status", "completed") == "completed"):
+                        from react_agent.eeg_research.agentic.skill_memory import accept_skills
+                        skills_result = accept_skills(camp_dir, body.get("proposed_skills") or [],
+                                                     curation_context.get("allowed_source_refs") or {})
+                    skills_metadata["skills_result"] = skills_result
+                if memory.enabled and proposal_status == "completed":
+                    # Index failures are siblings of successful curation, never a reason to rerun it.
+                    from react_agent.eeg_research.agentic.semantic_memory import retrieve
+                    try:
+                        indexed = retrieve(camp_dir, "", state=state)
+                        skills_metadata["memory_indexing"] = {k: indexed.get(k) for k in ("backend", "degraded", "reason", "indexing")}
+                    except Exception as exc:
+                        skills_metadata["memory_indexing"] = {"status": "pending", "reason": type(exc).__name__}
                 if proposal_status != "completed":
                     store.mark_pending_curation("curator_incomplete")
                 finish_role_task(
                     camp_dir,
                     task,
-                    {"status": proposal_status, "summary_zh": "已校验条件化经验提议", "proposal": _lesson_proposal(proposal), "accepted": accepted},
+                    {"status": proposal_status, "summary_zh": "已校验条件化经验提议", "proposal": _lesson_proposal(proposal), "accepted": accepted, **skills_metadata},
                     kind="lessons",
                     path=camp_dir / "memory" / f"lessons_{task['task_id']}.json",
                 )

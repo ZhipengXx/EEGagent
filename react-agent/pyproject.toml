@@ -26,6 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["mypy>=2.3.1", "ruff>=0.16.4"]
+memory = ["sentence-transformers>=3.0,<6"]
 p2 = [
     "torch>=2.4.0",
     "transformers>=4.44.0",

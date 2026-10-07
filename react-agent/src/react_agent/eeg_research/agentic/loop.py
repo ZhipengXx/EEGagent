@@ -842,7 +842,11 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         from react_agent.eeg_research.agentic.handoffs import record_read_delivery, prepare_read_delivery, _read_journal_records
         from react_agent.eeg_research.agentic.artifacts import request_digest
         reserved_id = _next_decision_id(camp, state)
+        from react_agent.eeg_research.agentic.semantic_memory import role_memory, apply_memory
+        frozen_memory = role_memory(camp, state=state)
         def planner_request(request):
+            if frozen_memory is not None:
+                request = apply_memory(request, frozen_memory)
             rows = request.get("artifact_reads") or []
             prepare_read_delivery(rows)
             prefix = reserved_id + ":planner_call:"
@@ -1313,7 +1317,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     from react_agent.eeg_research.agentic.audit_context import audit_feedback
     from react_agent.eeg_research.agentic.handoffs import selected_read_context
     from react_agent.eeg_research.agentic.research_progress import verified_diagnostic_facts
-    return development_view({
+    context = development_view({
         "verified_development_facts": verified_diagnostic_facts(camp, state, target_ids={parent, control}, max_facts=12),
         "verified_encoder_structural_facts": verified_encoder_structural_facts(camp, state),
         "previous_design_failure": state.get("design_failure"),
@@ -1342,6 +1346,11 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
         "budget": budget_snapshot(camp, state),
         "missing_inputs": missing,
     })
+    from react_agent.eeg_research.agentic.semantic_memory import role_memory, standalone_delivery
+    bundle = role_memory(camp, state=state, experiment=spec)
+    if bundle is not None and bundle.get("context_chars_used", 0) <= bundle["context_chars_budget"]:
+        context["retrieved_memory"] = standalone_delivery(bundle)
+    return context
 
 
 def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, Any], raw: dict[str, Any], services: Services) -> None:

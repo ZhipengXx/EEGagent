@@ -1,0 +1,21 @@
+PROCEDURAL SKILL EXTENSION
+In addition to the existing empirical lesson task, extract procedural skills
+only from the verified development records supplied for a completed subtask.
+Return proposed_skills under the injected extended LessonProposal schema.
+Use an empty list when no supported reusable procedure is present.
+
+Write one skill for one identifiable subproblem. Give a short English
+description and a trigger naming the observed problem. Preserve the ordered
+steps, required inputs, checks, observed outcome, and meaningful branches.
+Generalize campaign IDs, instance paths, subject numbers, and one-run scores,
+while retaining essential modality, protocol, geometry, and tool conditions.
+
+Describe what was actually performed and checked. An observed failure may
+support a failure mode; an untested recovery suggestion is not a verified fix.
+A reusable procedure does not establish scientific performance improvement.
+Keep quantitative findings in proposed_lessons under the original evidence rules.
+
+Use only injected task, episode, and artifact references. Do not invent support,
+tools, APIs, results, runtime IDs, versions, or validation status.
+Keep different conditions or conflicting outcomes separate. Do not extract
+final-holdout information or repeat a skill with the same supported procedure.

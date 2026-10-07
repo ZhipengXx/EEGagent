@@ -37,12 +37,30 @@ class LlmUnavailable(RuntimeError):
         self.diagnostics = diagnostics or {}
 
 
-def system_prompt(role: str) -> str:
+def domain_model_for(role: str, memory=None):
+    from react_agent.eeg_research.agentic.schemas import DOMAIN_OUTPUT_MODELS
+
+    if role == "memory_curator" and memory is not None and memory.enabled and memory.skills_enabled:
+        from react_agent.eeg_research.agentic.skill_memory import SkillLessonProposal
+        return SkillLessonProposal
+    return DOMAIN_OUTPUT_MODELS.get(role)
+
+
+def system_prompt(role: str, *, memory=None) -> str:
     from react_agent.eeg_research.agentic.schemas import role_output_schema
 
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
     mission = (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
-    return shared + "\n\n" + mission + "\n\nOUTPUT_SCHEMA\n" + role_output_schema(role) + "\nReturn one JSON object only.\n"
+    schema = role_output_schema(role)
+    if memory is not None and memory.enabled:
+        extension = {"research_planner": "retrieved_memory", "experiment_designer": "retrieved_procedural_hints",
+                     "candidate_coder": "retrieved_procedural_hints"}.get(role)
+        if role == "memory_curator" and memory.skills_enabled:
+            extension = "procedural_skill_extension"
+            schema = json.dumps(domain_model_for(role, memory).model_json_schema(), ensure_ascii=False)
+        if extension:
+            mission += "\n\n" + (PROMPTS / (extension + ".txt")).read_text(encoding="utf-8")
+    return shared + "\n\n" + mission + "\n\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object only.\n"
 
 
 def _ledger(camp: Path, row: dict[str, Any]) -> None:
@@ -163,7 +181,9 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
         config.fast.model = os.environ["DEEPSEEK_FAST_MODEL"]
     floor = CODER_MAX_TOKENS if role in LONG_JSON_ROLES else FAST_MAX_TOKENS
     config.fast.max_tokens = max(int(config.fast.max_tokens or 0), floor)
-    system = system_prompt(role)
+    from react_agent.eeg_research.agentic.embedding import memory_config
+    memory = memory_config(camp)
+    system = system_prompt(role, memory=memory)
     prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
     loop = asyncio.new_event_loop()
     client = DeepSeekBackend(config)
@@ -307,9 +327,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                     raise LlmUnavailable(str(exc)) from exc
             if role != "candidate_coder":
                 from pydantic import ValidationError
-                from react_agent.eeg_research.agentic.schemas import DOMAIN_OUTPUT_MODELS
-
-                domain_model = DOMAIN_OUTPUT_MODELS.get(role)
+                domain_model = domain_model_for(role, memory)
                 body = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else parsed
                 identity_keys = {"schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "artifact_refs", "candidate_id"}
                 if domain_model is not None:
