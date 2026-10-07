@@ -61,7 +61,7 @@ uv sync --group dev --extra p2
 uv run python -m react_agent.fmri.cli prepare-p2 --kind all --download
 ```
 
-See [asset setup](../assets/README.md) and [planned screening](../react-agent/docs/fmri_agentic_v1_3.md).
+See [asset setup](../assets/README.md) and [screening architecture](architecture.md#fmri-screening-collaboration).
 
 ### Inspect retrieval prerequisites
 
@@ -145,7 +145,7 @@ The native code-level worker requires the configured LLM backend. Offline rule s
 | Other tasks | Classification, image reconstruction, raw preprocessing and foundation-model adapters are currently unavailable |
 | Cost | Calls and tokens are recorded; unknown API dollar cost remains unpriced |
 
-Implementation and offline tests are separate from demonstrated real-data gains. The [canonical acceptance record](../react-agent/docs/revision_acceptance_canonical.md) documents offline/CPU checks and marks fresh live-role and GPU confirmation runs as not run in that revision. It does not establish a new retrieval benchmark result.
+Implementation and offline tests are separate from demonstrated real-data gains. Historical acceptance records document offline/CPU checks and identify which fresh live-role and GPU confirmation runs were not executed. Those records describe their own revisions and do not establish a new retrieval benchmark result.
 
 ## Local checks and historical validation
 

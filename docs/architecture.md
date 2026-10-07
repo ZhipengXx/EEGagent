@@ -73,6 +73,6 @@ Planner and replanner are modes of one planning responsibility. Rule screening d
 
 ## Evidence and historical notes
 
-The figures describe implementation paths. They do not claim every role has been validated in a new live campaign or that performance improved. [Canonical acceptance](../react-agent/docs/revision_acceptance_canonical.md) distinguishes offline/CPU checks from live-role and GPU runs not executed in that revision.
+The figures describe implementation paths. They do not claim every role has been validated in a new live campaign or that performance improved. Historical acceptance records distinguish offline/CPU checks from live-role and GPU runs not executed in their revisions.
 
 Older documents, including `eeg_research_v1_8.md` and `implementation_inventory.md`, are revision-specific. Their role inventories and limitations may differ from the inspected source. Treat those records as historical evidence, not the latest architecture specification.

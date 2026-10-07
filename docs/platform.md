@@ -49,7 +49,7 @@ The descriptions here follow the current source, rather than the older screensho
 
 Decision rationale means saved decision explanations and supporting evidence. Lifecycle events can lack a rationale; the interface preserves that absence. Training-worker activity and LLM-role activity are separate records. Lower loss alone does not demonstrate better retrieval.
 
-Source: [`workbench_static/app.js`](../react-agent/src/react_agent/fmri/workbench_static/app.js), [`timeline.py`](../react-agent/src/react_agent/eeg_research/agentic/timeline.py), [`job_metrics.py`](../react-agent/src/react_agent/eeg_research/agentic/job_metrics.py) and [`artifact_view.py`](../react-agent/src/react_agent/eeg_research/agentic/artifact_view.py). The earlier [workspace revision record](agentic_workspace_revision.md) documents the original capture procedure and its checks.
+Source: [`workbench_static/app.js`](../react-agent/src/react_agent/fmri/workbench_static/app.js), [`timeline.py`](../react-agent/src/react_agent/eeg_research/agentic/timeline.py), [`job_metrics.py`](../react-agent/src/react_agent/eeg_research/agentic/job_metrics.py) and [`artifact_view.py`](../react-agent/src/react_agent/eeg_research/agentic/artifact_view.py). The screenshot baseline and DEMO provenance are recorded above; follow the capture procedure below when refreshing the images.
 
 ## Refreshing the platform images
 
