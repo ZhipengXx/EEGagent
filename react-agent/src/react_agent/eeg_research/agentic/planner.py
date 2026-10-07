@@ -35,10 +35,10 @@ STOP_REASONS = (
 
 Backend = Callable[[dict[str, Any]], dict[str, Any]]
 
-# These existing dispatches derive campaign/latest-job diagnostics and do not
-# consume target_id. Known candidate annotations therefore share the local cost;
-# all training and implementation pipelines require exact target bindings.
-TARGET_INDEPENDENT_COST_ACTIONS = frozenset({"diagnose_results", "collect_diagnostics"})
+# Diagnostics annotate campaign history; memory retains its existing known
+# candidate filter/annotation. These local actions consume no model/training
+# resources by target. All training/implementation costs need exact bindings.
+TARGET_INDEPENDENT_COST_ACTIONS = frozenset({"diagnose_results", "collect_diagnostics", "retrieve_memory"})
 TARGETED_ACTIONS = frozenset({"run_pilot", "run_full", "replicate", "implement_candidate", "repair_candidate"})
 
 
@@ -48,11 +48,50 @@ def known_candidate_ids(observation: dict[str, Any]) -> set[str]:
             *[observation[key] for key in ("candidate_id", "implementation_target_id") if observation.get(key)]}
 
 
+def action_target_choices(
+    observation: dict[str, Any], action: str, *, legacy_implicit: bool = False
+) -> tuple[list[str], bool]:
+    """Derive dispatch-supported candidate pairs without granting execution rights."""
+    if action in TARGETED_ACTIONS:
+        targets = list((observation.get("eligible_targets") or {}).get(action) or [])
+        return targets, legacy_implicit and action in {
+            "implement_candidate",
+            "repair_candidate",
+        }
+    if action in TARGET_INDEPENDENT_COST_ACTIONS:
+        return sorted(known_candidate_ids(observation)), True
+    return [], True
+
+
+def action_target_error(
+    observation: dict[str, Any],
+    action: str,
+    target: str | None,
+    *,
+    check_eligible: bool = True,
+    legacy_implicit: bool = False,
+) -> str | None:
+    """Validate the same candidate semantics used by choices and cost binding."""
+    if target is not None and target not in known_candidate_ids(observation):
+        return "unknown_option_target"
+    targets, null_allowed = action_target_choices(
+        observation, action, legacy_implicit=legacy_implicit
+    )
+    if action not in TARGETED_ACTIONS and target is not None and target not in targets:
+        return "option_target_requires_null"
+    if action in TARGETED_ACTIONS and check_eligible:
+        if target is None and null_allowed:
+            return None
+        if target not in targets:
+            return "option_target_unavailable"
+    return None
+
+
 def resolve_cost_estimate(observation: dict[str, Any], action: str, target: str | None) -> tuple[str | None, dict[str, Any]]:
     """Prefer an exact cost row; allow only verified target-independent fallback."""
     rows: dict[str, dict[str, Any]] = observation.get("action_cost_estimates") or {}
     key = f"{action}:{target or ''}"
-    if target is not None and target not in known_candidate_ids(observation):
+    if action_target_error(observation, action, target, check_eligible=False):
         return None, {}
     if key in rows:
         return key, rows[key]
@@ -65,19 +104,18 @@ def resolve_cost_estimate(observation: dict[str, Any], action: str, target: str 
 def legal_choice_context(observation: dict[str, Any]) -> dict[str, Any]:
     """Project legal pairs and cost identities from this same observation."""
     choices = []
-    rows = observation.get("action_cost_estimates") or {}
     single_action = observation.get("planner_mode", (observation.get("goal") or {}).get("planner_mode", "single_action")) == "single_action"
     for action in observation.get("available_actions") or []:
-        targets = list((observation.get("eligible_targets") or {}).get(action) or [])
-        if action not in TARGETED_ACTIONS:
-            targets = sorted(known_candidate_ids(observation))
+        targets, null_allowed = action_target_choices(observation, action, legacy_implicit=single_action)
         implicit_target = single_action and action in {"implement_candidate", "repair_candidate"}
-        choices.append({"action": action, "targets": targets, "null_allowed": action not in TARGETED_ACTIONS or implicit_target,
+        pairs: list[str | None] = [*([None] if null_allowed else []), *targets]
+        bindings = [resolve_cost_estimate(observation, action, target)[0] for target in pairs]
+        choices.append({"action": action, "targets": targets, "null_allowed": null_allowed,
                         "implicit_target_semantics": "existing controller selects the approved current implementation/repair target" if implicit_target else None,
-                        "cost_keys": [key for key in rows if key.startswith(action + ":")]})
+                        "cost_keys": list(dict.fromkeys(key for key in bindings if key is not None))})
     return {"choices": choices, "candidate_ids": sorted(known_candidate_ids(observation)),
             "identity_rule": "target_id is an exact candidate ID; option_id selects an option; method names and artifact IDs are not candidates.",
-            "cost_rule": "Copy the resolved runtime row. Exact pairs win. Only diagnose_results/collect_diagnostics may share the targetless local cost for known candidates; these actions diagnose campaign/latest-job history, not a selected candidate job.",
+            "cost_rule": "Copy the resolved runtime row. Exact pairs win. Only diagnose_results/collect_diagnostics/retrieve_memory may share targetless local costs for known candidates: diagnostics annotate campaign history and memory keeps its existing candidate filter/annotation. Other non-targeted actions use null only.",
             "null_rule": "null means no candidate annotation. Training and compared implementation/repair options require listed targets. Legacy single_action implementation/repair may omit the target and use the controller's approved current target.",
             "lifecycle_source": "implementation_lifecycle and approved experiment are authoritative; missing source does not mean unapproved."}
 
@@ -438,13 +476,13 @@ def _repair_request(observation: dict[str, Any], parsed: dict[str, Any], reply: 
                                 "llm_calls": None, "gpu_seconds": None, "training_jobs": None},
                             "cost_confidence": estimate.get("cost_confidence") or "unknown"})
         repair_payload["schema_repair_context"] = {
-            "instruction": "Correct every invalid_estimated_cost_fields entry to its required value. Copy the resolved cost_binding_key row: exact targets win; only explicitly target-independent diagnostic actions may use the generic row for known candidates. Unsupported numbers, including zero, become null. Copy cost_basis verbatim; unknown basis is []. Explain in value_rationale.",
+            "instruction": "Correct every invalid_estimated_cost_fields entry to its required value. Copy the resolved cost_binding_key row: exact targets win; only diagnose_results/collect_diagnostics/retrieve_memory may use generic local costs for known candidates. Null-only actions must correct target_id in both copies, then copy their targetless runtime row. Unsupported numbers, including zero, become null. Copy cost_basis verbatim; unknown basis is []. Explain in value_rationale.",
             "option_costs": details,
             "invalid_estimated_cost_fields": invalid_fields,
         }
-    if parsed.get("detail") in {"unknown_option_target", "selected_option_execution_mismatch"}:
+    if parsed.get("detail") in {"unknown_option_target", "selected_option_execution_mismatch", "option_target_requires_null"}:
         repair_payload["schema_repair_context"] = {
-            "instruction": "Artifact IDs are read_requests/required_artifact_refs, not candidate target IDs. For retrieve_memory, set target_id=null in BOTH top-level and selected option unless filtering an existing candidate. Keep top-level action/target_id/question_id identical to the selected option. Fix every copy together.",
+            "instruction": "Artifact IDs are read_requests/required_artifact_refs, not candidate target IDs. Use legal_choice_context targets/null_allowed. inspect_data, stop and all other null-only actions require target_id=null in BOTH copies. retrieve_memory retains known candidate filtering/annotation. Keep top-level action/target_id/question_id identical to the selected option. Fix every copy together.",
             "eligible_targets": observation.get("eligible_targets") or {},
             "implementation_target_id": observation.get("implementation_target_id"),
         }
@@ -516,10 +554,11 @@ def _validate_reply(
     parsed = _parse(reply, allowed, known, trainable, eligible)
     if not parsed.get("ok"):
         return parsed
-    if reply.get("target_id") is not None and reply["target_id"] not in known_candidate_ids(observation):
-        return {"ok": False, "detail": "unknown_option_target"}
-    if parsed["action"] in {"implement_candidate", "repair_candidate"} and eligible is not None and reply.get("target_id") is not None and reply["target_id"] not in eligible.get(parsed["action"], []):
-        return {"ok": False, "detail": "option_target_unavailable"}
+    implicit = parsed["action"] in {"implement_candidate", "repair_candidate"} and reply.get("target_id") is None and not reply.get("options")
+    target_error = action_target_error(observation, parsed["action"], reply.get("target_id"),
+        check_eligible=eligible is not None, legacy_implicit=implicit)
+    if target_error:
+        return {"ok": False, "detail": target_error}
     if parsed["action"] == "design_experiment":
         draft = reply.get("experiment_draft") if isinstance(reply.get("experiment_draft"), dict) else {}
         existing = observation.get("experiment") if isinstance(observation.get("experiment"), dict) else {}
@@ -688,6 +727,9 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
             return "unknown_option_question"
         if option.target_id is not None and option.target_id not in candidates:
             return "unknown_option_target"
+        target_error = action_target_error(observation, option.action, option.target_id, check_eligible=option.executable)
+        if target_error:
+            return target_error
         if any(ref not in known for ref in option.evidence_refs):
             return "unknown_option_evidence"
         if not valid_pages(option.required_read_digests, option.required_artifact_refs):
@@ -776,7 +818,9 @@ def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=N
         return samples[-8:]
 
     for action in observation.get("available_actions") or []:
-        targets = (observation.get("eligible_targets") or {}).get(action) or [None]
+        candidate_targets, null_allowed = action_target_choices(observation, action,
+            legacy_implicit=observation.get("planner_mode", (observation.get("goal") or {}).get("planner_mode", "single_action")) == "single_action")
+        targets: list[str | None] = [*([None] if null_allowed else []), *candidate_targets]
         for target in targets:
             costs = {"llm_calls": None, "gpu_seconds": None, "training_jobs": None}
             components, basis, samples, unknown = {}, [], [], []
@@ -830,18 +874,6 @@ def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=N
                 "api_usd": None, "usd_status": "unpriced", "estimates_are_execution_authority": False,
                 "planner_call_already_in_budget_ledger": True,
             }
-    # Materialize the same resolver's generic diagnostic bindings so the model,
-    # validator and correction feedback see identical action:target rows.
-    with_costs = {**observation, "action_cost_estimates": estimates}
-    for action in TARGET_INDEPENDENT_COST_ACTIONS:
-        if action not in (observation.get("available_actions") or []):
-            continue
-        for target in sorted(known_candidate_ids(observation)):
-            key = f"{action}:{target}"
-            binding, estimate = resolve_cost_estimate(with_costs, action, target)
-            if key not in estimates and estimate:
-                estimates[key] = {**estimate, "cost_binding_key": binding,
-                                  "target_semantics": "campaign/latest-job diagnostics; known candidate annotation does not select a job"}
     return estimates
 
 
@@ -879,15 +911,19 @@ def mechanical_errors(reply: Any, observation: dict[str, Any]) -> list[dict[str,
         expected_intervention = (decision.experiment_draft or {}).get("intervention") if selected.action in {"design_experiment", "propose_experiment"} else None
         if selected.intervention is not None and expected_intervention != selected.intervention:
             add("options.selected.intervention", selected.intervention, expected_intervention, "copy_exact_design_intervention_or_null_for_non_design")
-    candidates = known_candidate_ids(observation)
+    top_error = action_target_error(observation, decision.action, decision.target_id,
+        legacy_implicit=not decision.options and decision.target_id is None)
+    if top_error:
+        targets, null_allowed = action_target_choices(observation, decision.action)
+        add("target_id", decision.target_id, [*([None] if null_allowed else []), *targets], top_error)
     for index, option in enumerate(decision.options):
         prefix = f"options[{index}]"
         if option.executable and option.action not in (observation.get("available_actions") or []):
             add(prefix + ".action", option.action, observation.get("available_actions") or [], "action_unavailable")
-        if option.target_id is not None and option.target_id not in candidates:
-            add(prefix + ".target_id", option.target_id, sorted(candidates), "unknown_candidate_not_method_or_artifact")
-        elif option.executable and option.action in TARGETED_ACTIONS and option.target_id not in (observation.get("eligible_targets") or {}).get(option.action, []):
-            add(prefix + ".target_id", option.target_id, (observation.get("eligible_targets") or {}).get(option.action, []), "target_unavailable_for_action")
+        target_error = action_target_error(observation, option.action, option.target_id, check_eligible=option.executable)
+        if target_error:
+            targets, null_allowed = action_target_choices(observation, option.action)
+            add(prefix + ".target_id", option.target_id, [*([None] if null_allowed else []), *targets], target_error)
         binding, estimate = resolve_cost_estimate(observation, option.action, option.target_id)
         for key, value in option.estimated_cost.model_dump().items():
             expected_cost = (estimate.get("estimated_cost") or {}).get(key)

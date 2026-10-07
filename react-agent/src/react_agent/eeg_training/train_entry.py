@@ -93,7 +93,7 @@ def build_loaders(design: Design, data_root: Path, identity: dict | None = None)
     import torch
     from torch.utils.data import DataLoader
 
-    from react_agent.eeg_training.data import RetrievalTrials, collate_retrieval, collect_records, load_feature_cache
+    from react_agent.eeg_training.data import RetrievalTrials, collate_retrieval, collect_records, collect_validation_records, load_feature_cache
 
     plan = split_plan(data_root, design)
     forbidden_paths = set(plan.forbidden_files)
@@ -105,11 +105,12 @@ def build_loaders(design: Design, data_root: Path, identity: dict | None = None)
     timesteps = spec["timesteps"]
     assert isinstance(timesteps, list)
     identity = identity or _frozen_identity()
+    if not plan.feature_caches:
+        raise SplitError("validation_feature_cache_missing")
     if plan.val_mode == "other_subjects_test":
         train_features = load_feature_cache(plan.feature_caches[0])
-        val_features = load_feature_cache(plan.feature_caches[1])
         train_records, train_images = collect_records(plan.train_files, train_features, channels, None)
-        val_records, val_images = collect_records(plan.val_files, val_features, channels, None)
+        val_records, val_images = collect_validation_records(plan, channels)
     else:
         features = load_feature_cache(plan.feature_caches[0])
         frozen_train = list((identity or {}).get("train_image_ids") or [])
@@ -121,7 +122,7 @@ def build_loaders(design: Design, data_root: Path, identity: dict | None = None)
             test_ids = sorted(set(_image_ids(plan.forbidden_files, channels)))
             kept, validation = holdout_image_ids(train_ids, test_ids, design.seed)
         train_records, train_images = collect_records(plan.train_files, features, channels, set(kept))
-        val_records, val_images = collect_records(plan.val_files, features, channels, set(validation))
+        val_records, val_images = collect_validation_records(plan, channels, validation_image_ids=set(validation), features=features)
     if set(train_images) & set(val_images):
         raise SplitError("train_validation_overlap")
     train_set = RetrievalTrials(train_records, timesteps)

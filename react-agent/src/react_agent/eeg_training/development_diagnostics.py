@@ -14,7 +14,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from react_agent.eeg_research.agentic.execution_protocol import design_from_protocol
 from react_agent.eeg_training.protocol import split_plan,geometry
-from react_agent.eeg_training.data import load_feature_cache,collect_records,RetrievalTrials,collate_retrieval
+from react_agent.eeg_training.data import collect_frozen_validation_records,RetrievalTrials,collate_retrieval
 from react_agent.eeg_training.fixed_bank import frozen_bank,FixedBankTally
 from react_agent.eeg_training.train_entry import rebuild_encoder
 from react_agent.eeg_research.agentic.artifacts import register
@@ -42,8 +42,10 @@ if output.exists():raise RuntimeError('diagnostic_already_exists_inspect_before_
 output.parent.mkdir(parents=True,exist_ok=True)
 p=read(CAMP/'execution_protocol.json');design=design_from_protocol(p);plan=split_plan(Path(p['data_root']),design)
 if set(plan.val_files)&set(plan.forbidden_files):raise RuntimeError('development_holdout_overlap')
-spec=geometry(p['dataset']);features=load_feature_cache(plan.feature_caches[1])
-records,images=collect_records(plan.val_files,features,spec['channels'],None)
+spec=geometry(p['dataset'])
+channels=spec['channels']
+assert channels is None or isinstance(channels,list)
+records,images=collect_frozen_validation_records(plan,channels,p)
 assert len(records)==len(p['validation_query_ids']) and set(images)==set(p['validation_image_ids'])
 assert set(str(r['query_id']) for r in records)==set(p['validation_query_ids'])
 loader=DataLoader(RetrievalTrials(records,spec['timesteps']),batch_size=256,shuffle=False,collate_fn=collate_retrieval)

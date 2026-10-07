@@ -27,6 +27,11 @@ _READ_TOOLS = {"list_project_files", "search_code", "read_code", "inspect_check_
 _WRITE_TOOLS = {"apply_candidate_patch", "edit_candidate_code"}
 
 
+def _is_check_receipt(result: dict[str, Any]) -> bool:
+    """Exclude request validation refusals, while retaining real check errors/cache."""
+    return result.get("error") not in {"invalid_tool_request", "invalid_tool_args"}
+
+
 def _read_key(tool: str, args: dict[str, Any], revision: str) -> tuple[Any, ...]:
     return (tool, str(args.get("path") or ""), str(args.get("query") or ""),
             int(args.get("start") or 1), int(args.get("end") or 200), revision)
@@ -132,7 +137,7 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
                 if not auto_check.get("ok") and failed_key not in failed_revisions:
                     failed_checks += 1
                     failed_revisions.add(failed_key)
-        if tool == "run_candidate_check" and result.get("error") != "invalid_tool_args":
+        if tool == "run_candidate_check" and _is_check_receipt(result):
             last_check = result
             check_fingerprint = str(result.get("check_fingerprint") or "")
             failed_key = check_fingerprint or last_patch_sha
@@ -151,8 +156,9 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
             raise RecoveryBlocked("checks_unreadable") from exc
         if not isinstance(stored, dict):
             raise RecoveryBlocked("checks_unreadable")
-        last_check = stored
-        check_fingerprint = str(stored.get("check_fingerprint") or check_fingerprint)
+        if _is_check_receipt(stored):
+            last_check = stored
+            check_fingerprint = str(stored.get("check_fingerprint") or check_fingerprint)
     entry = workspace / "extension" / "eeg_candidate.py"
     if entry.is_file():
         current = file_sha256(entry)
@@ -401,7 +407,7 @@ def implement(
             if not tool_for_check.get("ok") and last_check_fingerprint not in failed_revisions:
                 failed_checks += 1
                 failed_revisions.add(last_check_fingerprint)
-        if tool == "run_candidate_check" and request_error is None and not cached_check:
+        if tool == "run_candidate_check" and request_error is None and _is_check_receipt(result) and not cached_check:
             if entry.is_file():
                 result = {**result, "source_sha256": file_sha256(entry), "check_fingerprint": _check_fingerprint(workspace, python)}
             last_check = result

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import sys
+from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from react_agent.eeg_training.protocol import FULL_EEG_CHANNELS, SplitError
+from react_agent.eeg_training.protocol import FULL_EEG_CHANNELS, SplitError, SplitPlan
 
 
 def _alias_numpy_core() -> None:
@@ -156,3 +158,93 @@ def collect_records(
             )
             image_ids.append(image_id)
     return records, image_ids
+
+
+def collect_validation_records(
+    plan: SplitPlan,
+    channels: list[str] | None,
+    *,
+    validation_image_ids: set[str] | None = None,
+    features: dict[str, torch.Tensor] | None = None,
+) -> tuple[list[dict[str, torch.Tensor | str]], list[str]]:
+    """Share the trainer's cache/file/filter choice without reading final holdout."""
+    allowed: set[str] | None
+    if plan.val_mode == "other_subjects_test":
+        expected_caches, cache_index, allowed = 2, 1, None
+    elif plan.val_mode in {
+        "train_holdout",
+        "all_subjects_holdout",
+        "custom_train_holdout",
+    }:
+        expected_caches, cache_index, allowed = 1, 0, validation_image_ids
+        if not allowed:
+            raise SplitError("frozen_validation_image_identity_missing")
+    else:
+        raise SplitError("unsupported_validation_mode:" + plan.val_mode)
+    if not plan.feature_caches:
+        raise SplitError("validation_feature_cache_missing")
+    if len(plan.feature_caches) != expected_caches:
+        raise SplitError("validation_cache_mode_mismatch:" + plan.val_mode)
+    if not plan.val_files:
+        raise SplitError("validation_source_files_missing")
+    forbidden = {path.resolve() for path in plan.forbidden_files}
+    if forbidden & {path.resolve() for path in plan.val_files}:
+        raise SplitError("development_holdout_overlap")
+    selected = (
+        features
+        if features is not None
+        else load_feature_cache(plan.feature_caches[cache_index])
+    )
+    return collect_records(plan.val_files, selected, channels, allowed)
+
+
+def collect_frozen_validation_records(
+    plan: SplitPlan, channels: list[str] | None, identity: dict[str, Any]
+) -> tuple[list[dict[str, torch.Tensor | str]], list[str]]:
+    """Verify complete frozen query/gallery identities using only validation files."""
+
+    def required_ids(field: str) -> list[str]:
+        values = identity.get(field)
+        if (
+            not isinstance(values, list)
+            or not values
+            or any(not isinstance(value, str) or not value for value in values)
+        ):
+            raise SplitError("frozen_" + field + "_missing")
+        return values
+
+    image_ids = required_ids("validation_image_ids")
+    query_ids = required_ids("validation_query_ids")
+    gallery_ids = required_ids("gallery_image_ids")
+    if identity.get("val_mode") != plan.val_mode:
+        raise SplitError("frozen_validation_mode_mismatch")
+    if len(image_ids) != len(set(image_ids)) or Counter(gallery_ids) != Counter(
+        set(image_ids)
+    ):
+        raise SplitError("frozen_validation_gallery_mismatch")
+    positives = identity.get("positive_map")
+    if not isinstance(positives, dict) or any(
+        query not in positives for query in query_ids
+    ):
+        raise SplitError("frozen_validation_positive_identity_missing")
+    if plan.val_mode == "other_subjects_test":
+        files = identity.get("validation_files")
+        if (
+            not isinstance(files, list)
+            or not files
+            or any(not isinstance(name, str) or not name for name in files)
+            or [Path(name).resolve() for name in files]
+            != [path.resolve() for path in plan.val_files]
+        ):
+            raise SplitError("frozen_validation_source_mismatch")
+    records, images = collect_validation_records(
+        plan, channels, validation_image_ids=set(image_ids)
+    )
+    if Counter(str(row["query_id"]) for row in records) != Counter(query_ids):
+        raise SplitError("frozen_validation_query_mismatch")
+    if set(images) != set(image_ids):
+        raise SplitError("frozen_validation_image_mismatch")
+    if any(positives.get(str(row["query_id"])) != str(row["img"]) for row in records):
+        raise SplitError("frozen_validation_positive_mismatch")
+    # Keep the trainer's file/trial order and first-seen frozen_bank gallery order.
+    return records, images
