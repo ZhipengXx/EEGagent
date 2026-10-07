@@ -220,6 +220,8 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 call_payload = {**call_payload, "schema_error": schema_error, "previous": previous_domain,
                                 "schema_repair_context": schema_feedback,
                                 "correction_instruction": "Return a complete corrected JSON object using only OUTPUT_SCHEMA fields. Input metadata is read-only, not output. Remove every reported forbidden field; correct every reported missing/invalid field. Keep the task, legal actions, evidence identities and business context unchanged."}
+            from react_agent.eeg_research.agentic.role_examples import add_role_examples
+            call_payload = add_role_examples(call_payload, role, memory)
             goal_path = camp / "goal.json"
             if goal_path.is_file():
                 try:

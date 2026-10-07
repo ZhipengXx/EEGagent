@@ -760,6 +760,21 @@ def observation(camp: Path) -> dict[str, Any]:
     from react_agent.eeg_research.agentic.research_progress import progress_context, verified_diagnostic_facts
     public["research_progress"] = progress_context(camp, state, goal, public["budget"], public["available_actions"])
     public["verified_development_facts"] = verified_diagnostic_facts(camp, state)
+    failure = state.get("failure") or {}
+    last = (state.get("decisions") or [{}])[-1]
+    if failure.get("phase") == "planner" and failure.get("recoverable") is True and last.get("ok") is False:
+        # Native resume keeps the old decision immutable. Supply its diagnostic
+        # as input to the next bounded decide(), validated against current gates.
+        from react_agent.eeg_research.agentic.artifacts import request_digest
+        from react_agent.eeg_research.agentic.planner import _correction_view
+        decision_id = str(last.get("decision_id") or "")
+        if decision_id.startswith("d") and decision_id[1:].isdigit():
+            saved = _read(camp / "decisions" / (decision_id + ".json"))
+            raw = saved.get("raw")
+            if isinstance(raw, dict) and (saved.get("decision") or {}).get("decision_id") == decision_id and last.get("raw_digest") == request_digest(request=raw):
+                public["previous_planner_failure"] = {"decision_id": decision_id, "raw_digest": last["raw_digest"],
+                    "detail": last.get("detail"), "raw": _correction_view(raw),
+                    "scope": "historical failed input; revalidate all choices against current observation, not execution authority"}
     return public
 
 

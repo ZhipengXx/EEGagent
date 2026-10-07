@@ -346,7 +346,18 @@ def index_records(store: SidecarStore, records: list[dict], backend, *, rebuild:
 
 def _delivery_fields(bundle: dict, *, standalone: bool) -> dict:
     """Serialize the exact added request fields, including the size statistic itself."""
-    metadata = {key: copy.deepcopy(value) for key, value in bundle.items() if key != "lessons"}
+    # The search query is derived from the current goal/plan, not a memory record.
+    # Keep its full text in retrieval diagnostics; role fields carry its identity
+    # without spending the whole-record budget on a second copy of that text.
+    # Cache bookkeeping stays in diagnostics; the embedding fingerprint retains
+    # builder identity in role fields. Record bodies and source refs stay whole.
+    metadata = {key: copy.deepcopy(value) for key, value in bundle.items()
+                if key not in {"lessons", "indexing", "text_builder_version"}}
+    query = str(bundle.get("query") or "")
+    query_identity = {"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest()}
+    if len(canonical({"query": query})) > len(canonical(query_identity)):
+        metadata.pop("query", None)
+        metadata.update(query_identity)
     fields = {"retrieved_memory": metadata}
     if bundle["backend"] == "minilm":
         if standalone:

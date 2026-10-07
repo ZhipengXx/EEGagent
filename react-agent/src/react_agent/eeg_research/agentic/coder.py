@@ -44,6 +44,10 @@ def validate_tool_request(reply: Any) -> tuple[str, dict[str, Any], dict[str, An
     """Turn model formatting mistakes into feedback, without executing a tool."""
     if not isinstance(reply, dict) or not isinstance(reply.get("tool"), str):
         return "", {}, {"ok": False, "error": "invalid_tool_request", "detail": "Return {tool: string, args: object} using the supplied tools."}
+    if set(reply) - {"tool", "args"}:
+        return reply["tool"], {}, {"ok": False, "error": "invalid_tool_request",
+            "forbidden_fields": sorted(set(reply) - {"tool", "args"}),
+            "detail": "Return only tool and args. Input examples, history and metadata are not output fields."}
     tool = reply["tool"]
     args = reply.get("args", {})
     if tool not in TOOL_ARGUMENTS:
@@ -119,6 +123,7 @@ _REFERENCES = {
 
 
 def read_code(workspace: Path, relative: str, start: int = 1, end: int = 200) -> dict[str, Any]:
+    from react_agent.eeg_research.agentic.binding import file_sha256
     if relative in _REFERENCES:
         target = _REFERENCES[relative]
     elif relative == "reference/parent.py":
@@ -132,7 +137,7 @@ def read_code(workspace: Path, relative: str, start: int = 1, end: int = 200) ->
     lines = target.read_text(encoding="utf-8").splitlines()
     start = max(1, int(start))
     end = int(end)
-    return {"ok": True, **source_page(lines, start, end)}
+    return {"ok": True, "path": relative, "source_sha256": file_sha256(target), **source_page(lines, start, end)}
 
 
 def search_code(workspace: Path, query: str) -> dict[str, Any]:
@@ -156,7 +161,9 @@ def apply_candidate_patch(workspace: Path, relative: str, content: str, expected
     if not str(relative).startswith("extension/") or not _allowed(workspace, target):
         return {"ok": False, "error": "patch_refused"}
     if target.is_file() and file_sha256(target) != expected_base_hash:
-        return {"ok": False, "error": "base_hash_mismatch"}
+        return {"ok": False, "error": "base_hash_mismatch", "path": relative,
+                "current_sha256": file_sha256(target),
+                "detail": "The file revision changed. Use the current file/page and its hash, not a reference or previous revision."}
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding="utf-8")
     return {"ok": True, "path": relative, "sha256": file_sha256(target)}
@@ -170,7 +177,9 @@ def edit_candidate_code(workspace: Path, relative: str, edits: list[Any], expect
     if not str(relative).startswith("extension/") or not _allowed(workspace, target) or not target.is_file():
         return {"ok": False, "error": "edit_refused"}
     if file_sha256(target) != expected_base_hash:
-        return {"ok": False, "error": "base_hash_mismatch"}
+        return {"ok": False, "error": "base_hash_mismatch", "path": relative,
+                "current_sha256": file_sha256(target),
+                "detail": "The file revision changed. Rebuild the edit from the current source and hash."}
     if not edits or len(edits) > 20:
         return {"ok": False, "error": "invalid_tool_args", "detail": "edits must contain 1 to 20 exact replacements"}
     content = target.read_text(encoding="utf-8")
@@ -191,7 +200,9 @@ def edit_candidate_code(workspace: Path, relative: str, edits: list[Any], expect
         count = content.count(edit["old"])
         if count != 1:
             return {"ok": False, "error": "edit_not_found" if count == 0 else "edit_not_unique", "edit_index": index, "matches": count,
-                    "detail": "Use the exact current source and enough surrounding context for a unique match."}
+                    "path": relative, "current_sha256": file_sha256(target),
+                    "detail": "No exact old fragment matched; use the current source." if count == 0 else
+                              "The old fragment matches more than once; include unique surrounding lines or observed line ranges."}
         content = content.replace(edit["old"], edit["new"], 1)
     return {**apply_candidate_patch(workspace, relative, content, expected_base_hash), "edit_count": len(edits)}
 

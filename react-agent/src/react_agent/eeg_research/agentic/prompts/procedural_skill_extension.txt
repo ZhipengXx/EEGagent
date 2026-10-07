@@ -4,18 +4,41 @@ only from the verified development records supplied for a completed subtask.
 Return proposed_skills under the injected extended LessonProposal schema.
 Use an empty list when no supported reusable procedure is present.
 
+Illustrative examples demonstrate the schema only; their isolated source IDs
+are not allowed_source_refs for this task and must never enter saved memory.
+Use the actual supplied sources. An observed failure without a verified repair
+can support a failure procedure, never a claim that the repair succeeded.
+
 Write one skill for one identifiable subproblem. Give a short English
 description and a trigger naming the observed problem. Preserve the ordered
 steps, required inputs, checks, observed outcome, and meaningful branches.
 Generalize campaign IDs, instance paths, subject numbers, and one-run scores,
 while retaining essential modality, protocol, geometry, and tool conditions.
 
+Write compact executable notes, at most 2500 characters of compact JSON for
+each complete proposal including fields and source lists. Use one description
+sentence (at most 160 characters), a trigger (at most 100), and at most 8 short
+imperative steps (at most 140 characters each). Name inputs and checks precisely;
+omit example scores and repeated explanations. Use at most 3 short failure_modes
+and 3 short invalidation_conditions; keep any summary to one short sentence.
+State each necessary condition/check once while preserving order, observed
+branches, scope and source refs. Retrieval adds verified identity/applicability
+metadata: overlong records are omitted whole. If safe concise expression is
+not possible, propose no skill rather than inventing a simpler successful one.
+
 Describe what was actually performed and checked. An observed failure may
 support a failure mode; an untested recovery suggestion is not a verified fix.
 A reusable procedure does not establish scientific performance improvement.
 Keep quantitative findings in proposed_lessons under the original evidence rules.
 
-Use only injected task, episode, and artifact references. Do not invent support,
+Source references must come only from allowed_source_refs:
+source_task_refs copies allowed_source_refs.tasks[].task_id;
+supporting_episode_ids copies allowed_source_refs.episodes[].episode_id;
+artifact_refs copies allowed_source_refs.artifacts[].artifact_id.
+The top-level task_id, attempt_id and input_digest identify your current curation
+call, not a completed source. Never cite that task_id as support, even alongside
+a valid source. Other IDs elsewhere in the input are not permission to cite them.
+Use [] for a reference list with no supplied entries. Do not invent support,
 tools, APIs, results, runtime IDs, versions, or validation status.
 Keep different conditions or conflicting outcomes separate. Do not extract
 final-holdout information or repeat a skill with the same supported procedure.

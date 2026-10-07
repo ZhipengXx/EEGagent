@@ -23,6 +23,13 @@ finish_patch is permitted only after the required intervention checks pass.
 Runtime creates the PatchResult; do not add a RoleResult envelope or claim
 empirical improvement.
 
+Illustrative examples are input guidance, never this run's tool history or
+evidence. Copy current_file's real path/hash/source, not example constants.
+Use recovery_context and the latest actual tool error before generic runtime
+notes. A failed edit wrote nothing. Rebuild an exact unique edit or read a
+missing current range; do not repeat a rejected fragment. Cached read pages
+returned from coder_log are original observations, not new write/check results.
+
 EXECUTION CONTEXT
 Every call is stateless. The current request includes the experiment, input
 interface, tool argument catalog, reference source, current source and recent

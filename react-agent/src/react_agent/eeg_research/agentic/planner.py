@@ -35,6 +35,52 @@ STOP_REASONS = (
 
 Backend = Callable[[dict[str, Any]], dict[str, Any]]
 
+# These existing dispatches derive campaign/latest-job diagnostics and do not
+# consume target_id. Known candidate annotations therefore share the local cost;
+# all training and implementation pipelines require exact target bindings.
+TARGET_INDEPENDENT_COST_ACTIONS = frozenset({"diagnose_results", "collect_diagnostics"})
+TARGETED_ACTIONS = frozenset({"run_pilot", "run_full", "replicate", "implement_candidate", "repair_candidate"})
+
+
+def known_candidate_ids(observation: dict[str, Any]) -> set[str]:
+    """Derive candidate identities, never method names or artifact IDs."""
+    return {"baseline", *[row["candidate_id"] for row in observation.get("candidates") or [] if row.get("candidate_id")],
+            *[observation[key] for key in ("candidate_id", "implementation_target_id") if observation.get(key)]}
+
+
+def resolve_cost_estimate(observation: dict[str, Any], action: str, target: str | None) -> tuple[str | None, dict[str, Any]]:
+    """Prefer an exact cost row; allow only verified target-independent fallback."""
+    rows: dict[str, dict[str, Any]] = observation.get("action_cost_estimates") or {}
+    key = f"{action}:{target or ''}"
+    if target is not None and target not in known_candidate_ids(observation):
+        return None, {}
+    if key in rows:
+        return key, rows[key]
+    generic = f"{action}:"
+    if target is not None and action in TARGET_INDEPENDENT_COST_ACTIONS and generic in rows:
+        return generic, rows[generic]
+    return None, {}
+
+
+def legal_choice_context(observation: dict[str, Any]) -> dict[str, Any]:
+    """Project legal pairs and cost identities from this same observation."""
+    choices = []
+    rows = observation.get("action_cost_estimates") or {}
+    single_action = observation.get("planner_mode", (observation.get("goal") or {}).get("planner_mode", "single_action")) == "single_action"
+    for action in observation.get("available_actions") or []:
+        targets = list((observation.get("eligible_targets") or {}).get(action) or [])
+        if action not in TARGETED_ACTIONS:
+            targets = sorted(known_candidate_ids(observation))
+        implicit_target = single_action and action in {"implement_candidate", "repair_candidate"}
+        choices.append({"action": action, "targets": targets, "null_allowed": action not in TARGETED_ACTIONS or implicit_target,
+                        "implicit_target_semantics": "existing controller selects the approved current implementation/repair target" if implicit_target else None,
+                        "cost_keys": [key for key in rows if key.startswith(action + ":")]})
+    return {"choices": choices, "candidate_ids": sorted(known_candidate_ids(observation)),
+            "identity_rule": "target_id is an exact candidate ID; option_id selects an option; method names and artifact IDs are not candidates.",
+            "cost_rule": "Copy the resolved runtime row. Exact pairs win. Only diagnose_results/collect_diagnostics may share the targetless local cost for known candidates; these actions diagnose campaign/latest-job history, not a selected candidate job.",
+            "null_rule": "null means no candidate annotation. Training and compared implementation/repair options require listed targets. Legacy single_action implementation/repair may omit the target and use the controller's approved current target.",
+            "lifecycle_source": "implementation_lifecycle and approved experiment are authoritative; missing source does not mean unapproved."}
+
 
 def _has(evidence: list[dict[str, Any]], candidate_id: Any, fidelity: str) -> bool:
     return any(
@@ -334,7 +380,11 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
     trainable = set(observation.get("trainable_ids") or ["baseline"])
     eligible = observation.get("eligible_targets") if isinstance(observation.get("eligible_targets"), dict) else None
     from react_agent.eeg_research.agentic.planner_context import compact_planner_context, normalize_input_echoes
-    request = compact_planner_context(observation)
+    observation = {**observation, "legal_choice_context": legal_choice_context(observation)}
+    previous = observation.get("previous_planner_failure") or {}
+    request = (_repair_request(observation, {"detail": previous["detail"]}, previous["raw"])
+               if previous.get("raw") and previous.get("detail") else observation)
+    request = compact_planner_context(request)
     history = []
     for attempt in range(max(0, min(int(repairs), 2)), 3):
         reply, _ = normalize_input_echoes(backend(request), observation)
@@ -358,22 +408,39 @@ def _repair_request(observation: dict[str, Any], parsed: dict[str, Any], reply: 
     repair_payload = {**observation, "schema_error": parsed.get("detail"), "previous": _correction_view(reply)}
     if parsed.get("detail") in {"unknown_option_cost_basis", "option_cost_without_runtime_basis",
                               "option_cost_basis_missing", "option_cost_confidence_without_runtime_basis"}:
-        cost_rows = observation.get("action_cost_estimates") or {}
         options = reply.get("options") if isinstance(reply, dict) else []
         details = []
+        invalid_fields = []
         for option in (options if isinstance(options, list) else [])[:4]:
             if not isinstance(option, dict):
                 continue
             key = f"{option.get('action')}:{option.get('target_id') or ''}"
-            estimate = cost_rows.get(key) or {}
+            binding_key, estimate = resolve_cost_estimate(observation, str(option.get("action") or ""), option.get("target_id"))
+            expected = estimate.get("estimated_cost") or {}
+            submitted = option.get("estimated_cost") or {}
+            if isinstance(submitted, dict):
+                for field in ("llm_calls", "gpu_seconds", "training_jobs"):
+                    value, required = submitted.get(field), expected.get(field)
+                    if value is not None and (required is None or (
+                            isinstance(value, (int, float)) and abs(value - required) > 1e-6)):
+                        invalid_fields.append({
+                            "option_id": option.get("option_id"),
+                            "field": "estimated_cost." + field,
+                            "submitted": value, "required": required,
+                            "cost_estimate_key": key,
+                            "cost_binding_key": binding_key,
+                            "reason": "no_numeric_runtime_basis" if required is None else "runtime_value_mismatch",
+                        })
             details.append({"option_id": option.get("option_id"), "cost_estimate_key": key,
+                            "cost_binding_key": binding_key,
                             "allowed_cost_basis": estimate.get("cost_basis") or [],
                             "allowed_estimated_cost": estimate.get("estimated_cost") or {
                                 "llm_calls": None, "gpu_seconds": None, "training_jobs": None},
                             "cost_confidence": estimate.get("cost_confidence") or "unknown"})
         repair_payload["schema_repair_context"] = {
-            "instruction": "Copy these exact cost_basis strings without explanation, translation or path prefixes. Empty means []. Put explanations in value_rationale. Unknown numeric costs are null.",
+            "instruction": "Correct every invalid_estimated_cost_fields entry to its required value. Copy the resolved cost_binding_key row: exact targets win; only explicitly target-independent diagnostic actions may use the generic row for known candidates. Unsupported numbers, including zero, become null. Copy cost_basis verbatim; unknown basis is []. Explain in value_rationale.",
             "option_costs": details,
+            "invalid_estimated_cost_fields": invalid_fields,
         }
     if parsed.get("detail") in {"unknown_option_target", "selected_option_execution_mismatch"}:
         repair_payload["schema_repair_context"] = {
@@ -382,6 +449,8 @@ def _repair_request(observation: dict[str, Any], parsed: dict[str, Any], reply: 
             "implementation_target_id": observation.get("implementation_target_id"),
         }
     context = repair_payload.setdefault("schema_repair_context", {})
+    context["mechanical_errors"] = mechanical_errors(reply, observation)
+    context["legal_choice_context"] = legal_choice_context(observation)
     if parsed.get("detail") in {"duplicate_option_action", "option_intervention_requires_design"}:
         context["duplicate_option_feedback"] = duplicate_option_feedback(reply)
     if parsed.get("detail") == "design_hypothesis_missing":
@@ -447,6 +516,10 @@ def _validate_reply(
     parsed = _parse(reply, allowed, known, trainable, eligible)
     if not parsed.get("ok"):
         return parsed
+    if reply.get("target_id") is not None and reply["target_id"] not in known_candidate_ids(observation):
+        return {"ok": False, "detail": "unknown_option_target"}
+    if parsed["action"] in {"implement_candidate", "repair_candidate"} and eligible is not None and reply.get("target_id") is not None and reply["target_id"] not in eligible.get(parsed["action"], []):
+        return {"ok": False, "detail": "option_target_unavailable"}
     if parsed["action"] == "design_experiment":
         draft = reply.get("experiment_draft") if isinstance(reply.get("experiment_draft"), dict) else {}
         existing = observation.get("experiment") if isinstance(observation.get("experiment"), dict) else {}
@@ -593,6 +666,8 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
         return "selected_option_artifact_mismatch"
     if not set(parsed.resolves_issue_ids) <= set(selected.related_issue_ids):
         return "selected_option_issue_mismatch"
+    if selected.action not in {"design_experiment", "propose_experiment"} and selected.intervention is not None:
+        return "selected_option_intervention_mismatch"
     if any(option.action not in {"design_experiment", "propose_experiment"}
            and option.intervention is not None for option in parsed.options):
         return "option_intervention_requires_design"
@@ -628,7 +703,7 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
                 return "option_target_unavailable"
             if option.action in {"implement_candidate", "repair_candidate"} and option.target_id not in eligible.get(option.action, []):
                 return "option_target_unavailable"
-        estimate = (observation.get("action_cost_estimates") or {}).get(f"{option.action}:{option.target_id or ''}") or {}
+        _, estimate = resolve_cost_estimate(observation, option.action, option.target_id)
         expected_cost = estimate.get("estimated_cost") or {}
         for key, value in option.estimated_cost.model_dump().items():
             if value is not None and (expected_cost.get(key) is None or abs(value - expected_cost[key]) > 1e-6):
@@ -755,4 +830,76 @@ def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=N
                 "api_usd": None, "usd_status": "unpriced", "estimates_are_execution_authority": False,
                 "planner_call_already_in_budget_ledger": True,
             }
+    # Materialize the same resolver's generic diagnostic bindings so the model,
+    # validator and correction feedback see identical action:target rows.
+    with_costs = {**observation, "action_cost_estimates": estimates}
+    for action in TARGET_INDEPENDENT_COST_ACTIONS:
+        if action not in (observation.get("available_actions") or []):
+            continue
+        for target in sorted(known_candidate_ids(observation)):
+            key = f"{action}:{target}"
+            binding, estimate = resolve_cost_estimate(with_costs, action, target)
+            if key not in estimates and estimate:
+                estimates[key] = {**estimate, "cost_binding_key": binding,
+                                  "target_semantics": "campaign/latest-job diagnostics; known candidate annotation does not select a job"}
     return estimates
+
+
+def mechanical_errors(reply: Any, observation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Report bounded simultaneous mechanical errors under the existing schema."""
+    from pydantic import ValidationError
+
+    from react_agent.eeg_research.agentic.schemas import PlannerDecision
+
+    try:
+        decision = PlannerDecision.model_validate(reply)
+    except ValidationError as exc:
+        return [{"field": list(row["loc"]), "reason": row["type"], "detail": row["msg"]}
+                for row in exc.errors(include_input=False)[:12]]
+    errors: list[dict[str, Any]] = []
+
+    def add(field: str, current: Any, required: Any, reason: str) -> None:
+        errors.append({"field": field, "current": current, "required": required, "reason": reason})
+
+    selected = next((option for option in decision.options if option.option_id == decision.selected_option_id), None)
+    if selected is None and decision.options:
+        add("selected_option_id", decision.selected_option_id, [row.option_id for row in decision.options], "select_an_existing_executable_option")
+    if selected is not None:
+        for key in ("action", "target_id", "question_id"):
+            if getattr(decision, key) != getattr(selected, key):
+                add(key, getattr(decision, key), getattr(selected, key), "synchronize_with_a_legal_selected_option")
+        for key, expected in (("evidence_refs", selected.evidence_refs), ("required_artifact_refs", selected.required_artifact_refs), ("required_read_digests", selected.required_read_digests)):
+            actual = getattr(decision, key)
+            if key == "evidence_refs":
+                actual = actual or decision.evidence_ids
+            if (actual != expected if key == "required_read_digests" else set(actual) != set(expected)):
+                add(key, actual, expected, "synchronize_selected_references")
+        if decision.evidence_refs and decision.evidence_ids and set(decision.evidence_refs) != set(decision.evidence_ids):
+            add("evidence_ids", decision.evidence_ids, decision.evidence_refs, "evidence_alias_mismatch")
+        expected_intervention = (decision.experiment_draft or {}).get("intervention") if selected.action in {"design_experiment", "propose_experiment"} else None
+        if selected.intervention is not None and expected_intervention != selected.intervention:
+            add("options.selected.intervention", selected.intervention, expected_intervention, "copy_exact_design_intervention_or_null_for_non_design")
+    candidates = known_candidate_ids(observation)
+    for index, option in enumerate(decision.options):
+        prefix = f"options[{index}]"
+        if option.executable and option.action not in (observation.get("available_actions") or []):
+            add(prefix + ".action", option.action, observation.get("available_actions") or [], "action_unavailable")
+        if option.target_id is not None and option.target_id not in candidates:
+            add(prefix + ".target_id", option.target_id, sorted(candidates), "unknown_candidate_not_method_or_artifact")
+        elif option.executable and option.action in TARGETED_ACTIONS and option.target_id not in (observation.get("eligible_targets") or {}).get(option.action, []):
+            add(prefix + ".target_id", option.target_id, (observation.get("eligible_targets") or {}).get(option.action, []), "target_unavailable_for_action")
+        binding, estimate = resolve_cost_estimate(observation, option.action, option.target_id)
+        for key, value in option.estimated_cost.model_dump().items():
+            expected_cost = (estimate.get("estimated_cost") or {}).get(key)
+            if value is not None and (expected_cost is None or abs(value - expected_cost) > 1e-6):
+                add(prefix + ".estimated_cost." + key, value, expected_cost, "cost_binding:" + str(binding))
+        if any(ref not in (estimate.get("cost_basis") or []) for ref in option.cost_basis):
+            add(prefix + ".cost_basis", option.cost_basis, estimate.get("cost_basis") or [], "copy_runtime_basis")
+        numeric = any(value is not None for value in option.estimated_cost.model_dump().values())
+        if numeric and not option.cost_basis:
+            add(prefix + ".cost_basis", [], estimate.get("cost_basis") or [], "numeric_cost_requires_basis")
+        if numeric and option.cost_confidence != estimate.get("cost_confidence"):
+            add(prefix + ".cost_confidence", option.cost_confidence, estimate.get("cost_confidence") or "unknown", "copy_runtime_confidence")
+        if option.action not in {"design_experiment", "propose_experiment"} and option.intervention is not None:
+            add(prefix + ".intervention", option.intervention, None, "non_design_intervention_is_null")
+    return errors[:32]

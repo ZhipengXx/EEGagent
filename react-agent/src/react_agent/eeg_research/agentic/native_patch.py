@@ -102,6 +102,7 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
     check_fingerprint = ""
     extension_answered = False
     seen_reads: set[tuple[Any, ...]] = set()
+    read_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
     for row in rows:
         tool = str(row.get("tool") or "")
         result = row.get("result")
@@ -114,7 +115,9 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
             args = row.get("args") if isinstance(row.get("args"), dict) else {}
             if result.get("ok"):
                 key = row.get("read_key")
-                seen_reads.add(tuple(key) if isinstance(key, list) else _read_key(tool, args, last_patch_sha))
+                restored_key = tuple(key) if isinstance(key, list) else _read_key(tool, args, last_patch_sha)
+                seen_reads.add(restored_key)
+                read_cache[restored_key] = result
         if tool == "requires_framework_extension_answered":
             extension_answered = True
         if tool in _WRITE_TOOLS and result.get("ok"):
@@ -179,6 +182,7 @@ def _restore_coder(workspace: Path, *, ignore_finish: bool = False) -> dict[str,
         "writes": writes,
         "reads": reads,
         "seen_reads": seen_reads,
+        "read_cache": read_cache,
         "next_step": last_step + 1,
     }
 
@@ -213,6 +217,7 @@ def implement(
     writes = int(restored["writes"])
     reads = int(restored["reads"])
     seen_reads: set[tuple[Any, ...]] = set(restored.get("seen_reads") or [])
+    read_cache = dict(restored.get("read_cache") or {})
     next_step = int(restored["next_step"])
     step_limit = max_steps
     first_step = 1
@@ -297,6 +302,16 @@ def implement(
             request["runtime_note"] = "The stored check passed for an older fingerprint. Call run_candidate_check before finish_patch; rereading source or repeating finish cannot refresh the check."
         elif last_check is not None and last_check.get("ok"):
             request["runtime_note"] = "The current check passed. Call finish_patch unless a required source change is missing."
+        latest_result = (history[-1].get("result") or {}) if history else {}
+        if latest_result.get("error") in {"edit_not_found", "edit_not_unique", "base_hash_mismatch"}:
+            request["recovery_context"] = {
+                "error": latest_result["error"], "edit_index": latest_result.get("edit_index"),
+                "matches": latest_result.get("matches"), "path": latest_result.get("path"),
+                "current_sha256": (current or {}).get("sha256"),
+                "source_view": "current_file and failure_source; read_code if the needed range is missing",
+                "missing_inputs": ["needed source range"] if not current or current.get("truncated") else [],
+            }
+            request["runtime_note"] = "The last edit wrote nothing. Use current_file's hash and exact source; request a missing range or make a unique edit. Do not repeat the rejected fragment."
         reply = backend(request)
         tool, args, request_error = validate_tool_request(reply)
         started = time.time()
@@ -318,15 +333,36 @@ def implement(
         elif tool in _READ_TOOLS:
             key = _read_key(tool, args, last_hash)
             if key in seen_reads:
-                result = {
-                    "ok": False,
-                    "error": "repeated_read",
-                    "detail": "this range is already complete; request next_range or apply_candidate_patch",
-                }
+                cached = read_cache.get(key)
+                visible = any(item.get("tool") == tool and cached is not None and
+                              all((item.get("result") or {}).get(field) == cached.get(field)
+                                  for field in ("text", "start", "end", "path", "source_sha256"))
+                              for item in request["history"]) if tool == "read_code" else any(
+                                  item.get("tool") == tool and item.get("result") == cached for item in request["history"])
+                cache_current = False
+                if cached is not None and tool == "read_code":
+                    path = _REFERENCES.get(str(args.get("path") or "")) or (workspace / str(args.get("path")))
+                    try:
+                        lines = path.read_text(encoding="utf-8").splitlines()
+                        observed_sha = cached.get("source_sha256") or (key[-1] if args.get("path") == "extension/eeg_candidate.py" else None)
+                        cache_current = observed_sha == file_sha256(path) and cached.get("text") == "\n".join(lines[cached["start"] - 1:cached["end"]])
+                    except (OSError, KeyError, TypeError):
+                        cache_current = False
+                if cache_current and isinstance(cached, dict) and not visible:
+                    result = {**cached, "cached": True, "recovered_from": "coder_log",
+                              "detail": "The same revision's original page was no longer visible; use this page or next_range."}
+                elif cached is not None and tool == "read_code" and not cache_current:
+                    result = _execute(workspace, tool, args, last_check, python)
+                    if result.get("ok"):
+                        read_cache[key] = result
+                else:
+                    result = {"ok": False, "error": "repeated_read",
+                              "detail": "This revision's original result is visible in history; use its page or next_range."}
             else:
                 result = _execute(workspace, tool, args, last_check, python)
                 if result.get("ok"):
                     seen_reads.add(key)
+                    read_cache[key] = result
         elif tool == "requires_framework_extension" and not extension_answered:
             extension_answered = True
             result = {

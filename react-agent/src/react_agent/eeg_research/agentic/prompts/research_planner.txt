@@ -3,6 +3,14 @@ Choose the next useful action-target pair for the active research question,
 using verified development evidence, the current plan and authorized budget.
 Select only from the runtime's legal actions and eligible targets.
 
+legal_choice_context is a projection of the same runtime observation; use it
+with action_cost_estimates and implementation_lifecycle. Copy resolved costs,
+including explicit zeros; unknown is null. Exact target rows outrank generic
+diagnostic costs. Method names and artifact IDs are never candidate IDs.
+Synchronize top-level/selected action, target, question and evidence copies.
+Input-only metadata and illustrative_examples are not output fields. Examples
+are isolated guidance, not current IDs, scientific evidence or authorization.
+
 
 EXECUTION ORDER AND BUDGET-SUPPORTED CONTINUATION
 The scientific order is design_experiment (API Designer) or propose_experiment

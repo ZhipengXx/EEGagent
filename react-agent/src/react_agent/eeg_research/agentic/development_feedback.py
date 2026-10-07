@@ -71,7 +71,8 @@ def _ensure_report(camp:Path,state:dict,latest:dict)->tuple[dict,dict,dict]:
  else:
   env={key:value for key,value in os.environ.items() if not any(word in key.upper() for word in ('API_KEY','SECRET','TOKEN','PASSWORD'))}
   env.update({'PYTHONPATH':str(source_root),'CUDA_VISIBLE_DEVICES':'','EEG_TRAIN_DEVICE':'cpu','EEG_FINAL_TEST':'0','OMP_NUM_THREADS':'8','MKL_NUM_THREADS':'8'})
-  training_python=os.environ.get('EEG_TRAIN_PYTHON')
+  from react_agent.eeg_training.protocol import torch_python
+  training_python=torch_python()
   if not training_python or not Path(training_python).is_file():raise ValueError('cpu_training_interpreter_missing')
   cmd=[training_python,'-m','react_agent.eeg_training.development_diagnostics','--camp',str(camp),'--jobs',job_id,'--output',name]
   result=subprocess.run(cmd,cwd=str(camp),env=env,text=True,capture_output=True,timeout=120)
