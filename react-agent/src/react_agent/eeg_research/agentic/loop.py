@@ -651,6 +651,7 @@ def observation(camp: Path) -> dict[str, Any]:
     state["_has_open_report_issues"] = bool((state.get("report_draft") or {}).get("claims") and any(
         row["status"] == "open" and row.get("claim_id") for row in feedback["issues"]))
     state["_implementation_target"] = candidate_implementation_target(camp, state)
+    state = {**state, "budget": budget_snapshot(camp, state)}
     actions = available_actions(state)
     public = development_view({
         "goal": _planner_goal(goal),
@@ -1028,6 +1029,7 @@ def _apply_action(
         live["budget"] = budget_snapshot(camp, state)
         scope = {**current, **{key: state.get(key) for key in ("max_llm_calls", "llm_calls", "llm_calls_left",
                     "max_training_jobs", "training_jobs", "max_gpu_seconds", "gpu_seconds_left")},
+                 "budget": live["budget"],
                  "_implementation_target": live.get("implementation_target_id"),
                  "_has_development_artifacts": any(row.get("verification_status") == "verified" for row in live.get("artifact_index") or []),
                  "_read_remaining": live["artifact_read_budget"]["remaining_reads"],

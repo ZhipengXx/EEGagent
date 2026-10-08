@@ -249,7 +249,8 @@ def implement(
         input_spec = json.loads(spec_path.read_text(encoding="utf-8"))
     else:
         input_spec = candidate_interface(None)
-    pages = {name: source_page(path.read_text(encoding="utf-8").splitlines(), 1, 100000, char_limit=12000) for name, path in _REFERENCES.items()}
+    pages = {name: source_page(path.read_text(encoding="utf-8").splitlines(), 1, 100000, char_limit=12000)
+             for name, path in _REFERENCES.items() if name not in {"reference/hooks.py", "reference/hook_config.py"}}
     parent = workspace / "reference" / "parent.py"
     if parent.is_file():
         pages["reference/parent.py"] = source_page(parent.read_text(encoding="utf-8").splitlines(), 1, 100000, char_limit=12000)
@@ -282,6 +283,9 @@ def implement(
             "last_check": last_check,
             "history": history[-8:],
         }
+        if last_check and not last_check.get("ok") and "config" in json.dumps(last_check, default=str).lower():
+            from react_agent.eeg_research.agentic.handoffs import training_semantics
+            request["hook_config_runtime_source"] = training_semantics(config_only=True)
         current_fingerprint = _check_fingerprint(workspace, python) if entry.is_file() else ""
         check_fresh = bool(current and last_hash == current["sha256"] and last_check_fingerprint == current_fingerprint)
         request["check_status"] = {

@@ -119,6 +119,8 @@ _REFERENCES = {
     "reference/baseline.py": Path(__file__).resolve().parent / "baseline.py",
     "reference/model.py": Path(__file__).resolve().parents[2] / "eeg_training" / "model.py",
     "reference/train_entry.py": Path(__file__).resolve().parents[2] / "eeg_training" / "train_entry.py",
+    "reference/hooks.py": Path(__file__).resolve().parents[2] / "eeg_training" / "hooks.py",
+    "reference/hook_config.py": Path(__file__).resolve().parent / "hook_config.py",
 }
 
 

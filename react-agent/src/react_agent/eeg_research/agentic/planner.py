@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 from typing import Any, Callable
 
@@ -167,6 +168,53 @@ def training_actions(scope: dict[str, Any]) -> set[str]:
     return set(declared)
 
 
+def _number(value: Any) -> float | None:
+    return float(value) if type(value) in (int, float) and math.isfinite(value) else None
+
+
+def training_block_reason(state: dict[str, Any], budget: dict[str, Any] | None = None) -> str | None:
+    """Share canonical feasibility without treating missing values as zero."""
+    budget = budget if budget is not None else state.get("budget") or {}
+    jobs = _number(budget.get("training_jobs_left", state.get("training_jobs_left")))
+    if jobs is None and "training_jobs_left" not in budget and "training_jobs_left" not in state:
+        limit, used = _number(state.get("max_training_jobs")), _number(state.get("training_jobs"))
+        if limit is not None and used is not None:
+            jobs = limit - used
+    if jobs is not None and jobs <= 0:
+        return "training_job_budget"
+    gpu = _number(budget.get("gpu_seconds_left", state.get("gpu_seconds_left")))
+    if gpu is not None and gpu <= 0:
+        return "gpu_budget"
+    if not training_actions(state):
+        return "training_scope"
+    return None
+
+
+def design_block_reason(state: dict[str, Any], budget: dict[str, Any] | None = None) -> str | None:
+    """Preserve the offline design path for an explicitly training-free scope."""
+    if state.get("allowed_training_actions") == []:
+        return None
+    reason = training_block_reason(state, budget)
+    if reason:
+        return reason
+    if not training_actions(state).intersection({"run_pilot", "run_full"}):
+        return "training_scope_no_initial_run"
+    return None
+
+
+def _new_implementation_block_reason(state: dict[str, Any]) -> str | None:
+    # Existing source/receipt or a native repair is engineering closeout, even
+    # when no future training is possible. Preserve those pending tasks.
+    if state.get("repair_task"):
+        return None
+    target = state.get("_implementation_target") or state.get("candidate_id")
+    if any(row.get("candidate_id") == target and row.get("source_hash") for row in state.get("candidates") or []):
+        return None
+    if any(row.get("candidate_id") == target and row.get("evaluation_valid") for row in state.get("evidence") or []):
+        return None
+    return design_block_reason(state)
+
+
 def submitted_candidates(state: dict[str, Any]) -> int:
     """Scientific candidates that produced a patch. Baseline is counted separately."""
     unwritten = {"implementation_failed", "requires_framework_extension"}
@@ -206,7 +254,7 @@ def _seen_without_new_evidence(state: dict[str, Any], action: str) -> bool:
 def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
     """Actions bound to one candidate. Readiness of c1 does not authorize c2."""
     evidence = state.get("evidence") or []
-    room = int(state.get("training_jobs", 0)) < int(state.get("max_training_jobs", 0)) and float(state.get("gpu_seconds_left", 1)) > 0
+    room = training_block_reason(state) is None
     # A frozen baseline is an independent legal measurement, including cold start.
     # It must not require a candidate that in turn requires baseline diagnostics.
     names: list[str] = ["baseline"] if state.get("execution_fingerprint") else []
@@ -222,6 +270,8 @@ def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
     targets: dict[str, list[str]] = {"run_pilot": [], "run_full": [], "replicate": [],
         "implement_candidate": [str(implementation_target)] if implementation_target else [],
         "repair_candidate": [str(repair["candidate_id"])] if repair.get("candidate_id") else []}
+    if _new_implementation_block_reason(state):
+        targets["implement_candidate"] = []
     permitted = training_actions(state)
     if not room:
         return targets
@@ -255,27 +305,35 @@ def blocked_actions(state: dict[str, Any]) -> list[dict[str, str]]:
     reason = experiment_block_reason(state.get("experiment") if isinstance(state.get("experiment"), dict) else None)
     if reason and not state.get("repair_task"):
         gaps.append({"action": "implement_candidate", "reason": reason})
-    if float(state.get("gpu_seconds_left") or 0) <= 0:
-        gaps.append({"action": "run_pilot", "reason": "gpu_budget"})
-    if int(state.get("llm_calls_left") or 0) < IMPLEMENT_CALLS and state.get("experiment"):
+    training_reason = training_block_reason(state)
+    if training_reason:
+        gaps.extend({"action": action, "reason": training_reason} for action in ("run_pilot", "run_full", "replicate"))
+    design_reason = design_block_reason(state)
+    if design_reason:
+        gaps.extend({"action": action, "reason": design_reason} for action in ("design_experiment", "propose_experiment"))
+    if state.get("experiment") and _new_implementation_block_reason(state):
+        gaps.append({"action": "implement_candidate", "reason": _new_implementation_block_reason(state)})
+    calls = _number(state.get("llm_calls_left"))
+    if calls is not None and calls < IMPLEMENT_CALLS and state.get("experiment"):
         gaps.append({"action": "implement_candidate", "reason": "llm_budget"})
     return gaps
 
 
 def available_actions(state: dict[str, Any]) -> list[str]:
-    if state.get("gpu_seconds_left", 1) <= 0 and state.get("llm_calls_left", 1) <= 0:
+    gpu, calls = _number(state.get("gpu_seconds_left")), _number(state.get("llm_calls_left"))
+    if gpu is not None and calls is not None and gpu <= 0 and calls <= 0:
         return ["stop"]
     evidence = state.get("evidence") or []
     actions = ["inspect_data", "retrieve_memory", "retrieve_methods", "audit_result", "stop"]
     pending_experiment = bool(state.get("experiment")) and not state.get("candidate_ready") and not state.get("experiment_failed")
-    if not pending_experiment:
+    if not pending_experiment and design_block_reason(state) is None:
         actions.append("propose_experiment")
         actions.append("design_experiment")
     if any(row.get("job_dir") or row.get("fidelity") for row in evidence):
         actions.append("diagnose_results")
         actions.append("collect_diagnostics")
         actions.append("audit_result")
-    calls_left = int(state.get("llm_calls_left", 1_000))
+    calls_left = calls if calls is not None else 1_000
     from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
 
     approved = experiment_is_approved(state.get("experiment") if isinstance(state.get("experiment"), dict) else None)
@@ -288,6 +346,7 @@ def available_actions(state: dict[str, Any]) -> list[str]:
         and approved
         and submitted_candidates(state) < int(state.get("max_candidates", 4))
         and calls_left >= IMPLEMENT_CALLS
+        and _new_implementation_block_reason(state) is None
     ):
         actions.append("implement_candidate")
     if state.get("_has_open_report_issues"):
@@ -780,6 +839,15 @@ def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=N
         protocol = {**protocol, "training_seeds": policy.get("training_seeds") or []}
     fingerprint = state.get("execution_fingerprint")
     evidence = state.get("evidence") or []
+    verified_evidence = evidence
+    confirmation = {}
+    if camp:
+        from react_agent.eeg_research.agentic.research_progress import (
+            remaining_confirmation_work,
+            verified_seed_records,
+        )
+        verified_evidence = verified_seed_records(camp, state, protocol)
+        confirmation = remaining_confirmation_work(camp, state, protocol, policy, records=verified_evidence)
 
     def samples_for(target, fidelity):
         samples, seen = [], set()
@@ -833,7 +901,21 @@ def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=N
                     seed = next_unused_training_seed(protocol, used)
                 matched = target == "baseline" or any(row.get("candidate_id") == "baseline" and row.get("fidelity") == fidelity
                     and row.get("evaluation_valid") is True and int(row.get("seed") or 0) == seed
-                    and (row.get("execution_fingerprint") or row.get("contract_fingerprint")) == fingerprint for row in evidence)
+                    and (row.get("execution_fingerprint") or row.get("contract_fingerprint")) == fingerprint for row in verified_evidence)
+                if camp and target != "baseline":
+                    from react_agent.eeg_research.agentic.comparison import (
+                        compare_runs,
+                        matched_control,
+                    )
+                    from react_agent.eeg_research.agentic.run_context import (
+                        load_approved_binding,
+                    )
+                    binding = load_approved_binding(camp, target) or {}
+                    prospective = {"candidate_id": target, "fidelity": fidelity, "seed": seed,
+                        "execution_fingerprint": fingerprint, "evaluation_valid": True,
+                        "negative_sampling_policy": binding.get("negative_sampling_policy") or protocol.get("negative_sampling_policy")}
+                    control = matched_control(verified_evidence, prospective, protocol)
+                    matched = compare_runs(candidate=prospective, control=control, protocol=protocol)["comparable"]
                 required_targets = [target] + ([] if matched else ["baseline"])
                 totals = []
                 for name in required_targets:
@@ -856,6 +938,8 @@ def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=N
                     "llm_calls": None, "gpu_seconds": None, "training_jobs": None,
                     "target_pairs": policy.get("target_pairs"), "training_seeds": policy.get("training_seeds"),
                     "policy_hash": policy.get("policy_hash"), "condition": "depends_on_observed_result_and_remaining_pairs"}
+                components["followup_confirmation"]["declared_full_seed_work"] = next(
+                    (row for row in confirmation.get("candidates", []) if row["candidate_id"] == target), None)
                 unknown = ["review_or_repair_calls", "analysis_retries", "conditional_followup_confirmation"]
                 if costs["gpu_seconds"] is None:
                     unknown.append("comparable_gpu_history_missing")

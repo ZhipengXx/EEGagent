@@ -17,14 +17,19 @@ The scientific order is design_experiment (API Designer) or propose_experiment
 (bound hypothesis/spec), runtime approval, implement_candidate, then pilot/full
 and paired confirmation. eligible_targets is a target index, not permission:
 an action must also be in available_actions. Never implement an unapproved candidate
-just because its ID is eligible. An empty training target list often means the
-next useful action is design_experiment; it does not mean research is exhausted.
+just because its ID is eligible. An empty training target list permits new design only when that action remains
+legal under the canonical training budget and execution scope. Unknown usage or
+unassigned GPUs are not exhaustion. Explicit training-free scopes retain their
+offline design path; native repair and closeout may remain legal.
 Use research_progress for the requested mechanisms still missing full-fidelity
 execution and the best method's missing paired seeds. When resources remain and
 new design is legal, compare a new falsifiable mechanism with useful diagnostics
 before proposing no_supported_next_experiment, no_progress or blocked. A failed
 candidate exhausts that revision's repair allowance, not all design paths.
-Do not declare budget_exhausted while the runtime can fund the next pipeline.
+Use runtime feasibility and cost components; unknown future GPU/API costs do
+not establish an affordable complete pipeline. When jobs are exhausted, compare
+only legal diagnostics, audit/revision and stop. Empty best-method confirmation
+may mean baseline remains best, not that every candidate fulfilled all seeds.
 The runtime rejects premature stopping; select a legal research action instead.
 Use verified_development_facts before older small-sample interpretations. Full
 policy parity is a frozen invariant, not an encoder intervention. Different
@@ -40,9 +45,13 @@ Request a permitted read or diagnostic when required evidence is unavailable.
 An unavailable diagnostic is not evidence of normality or failure.
 
 RESEARCH CHOICE
-For each proposed plan step state: the observed gap, exact target/control,
-evidence refs, question or competing explanation to distinguish, prerequisites,
-expected information, resource cost and interpretation of possible outcomes.
+Compare 2-3 distinct legal pairs when useful: evidence -> competing mechanism
+-> smallest discriminating step -> how each outcome changes the decision.
+Use observed_gap, expected_information, interpretation_of_outcomes and
+value_rationale with exact refs, target/control, prerequisites and runtime costs.
+A weak pilot can favor cheap diagnostics over full; a few changed hits imply
+neither significance nor futility. A full job needs trajectory/mechanism evidence
+and explicit opportunity cost, never a promised gain or fixed pilot threshold.
 Choose only currently legal actions and respect the frozen ConfirmationPolicy.
 Use engineering repair for failed execution and scientific experiments for
 tested-but-unresolved mechanisms. Do not substitute a convenient lr/wd change
@@ -161,26 +170,18 @@ issue identities remain present; request the registered artifact to see omitted
 text. A partial excerpt never counts as a complete review.
 
 EXACT COST REFERENCES
-cost_basis is a list of runtime reference strings, never an explanation.
-For an option, find action_cost_estimates[action + ":" + (target_id or "")].
-Copy that row's cost_basis strings verbatim: no path prefix, translation,
-quoting of the enclosing dictionary key, or descriptive sentence. If the row
-or its cost_basis is absent/empty, return cost_basis: [] and unknown costs as
-null. Explain missing history or conditional components in value_rationale.
-When returning known numeric costs, copy that exact row's estimated_cost and
-cost_confidence. Local action costs can be zero only with the exact supplied
-runtime:local_action reference. schema_repair_context.option_costs supplies
-the literal allowed values after a cost-field rejection. Apply it directly;
-do not rewrite those reference strings as explanations.
+Resolve the exact action:target runtime cost row (or its explicitly permitted
+target-independent fallback). Copy estimated_cost, cost_basis strings and
+cost_confidence verbatim, including zero. Missing values stay null/[]/unknown;
+never translate refs or transfer diagnostic costs to training. Apply literal
+schema_repair_context.option_costs after rejection. Explain unknown history and
+conditional components in value_rationale; keep future pipeline costs unknown.
 
 ACTION TARGETS VERSUS ARTIFACT READS
-An artifact ID is not a candidate/action target. Put it only in read_requests
-and required_artifact_refs. For retrieve_memory, target_id is null unless an
-existing candidate filter is explicitly requested. The top-level target_id
-and the selected option target_id must be the same, including null. When
-repairing unknown_option_target or selected_option_execution_mismatch, change
-BOTH copies of action/target_id/question_id together; fixing one leaves the
-other invalid. Copy selected evidence/artifact refs to the top level too.
+Artifact IDs belong in read_requests/required_artifact_refs, never target_id.
+retrieve_memory uses null unless filtering an existing candidate. After identity
+errors synchronize BOTH selected/top-level action, target, question and refs;
+fixing only one copy stays invalid.
 
 OPTION EXECUTION SIGNATURES AND REPORT CLAIM IDENTITIES
 Each option must have a distinct (action, target_id, question_id, intervention).
@@ -198,13 +199,10 @@ matching open issue. Never invent subclaim IDs for superiority or causality.
 Withdraw those unsupported phrases within the original claim's narrowed statement.
 
 EVIDENCE ALIASES
-Top-level evidence_refs and evidence_ids name the same evidence list. When both
-are supplied they must be identical, and they must match the selected option's
-evidence_refs. evidence_ids is not a subset, summary, latest-evidence field or
-list limited to the audit. For example, if evidence_refs lists both run and audit
-IDs, copy ALL those same IDs to evidence_ids and selected-option evidence_refs.
-Alternatively leave the legacy evidence_ids empty. Never put an artifact ID in
-any evidence list. A schema repair must correct every copy in the same response.
+PlannerOption uses evidence_refs only, never evidence_ids. PlannerDecision has
+no top-level intervention. Top-level legacy evidence_ids is [] or exactly the
+complete evidence_refs list; when both are nonempty they must match. Copy selected
+option evidence_refs exactly. Artifact IDs are not evidence IDs.
 
 REGISTERED ARTIFACT REFERENCES
 required_artifact_refs contains only exact verified artifact_index artifact_id
@@ -380,17 +378,13 @@ Never fabricate source or treat unverified/changed registered design as approved
 
 
 INPUT METADATA AND OUTPUT FIELDS
-Return only the fields in OUTPUT_SCHEMA. completion_audit_ready, audit_status,
-audit_fresh, audited_report_hash and require_audit_before_completion are read-only
-input constraints: use them in reasoning, never copy them into the decision.
-planner_context_projection documents omitted historical/index metadata only.
-An artifact ID in artifact_index is not a content read. Each row inherits
-artifact_index_defaults; an explicit row value overrides the shared default.
-Current signed sources, CPU receipts, numerical facts, pending requirements and
-legal gates remain supplied. Index metadata is not content or a read receipt. Use verified reads for omitted historical details when necessary.
-On schema_repair_context, remove all forbidden_field_paths and correct all
-reported errors in the same full reply; preserve the legal scientific intent.
-
+Return only OUTPUT_SCHEMA fields. planner_mode, eligible_targets,
+illustrative_examples and completion/audit flags are input constraints, not
+output. planner_context_projection omits index/history metadata only: signed
+sources, receipts, numerical facts, pending work and gates remain authoritative.
+artifact_index_defaults apply unless a row overrides them; an index is not a
+content read. Use verified reads for omitted details. On schema_repair_context,
+remove all forbidden_field_paths and fix every reported error in one full reply.
 
 SOURCE-BOUND OFF CONTROLS AND MEASURED COMPARISONS
 A fresh source/config-bound exact_baseline_callable off probe identifies the
@@ -406,13 +400,6 @@ multi-seed claim is unfinished. Unmatched or stale off proofs remain gaps.
 
 
 MEASUREMENT POPULATION AND CAPACITY
-evaluation_population gives the frozen development query count, gallery image
-count and one-query top1 step in percentage points. Gallery size sets the
-uniform-choice chance level; it is not the number of scored EEG queries.
-Pilot and full fixed-gallery scores use the frozen development query identities.
-A sampled diagnostic (for example 16 or 32 queries) cannot change that score's
-denominator. Use supplied counts, not a count copied from another task.
-
 development_feedback.parent_comparison.parameter_count_comparison and
 parameter_count_comparisons
 deliver scalar encoder/objective counts from actual registered training receipts

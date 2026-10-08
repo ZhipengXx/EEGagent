@@ -26,16 +26,20 @@ CONTROL_TEXT_CHARS = 16000
 READ_JOURNAL = "artifact_reads.jsonl"
 
 
-def training_semantics() -> list[dict[str, Any]]:
+def training_semantics(*, config_only: bool = False) -> list[dict[str, Any]]:
     """Source evidence for how the trainer calls configs and owns logit scaling."""
     import ast
     root = Path(__file__).resolve().parents[2] / "eeg_training"
     views = []
-    for name, selected in (("model.py", {"LocalRetrieval", "contrastive_loss"}),
+    selections = (("model.py", {"LocalRetrieval", "contrastive_loss"}),
                            ("hooks.py", {"compute_objective", "scalar_loss", "is_custom_objective"}), ("train_entry.py", {
         "_build_hook", "_logit_scale", "_instantiate_candidate", "train_channel_statistics",
         "unique_trainable_parameters", "placed_retrieval", "rebuild_encoder", "fit",
-    })):
+    }))
+    if config_only:
+        selections = (("hooks.py", {"call_configured"}), ("train_entry.py", {"_build_hook"}),
+                      ("../eeg_research/agentic/hook_config.py", {"normalize_hook_config"}))
+    for name, selected in selections:
         path = root / name
         source = path.read_text(encoding="utf-8")
         nodes = [node for node in ast.parse(source).body if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in selected]

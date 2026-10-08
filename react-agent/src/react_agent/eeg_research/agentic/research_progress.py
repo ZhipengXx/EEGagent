@@ -142,6 +142,92 @@ def objective_semantic_findings(camp: Path, state: dict[str, Any], target: str,
     return findings
 
 
+def verified_seed_records(camp: Path, state: dict[str, Any], protocol: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reuse accepted records only under each target's own current identity."""
+    from react_agent.eeg_research.agentic.artifacts import file_digest
+    from react_agent.eeg_research.agentic.execution_protocol import effective_config
+    from react_agent.eeg_research.agentic.jobs import baseline_manifest
+    from react_agent.eeg_research.agentic.run_context import build_frozen_run_spec
+    records = []
+    for row in state.get('evidence') or []:
+        if row.get('evaluation_valid') is not True or type(row.get('seed')) is not int or row.get('fidelity') not in {'pilot', 'full'}:
+            continue
+        target, seed, fidelity = row.get('candidate_id'), row['seed'], row['fidelity']
+        try:
+            expected = build_frozen_run_spec(camp, target, state, fidelity=fidelity, seed=seed, protocol=protocol)
+            source = baseline_manifest()['entry_sha256'] if target == 'baseline' else expected['source_manifest_hash']
+            if target != 'baseline':
+                current = camp / 'candidates' / target
+                assigned = _read(current / 'spec.json')
+                assigned = assigned.get('experiment') or assigned
+                if (file_digest(current / 'extension/eeg_candidate.py') != source
+                        or assigned.get('spec_hash') != expected['spec_hash']
+                        or (expected['approved_binding'].get('approval_record') or {}).get('status') != 'approved'):
+                    continue
+            job = Path(str(row.get('job_dir') or camp / 'jobs' / str(row.get('job_id') or ''))).resolve()
+            if not job.is_relative_to(camp.resolve()):
+                continue
+            frozen = _read(job / 'frozen_run_spec.json')
+            record = _read(job / 'job.json')
+            binding = _read(job / 'source_binding.json')
+            source_path = Path(str(binding.get('class_file') or ''))
+            if not source_path.is_absolute():
+                source_path = job / source_path
+            config = effective_config(protocol, fidelity, training_seed=seed)
+            if (not source or row.get('source_hash') != source or row.get('spec_hash') != expected['spec_hash']
+                    or row.get('execution_fingerprint') != expected['evaluation_hash']
+                    or any(frozen.get(key) != expected.get(key) for key in
+                           ('target_id', 'spec_hash', 'model', 'objective', 'transform', 'recipe', 'evaluation_hash', 'run_config_hash'))
+                    or record.get('status') != 'finished' or record.get('candidate_id') != target
+                    or record.get('seed') != seed or record.get('fidelity') != fidelity
+                    or record.get('effective_config') != config
+                    or binding.get('file_sha256') != source or file_digest(source_path) != source):
+                continue
+            records.append(row)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return records
+
+
+def remaining_confirmation_work(camp: Path, state: dict[str, Any], protocol: dict[str, Any], policy: dict[str, Any], *, records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Conditional job lower bounds, never new commitments or execution rights."""
+    from react_agent.eeg_research.agentic.comparison import matched_control
+    from react_agent.eeg_research.agentic.confirmation_policy import (
+        policy_training_seeds,
+    )
+    from react_agent.eeg_research.agentic.run_context import load_approved_binding
+    seeds = policy_training_seeds(policy)
+    records = verified_seed_records(camp, state, protocol) if records is None else records
+    targets = [row['candidate_id'] for row in state.get('candidates') or []
+               if row.get('candidate_id') and row['candidate_id'] != 'baseline']
+    views = []
+    for target in dict.fromkeys(targets):
+        binding = load_approved_binding(camp, target) or {}
+        if not binding.get('source_hash') or not binding.get('spec_hash'):
+            continue
+        missing_candidate, missing_baseline, paired = [], [], []
+        for seed in seeds or []:
+            candidate = next((row for row in records if row.get('candidate_id') == target and row['seed'] == seed and row['fidelity'] == 'full'), None)
+            prospective = candidate or {'candidate_id': target, 'seed': seed, 'fidelity': 'full',
+                'execution_fingerprint': protocol.get('fingerprint')}
+            baseline = matched_control(records, prospective, protocol)
+            if baseline and (baseline.get('negative_sampling_policy') or protocol.get('negative_sampling_policy')) != (binding.get('negative_sampling_policy') or protocol.get('negative_sampling_policy')):
+                baseline = None
+            if candidate is None:
+                missing_candidate.append(seed)
+            if baseline is None:
+                missing_baseline.append(seed)
+            if candidate is not None and baseline is not None:
+                paired.append(seed)
+        views.append({'candidate_id': target, 'source_hash': binding['source_hash'], 'spec_hash': binding['spec_hash'],
+                      'paired_training_seeds': paired, 'missing_candidate_full_seeds': missing_candidate,
+                      'missing_matched_baseline_full_seeds': missing_baseline,
+                      'training_jobs_lower_bound': len(missing_candidate) + len(missing_baseline) if seeds is not None else None,
+                      'gpu_seconds': None, 'llm_calls': None, 'pilot_jobs': None})
+    return {'candidates': views, 'policy_hash': policy.get('policy_hash'), 'training_seeds': seeds,
+            'scope': 'Conditional work for all frozen declared full seeds, per candidate; not an obligation to confirm every failed method. Shared baseline jobs are reusable, so do not sum candidates. Pilot work and future GPU/API costs are unknown. No reservation or affordability guarantee.'}
+
+
 def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
                      budget: dict[str, Any], actions: list[str]) -> dict[str, Any]:
     """Count applied full-fidelity mechanisms from accepted, source-bound jobs."""
@@ -256,13 +342,19 @@ def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
     questions.extend({'family':'declared_switch_ablation',**item} for item in declared_switches)
     legal=[action for action in actions if action in {'design_experiment','propose_experiment','implement_candidate',
                 'repair_candidate','run_pilot','run_full','replicate','retrieve_methods','collect_diagnostics','diagnose_results'}]
-    design_room=(int(budget.get('llm_calls_left') or 0)>=13 and
-                 int(budget.get('training_jobs_left') or 0)>0 and
-                 float(budget.get('gpu_seconds_left') or 0)>0 and
+    from react_agent.eeg_research.agentic.planner import (
+        _number,
+        design_block_reason,
+        training_block_reason,
+    )
+    calls = _number(budget.get('llm_calls_left'))
+    scope = {**goal, **state}
+    design_reason = design_block_reason(scope, budget)
+    training_reason = training_block_reason(scope, budget)
+    design_room=(calls is not None and calls>=13 and design_reason is None and
                  sum(row.get('status') not in {'implementation_failed','requires_framework_extension'}
                      for row in state.get('candidates') or [])<int(goal.get('max_candidates') or state.get('max_candidates') or 0))
-    training_room=(int(budget.get('llm_calls_left') or 0)>=3 and
-                   int(budget.get('training_jobs_left') or 0)>0 and float(budget.get('gpu_seconds_left') or 0)>0)
+    training_room=(calls is not None and calls>=3 and training_reason is None)
     can_continue=(design_room and any(action in actions for action in ('design_experiment','propose_experiment','implement_candidate','repair_candidate'))
                   or training_room and any(action in actions for action in ('run_pilot','run_full','replicate')))
     return {'schema_version':'eeg_research.progress.v1','authority':'runtime_source_bound_development_records',
@@ -272,13 +364,15 @@ def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
             'fulfilled_declared_switch_ablations':fulfilled_switches,
             'unfinished_requirements':questions,'best_development_method_so_far':best,
             'legal_research_next_actions':legal,'budget_can_continue':bool(can_continue),
+            'training_block_reason': training_reason, 'new_design_block_reason': design_reason,
+            'best_confirmation_scope': 'Empty pending_best_method_confirmation may mean baseline remains best; it does not establish all-candidate confirmation.',
             'coverage_rejected_job_ids':invalid,
             'objective_hook_execution_coverage':objective_hook_execution_coverage,
             'objective_semantic_findings':semantic_findings,
             'objective_effectiveness_findings':effectiveness,'ineffective_objective_jobs':ineffective_objective_jobs,
             'limits':['Coverage is execution evidence, not evidence of benefit or causality.',
                       'This is not a final-holdout result or execution permission.',
-                      'Missing trainable targets do not disable legal experiment design.']}
+                      'Missing trainable targets do not disable a budget-feasible legal design; exhausted training resources do.']}
 
 
 def stopping_block_reason(scope: dict[str, Any], reason: Any) -> str | None:

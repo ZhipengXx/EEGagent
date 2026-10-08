@@ -12,8 +12,15 @@ Distinguish aggregate retrieval metrics from sampled query/representation
 diagnostics. Use actual top-k decisions, explicit tie handling and positive-map
 identity; an optimistic tied rank is not a hit. Cite observations supporting and
 contradicting each prediction, remaining confounders and a discriminating next
-measurement. Mechanistic explanations remain interpretations unless the
-experiment separated them. Preserve inconclusive results and uncertainty.
+measurement. Chance-level aggregate Top1 alone establishes neither uniform random output,
+constant prediction nor collapse. Consume verified unique_top1_gallery_predictions,
+ties_for_best_score_queries, margin_mean, centered_singular_entropy_effective_rank
+and centered_energy_fraction; missing measurements are evidence_gaps. Separate
+observations from competing optimization/representation explanations. For a tiny
+matched pilot difference report hits, denominator and pp without significance or
+a universal promotion/rejection threshold. Suggest a legal diagnostic/full step
+only with its missing evidence, outcome-dependent decision and job opportunity
+cost. Preserve valid negative experiments as executed research, not code failure.
 
 HYPOTHESES
 A frozen baseline run needs no candidate hypothesis or candidate design approval.
@@ -44,7 +51,7 @@ A copied baseline objective with zero custom-objective calls remains unchanged.
 
 AUTOMATIC COMPLETE DEVELOPMENT FEEDBACK
 For a full run, development_feedback identifies source-bound diagnostics over
-all 1800 development queries. Use their definitions and counts before the small
+all frozen development queries identified by evaluation_population and the manifest. Use their definitions and counts before the small
 sample summaries. parent_comparison, when present, is a verified same-seed,
 same-fidelity comparison to the declared trained ablation parent, distinct from
 the runtime baseline comparator. Preserve its single-seed and seen-subject limits.
@@ -60,10 +67,10 @@ baseline mean. An exact seed-0 prediction is assessed from the seed-0 record,
 not replaced by a favorable seed-1 result. A supported latest-seed observation
 cannot turn a failed named-seed prediction or unfinished multi-seed requirement
 into an overall supported hypothesis. Runtime promotion is separate authority.
-Full-query retrieval/representation/group facts have query_count/sample_count
-1800 and nine source-subject groups. Report their provided means/counts; do not
-label full-query margins or verified source-subject groups unavailable because
-an older 16/32-sample diagnostic lacks them. Group development results still do
+Use the query_count/sample_count and group IDs/count/coverage supplied by
+source-bound diagnostics. Report their provided means/counts; missing group
+fields remain unknown. Do not mark full-query facts unavailable just because
+an older sampled diagnostic lacks them. Group development results still do
 not measure the untouched subject. Use checkpoint identity and explicit scope.
 
 EXPLICIT AVAILABILITY AND PAIRED ARITHMETIC
@@ -71,8 +78,8 @@ verified_run_coverage gives one seed_record for every actual independent candida
 seed in matched_run_history. Use its same-seed baseline values and paired mean;
 name failed exact-seed predictions separately from missing seed coverage.
 Include the observed seed records in observations. A full_query_groups_available
-value of true means all nine subject-group values are supplied in the corresponding
-verified_development_facts. They are available for that job, not only the latest job.
+value of true describes the supplied group coverage for that job; verify the
+actual group IDs and counts in verified_development_facts against the manifest. They are available for that job, not only the latest job.
 development_feedback_history supplies every candidate seed's parent comparison.
 An existing verified seed-0 parent comparison is not missing just because the
 latest seed has another parent status. missing_parent_run describes only that
@@ -148,8 +155,8 @@ per-seed top1 prediction disagreements, hit-flag disagreements, gained/lost
 hits, top5 list disagreements and score scope separately. Equal hit counts
 can coexist with different predictions; equal hit masks can coexist with
 different wrong-image predictions. Never summarize them all as zero per-query
-difference. Keep the predeclared gain threshold exact: a mean below 0.5 pp
-does not meet 0.5 pp by rounding. A completed negative earlier encoder trial
+difference. Use only the exact gain threshold declared by the goal or signed prediction;
+rounding cannot turn a value below that threshold into a pass. A completed negative earlier encoder trial
 remains executed history, not an unperformed prerequisite.
 
 DELIVERED FACTUAL CORRECTIONS AND PREDICTION-LEVEL ASSESSMENT
@@ -204,13 +211,6 @@ multi-seed claim is unfinished. Unmatched or stale off proofs remain gaps.
 
 
 MEASUREMENT POPULATION AND CAPACITY
-evaluation_population gives the frozen development query count, gallery image
-count and one-query top1 step in percentage points. Gallery size sets the
-uniform-choice chance level; it is not the number of scored EEG queries.
-Pilot and full fixed-gallery scores use the frozen development query identities.
-A sampled diagnostic (for example 16 or 32 queries) cannot change that score's
-denominator. Use supplied counts, not a count copied from another task.
-
 development_feedback.parent_comparison.parameter_count_comparison and
 parameter_count_comparisons
 deliver scalar encoder/objective counts from actual registered training receipts

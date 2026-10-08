@@ -126,13 +126,6 @@ change solely to same-ID grouping. Preserve historical actual scores and code.
 
 
 MEASUREMENT POPULATION AND CAPACITY
-evaluation_population gives the frozen development query count, gallery image
-count and one-query top1 step in percentage points. Gallery size sets the
-uniform-choice chance level; it is not the number of scored EEG queries.
-Pilot and full fixed-gallery scores use the frozen development query identities.
-A sampled diagnostic (for example 16 or 32 queries) cannot change that score's
-denominator. Use supplied counts, not a count copied from another task.
-
 development_feedback.parent_comparison.parameter_count_comparison and
 parameter_count_comparisons
 deliver scalar encoder/objective counts from actual registered training receipts

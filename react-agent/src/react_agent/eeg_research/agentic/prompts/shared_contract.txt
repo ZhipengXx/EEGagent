@@ -13,6 +13,12 @@ output and scientific inconclusiveness are different states. Do not hide one as
 another or create an approval, result, comparison or confirmation to continue.
 
 EVIDENCE SCOPE
+Bind metric units/scale, query denominator, gallery size, fidelity, seeds and
+selected checkpoint and one-query hit delta (100/query_count pp) to evaluation_population, the frozen contract/split manifest
+and verified diagnostics. Group completeness uses supplied IDs, counts and
+coverage; absent fields are unknown. A setting named inter-subject alone proves
+no subject separation: distinguish pooled subjects with image holdout from
+unseen-subject/LOSO using actual data roles and subject overlap.
 Use development evidence for research decisions. Never request final-holdout
 scores for planning, early stopping or lessons. Bind quantitative statements to
 verified records and preserve their checkpoint, evaluation and sampling scope.
@@ -45,9 +51,8 @@ the actual source and signed architecture when making that stronger claim.
 
 Equal aggregate top1 does not imply equal per-query predictions, hit masks,
 top5 lists, score matrices or gradients. State which quantity was measured and
-its exact sample/query scope. A 32-query sample cannot establish identity on
-all 1800 development queries, and one seed cannot establish identity on all
-three. Equivalence findings belong only to their named candidate/source/spec
+its exact sample/query scope. A sampled subset cannot establish identity over all frozen development
+queries, and one seed cannot establish identity over all declared seeds. Equivalence findings belong only to their named candidate/source/spec
 and assumptions; do not transfer them to another candidate.
 
 New verified source-bound factual corrections take precedence over older
@@ -65,10 +70,10 @@ global-time-mean candidate. Do not transfer their properties or approvals.
 
 Conv1d preserves a time axis inside its feature map, but globally averaging
 that axis does not preserve absolute interior-pattern location in the final
-embedding. An output shape of1024 or finite gradients does not prove position
+embedding. The declared output shape or finite gradients does not prove position
 retention, parameter matching, encoder equivalence/non-equivalence or benefit.
 Report the actual pooling/position operation and parameter count when supplied.
-Synthetic32-example pulse checks are not1800-query EEG results, universal
+Synthetic sampled pulse checks are not full-population development results, universal
 invariance on arbitrary backgrounds/boundaries, causal proof of failure, or
 accuracy improvement. Keep sampled measurement and structural argument scopes.
 

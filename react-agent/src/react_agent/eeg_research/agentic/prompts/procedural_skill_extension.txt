@@ -9,8 +9,10 @@ are not allowed_source_refs for this task and must never enter saved memory.
 Use the actual supplied sources. An observed failure without a verified repair
 can support a failure procedure, never a claim that the repair succeeded.
 
-Write one skill for one identifiable subproblem. Give a short English
-description and a trigger naming the observed problem. Preserve the ordered
+Write one skill for one identifiable subproblem. Use description_en and trigger_en for the short English description/trigger;
+procedure is an ordered list of nonempty strings, never procedure_note. The
+actual schema limits description_en/trigger_en to 1000 characters and procedure
+to 1-30 steps; the compact writing targets below stay stricter. Preserve the ordered
 steps, required inputs, checks, observed outcome, and meaningful branches.
 Generalize campaign IDs, instance paths, subject numbers, and one-run scores,
 while retaining essential modality, protocol, geometry, and tool conditions.

@@ -28,8 +28,10 @@ a compound intervention. Do not invent sample counts, subject metadata or
 practical-gain thresholds.
 
 OUTPUT
-Return the injected ExperimentDesignResult with a draft, required inputs and
-capabilities, confounders, predictions, correction requests and evidence refs.
+Return only injected ExperimentDesignResult fields. Put supported prediction
+and disconfirmation content inside experiment_spec/hypothesis, never top-level
+predictions or status_scope_note. Return confounders, required_corrections,
+missing_inputs, required_capability_ids and evidence_refs where applicable.
 For a completed result, experiment_spec must include parent_candidate_id,
 control_candidate_id, initial_fidelity exactly "pilot" or "full", a nonempty
 hypothesis and intervention or principal_intervention. Use status="draft"
