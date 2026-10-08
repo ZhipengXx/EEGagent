@@ -259,12 +259,13 @@ def main(argv: list[str] | None = None) -> int:
     root = args.root.resolve()
     camp = root / args.campaign
     if args.command == "create":
+        selected_gpus = tuple(int(item) for item in args.gpu.split(",") if item.strip())
         design = __import__("react_agent.eeg_training.protocol", fromlist=["Design"]).Design(
-            "eeg", "inter-subject", "all", policy="agentic", training_strategy="pooled_subjects"
+            "eeg", "inter-subject", "all", gpu=selected_gpus, policy="agentic", training_strategy="pooled_subjects"
         )
         from react_agent.eeg_training.protocol import data_root
 
-        base = data_root()
+        base = args.data_root if args.data_root is not None else data_root()
         submitted = goal(args.campaign, design)
         if args.goal is not None:
             submitted = {**submitted, **load_goal_file(args.goal)}
@@ -289,7 +290,7 @@ def main(argv: list[str] | None = None) -> int:
             request_id=args.request_id or args.campaign,
             protocol=protocol,
         )
-        state["gpu"] = [int(item) for item in args.gpu.split(",") if item.strip()]
+        state["gpu"] = list(design.gpu)
         save_state(camp, state)
         print(
             json.dumps(
