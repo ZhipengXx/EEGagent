@@ -21,6 +21,7 @@ from react_agent.eeg_research.agentic.loop import (
     save_state,
 )
 from react_agent.eeg_research.agentic.schemas import GoalSpec
+from react_agent.eeg_training.protocol import parse_subject_selection
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[4] / "runs" / "eeg_research_v18"
 
@@ -29,12 +30,16 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m react_agent.eeg_research.agentic.cli")
     parser.add_argument(
         "command",
-        choices=["create", "start", "run", "status", "pause", "resume", "stop", "validate-goal", "evaluate-export", "evaluate-pack"],
+        choices=["create", "start", "run", "status", "pause", "resume", "stop", "validate-goal", "evaluate-export", "evaluate-pack",
+                 "study-create", "study-status", "study-run", "study-freeze", "study-evaluate", "study-aggregate",
+                 "suite-retry-fold"],
     )
     parser.add_argument("--campaign", default="eeg_retrieval_research_v1")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--request-id", default="")
     parser.add_argument("--gpu", default="0", help="Comma-separated GPU indices for training jobs")
+    parser.add_argument("--subject", type=parse_subject_selection, default="all",
+                        help="Training subjects, comma-separated; LOSO selects nine source subjects")
     parser.add_argument("--poll-seconds", type=float, default=30.0)
     parser.add_argument("--reopen-reason", default="", help="Reopen a finished campaign after a framework fix; the reason is logged")
     parser.add_argument("--goal", type=Path, default=None, help="GoalSpec YAML. validate-goal prints it and does not start a worker.")
@@ -44,6 +49,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--execute", action="store_true", help="Run evaluate-only for a pack. Default is dry-run argv.")
+    parser.add_argument("--study", type=Path, default=None, help="Native sequential ten-fold LOSO study directory")
+    parser.add_argument("--allow-partial", action="store_true", help="Freeze valid pairs with explicitly incomplete fold coverage")
+    parser.add_argument("--allow-shared-gpus", action="store_true", help="Explicit authorization to use occupied GPUs without terminating their processes")
+    parser.add_argument("--inherit-study", type=Path, help="Native verified budget source for a new method-level LOSO campaign")
+    parser.add_argument("--suite", default=None, help="Frozen method suite ID for an engineering retry")
+    parser.add_argument("--fold", default=None, help="Fold ID for an engineering retry")
+    parser.add_argument("--retry-reason", default="", help="Observed engineering failure that requires a fresh fold process")
     return parser
 
 
@@ -175,6 +187,32 @@ def status_view(camp: Path) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command.startswith("study-"):
+        from react_agent.eeg_research.agentic import loso_study
+        from react_agent.eeg_training.protocol import data_root, parse_gpu_list
+
+        if args.study is None:
+            print(json.dumps({"error": "study_directory_required"}))
+            return 2
+        study = args.study.resolve()
+        try:
+            if args.command == "study-create":
+                if args.goal is None:
+                    raise ValueError("study_goal_template_required")
+                payload = loso_study.create(study, load_goal_file(args.goal),
+                    args.data_root if args.data_root is not None else data_root(), parse_gpu_list(args.gpu),
+                    allow_shared_gpus=args.allow_shared_gpus)
+            elif args.command == "study-freeze":
+                payload = loso_study.freeze(study, allow_partial=args.allow_partial)
+            else:
+                operation = {"study-status": loso_study.status, "study-run": loso_study.advance,
+                             "study-evaluate": loso_study.evaluate, "study-aggregate": loso_study.aggregate}[args.command]
+                payload = operation(study)
+        except (OSError, ValueError, KeyError) as exc:
+            print(json.dumps({"error": str(exc), "command": args.command}, ensure_ascii=False))
+            return 2
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
     if args.command == "validate-goal":
         if args.goal is None:
             print(json.dumps({"error": "goal_missing"}, ensure_ascii=False))
@@ -261,7 +299,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "create":
         selected_gpus = tuple(int(item) for item in args.gpu.split(",") if item.strip())
         design = __import__("react_agent.eeg_training.protocol", fromlist=["Design"]).Design(
-            "eeg", "inter-subject", "all", gpu=selected_gpus, policy="agentic", training_strategy="pooled_subjects"
+            "eeg", "inter-subject", args.subject, gpu=selected_gpus, policy="agentic", training_strategy="pooled_subjects"
         )
         from react_agent.eeg_training.protocol import data_root
 
@@ -272,6 +310,25 @@ def main(argv: list[str] | None = None) -> int:
             submitted["goal_id"] = args.campaign
         if args.planner_mode is not None:
             submitted["planner_mode"] = args.planner_mode
+        inherited = None
+        estimate_basis = []
+        if submitted.get("evaluation_mode") == "loso_method_search":
+            from dataclasses import replace
+            from react_agent.eeg_research.agentic.budget_inheritance import verified_history, derive_limits, estimate_suite
+            from react_agent.eeg_research.agentic.loso_study import SUBJECTS
+            if args.inherit_study is None:
+                print(json.dumps({"error": "method_search_requires_native_budget_inheritance"}))
+                return 2
+            inherited = verified_history(args.inherit_study)
+            submitted = derive_limits(submitted, inherited)
+            estimate, estimate_basis = estimate_suite(inherited, len(selected_gpus))
+            submitted["method_suite_gpu_seconds_estimate"] = max(estimate, submitted.get("method_suite_gpu_seconds_estimate") or 0)
+            design = replace(design, subject=",".join(SUBJECTS[:-1]), epochs=50, stop="single_full", seed=0,
+                             data_root=str(base.resolve()), evaluation_mode="loso_method_search",
+                             checkpoint_policy=submitted["checkpoint_policy"], selection_min_delta=submitted["selection_min_delta"])
+        elif args.inherit_study is not None:
+            print(json.dumps({"error": "budget_inheritance_requires_method_search"}))
+            return 2
         try:
             protocol = build_execution_protocol(
                 design,
@@ -291,6 +348,17 @@ def main(argv: list[str] | None = None) -> int:
             protocol=protocol,
         )
         state["gpu"] = list(design.gpu)
+        if inherited is not None:
+            from react_agent.eeg_research.agentic.budget_inheritance import claim_successor
+            from react_agent.eeg_research.agentic.method_suite import create_manifest, manifest
+            claim_successor(camp, inherited)
+            if not (camp / "method_search_manifest.json").exists():
+                create_manifest(camp, design, allow_shared_gpus=args.allow_shared_gpus,
+                                estimate=submitted["method_suite_gpu_seconds_estimate"])
+                from react_agent.eeg_research.agentic.loso_study import write_once
+                write_once(camp / "suite_cost_basis.json", {"basis": estimate_basis, "estimate": submitted["method_suite_gpu_seconds_estimate"]})
+            else:
+                manifest(camp)
         save_state(camp, state)
         print(
             json.dumps(
@@ -309,6 +377,13 @@ def main(argv: list[str] | None = None) -> int:
     if not (camp / "campaign_state.json").is_file():
         print(json.dumps({"error": "campaign_missing"}))
         return 2
+    if args.command in {"start", "resume", "run"} and (root.parent / "benchmark_freeze.json").is_file():
+        manifest_path = root.parent / "study_manifest.json"
+        if manifest_path.is_file():
+            study = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if root.name == "campaigns" and any(row.get("campaign_id") == camp.name for row in study.get("folds") or []):
+                print(json.dumps({"error": "study_research_closed_after_freeze"}))
+                return 2
     if args.command == "run":
         from react_agent.eeg_research.agentic.worker import run_worker
 
@@ -319,6 +394,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(status_view(camp), ensure_ascii=False, indent=2))
         return 0
     state = load_state(camp)
+    if args.command == "suite-retry-fold":
+        import fcntl
+        from react_agent.eeg_research.agentic.method_suite import retry_fold
+        with (camp / "worker.lock").open("a", encoding="utf-8") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(json.dumps({"error": "engineering_retry_requires_worker_step_boundary"}))
+                return 2
+            try:
+                state = load_state(camp)
+                payload = retry_fold(camp, state, args.suite, args.fold, reason=args.retry_reason)
+                save_state(camp, state)
+            except (OSError, ValueError, KeyError, RuntimeError) as exc:
+                print(json.dumps({"error": str(exc), "command": args.command}, ensure_ascii=False))
+                return 2
+        print(json.dumps(payload, ensure_ascii=False))
+        return 0
     if args.command in {"start", "resume"}:
         from react_agent.eeg_research.agentic.worker import worker_lock_held
 

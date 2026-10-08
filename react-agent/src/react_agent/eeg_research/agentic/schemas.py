@@ -15,7 +15,7 @@ ROLE_OUTPUT_SCHEMAS = {
     "research_librarian": "MethodEvidencePacket: question, search_scope, sources, method_cards, competing_hypotheses, applicability_limits, knowledge_gaps, local_only, summary_zh",
     "experiment_designer": "ExperimentDesignResult: status, experiment_spec, missing_inputs, required_capability_ids, confounders, required_corrections, evidence_refs, summary_zh",
     "candidate_coder": "One tool request: tool, args. The runtime builds PatchResult.",
-    "candidate_reviewer": "ImplementationReview: status, intervention_coverage, issues, verified_invariants_with_refs, unverified_invariants, review_limits, summary_zh",
+    "candidate_reviewer": "ImplementationReview: status, intervention_coverage, requirement_coverage, issues, verified_invariants_with_refs, unverified_invariants, review_limits, summary_zh",
     "result_analyst": "ResultAnalysis: execution_assessment, hypothesis_assessment, observations, interpretations, competing_explanations, evidence_gaps, suggested_next_actions, evidence_refs, summary_zh",
     "memory_curator": "LessonProposal: proposed_lessons with statement, conditions, invalidation_conditions, supporting_episode_ids, contradicting_episode_ids, comparison_refs, observed_effect_refs, requested_evidence_level, uncertainty",
     "result_auditor": "AuditReport: verdict, audited_report_ref, claims, open_issues, required_corrections, review_limits, summary_zh",
@@ -156,6 +156,55 @@ class MethodEvidencePacket(DomainOutput):
     summary_zh: str = ""
 
 
+class OrderedWindowProbe(DomainOutput):
+    """Observe slots at the real representation consumer, after temporal pooling."""
+
+    input_module_path: str = Field(min_length=1, description="Named module whose input is the temporal pool input.")
+    representation_module_path: str = Field(min_length=1, description="Named downstream module whose input must still contain all ordered window slots.")
+    slot_count: int = Field(ge=2, le=32)
+    window_axis: Literal[-1, 2] = -1
+    layout: Literal["flatten_channel_major", "flatten_window_major", "channel_window", "window_channel"] = "flatten_channel_major"
+
+
+class ImplementationRequirement(DomainOutput):
+    """An implementation promise, separate from an untested performance prediction."""
+
+    requirement_id: str = Field(min_length=1)
+    kind: Literal["implementation", "scientific_hypothesis"] = "implementation"
+    core: bool = True
+    expected_behavior: str = Field(min_length=1)
+    code_locations: list[str] = Field(default_factory=list)
+    verification: Literal["source_review", "ordered_window_slots"] = "source_review"
+    probe: OrderedWindowProbe | None = None
+
+    @model_validator(mode="after")
+    def explicit_verification(self):
+        if self.kind == "implementation" and not self.code_locations:
+            raise ValueError("implementation_requirement_needs_code_locations")
+        if self.verification == "ordered_window_slots":
+            if self.kind != "implementation" or self.probe is None:
+                raise ValueError("ordered_window_requirement_needs_typed_probe")
+        elif self.probe is not None:
+            raise ValueError("source_review_requirement_cannot_have_window_probe")
+        return self
+
+
+class RequirementCoverage(DomainOutput):
+    requirement_id: str = Field(min_length=1)
+    status: Literal["implemented", "contradicted", "unverified"]
+    source_hash: str = ""
+    source_refs: list[str] = Field(default_factory=list)
+    check_ref: str = ""
+    check_sha256: str = ""
+    detail: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def implemented_has_evidence(self):
+        if self.status in {"implemented", "contradicted"} and not all((self.source_hash, self.source_refs, self.check_ref, self.check_sha256)):
+            raise ValueError("verified_requirement_status_needs_source_and_check_refs")
+        return self
+
+
 class DesignerExperimentSpec(BaseModel):
     """The executable fields required by the deterministic experiment gate."""
 
@@ -170,6 +219,7 @@ class DesignerExperimentSpec(BaseModel):
     model: dict[str, Any] = Field(default_factory=dict)
     objective: dict[str, Any] = Field(default_factory=dict)
     transform: dict[str, Any] = Field(default_factory=dict)
+    implementation_requirements: list[ImplementationRequirement] = Field(default_factory=list)
     status: Literal["draft"] = "draft"
 
     @model_validator(mode="after")
@@ -178,6 +228,9 @@ class DesignerExperimentSpec(BaseModel):
             raise ValueError("intervention_missing")
         if not self.hypothesis:
             raise ValueError("hypothesis_missing")
+        ids = [requirement.requirement_id for requirement in self.implementation_requirements]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate_implementation_requirement_id")
         return self
 
 
@@ -214,6 +267,7 @@ class ImplementationIssue(BaseModel):
 class ImplementationReview(DomainOutput):
     status: Literal["ready", "needs_fix", "blocked"]
     intervention_coverage: Any = None
+    requirement_coverage: list[RequirementCoverage] = Field(default_factory=list)
     issues: list[ImplementationIssue] = Field(default_factory=list)
     verified_invariants_with_refs: list[Any] = Field(default_factory=list)
     unverified_invariants: list[Any] = Field(default_factory=list)
@@ -227,6 +281,9 @@ class ImplementationReview(DomainOutput):
             raise ValueError("ready_review_cannot_have_blocking_issues: resolved allegations belong in verified_invariants_with_refs, not issues")
         if self.status == "needs_fix" and not blocking:
             raise ValueError("needs_fix_requires_an_unresolved_blocking_issue_and_concrete_correction")
+        ids = [coverage.requirement_id for coverage in self.requirement_coverage]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate_requirement_coverage_id")
         return self
 
 
@@ -293,6 +350,14 @@ class GoalSpec(BaseModel):
     objective: str = ""
     task_type: Literal["eeg_image_retrieval"] = "eeg_image_retrieval"
     research_scope: str = "pooled_subject_retrieval"
+    evaluation_mode: Literal["single_target", "loso_method_search"] = "single_target"
+    benchmark_feedback_enabled: bool = False
+    subject_aggregation: Literal["none", "macro_mean"] = "none"
+    benchmark_subjects: list[str] = Field(default_factory=list)
+    required_fold_count: int = Field(default=1, ge=1)
+    checkpoint_policy: Literal["legacy_min_delta", "strict_best"] = "legacy_min_delta"
+    selection_min_delta: float = Field(default=0.001, ge=0, allow_inf_nan=False)
+    method_suite_gpu_seconds_estimate: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     primary_metric: str = "validation.fixed_gallery_top1"
     direction: Literal["maximize", "minimize"] = "maximize"
     min_practical_gain_pp: float | None = None
@@ -315,6 +380,29 @@ class GoalSpec(BaseModel):
     frozen_components: list[str] = Field(default_factory=list)
     schema_version: str = SCHEMA_VERSION
 
+    @model_validator(mode="after")
+    def benchmark_mode_contract(self):
+        if self.evaluation_mode == "single_target":
+            if self.benchmark_feedback_enabled or self.benchmark_subjects or self.required_fold_count != 1 or self.subject_aggregation != "none":
+                raise ValueError("benchmark_feedback_requires_loso_method_search")
+            return self
+        subjects = [f"sub-{index:02d}" for index in range(1, 11)]
+        if not self.benchmark_feedback_enabled or self.final_test_enabled:
+            raise ValueError("loso_requires_explicit_benchmark_feedback_and_separate_final_protection")
+        if sorted(self.benchmark_subjects) != subjects or self.required_fold_count != 10:
+            raise ValueError("loso_requires_ten_unique_benchmark_subjects_and_folds")
+        if self.subject_aggregation != "macro_mean" or self.primary_metric != "benchmark.loso_mean_fixed_gallery_top1":
+            raise ValueError("loso_requires_subject_macro_mean_primary_metric")
+        if self.checkpoint_policy != "strict_best":
+            raise ValueError("loso_requires_strict_best_checkpoint_policy")
+        if self.training_seeds != [0] or self.confirmation_target_pairs != 1:
+            raise ValueError("loso_method_runtime_requires_one_seed0_suite_pair")
+        if self.max_concurrent_training_jobs != 1 or not 0 <= self.max_candidates <= 2:
+            raise ValueError("loso_method_runtime_requires_serial_jobs_and_at_most_two_methods")
+        if not 0 <= self.max_repairs_per_candidate <= 2 or "replicate" in self.allowed_training_actions:
+            raise ValueError("loso_method_runtime_requires_bounded_repairs_without_replication")
+        return self
+
 
 class EvaluationContract(BaseModel):
     """Frozen evaluator identity. Training seeds are not part of this object."""
@@ -322,6 +410,7 @@ class EvaluationContract(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     task_type: str = "eeg_image_retrieval"
+    evaluation_mode: Literal["single_target", "loso_method_search"] = "single_target"
     data_version: str = ""
     split_seed: int
     train_query_ids: list[str] = Field(default_factory=list)

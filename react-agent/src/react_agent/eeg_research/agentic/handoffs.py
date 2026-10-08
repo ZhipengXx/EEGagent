@@ -25,6 +25,370 @@ HISTORY_ITEM_CHARS = 2000
 CONTROL_TEXT_CHARS = 16000
 READ_JOURNAL = "artifact_reads.jsonl"
 
+# Application characters, including the system/output-schema string. These are
+# hard role totals, not a token/latency claim. Essential evidence is never cut to
+# meet them: an over-budget projection must be paged or fail before transport.
+ROLE_CONTEXT_BUDGETS = {
+    "research_planner": 160_000, "candidate_coder": 160_000,
+    "candidate_reviewer": 160_000, "result_analyst": 120_000,
+    "experiment_designer": 120_000, "memory_curator": 100_000,
+    "result_auditor": 200_000, "research_librarian": 80_000,
+}
+ROLE_CONTEXT_REVISION = "deterministic_role_projection_v1"
+
+
+def _context_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str,
+                      separators=(",", ":"))
+
+
+def method_suite_role_view(payload: dict[str, Any]) -> dict[str, Any]:
+    """Select scalar training facts from complete suite fold-freeze deliveries.
+
+    Authorization/verification belongs to the native suite reader. This projection
+    never upgrades a partial suite. Full raw curve/image-ID arrays remain immutable
+    and are identified by their exact payload digest plus supplied freeze refs.
+    Selected checkpoint, metric definitions, diagnostic coverage and all benchmark
+    scores remain literal. It performs no IO, inference, or scientific aggregation.
+    """
+    import copy
+
+    def fold_view(fold: dict[str, Any], score: dict[str, Any]) -> dict[str, Any]:
+        result = copy.deepcopy(fold)
+        metrics = result.get("development_metrics")
+        omitted = []
+        if isinstance(metrics, dict):
+            for key in ("validation_image_ids", "train_image_ids", "history", "curves"):
+                value = metrics.get(key)
+                if not isinstance(value, (list, dict)):
+                    continue
+                metrics.pop(key)
+                entry = {"field": "development_metrics." + key,
+                         "sha256": hashlib.sha256(_context_json(value).encode("utf-8")).hexdigest(),
+                         "item_count": len(value)}
+                if key == "history" and isinstance(value, list) and value:
+                    best_epoch = metrics.get("selected_checkpoint_epoch", metrics.get("best_epoch"))
+                    points = [value[0], value[-1]]
+                    points.extend(row for row in value if isinstance(row, dict) and row.get("epoch") == best_epoch)
+                    entry["exact_boundary_and_selected_epoch_points"] = points
+                omitted.append(entry)
+        # The native reader already verified these complete-fold dependencies.
+        # Keep the exact freeze ref/hash rather than repeating its full path and
+        # permission/dependency manifests in every role delivery. Source,
+        # checkpoint, protocol and evaluator identities remain literal below.
+        for key in ("dependencies", "permission", "protocol_path"):
+            if key not in result:
+                continue
+            detail = result.pop(key)
+            omitted.append({"field": key,
+                            "sha256": hashlib.sha256(_context_json(detail).encode()).hexdigest()})
+        if omitted:
+            result["training_detail_projection"] = {
+                "revision": ROLE_CONTEXT_REVISION, "omitted": omitted,
+                "freeze_ref": score.get("freeze_ref"), "freeze_sha256": score.get("freeze_sha256"),
+                "original_fold_view_sha256": hashlib.sha256(_context_json(fold).encode("utf-8")).hexdigest(),
+                "scope": "Provider scalar/boundary view. Omitted raw detail remains in the immutable native freeze. Refs are provenance, not delivered artifact pages."}
+        return result
+
+    def complete(aggregate: Any) -> bool:
+        return (isinstance(aggregate, dict) and aggregate.get("status") == "complete"
+                and aggregate.get("coverage") == 10)
+
+    def diagnostics_view(diagnostics: Any, aggregate: dict[str, Any]) -> Any:
+        if not isinstance(diagnostics, dict) or not isinstance(diagnostics.get("folds"), list):
+            return diagnostics
+        result = copy.deepcopy(diagnostics)
+        scores = {row.get("fold_id"): row for row in aggregate.get("scores") or [] if isinstance(row, dict)}
+        result["folds"] = [fold_view(fold, scores.get(fold.get("fold_id"), {}))
+                           if isinstance(fold, dict) else fold for fold in diagnostics["folds"]]
+        if aggregate.get("scope") == "method_development_benchmark":
+            _share_representation_columns(result)
+        return result
+
+    def visit(value: Any) -> Any:
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        result = {key: visit(child) for key, child in value.items()}
+        aggregate = value.get("aggregate")
+        if value.get("kind") == "method_suite" and complete(aggregate) and "diagnostics" in value:
+            result["diagnostics"] = diagnostics_view(value.get("diagnostics"), aggregate)
+            if aggregate.get("scope") == "method_development_benchmark":
+                _share_score_identity(result["aggregate"])
+        # worker._analyze_run delivers the native verified aggregate directly,
+        # while its full fold freezes are sibling diagnostic views. Preserve
+        # that consumer shape rather than requiring an invented wrapper.
+        native = value.get("method_suite")
+        curation_run = value.get("run")
+        if (isinstance(curation_run, dict) and curation_run.get("kind") == "method_suite"
+                and complete(curation_run.get("aggregate"))):
+            native = curation_run["aggregate"]
+        if (complete(native) and native.get("scope") == "method_development_benchmark"
+                and (value.get("evaluation_mode") == "loso_method_search"
+                     or isinstance(curation_run, dict) and curation_run.get("kind") == "method_suite")):
+            for key in ("diagnostics", "verified_training_diagnostics"):
+                if key in value:
+                    result[key] = diagnostics_view(value[key], native)
+            if isinstance(curation_run, dict) and curation_run.get("kind") == "method_suite":
+                _share_score_identity(result["run"]["aggregate"])
+            else:
+                _share_score_identity(result["method_suite"])
+        return result
+    return visit(payload)
+
+
+def _shared_scalar_fields(records: list[dict[str, Any]], *, excluded: set[str] | None = None) -> dict[str, Any]:
+    """Factor literal equal columns in a derived copy, restored by dict merge."""
+    import copy
+    if len(records) < 2:
+        return {}
+    excluded = excluded or set()
+    common = {key: copy.deepcopy(value) for key, value in records[0].items()
+              if key not in excluded and all(key in other and _context_json(other[key]) == _context_json(value)
+                                             for other in records[1:])}
+    if len(_context_json(common)) < 200:
+        return {}
+    for record in records:
+        for key in common:
+            record.pop(key)
+    return common
+
+
+def _share_score_identity(aggregate: dict[str, Any]) -> None:
+    """Factor only exactly equal native identity columns in a derived aggregate."""
+    scores = aggregate.get("scores")
+    if not isinstance(scores, list) or not all(isinstance(score, dict) for score in scores):
+        return
+    common = _shared_scalar_fields(scores, excluded={"fold_id", "held_out_subject", "train_subjects", "metrics",
+                                                   "freeze_ref", "freeze_sha256", "score_ref", "score_sha256"})
+    if common:
+        aggregate.setdefault("shared_score_identity", {}).update(common)
+    if aggregate.get("shared_score_identity"):
+        aggregate["score_identity_merge_rule"] = (
+            "Each scalar score is shared_score_identity merged with its per-fold fields; "
+            "all shared columns were exactly equal in the native scores. This changes delivery layout only.")
+
+
+def _share_representation_columns(diagnostics: dict[str, Any]) -> None:
+    """Share exact existing representation defaults without creating missing items."""
+    representations = [fold["diagnostics"]["items"]["representation"]
+                       for fold in diagnostics.get("folds", [])
+                       if isinstance(fold, dict) and isinstance(fold.get("diagnostics"), dict)
+                       and isinstance(fold["diagnostics"].get("items"), dict)
+                       and isinstance(fold["diagnostics"]["items"].get("representation"), dict)]
+    coverage_records = [item["coverage"] for item in representations if isinstance(item.get("coverage"), dict)]
+    representation_common = _shared_scalar_fields(representations, excluded={"coverage"})
+    coverage_common = _shared_scalar_fields(coverage_records)
+    if representation_common:
+        diagnostics.setdefault("shared_representation_fields", {}).update(representation_common)
+    if coverage_common:
+        diagnostics.setdefault("shared_representation_coverage", {}).update(coverage_common)
+    if diagnostics.get("shared_representation_fields") or diagnostics.get("shared_representation_coverage"):
+        diagnostics.setdefault("shared_representation_fields", {})
+        diagnostics.setdefault("shared_representation_coverage", {})
+        diagnostics["representation_merge_rule"] = (
+            "For an existing per-fold representation, merge shared_representation_fields then its fields; "
+            "merge shared_representation_coverage then its existing coverage. Shared values are exact equal "
+            "native columns. Do not create a missing item or coverage.")
+
+
+def method_suite_scalar_view(row: dict[str, Any], *,
+                             score_dependencies: list[dict[str, Any]] | None = None,
+                             historical_diagnostics: bool = False) -> dict[str, Any]:
+    """Provider view of a native-reader-verified complete suite, never authority.
+
+    Preserve exact macro metrics and all ten subject scalars rather than a JSON
+    prefix. Native score/freeze paths and digests identify omitted raw detail;
+    this selection computes no metric and does not claim an artifact page read.
+    The caller must first verify the suite with ``verified_suite_records``.
+    """
+    import copy
+    aggregate = row.get("aggregate") or {}
+    if (row.get("kind") != "method_suite" or row.get("evaluation_valid") is not True
+            or aggregate.get("status") != "complete" or aggregate.get("coverage") != 10
+            or aggregate.get("scope") != "method_development_benchmark"):
+        raise ValueError("method_scalar_view_requires_verified_complete_suite")
+    result = method_suite_role_view(row)
+    dependencies = {json.loads(Path(item["path"]).read_text(encoding="utf-8"))["fold_id"]: item
+                    for item in score_dependencies or []}
+    fields = ("status", "suite_hash", "method_revision", "candidate_id", "fold_id", "held_out_subject",
+              "train_subjects", "seed", "fidelity", "protocol_hash", "evaluation_key", "evaluator_hash",
+              "checkpoint_hash", "scope", "device", "precision", "gpu_seconds", "freeze_ref", "freeze_sha256")
+    scores = []
+    for score in aggregate["scores"]:
+        selected = {key: copy.deepcopy(score[key]) for key in fields if key in score}
+        selected["metrics"] = {key: score["metrics"][key] for key in
+                               ("top1", "top5", "query_count", "candidate_count")}
+        dependency = dependencies.get(score["fold_id"])
+        if dependency is not None:
+            selected.update(score_ref=dependency["path"], score_sha256=dependency["sha256"])
+        scores.append(selected)
+    result["aggregate"]["scores"] = scores
+    diagnostics = result.get("diagnostics")
+    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("folds"), list):
+        by_fold = {score["fold_id"]: score for score in scores}
+        retained = {"fold_id", "development_metrics", "selected_checkpoint", "diagnostics"}
+        folds = []
+        for original in diagnostics["folds"]:
+            score = by_fold[original["fold_id"]]
+            # These exact identities are already literal in aggregate.scores.
+            # Bind by native fold_id instead of repeating them, their freeze
+            # refs and two omission manifests in every diagnostic delivery.
+            for key in ("held_out_subject", "train_subjects", "seed", "fidelity", "method_revision",
+                        "protocol_hash", "checkpoint_hash", "evaluator_hash", "evaluation_key"):
+                if key in original and key in score and original[key] != score[key]:
+                    raise ValueError("method_scalar_fold_score_identity_mismatch")
+            fold = {key: value for key, value in original.items() if key in retained}
+            if historical_diagnostics:
+                metrics = fold.get("development_metrics")
+                if isinstance(metrics, dict):
+                    fold["development_metrics"] = {key: value for key, value in metrics.items()
+                        if not isinstance(value, (list, dict)) or key in {"coverage", "sampling", "definitions"}}
+                bundle = fold.get("diagnostics")
+                if isinstance(bundle, dict) and isinstance(bundle.get("items"), dict):
+                    mechanisms = {"representation", "training_dynamics", "retrieval_errors",
+                                  "intervention_probe", "group_results"}
+                    items = bundle["items"]
+                    fold["diagnostics"] = {key: value for key, value in bundle.items() if key != "items"}
+                    fold["diagnostics"].update(
+                        items={key: value for key, value in items.items()
+                               if key in mechanisms and isinstance(value, dict)
+                               and (value.get("status") != "unavailable" or "training_execution" in value)},
+                        unavailable={key: value.get("reason") for key, value in items.items()
+                                     if isinstance(value, dict) and value.get("status") == "unavailable"},
+                        omitted_nonmechanism_items=[key for key, value in items.items()
+                            if key not in mechanisms and isinstance(value, dict) and value.get("status") != "unavailable"])
+            folds.append(fold)
+        diagnostics["folds"] = folds
+        diagnostics["fold_identity_binding"] = {
+            "basis": "Each fold_id binds to the exact same-row aggregate.scores identity, including native freeze ref/hash.",
+            "source_hash": row.get("source_hash"), "detail": "historical_mechanism_scalars" if historical_diagnostics else "current_full_diagnostics",
+            "raw_freeze_pages_delivered": False,
+            "scope": "Refs identify immutable provenance, not delivered pages or permission. Use registered aggregate/analysis IDs for native reads."}
+        _share_representation_columns(diagnostics)
+    _share_score_identity(result["aggregate"])
+    result["scientific_view"] = {"revision": ROLE_CONTEXT_REVISION,
+        "scope": "Exact complete-suite scalar provider view. Raw score/freeze refs identify immutable provenance, not delivered pages or read permission; registered aggregate/analysis IDs are native read entry points.",
+        "aggregate_ref": row.get("suite_ref"), "aggregate_sha256": row.get("result_hash"),
+        "independent_seed_count": aggregate["independent_seed_count"], "raw_score_metadata_omitted": True}
+    return result
+
+
+def method_benchmark_origin(row: dict[str, Any]) -> dict[str, Any]:
+    """Runtime origin for a derived role artifact, never a model permission."""
+    aggregate = row.get("aggregate") or {}
+    if (row.get("kind") != "method_suite" or row.get("evaluation_valid") is not True
+            or aggregate.get("status") != "complete" or aggregate.get("coverage") != 10
+            or aggregate.get("scope") != "method_development_benchmark"):
+        raise ValueError("method_origin_requires_complete_native_suite")
+    return {"run_evidence_id": row["evidence_id"],
+            **{key: row[key] for key in ("candidate_id", "suite_id", "suite_ref", "suite_hash", "result_hash",
+                "method_revision", "source_hash", "spec_hash", "config_hash", "contract_fingerprint", "seed", "fidelity")},
+            "aggregate_artifact_id": row["artifact_refs"][0], "scope": "method_development_benchmark",
+            "coverage": 10, "independent_seed_count": 1, "replicated": False,
+            "independent_final_test": False}
+
+
+def compact_role_context(payload: dict[str, Any], role: str, *,
+                         system_chars: int = 0, target_chars: int | None = None) -> dict[str, Any]:
+    """Return a deterministic derived view with one copy of large identical facts.
+
+    Canonical references are JSON pointers into this same request, not evidence
+    IDs or claimed artifact reads. No source, metric, gate or receipt is sliced.
+    Optional *older* history may be omitted only with its exact digest and IDs;
+    current/full source, all legal actions, approval and schema feedback survive.
+    The caller checks ``fits_budget`` before a paid API call.
+    """
+    import copy
+    original = copy.deepcopy(payload)
+    original.pop("role_context_projection", None)
+    working = method_suite_role_view(original) if role in {
+        "research_planner", "result_analyst", "memory_curator", "experiment_designer", "result_auditor",
+    } else original
+    budget = target_chars if target_chars is not None else ROLE_CONTEXT_BUDGETS.get(role, 160_000)
+    if budget <= 0 or system_chars < 0:
+        raise ValueError("invalid_role_context_budget")
+    canonical: dict[str, tuple[str, str, str]] = {}
+    duplicates: list[dict[str, Any]] = []
+    method_context = original.get("evaluation_mode") == "loso_method_search"
+    canonical_min_chars = 400 if method_context else 1200
+
+    def pointer(path: str, key: Any) -> str:
+        return path + "/" + str(key).replace("~", "~0").replace("/", "~1")
+
+    def project(value: Any, path: str) -> Any:
+        encoded = _context_json(value)
+        # Retain small control/identity values literally; canonicalize sizeable
+        # data only. Hash equality is checked against the exact encoded bytes.
+        digest = None
+        if isinstance(value, (dict, list, str)) and len(encoded) >= canonical_min_chars:
+            digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            prior = canonical.get(digest)
+            if prior is not None and prior[1] == encoded:
+                duplicates.append({"path": path, "canonical_pointer": prior[0],
+                                   "sha256": prior[2], "original_chars": len(encoded)})
+                reference = {"canonical_context_ref": prior[0], "sha256": prior[2]}
+                if not method_context:
+                    reference["scope"] = "Exact duplicate already present in this request; follow the JSON pointer. Not an artifact read."
+                return reference
+        if isinstance(value, dict):
+            projected = {key: project(child, pointer(path, key)) for key, child in value.items()}
+        elif isinstance(value, list):
+            projected = [project(child, pointer(path, index)) for index, child in enumerate(value)]
+        else:
+            projected = value
+        if digest is not None:
+            canonical[digest] = (path, encoded, hashlib.sha256(_context_json(projected).encode("utf-8")).hexdigest())
+        return projected
+
+    result = project(working, "")
+    omissions = []
+    # A context budget does not justify truncating source or authoritative facts.
+    # Historical prose is already indexed by immutable IDs; preserve at least
+    # the newest two rows and give the omitted exact identities/digest.
+    for key in ("memory", "lessons", "analyses", "recent_decisions"):
+        rows = result.get(key)
+        if not isinstance(rows, list) or len(rows) <= 2:
+            continue
+        if len(_context_json(result)) + system_chars <= budget:
+            break
+        omitted = rows[:-2]
+        # Never omit a node targeted by a canonical duplicate elsewhere.
+        if any(row["canonical_pointer"].startswith(f"/{key}/") for row in duplicates):
+            continue
+        result[key] = rows[-2:]
+        omissions.append({"field": key, "rows": len(omitted),
+                         "sha256": hashlib.sha256(_context_json(omitted).encode("utf-8")).hexdigest(),
+                         "identities": [{name: row[name] for name in
+                             ("evidence_id", "artifact_id", "analysis_artifact_id", "episode_id", "decision_id", "candidate_id")
+                             if isinstance(row, dict) and name in row} for row in omitted],
+                         "reason": "Older optional history omitted from provider view; authoritative registry/history unchanged. Request a verified page if needed."})
+    duplicate_report = duplicates
+    if method_context:
+        grouped = {}
+        for row in duplicates:
+            key = (row["canonical_pointer"], row["sha256"], row["original_chars"])
+            if key not in grouped:
+                grouped[key] = {**row, "duplicate_paths": []}
+            else:
+                grouped[key]["duplicate_paths"].append(row["path"])
+        duplicate_report = list(grouped.values())
+    report = {"revision": ROLE_CONTEXT_REVISION, "role": role,
+              "budget_chars": budget, "system_chars": system_chars,
+              "original_user_chars": len(_context_json(original)),
+              "duplicate_views": duplicate_report, "duplicate_view_count": len(duplicates), "omissions": omissions,
+              "source_metrics_gates_and_schema_feedback_preserved": True,
+              "canonical_reference_instruction": "Resolve canonical_context_ref as a JSON pointer within this request. Its sha256 covers the exact canonical value; it is not an artifact/evidence ID.",
+              "scope": "Deterministic provider view only; no raw artifact/history/source changed and no paid summarizer used."}
+    result["role_context_projection"] = report
+    total = len(_context_json(result)) + system_chars
+    report["projected_total_chars"] = total
+    report["fits_budget"] = total + 100 <= budget  # account for these two fields
+    if not report["fits_budget"]:
+        report["missing_inputs"] = ["essential_context_exceeds_role_budget: obtain permitted digest-bound pages or narrow the task; do not infer omitted code"]
+    return result
+
 
 def training_semantics(*, config_only: bool = False) -> list[dict[str, Any]]:
     """Source evidence for how the trainer calls configs and owns logit scaling."""
@@ -156,9 +520,12 @@ def candidate_context(camp: Path, target: str) -> dict[str, Any]:
         "candidate_id": target,
         "source_hash": current_hash,
         "source_ref": str(entry),
-        "source": None if source is None else source[:SOURCE_CHARS],
-        "source_truncated": source is not None and len(source) > SOURCE_CHARS,
-        "source_range": None if source is None else [0, min(len(source), SOURCE_CHARS)],
+        # Essential candidate functions cannot be safely selected by a prefix.
+        # The role-level budget either carries the complete source or reports a
+        # pre-transport paging/task gap; it never licenses a partial review.
+        "source": source,
+        "source_truncated": False,
+        "source_range": None if source is None else [0, len(source)],
         "encoder_reference": encoder_reference,
         "cpu_check_receipt": candidate_cpu_check(camp,target,binding,current_hash),
         "approval_ref": approval_ref,
@@ -302,6 +669,8 @@ def load_analysis_views(camp: Path, state: dict[str, Any], *, target: str | None
         if key and row.get("status") == "completed" and row.get("analysis_artifact_id"):
             try:
                 registered = resolve_verified_artifact(camp, row["analysis_artifact_id"])
+                if state.get("evaluation_mode") == "loso_method_search":
+                    registered = development_artifact(camp, row["analysis_artifact_id"])
                 body = json.loads(Path(registered["path"]).read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
@@ -321,6 +690,8 @@ def load_analysis_views(camp: Path, state: dict[str, Any], *, target: str | None
             continue
         try:
             registered = resolve_verified_artifact(camp, ref)
+            if state.get("evaluation_mode") == "loso_method_search":
+                registered = development_artifact(camp, ref)
             body = json.loads(Path(registered["path"]).read_text(encoding="utf-8"))
         except (OSError, ValueError):
             views.append({"evidence_id": row.get("evidence_id"), "artifact_id": ref,
@@ -365,9 +736,87 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
     if path.stat().st_size > READ_FILE_BYTES:
         raise ValueError("artifact_exceeds_read_file_limit")
     body = json.loads(path.read_text(encoding="utf-8"))
+    def contains_benchmark_scope(value: Any) -> bool:
+        if isinstance(value, dict):
+            return (any(value.get(key) == "method_development_benchmark" for key in
+                        ("scope", "data_role", "partition", "metric_scope"))
+                    or any(contains_benchmark_scope(child) for child in value.values()))
+        return isinstance(value, list) and any(contains_benchmark_scope(child) for child in value)
+    if row.get("kind") != "method_suite" and contains_benchmark_scope(body):
+        payload = body.get("payload")
+        origin = payload.get("method_benchmark_origin") if isinstance(payload, dict) else None
+        if row.get("kind") not in {"analysis", "lessons"} or not isinstance(origin, dict):
+            raise ValueError("benchmark_artifact_requires_native_complete_suite_kind")
+        return _derived_method_artifact(camp, row, body, origin)
+    if row.get("kind") == "method_suite":
+        # An artifact kind/scope label never grants benchmark permission. Bind
+        # the opt-in goal, frozen manifest, exact native path and all ten score
+        # dependencies, then recompute the aggregate before permitting a read.
+        from react_agent.eeg_research.agentic.method_suite import MODE, manifest, read_aggregate
+        goal = json.loads((camp / "goal.json").read_text(encoding="utf-8"))
+        if goal.get("evaluation_mode") != MODE:
+            raise ValueError("method_benchmark_read_requires_explicit_opt_in")
+        permission = manifest(camp)["benchmark_permission"]
+        suite_id = path.parent.name
+        expected = (camp / "suites" / suite_id / "aggregate.json").resolve()
+        if path != expected or not permission.get("authorized") or permission.get("partial_feedback") is not False:
+            raise ValueError("method_benchmark_read_identity_or_permission_mismatch")
+        computed = read_aggregate(camp, suite_id)
+        if (body.get("aggregate") != computed or computed.get("status") != "complete"
+                or computed.get("coverage") != 10 or computed.get("required_fold_count") != 10
+                or computed.get("scope") != "method_development_benchmark"
+                or computed.get("independent_final_test") is not False):
+            raise ValueError("method_benchmark_read_requires_verified_complete_suite")
+        return {**row, "development_scope": "method_development_benchmark",
+                "native_completion_verified": True}
     if development_view(body) is None:
         raise ValueError("artifact_scope_forbidden")
     return row
+
+
+def _derived_method_artifact(camp: Path, row: dict[str, Any], body: dict[str, Any],
+                             origin: dict[str, Any]) -> dict[str, Any]:
+    """Allow only a completed native role receipt bound to a current full suite.
+
+    Registered bytes, producer/task identity, aggregate input dependency, current
+    suite/source and explicit benchmark permission must all agree. A scope label
+    or a model-provided origin alone cannot grant this derived read permission.
+    """
+    from react_agent.eeg_research.agentic.task_ledger import latest
+    from react_agent.eeg_research.agentic.roles import validate_role_result
+    from react_agent.eeg_research.agentic.method_suite import verified_suite_records
+    from react_agent.eeg_research.agentic.semantic_memory import unsafe_source
+    if unsafe_source(body):
+        raise ValueError("method_derived_artifact_forbidden_scope")
+    producer = row.get("producer_task_id")
+    task = latest(camp, str(producer)) if producer else None
+    expected_role = {"analysis": "result_analyst", "lessons": "memory_curator"}[row["kind"]]
+    if (not task or task.get("status") != "completed" or task.get("role") != expected_role
+            or task.get("artifact_id") != row["artifact_id"] or body.get("status") != "completed"):
+        raise ValueError("method_derived_artifact_requires_completed_producer")
+    envelope = validate_role_result(body, task)
+    state = json.loads((camp / "campaign_state.json").read_text(encoding="utf-8"))
+    source = next((item for item in verified_suite_records(camp, state)
+                   if item["evidence_id"] == origin.get("run_evidence_id")), None)
+    if source is None or origin != method_benchmark_origin(source):
+        raise ValueError("method_derived_artifact_native_origin_mismatch")
+    native = development_artifact(camp, origin["aggregate_artifact_id"])
+    if (native["path"] != origin["suite_ref"] or native["sha256"] != origin["result_hash"]
+            or not any(Path(ref).resolve() == Path(native["path"]).resolve()
+                       for ref in task.get("input_artifact_refs") or [])):
+        raise ValueError("method_derived_artifact_aggregate_input_unbound")
+    if row["kind"] == "analysis" and (task.get("candidate_id") != source["candidate_id"]
+                                      or row.get("candidate_id") != source["candidate_id"]):
+        raise ValueError("method_derived_artifact_candidate_mismatch")
+    pointers = [item for item in state.get("evidence") or []
+                if item.get("analysis_artifact_id") == row["artifact_id"]]
+    if any(item.get("run_evidence_id") != source["evidence_id"] or item.get("status") != "completed"
+           for item in pointers):
+        raise ValueError("method_derived_artifact_analysis_pointer_mismatch")
+    if envelope["input_digest"] != task["input_digest"]:
+        raise ValueError("method_derived_artifact_task_input_mismatch")
+    return {**row, "development_scope": "method_development_benchmark",
+            "native_completion_verified": True, "method_benchmark_origin": origin}
 
 
 def artifact_index(camp: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -379,14 +828,18 @@ def artifact_index(camp: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
         if not ref:
             continue
         missing = []
+        validated = None
         try:
-            development_artifact(camp, str(ref))
+            validated = development_artifact(camp, str(ref))
         except (OSError, ValueError, KeyError) as exc:
             missing = [str(exc)]
         linked = [row for row in evidence if ref in (row.get("artifact_refs") or []) or
                   ref in (row.get("analysis_artifact_id"), row.get("audit_artifact_id"))]
         completion = "unknown"
         completion_verified = False
+        if validated and validated.get("native_completion_verified"):
+            completion = "completed"
+            completion_verified = True
         if not missing and record.get("producer_task_id"):
             from react_agent.eeg_research.agentic.task_ledger import latest
             from react_agent.eeg_research.agentic.roles import validate_role_result, RoleResultError
@@ -407,7 +860,7 @@ def artifact_index(camp: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
             "evidence_refs": [row["evidence_id"] for row in linked if row.get("evidence_id")],
             "verification_status": "invalid" if missing else "verified",
             "completion_status": completion, "completion_identity_verified": completion_verified,
-            "scope": "development" if not missing else "unavailable",
+            "scope": (validated or {}).get("development_scope", "development") if not missing else "unavailable",
             "missing_inputs": missing, "content_injected": False})
     return rows
 
@@ -738,7 +1191,8 @@ def bounded_history(value: Any, *, budget: int = HISTORY_CHARS) -> tuple[Any, di
         for original in reversed(value[-HISTORY_ROWS:]):
             item = development_view(original)
             encoded = json.dumps(item, ensure_ascii=False, default=str)
-            identity = {key: item.get(key) for key in ("evidence_id", "episode_id", "lesson_id", "artifact_id", "candidate_id", "kind", "fidelity")
+            identity = {key: item.get(key) for key in ("evidence_id", "episode_id", "lesson_id", "artifact_id", "candidate_id", "kind", "fidelity", "diagnostic_ref",
+                        "verification_status", "completion_status", "run_evidence_id", "content_hash", "input_digest", "authority", "status")
                         if isinstance(item, dict) and item.get(key) is not None}
             if len(encoded) > HISTORY_ITEM_CHARS:
                 item = {**identity, "summary_excerpt": encoded[:HISTORY_ITEM_CHARS], "truncated": True,
@@ -780,20 +1234,63 @@ def analysis_experiment_binding(camp: Path, latest: dict[str, Any]) -> dict[str,
             raise ValueError("run_spec_hash_mismatch")
         if binding.get("target_id")!=target or binding.get("source_hash")!=latest.get("source_hash"):
             raise ValueError("run_source_binding_mismatch")
-        job=Path(str(latest.get("job_dir") or ""))
-        if not job.resolve().is_relative_to(camp.resolve()):raise ValueError("run_outside_campaign")
-        frozen=json.loads((job/"frozen_run_spec.json").read_text())
-        source=json.loads((job/"source_binding.json").read_text())
-        if frozen.get("spec_hash")!=expected or frozen.get("candidate_id", frozen.get("target_id"))!=target:
-            raise ValueError("frozen_run_spec_mismatch")
-        path=Path(str(source.get("class_file") or ""));path=path if path.is_absolute() else job/path
-        if source.get("file_sha256")!=latest.get("source_hash") or file_digest(path)!=latest.get("source_hash"):
-            raise ValueError("loaded_source_changed")
+        method_identity = {}
+        if latest.get("kind") == "method_suite":
+            # A complete method is ten native folds, not a legacy single job.
+            # Its immutable suite and source/review dependencies carry the
+            # exact approved intent; never fabricate a job_dir or hypothesis.
+            from react_agent.eeg_research.agentic.method_suite import read_aggregate, validate_suite
+            from react_agent.eeg_research.agentic.native_patch import enforce_requirement_review
+            suite_id = str(latest.get("suite_id") or "")
+            if not suite_id or Path(suite_id).name != suite_id or suite_id in {".", ".."}:
+                raise ValueError("method_suite_identity_missing")
+            suite = validate_suite(camp, suite_id)
+            suite_path = camp / "suites" / suite_id / "suite_manifest.json"
+            aggregate_path = suite_path.with_name("aggregate.json")
+            aggregate = read_aggregate(camp, suite_id)
+            if (latest.get("evaluation_valid") is not True or aggregate != latest.get("aggregate")
+                    or latest.get("result_hash") != file_digest(aggregate_path)
+                    or Path(str(latest.get("suite_ref") or "")).resolve() != aggregate_path.resolve()
+                    or latest.get("suite_hash") != suite["suite_hash"]
+                    or latest.get("method_revision") != suite["method"]["method_revision"]):
+                raise ValueError("analysis_method_suite_identity_mismatch")
+            method = suite["method"]
+            if (method["candidate_id"] != target or method["spec_hash"] != expected
+                    or method["source_hash"] != latest.get("source_hash")
+                    or method["approved_binding"] != binding
+                    or method["approval_ref"] != binding.get("spec_ref")):
+                raise ValueError("analysis_method_binding_mismatch")
+            workspace = camp / "candidates" / target
+            source = json.loads((workspace / "source_manifest.json").read_text())
+            path = Path(str(source.get("entry") or ""))
+            if (source != method["source_manifest"] or source.get("entry_sha256") != method["source_hash"]
+                    or not path.resolve().is_relative_to(workspace.resolve())
+                    or file_digest(path) != method["source_hash"]):
+                raise ValueError("loaded_source_changed")
+            checks = json.loads((workspace / "checks.json").read_text())
+            review = enforce_requirement_review(workspace, {"experiment": spec},
+                json.loads((workspace / "review.json").read_text()), checks)
+            if review.get("status") != "ready" or not checks.get("ok"):
+                raise ValueError("analysis_method_requires_current_ready_review_and_check")
+            method_identity = {"suite_id": suite_id, "suite_ref": str(aggregate_path.resolve()),
+                               "suite_manifest_ref": str(suite_path.resolve()),
+                               "result_hash": latest["result_hash"],
+                               "suite_hash": suite["suite_hash"], "method_revision": method["method_revision"]}
+        else:
+            job=Path(str(latest.get("job_dir") or ""))
+            if not job.resolve().is_relative_to(camp.resolve()):raise ValueError("run_outside_campaign")
+            frozen=json.loads((job/"frozen_run_spec.json").read_text())
+            source=json.loads((job/"source_binding.json").read_text())
+            if frozen.get("spec_hash")!=expected or frozen.get("candidate_id", frozen.get("target_id"))!=target:
+                raise ValueError("frozen_run_spec_mismatch")
+            path=Path(str(source.get("class_file") or ""));path=path if path.is_absolute() else job/path
+            if source.get("file_sha256")!=latest.get("source_hash") or file_digest(path)!=latest.get("source_hash"):
+                raise ValueError("loaded_source_changed")
         hypothesis=spec.get("hypothesis")
         if not hypothesis:raise ValueError("approved_hypothesis_missing")
         return {"status":"verified", "hypothesis":hypothesis, "experiment":spec,
                 "spec_hash":expected,"source_hash":latest.get("source_hash"),
                 "artifact_ref":registry["artifact_id"],"artifact_sha256":registry["sha256"],
-                "missing_inputs":[]}
+                **method_identity, "missing_inputs":[]}
     except (OSError,ValueError,KeyError,TypeError) as exc:
         return {"status":"unavailable","missing_inputs":[str(exc)]}

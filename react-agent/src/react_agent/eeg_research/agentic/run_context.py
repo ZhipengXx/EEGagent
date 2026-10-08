@@ -56,6 +56,7 @@ def persist_approved_binding(
         "control_candidate_id": spec.get("control_candidate_id") or spec.get("control_id") or "baseline",
         "intervention": spec.get("principal_intervention") or spec.get("intervention"),
         "hypothesis": spec.get("hypothesis"),
+        "implementation_requirements": spec.get("implementation_requirements") or [],
     }
     (dest / "approved_binding.json").write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
     return binding
@@ -166,6 +167,17 @@ def build_frozen_run_spec(
         "approved_binding": binding,
         "spec_ref": spec_ref,
     }
+    if protocol.get("evaluation_mode") == "loso_method_search":
+        frozen["recipe"].update({key: protocol.get(key) for key in (
+            "evaluation_mode", "checkpoint_policy", "selection_min_delta", "full_epochs", "fidelity_overrides",
+            "batch_size", "lr", "gpu", "weight_decay", "subject", "input_geometry")})
+        frozen["implementation_requirements"] = binding.get("implementation_requirements") or []
+        if protocol.get("method_suite_id"):
+            from react_agent.eeg_research.agentic.method_suite import validate_fold_derivation
+            frozen["fold_derivation"] = validate_fold_derivation(camp, target, protocol)
+            frozen["target_revision"] = protocol["method_revision"]
+            frozen["run_config_hash"] = run_config_hash(hook, seed=seed, fidelity=fidelity,
+                extra={"method_revision": protocol["method_revision"], "fold_protocol": protocol["fingerprint"]})
     return frozen
 
 

@@ -42,6 +42,27 @@ or blocked result without these fields, set experiment_spec=null.
 You cannot approve your own experiment; only runtime validation can issue an
 approval record bound to this exact draft and context.
 
+CHECKABLE IMPLEMENTATION PROMISES
+Use experiment_spec.implementation_requirements for the method's core promises.
+Each item has a unique requirement_id, kind="implementation", core=true,
+expected_behavior, real code_locations and verification. In loso_method_search
+at least one core implementation requirement is mandatory. Use verification=
+"source_review" for execution paths, optional-off behavior, loss-item gradients,
+train-only augmentation or train-only fitted statistics that require literal
+source/check inspection. Do not infer any of these from a configuration label.
+For a promised ordered window representation use "ordered_window_slots" and
+the typed probe: input_module_path is the actual pool input boundary;
+representation_module_path is the downstream module whose input consumes that
+representation; slot_count and layout describe the ordered slots there. This
+checks slots after all declared pooling, including any subsequent window mean.
+It does not assume raw-EEG permutation sensitivity. Ordered scale concatenation
+alone is not ordered temporal-window preservation. Declare only properties the
+method actually promises; global pooling is legal when no slot preservation is
+promised. A probe location must identify real named modules, not prospective
+config text. Put hoped-for score improvements in hypothesis or a separate
+kind="scientific_hypothesis" requirement; these are untested before training
+and never implementation gates.
+
 COLD START AND CAPABILITY STATUS
 No diagnostics at cold start means an untested prior. It is not a requirement
 to invent a failure or block every independent executable experiment. Clearly

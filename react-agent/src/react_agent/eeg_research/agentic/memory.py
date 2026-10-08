@@ -18,6 +18,73 @@ LEVEL_ORDER = (
 )
 
 
+def verified_method_episode(camp: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate an opt-in complete method benchmark episode at its native source.
+
+    This is one development-search seed/suite, regardless of ten subject folds;
+    it is not confirmation/replication or an independent untouched final test.
+    The actual registered aggregate and its fold dependencies are revalidated.
+    """
+    from react_agent.eeg_research.agentic.artifacts import REGISTRY, resolve_verified_artifact
+    from react_agent.eeg_research.agentic.handoffs import development_artifact
+    ref = str(payload.get("artifact") or "")
+    if ref.startswith("art_"):
+        row = resolve_verified_artifact(camp, ref)
+    else:
+        path = Path(ref)
+        if not path.is_absolute():
+            path = camp / path
+        rows = [json.loads(line) for line in (camp / REGISTRY).read_text(encoding="utf-8").splitlines() if line.strip()]
+        row = next((item for item in rows if Path(str(item.get("path") or "")).resolve() == path.resolve()
+                    and item.get("kind") == "method_suite"), None)
+        if row is None:
+            raise ValueError("method_episode_requires_registered_suite")
+    if row.get("kind") != "method_suite":
+        raise ValueError("method_episode_requires_registered_suite")
+    validated = development_artifact(camp, str(row["artifact_id"]))
+    aggregate = json.loads(Path(validated["path"]).read_text(encoding="utf-8"))["aggregate"]
+    if (payload.get("scope") != "method_development_benchmark"
+            or payload.get("candidate_id") != aggregate["candidate_id"]
+            or payload.get("seed") != aggregate["seed"] or payload.get("fidelity") != "full"
+            or payload.get("primary_metric") != aggregate["mean_top1"]
+            or payload.get("evidence_level") != "exploratory_result"
+            or payload.get("kind") != "exploratory_result"):
+        raise ValueError("method_episode_identity_scope_or_level_mismatch")
+    return {"artifact_id": validated["artifact_id"], "path": validated["path"],
+            "sha256": validated["sha256"], "aggregate": aggregate,
+            "scope": "method_development_benchmark", "independent_seed_count": 1,
+            "replicated": False}
+
+
+def verified_method_comparison(camp: Path, ref: str) -> dict[str, Any]:
+    """Resolve a current complete-suite pair and its exact observed pp effect."""
+    from react_agent.eeg_research.agentic.method_suite import METRIC, verified_suite_records
+    state = json.loads((camp / "campaign_state.json").read_text(encoding="utf-8"))
+    records = verified_suite_records(camp, state)
+    target = next((row for row in records if row.get("evidence_id") == ref), None)
+    control = next((row for row in records if target and row.get("evidence_id") == target.get("control_id")), None)
+    if target is None or control is None:
+        raise ValueError("method_comparison_requires_verified_complete_pair")
+    comp = target.get("comparison") or {}
+    candidate = {row["held_out_subject"]: row["metrics"]["top1"] for row in target["aggregate"]["scores"]}
+    baseline = {row["held_out_subject"]: row["metrics"]["top1"] for row in control["aggregate"]["scores"]}
+    import statistics
+    deltas = {subject: 100 * (candidate[subject] - baseline[subject]) for subject in candidate}
+    if (set(candidate) != set(baseline) or len(candidate) != 10 or comp.get("comparable") is not True
+            or comp.get("metric") != METRIC or comp.get("metric_unit") != "fraction"
+            or comp.get("delta_pp") != statistics.mean(deltas.values())
+            or comp.get("subject_deltas_pp") != deltas or comp.get("replicated") is not False
+            or comp.get("independent_seed_count") != 1 or comp.get("control_run_id") != control["evidence_id"]
+            or comp.get("candidate_suite_hash") != target["suite_hash"]
+            or comp.get("control_suite_hash") != control["suite_hash"]
+            or target.get("execution_fingerprint") != control.get("execution_fingerprint")):
+        raise ValueError("method_comparison_identity_or_units_mismatch")
+    saved = json.loads((camp / "comparisons" / (ref + ".json")).read_text(encoding="utf-8"))
+    if saved.get("comparison") != comp:
+        raise ValueError("method_comparison_receipt_changed")
+    return comp
+
+
 def _usable_comparison(path: Path) -> bool:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -278,6 +345,8 @@ class EpisodeStore:
     def persist_episode(self, row: dict[str, Any]) -> dict[str, Any]:
         payload = dict(row)
         payload.setdefault("episode_id", f"ep_{uuid.uuid4().hex[:12]}")
+        if payload.get("scope") == "method_development_benchmark":
+            verified_method_episode(self.camp, payload)
         conn = open_store(self.camp)
         try:
             existing = conn.execute("SELECT payload FROM episodes WHERE episode_id = ?", (payload["episode_id"],)).fetchone()
@@ -383,6 +452,12 @@ class EpisodeStore:
                 if missing or missing_counter:
                     reasons.append("episode_missing")
                 cited = [episodes[item] for item in supporting if item in episodes]
+                method_cited = [item for item in cited if item.get("scope") == "method_development_benchmark"]
+                for item in method_cited:
+                    try:
+                        verified_method_episode(self.camp, item)
+                    except (OSError, ValueError, KeyError, TypeError):
+                        reasons.append("method_suite_support_invalid")
                 if any("test" in json_keys(item) for item in cited):
                     reasons.append("final_test_derived")
                 group_level = min((_rank(item.get("evidence_level")) for item in cited), default=0)
@@ -398,6 +473,9 @@ class EpisodeStore:
                 conditions = lesson.get("conditions") if "conditions" in lesson else proposal.get("conditions")
                 if not isinstance(conditions, dict) or not conditions:
                     reasons.append("conditions_missing")
+                if method_cited and (not isinstance(conditions, dict) or conditions.get("fidelity") != "full"
+                        or any(conditions.get("evaluation_identity") != item.get("contract_fingerprint") for item in method_cited)):
+                    reasons.append("method_suite_conditions_mismatch")
                 effect = lesson.get("observed_effect")
                 comparison_refs = [str(item) for item in lesson.get("comparison_refs") or lesson.get("observed_effect_refs") or []]
                 confirmation_refs = [str(item) for item in lesson.get("confirmation_refs") or []]
@@ -412,7 +490,15 @@ class EpisodeStore:
                         continue
                     path = self.camp / "comparisons" / f"{item}.json"
                     if path.is_file():
-                        if not _usable_comparison(path):
+                        if method_cited:
+                            try:
+                                comp = verified_method_comparison(self.camp, item)
+                                effects.append({"comparison_ref": item, "delta_pp": float(comp["delta_pp"]),
+                                                "unit": "percentage_points", "scope": "method_development_benchmark",
+                                                "independent_seed_count": 1, "replicated": False})
+                            except (OSError, ValueError, KeyError, TypeError):
+                                fake_refs.append(item)
+                        elif not _usable_comparison(path):
                             fake_refs.append(item)
                         else:
                             raw = json.loads(path.read_text(encoding="utf-8"))

@@ -261,6 +261,30 @@ def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: f
     if completed.returncode != 0:
         payload["ok"] = False
         payload.setdefault("error", "check_nonzero_returncode")
+    input_spec = json.loads(spec_path.read_text()) if spec_path.is_file() else {}
+    if payload.get("ok") and (input_spec.get("multigpu_check") or {}).get("enabled"):
+        from react_agent.eeg_research.agentic.execution_protocol import load_protocol
+        from react_agent.eeg_research.agentic.multigpu_check import run_multigpu_check, validate_receipt
+        camp = workspace.resolve().parent.parent
+        protocol = load_protocol(camp)
+        if protocol is None or protocol.get("evaluation_mode") != "loso_method_search":
+            receipt = {"ok": False, "error": "multigpu_probe_frozen_protocol_missing"}
+        else:
+            receipt = run_multigpu_check(camp, protocol, workspace=workspace, python=interpreter, timeout_s=min(timeout_s, 120.0))
+            if receipt.get("ok"):
+                try:
+                    validate_receipt(camp, protocol, receipt, workspace=workspace)
+                except (ValueError, KeyError, TypeError, OSError) as exc:
+                    receipt = {**receipt, "ok": False, "error": "multigpu_check_current_identity_invalid", "detail": str(exc)}
+        if receipt.get("status") in {"blocked", "running", "uncertain_pending", "uncertain", "blocked_live_child", "blocked_live_gpu_child_after_deadline"}:
+            from react_agent.eeg_research.agentic.native_patch import RecoveryBlocked
+            raise RecoveryBlocked("multigpu_probe_environment_or_recovery_blocked:" + str(receipt.get("error")))
+        payload["multigpu_check"] = receipt
+        if not receipt.get("ok"):
+            payload["ok"] = False
+            payload["failures"] = [*(payload.get("failures") or []), "multigpu_runtime_check_failed"]
+            payload["error"] = receipt.get("error") or "multigpu_runtime_check_failed"
+            payload["detail"] = (receipt.get("result") or {}).get("detail") or receipt.get("stderr_tail") or str(receipt)
     return payload
 
 

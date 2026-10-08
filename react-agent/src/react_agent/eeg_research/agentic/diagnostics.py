@@ -21,6 +21,38 @@ CATEGORIES = (
 )
 
 
+def _training_execution_summary(item: Any) -> dict[str, Any]:
+    """Keep observed loss/batch scalars while omitting device/debug receipts."""
+    item = item if isinstance(item, dict) else {}
+    projected = {"status": item.get("status") or UNAVAILABLE}
+    if "reason" in item:
+        projected["reason"] = item["reason"]
+    payload = item.get("payload")
+    if isinstance(payload, dict):
+        kept = {key: payload[key] for key in (
+            "loss_definition", "loss_direction_reduction", "loss_replica_reduction",
+            "negative_sampling_policy", "objective_is_custom", "optimizer_learning_rates",
+            "embedding_dtype", "epoch_reduction", "coverage", "limitations",
+        ) if key in payload}
+        if isinstance(payload.get("batches"), list):
+            batches = []
+            for batch in payload["batches"]:
+                if not isinstance(batch, dict):
+                    continue
+                observed = {key: batch[key] for key in (
+                    "epoch", "batch_index", "batch_position", "global_batch_size",
+                    "uniform_logit_reference",
+                ) if key in batch}
+                replicas = batch.get("replicas")
+                if isinstance(replicas, list):
+                    observed["local_batch_sizes"] = [replica.get("local_batch_size") for replica in replicas]
+                    observed["logit_scales"] = [replica.get("logit_scale") for replica in replicas]
+                batches.append(observed)
+            kept["batches"] = batches
+        projected["payload"] = kept
+    return projected
+
+
 def summarize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
     """Compact view for the planner. Unavailable stays unavailable."""
     summary = {"schema_version": bundle.get("schema_version"), "items": {}}
@@ -39,6 +71,11 @@ def summarize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
                 "hit_rate",
                 "effective_rank",
                 "effective_rank_definition",
+                "mean_norm",
+                "mean_dimension_variance",
+                "last_loss",
+                "coverage",
+                "scope",
                 "method",
                 "last_fixed_bank_top1",
                 "epochs",
@@ -51,6 +88,8 @@ def summarize_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
             ):
                 if key in payload:
                     summary["items"][name][key] = payload[key]
+            if name == "training_dynamics" and "training_execution" in payload:
+                summary["items"][name]["training_execution"] = _training_execution_summary(payload["training_execution"])
     return summary
 
 

@@ -108,6 +108,35 @@ def accept_job(
             "execution_succeeded": True,
             "fixed_bank_top1": None,
         }
+    if protocol is not None and protocol.get("evaluation_mode") == "loso_method_search":
+        from react_agent.eeg_training.checkpoint_selection import validate_training_completion
+        from react_agent.eeg_training.inference_consistency import (
+            CONSISTENCY_NAME, validate_reconstruction_context,
+        )
+        from react_agent.eeg_training.protocol import SplitError
+        selected_path, consistency_path = job_dir / "selected_checkpoint.json", job_dir / CONSISTENCY_NAME
+        if not selected_path.is_file() or not consistency_path.is_file():
+            return {"evaluation_valid": False, "reason": "method_training_selection_or_consistency_missing", "fidelity": fidelity}
+        selected = json.loads(selected_path.read_text(encoding="utf-8"))
+        ok, reason = validate_training_completion(payload, selected, protocol, fidelity)
+        if not ok:
+            return {"evaluation_valid": False, "reason": reason, "fidelity": fidelity, "execution_succeeded": True}
+        try:
+            identity = validate_reconstruction_context(job_dir, job_dir / "last.ckpt")
+        except (SplitError, OSError, ValueError, KeyError, TypeError) as exc:
+            return {"evaluation_valid": False, "reason": "method_training_reconstruction_invalid:" + str(exc), "fidelity": fidelity}
+        consistency = json.loads(consistency_path.read_text(encoding="utf-8"))
+        expected_count = len(protocol.get("validation_query_ids") or [])
+        if (identity is None or consistency.get("status") != "verified" or
+            consistency.get("training_inference_identity_fingerprint") != identity["fingerprint"] or
+            consistency.get("checkpoint_sha256") != identity["context"]["checkpoint_sha256"] or
+            consistency.get("development_query_count") != expected_count or not expected_count or
+            consistency.get("candidate_count") != len(expected_gallery or [])):
+            return {"evaluation_valid": False, "reason": "method_training_consistency_identity_mismatch", "fidelity": fidelity}
+        if (any(type(consistency.get(key)) is not int or not 0 <= consistency[key] <= expected_count for key in ("top1_hits", "top5_hits")) or
+            consistency.get("top1_hits") / expected_count != score or
+            consistency.get("top5_hits") / expected_count != payload.get("fixed_bank_top5")):
+            return {"evaluation_valid": False, "reason": "method_training_consistency_metrics_mismatch", "fidelity": fidelity}
     ok, reason = binding_accepts(job_dir, manifest)
     record = {
         "evaluation_valid": ok,
@@ -120,6 +149,10 @@ def accept_job(
         "implementation_failure": False,
         "execution_fingerprint": None if protocol is None else protocol.get("fingerprint"),
     }
+    if protocol is not None and protocol.get("evaluation_mode") == "loso_method_search":
+        record.update(evaluation_mode="loso_method_search", metric_scope="fold_development_execution_only",
+                      scientific_ranking_eligible=False, fixed_bank_top5=payload.get("fixed_bank_top5"),
+                      checkpoint_policy=payload.get("checkpoint_policy"), last_epoch=payload.get("last_epoch"))
     if payload.get("error") in {"oom", "nan"}:
         record["evaluation_valid"] = False
         record["fixed_bank_top1"] = None

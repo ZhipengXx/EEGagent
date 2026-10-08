@@ -42,6 +42,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--evaluate-only", action="store_true")
     parser.add_argument("--checkpoint", default=None, help="Checkpoint path, separate from the output directory")
     parser.add_argument("--negative-policy", default="data_parallel_local")
+    parser.add_argument("--evaluation-mode", default="single_target", choices=["single_target", "loso_method_search"])
+    parser.add_argument("--checkpoint-policy", default="legacy_min_delta", choices=["legacy_min_delta", "strict_best"])
+    parser.add_argument("--selection-min-delta", type=float, default=0.001)
     parser.add_argument("--device", default=None, choices=["cpu", "cuda"], help="Training device. Production default remains CUDA.")
     return parser
 
@@ -309,7 +312,7 @@ def _stored_test_result(out: Path) -> dict[str, float] | None:
     return {"top1": float(result["top1"]), "top5": float(result["top5"])}
 
 
-def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, float] | None:
+def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, object] | None:
     """Score the held-out test files after fit. A missing cache is not a score."""
     plan = split_plan(data_root, design)
     cache = feature_cache(data_root, design, "test")
@@ -334,17 +337,38 @@ def score_held_out(design: Design, data_root: Path, out_dir: Path) -> dict[str, 
         return None
     if not records:
         return None
+    identity = None
+    if design.evaluation_mode == "loso_method_search":
+        from react_agent.eeg_training.inference_consistency import validate_reconstruction_context
+        identity = validate_reconstruction_context(out_dir, checkpoint)
+        if identity is None:
+            raise SplitError("training_inference_identity_missing")
     dataset = RetrievalTrials(records, timesteps)
     loader = DataLoader(dataset, batch_size=min(200, len(dataset)), shuffle=False, collate_fn=collate_retrieval)
     encoder = _load_encoder(spec, checkpoint, out_dir)
     result = _fixed_bank_pass(encoder, loader, records)
-    return {
+    scored = {
         "top1": result["fixed_bank_top1"],
         "top5": result["fixed_bank_top5"],
         "metric": "fixed_bank",
         "query_count": result["query_count"],
         "candidate_count": result["candidate_count"],
     }
+    if identity is not None:
+        from react_agent.eeg_training.inference_consistency import file_digest, object_digest, validation_records_identity
+        inference = {"schema_version": "eeg_research.held_out_inference_identity.v1",
+                     "training_inference_identity_fingerprint": identity["fingerprint"],
+                     "checkpoint_sha256": identity["context"]["checkpoint_sha256"],
+                     "source_sha256": identity["context"]["candidate_source_sha256"],
+                     "held_out_files": [{"path": str(path), "sha256": file_digest(path)} for path in plan.forbidden_files],
+                     "test_image_cache": {"path": str(cache), "sha256": file_digest(cache)},
+                     "actual_inputs": validation_records_identity(records),
+                     "input_geometry": spec, "eval_mode": True, "augmentation": "not_applied",
+                     "evaluator": identity["evaluator"], "tie_policy": identity["tie_policy"],
+                     "device": str(next(encoder.parameters()).device), "dtype": str(next(encoder.parameters()).dtype)}
+        scored["inference_identity"] = inference
+        scored["inference_fingerprint"] = object_digest(inference)
+    return scored
 
 
 def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
@@ -352,6 +376,9 @@ def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
     import importlib
 
     import torch
+    from react_agent.eeg_training.inference_consistency import persistent_buffers_digest, validate_reconstruction_context, file_digest
+
+    identity = validate_reconstruction_context(out_dir, checkpoint)
 
     binding_path = out_dir / "source_binding.json"
     binding = {}
@@ -373,6 +400,8 @@ def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
             class_path = (Path(out_dir) / class_file).resolve()
         if not class_path.is_file():
             raise SplitError("candidate_source_missing")
+        if binding.get("file_sha256") and file_digest(class_path) != binding["file_sha256"]:
+            raise SplitError("candidate_source_hash_mismatch")
         parent = str(class_path.parent)
         if parent not in sys.path:
             sys.path.insert(0, parent)
@@ -410,6 +439,9 @@ def rebuild_encoder(spec: dict[str, object], checkpoint: Path, out_dir: Path):
             raise SplitError(f"candidate_reload_failed:{type(exc).__name__}") from exc
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
     encoder.load_state_dict(saved["state_dict"])
+    if identity is not None and persistent_buffers_digest(encoder) != identity.get("persistent_buffers_sha256"):
+        raise SplitError("reconstruction_fitted_buffer_mismatch")
+    encoder.eval()
     device = resolve_train_device()
     return encoder.to(device)
 
@@ -427,11 +459,16 @@ def _fixed_bank_pass(encoder, loader, records) -> dict[str, float]:
 
     device = next(encoder.parameters()).device
     bank, labels = frozen_bank(records)
+    if not torch.isfinite(bank).all():
+        raise SplitError("non_finite_evaluation_image_features")
     tally = FixedBankTally(bank.to(device), labels.to(device))
     encoder.eval()
     with torch.no_grad():
         for batch in loader:
-            tally.add(encoder(batch["eeg"].to(device)))
+            embedding = encoder(batch["eeg"].to(device))
+            if not torch.isfinite(embedding).all():
+                raise SplitError("non_finite_evaluation_embedding")
+            tally.add(embedding)
     return tally.result()
 
 
@@ -448,6 +485,14 @@ def evaluate_checkpoint(design: Design, data_root: Path, out_dir: Path, checkpoi
     _train_loader, val_loader, _train_images, _val_images, spec = build_loaders(
         design, data_root, identity=_frozen_identity(context)
     )
+    from react_agent.eeg_training.inference_consistency import validate_development_identity, validate_reconstruction_context, validate_frozen_loader_identity
+    identity = validate_reconstruction_context(context, checkpoint)
+    if design.evaluation_mode == "loso_method_search" and identity is None:
+        raise SplitError("training_inference_identity_missing")
+    if design.evaluation_mode == "loso_method_search":
+        validate_frozen_loader_identity(val_loader.dataset.records, _frozen_identity(context))
+    if identity is not None:
+        validate_development_identity(identity, design, val_loader.dataset.records)
     encoder = _load_encoder(spec, checkpoint, context)
     validation = _fixed_bank_pass(encoder, val_loader, val_loader.dataset.records)
     return {
@@ -685,9 +730,30 @@ def placed_retrieval(encoder, device, n_visible: int, objective=None):
     return model
 
 
+def _replica_device_probe(receipts):
+    """Observe actual replica inputs and losses without changing their values."""
+    def observe(module, inputs, output):
+        loss = output[0]
+        # DataParallel replicas expose copied tensors as _former_parameters
+        # rather than through parameters(); inspect both native registries.
+        parameters = [value for child in module.modules()
+                      for value in {**child._parameters, **getattr(child, "_former_parameters", {})}.values()
+                      if value is not None]
+        scale_owner = module.encoder if hasattr(module, "encoder") and hasattr(module.encoder, "logit_scale") else module
+        scale = _logit_scale(scale_owner, inputs[0].device)
+        receipts.append({"input_device": str(inputs[0].device), "local_batch_size": int(inputs[0].shape[0]),
+                         "parameter_devices": sorted({str(value.device) for value in parameters}),
+                         "loss_device": str(loss.device), "logit_scale": float(scale.detach()),
+                         "temperature": 1.0 / float(scale.detach()) if float(scale.detach()) > 0 else None})
+    return observe
+
+
 def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
     """Train on validation top-1 and write metrics only after a completed loop."""
     import hashlib
+    from react_agent.eeg_training.checkpoint_selection import CheckpointSelection
+
+    validate_design(design)
 
     limit_visible_gpus(design)
     begin_history(out_dir, design.epochs)
@@ -708,12 +774,18 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
 
     device = resolve_train_device()
     random.seed(design.seed)
+    if design.evaluation_mode == "loso_method_search":
+        import numpy as np
+        np.random.seed(design.seed)
     torch.manual_seed(design.seed)
     if device.type == "cuda":
         torch.cuda.manual_seed_all(design.seed)
     train_loader, val_loader, train_images, val_images, spec = build_loaders(
         design, data_root, identity=_frozen_identity(out_dir)
     )
+    if design.evaluation_mode == "loso_method_search":
+        from react_agent.eeg_training.inference_consistency import validate_frozen_loader_identity
+        validate_frozen_loader_identity(val_loader.dataset.records, _frozen_identity(out_dir))
     encoder, candidate, module_name, used_fit = _instantiate_candidate(spec, out_dir, train_loader)
     encoder = encoder.to(device)
     transform_config = _hook_section(out_dir, "transform")
@@ -735,6 +807,8 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         pass
     custom = is_custom_objective(objective)
     negative_policy = resolve_negative_policy(candidate, objective)
+    if design.evaluation_mode == "loso_method_search" and negative_policy != "data_parallel_local":
+        raise SplitError("method_search_requires_data_parallel_local_negatives")
     use_global = negative_policy == "global_batch"
     n_visible = len(design.gpu) if device.type == "cuda" else 1
     extra = objective_parameters(objective)
@@ -754,17 +828,23 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         )
         wrapped = None
     bank, bank_labels = frozen_bank(val_loader.dataset.records)
+    if not torch.isfinite(bank).all():
+        raise SplitError("non_finite_development_image_features")
     bank = bank.to(device)
     bank_labels = bank_labels.to(device)
     best = None
-    stall = 0
+    selection = CheckpointSelection(design.checkpoint_policy, design.selection_min_delta)
     best_top5 = None
     best_within = None
     finished = 0
     best_epoch = None
     last_fixed = None
+    selected_scores = None
+    selected_probe = None
+    method_search = design.evaluation_mode == "loso_method_search"
     early_stop_enabled = design.stop in {"single_early", "chain_early"}
     duplicate_batches: list[list[str]] = []
+    device_receipts = []
     write_status(out_dir, "training", 0, design.epochs)
     for epoch_index in range(design.epochs):
         if use_global:
@@ -775,7 +855,7 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             assert model is not None
             model.train()
         losses: list[float] = []
-        for batch in train_loader:
+        for batch_index, batch in enumerate(train_loader):
             eeg = apply_train_transform(transform, batch["eeg"].to(device), counters)
             img = batch["img_features"].to(device)
             ids = _batch_image_ids(batch)
@@ -788,23 +868,50 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 loss = scalar_loss(compute_objective(objective, eeg_z, img, scale, ids))
             else:
                 assert model is not None
+                probe, probe_handle = [], None
+                if epoch_index == 0 and batch_index in {0, len(train_loader) - 1}:
+                    underlying = model.module if isinstance(model, torch.nn.DataParallel) else model
+                    probe_handle = underlying.register_forward_hook(_replica_device_probe(probe))
                 if ids:
                     codes = torch.tensor([int(hashlib.sha256(item.encode("utf-8")).hexdigest()[:8], 16) % (2**31) for item in ids], device=device, dtype=torch.long)
                     loss, _top1, _top5 = model(eeg, img, codes)
                 else:
                     loss, _top1, _top5 = model(eeg, img)
+                if probe_handle is not None:
+                    probe_handle.remove()
                 # LocalRetrieval checked each scalar objective; gather adds one
                 # loss per replica while preserving the local negative batches.
                 if isinstance(model, torch.nn.DataParallel):
                     loss = loss.mean()
                 loss = scalar_loss(loss)
-            losses.append(float(loss))
+            losses.append(float(loss.detach()))
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
+            if not use_global and probe_handle is not None:
+                device_receipts.append({"epoch": 1, "batch_index": batch_index,
+                    "batch_position": "first" if batch_index == 0 else "tail", "global_batch_size": int(eeg.shape[0]),
+                    "replicas": sorted(probe, key=lambda row: row["input_device"]),
+                    "gathered_loss_device": str(loss.device),
+                    "optimizer_parameter_devices": sorted({str(p.device) for group in optimizer.param_groups for p in group['params']}),
+                    "optimizer_state_devices": {key: sorted({str(value.device) for state in optimizer.state.values()
+                        for name, value in state.items() if name == key and isinstance(value, torch.Tensor)})
+                        for key in ('step', 'exp_avg', 'exp_avg_sq')}})
+                (out_dir / "training_devices.json").write_text(json.dumps({
+                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "gpu": list(design.gpu),
+                    "negative_sampling_policy": negative_policy,
+                    "objective_is_custom": custom,
+                    "loss_definition": "candidate_custom_objective" if custom else "symmetric_diagonal_contrastive_cross_entropy",
+                    "loss_direction_reduction": "unknown" if custom else "mean",
+                    "loss_replica_reduction": "mean",
+                    "loss_epoch_reduction": "arithmetic_mean_of_batch_scalars",
+                    "optimizer_learning_rates": [float(group["lr"]) for group in optimizer.param_groups],
+                    "embedding_dtype": str(next(encoder.parameters()).dtype),
+                    "batches": device_receipts}, indent=2), encoding="utf-8")
         scores_top1: list[float] = []
         scores_top5: list[float] = []
         tally = FixedBankTally(bank, bank_labels)
+        epoch_probe = None
         if use_global:
             raw_encoder = encoder.module if isinstance(encoder, torch.nn.DataParallel) else encoder
             encoder.eval()
@@ -813,6 +920,10 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 for batch in val_loader:
                     eeg = batch["eeg"].to(device)
                     embedding = raw_encoder(eeg)
+                    if not torch.isfinite(embedding).all():
+                        raise SplitError("non_finite_development_embedding")
+                    if method_search and epoch_probe is None:
+                        epoch_probe = embedding[:8].detach().cpu().clone()
                     tally.add(embedding)
                     top1, top5 = within_batch_accuracy(embedding, batch["img_features"].to(device))
                     scores_top1.append(float(top1))
@@ -827,6 +938,10 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 for batch in val_loader:
                     eeg = batch["eeg"].to(device)
                     embedding = raw_encoder(eeg)
+                    if not torch.isfinite(embedding).all():
+                        raise SplitError("non_finite_development_embedding")
+                    if method_search and epoch_probe is None:
+                        epoch_probe = embedding[:8].detach().cpu().clone()
                     tally.add(embedding)
                     top1, top5 = within_batch_accuracy(embedding, batch["img_features"].to(device))
                     scores_top1.append(float(top1))
@@ -847,19 +962,18 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             )
         write_status(out_dir, "training", finished, design.epochs)
         last_fixed = fixed["fixed_bank_top1"]
-        if best is None or fixed["fixed_bank_top1"] > best + 0.001:
+        if selection.observe(fixed["fixed_bank_top1"], finished):
             best = fixed["fixed_bank_top1"]
             best_top5 = fixed["fixed_bank_top5"]
             best_within = val_top1
             best_epoch = finished
-            stall = 0
+            selected_scores = dict(fixed)
+            selected_probe = epoch_probe
             payload = {"state_dict": raw_encoder.state_dict(), "epoch": finished}
             if isinstance(objective, torch.nn.Module):
                 payload["objective_state"] = objective.state_dict()
             torch.save(payload, out_dir / "last.ckpt")
-        else:
-            stall += 1
-        if early_stop_enabled and stall >= 5:
+        if early_stop_enabled and selection.stall >= 5:
             break
     write_status(out_dir, "finished", finished, design.epochs)
     if duplicate_batches:
@@ -888,6 +1002,16 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
                 "last_epoch": finished,
                 "best_fixed_bank_top1": best,
                 "last_epoch_fixed_bank_top1": last_fixed,
+                "policy": design.checkpoint_policy,
+                "raw_best_top1": selection.raw_best,
+                "saved_top1": selection.saved_best,
+                "patience_anchor_top1": selection.patience_anchor,
+                "patience_min_delta": selection.min_delta,
+                "stall": selection.stall,
+                "stop_reason": "epochs_completed" if finished == design.epochs else "development_patience_exhausted",
+                "monitor": "legal_development_fixed_bank_top1",
+                "monitor_unit": "fraction_0_to_1",
+                "tie_policy": "retain_earlier_epoch",
             },
             ensure_ascii=False,
             indent=2,
@@ -898,6 +1022,22 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         from react_agent.eeg_training.diagnostics import write_validation_artifacts
 
         best_encoder = _load_encoder(spec, checkpoint, out_dir)
+        if method_search:
+            from react_agent.eeg_training.inference_consistency import (
+                freeze_training_identity, validate_development_identity, compare_reconstruction, CONSISTENCY_NAME,
+            )
+            identity = freeze_training_identity(design, data_root, out_dir, checkpoint, best_encoder, val_loader.dataset.records)
+            validate_development_identity(identity, design, val_loader.dataset.records)
+            actual_scores = _fixed_bank_pass(best_encoder, val_loader, val_loader.dataset.records)
+            with torch.no_grad():
+                first_batch = next(iter(val_loader))
+                actual_probe = best_encoder(first_batch["eeg"].to(device))[:8].detach().cpu()
+            if selected_scores is None or selected_probe is None:
+                raise SplitError("selected_development_probe_missing")
+            consistency = compare_reconstruction(selected_scores, actual_scores, selected_probe, actual_probe)
+            consistency["training_inference_identity_fingerprint"] = identity["fingerprint"]
+            consistency["checkpoint_sha256"] = identity["context"]["checkpoint_sha256"]
+            (out_dir / CONSISTENCY_NAME).write_text(json.dumps(consistency, ensure_ascii=False, indent=2), encoding="utf-8")
         best_encoder.eval()
         note_eval_without_transform(counters)
         limit = int(os.environ.get("EEG_DIAGNOSTIC_SAMPLE_LIMIT") or 32)
@@ -929,6 +1069,8 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
             limit=limit,
             checkpoint_id=str(checkpoint),
             sample_seed=sample_seed,
+            total_query_count=reservoir.seen,
+            sampling_policy="uniform_reservoir_without_replacement",
         )
     encoder_params = sum(int(item.numel()) for item in encoder.parameters())
     objective_params = sum(int(item.numel()) for item in extra)
@@ -967,12 +1109,19 @@ def fit(design: Design, data_root: Path, out_dir: Path) -> dict[str, object]:
         "test_result": None,
         "train_image_count": len(set(train_images)),
         "validation_image_count": len(set(val_images)),
+        "query_count": None if selected_scores is None else selected_scores["query_count"],
         "validation_image_ids": sorted(set(val_images)),
         "train_validation_overlap": False,
         "negative_sampling_policy": negative_policy,
         "selected_checkpoint_epoch": best_epoch,
         "last_epoch": finished,
         "last_epoch_fixed_bank_top1": last_fixed,
+        "checkpoint_policy": design.checkpoint_policy,
+        "evaluation_mode": design.evaluation_mode,
+        "raw_best_top1": selection.raw_best,
+        "saved_top1": selection.saved_best,
+        "stop_reason": "epochs_completed" if finished == design.epochs else "development_patience_exhausted",
+        "training_complete": finished == design.epochs,
     }
 
 
@@ -993,6 +1142,9 @@ def main(argv: list[str] | None = None) -> int:
         stop=args.stop,
         weight_decay=args.weight_decay,
         test_only=args.test_only,
+        evaluation_mode=args.evaluation_mode,
+        checkpoint_policy=args.checkpoint_policy,
+        selection_min_delta=args.selection_min_delta,
     )
     if args.device:
         os.environ["EEG_TRAIN_DEVICE"] = args.device
@@ -1006,6 +1158,8 @@ def main(argv: list[str] | None = None) -> int:
         validate_design(design)
         limit_visible_gpus(design)
         if args.test_only:
+            if design.evaluation_mode == "loso_method_search":
+                raise SplitError("method_search_requires_readonly_benchmark_entrypoint")
             payload = json.loads(metrics.read_text(encoding="utf-8")) if metrics.is_file() else {}
             payload["test_result"] = score_held_out(design, args.data_root, out_dir)
             metrics.write_text(json.dumps(payload), encoding="utf-8")
@@ -1016,8 +1170,9 @@ def main(argv: list[str] | None = None) -> int:
 
         if isinstance(image_ids, list):
             payload["validation_identity"] = validation_identity_for(design, args.data_root, [str(item) for item in image_ids])
-        payload = apply_final_test_policy(payload, os.environ.get("EEG_FINAL_TEST", "1") != "0")
-        if os.environ.get("EEG_FINAL_TEST", "1") != "0":
+        final_enabled = os.environ.get("EEG_FINAL_TEST", "1") != "0" and design.evaluation_mode != "loso_method_search"
+        payload = apply_final_test_policy(payload, final_enabled)
+        if final_enabled:
             payload["test_result"] = score_held_out(design, args.data_root, out_dir)
     except SplitError as exc:
         (out_dir / "error.txt").write_text(str(exc), encoding="utf-8")
@@ -1033,6 +1188,8 @@ def _evaluate_main(design: Design, data_root: Path, out_dir: Path, checkpoint: P
     try:
         validate_design(design)
         context = Path(checkpoint).parent if checkpoint is not None else out_dir
+        if design.evaluation_mode == "loso_method_search" and (out_dir.resolve() == context.resolve() or target.exists()):
+            raise SplitError("method_search_requires_new_readonly_scoring_directory")
         payload = evaluate_checkpoint(design, data_root, out_dir, checkpoint=checkpoint, context_dir=context)
     except (SplitError, OSError, RuntimeError, ValueError) as exc:
         target.write_text(json.dumps({"error": str(exc)}), encoding="utf-8")

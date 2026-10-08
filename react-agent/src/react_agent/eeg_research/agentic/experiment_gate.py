@@ -91,8 +91,7 @@ def _digest(value: Any) -> str:
 
 def context_hash(context: dict[str, Any] | None) -> str:
     body = context if isinstance(context, dict) else {}
-    return _digest(
-        {
+    identity = {
             "capabilities": body.get("capabilities"),
             "evaluation_contract": body.get("evaluation_contract"),
             "parent_candidate_id": body.get("parent_candidate_id"),
@@ -100,7 +99,9 @@ def context_hash(context: dict[str, Any] | None) -> str:
             "budget": body.get("budget"),
             "policy_version": body.get("policy_version") or POLICY_VERSION,
         }
-    )
+    if "evaluation_mode" in body:
+        identity["evaluation_mode"] = body["evaluation_mode"]
+    return _digest(identity)
 
 
 def canonicalize_experiment_spec(spec: dict[str, Any] | None, *, allow_legacy: bool = True) -> dict[str, Any]:
@@ -127,6 +128,19 @@ def canonicalize_experiment_spec(spec: dict[str, Any] | None, *, allow_legacy: b
             copied[key] = {}
         elif not isinstance(value, dict):
             raise CanonicalizationError("config_not_object")
+    if "implementation_requirements" in copied:
+        from pydantic import ValidationError
+        from react_agent.eeg_research.agentic.schemas import ImplementationRequirement
+        value = copied["implementation_requirements"]
+        if not isinstance(value, list):
+            raise CanonicalizationError("implementation_requirements_not_list")
+        try:
+            copied["implementation_requirements"] = [ImplementationRequirement.model_validate(item).model_dump() for item in value]
+        except ValidationError as exc:
+            raise CanonicalizationError("implementation_requirement_invalid:" + str(exc.errors()[0]["loc"])) from exc
+        ids = [item["requirement_id"] for item in copied["implementation_requirements"]]
+        if len(ids) != len(set(ids)):
+            raise CanonicalizationError("duplicate_implementation_requirement_id")
     copied["schema_version"] = copied.get("schema_version") or SPEC_SCHEMA
     return copied
 
@@ -149,12 +163,14 @@ def _execution_hash(spec: dict[str, Any]) -> str:
             "hypothesis",
         )
     }
+    if "implementation_requirements" in spec:
+        body["implementation_requirements"] = spec["implementation_requirements"]
     return _digest(body)
 
 
 def scientific_identity(spec: dict[str, Any] | None) -> dict[str, Any]:
     spec = spec if isinstance(spec, dict) else {}
-    return {
+    identity = {
         "intervention": spec.get("principal_intervention") or spec.get("intervention"),
         "hypothesis": spec.get("hypothesis"),
         "parent_candidate_id": spec.get("parent_candidate_id"),
@@ -164,6 +180,9 @@ def scientific_identity(spec: dict[str, Any] | None) -> dict[str, Any]:
         "transform": spec.get("transform") if isinstance(spec.get("transform"), dict) else {},
         "negative_sampling_policy": spec.get("negative_sampling_policy"),
     }
+    if "implementation_requirements" in spec:
+        identity["implementation_requirements"] = spec["implementation_requirements"]
+    return identity
 
 
 def same_scientific_intervention(left: dict[str, Any] | None, right: dict[str, Any] | None) -> bool:
@@ -309,6 +328,13 @@ def approve_experiment(
     copied.pop("approval_record", None)
     copied.pop("experiment_ref", None)
     draft_problem = executable_draft_problem(copied)
+    evaluation = (context or {}).get("evaluation_contract") or {}
+    mode = (context or {}).get("evaluation_mode") or evaluation.get("evaluation_mode")
+    if mode == "loso_method_search" and not any(
+        item.get("kind", "implementation") == "implementation" and item.get("core", True)
+        for item in copied.get("implementation_requirements") or []
+    ):
+        draft_problem = "core_implementation_requirements_missing"
     if draft_problem:
         copied["status"] = "blocked"
         copied["blocked_reason"] = draft_problem

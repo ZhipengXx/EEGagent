@@ -45,21 +45,26 @@ def _check_fingerprint(workspace: Path, python: str | None) -> str:
     approved = workspace / "spec.json"
     assigned = json.loads(approved.read_text(encoding="utf-8")) if approved.is_file() else {}
     config = assigned.get("experiment") or assigned
-    # check_entry consumes only these hook configs. Repair prose and artifact
+    # check_entry consumes hook configs and declared implementation properties. Repair prose and artifact
     # receipts do not change the computation checked by this fingerprint.
     hook_config = {key: config.get(key) or {} for key in ("model", "objective", "transform")}
     payload = {
-        "fingerprint_version": 3,
+        "fingerprint_version": 4,
         "source": file_sha256(workspace / "extension" / "eeg_candidate.py"),
         "input_spec": json.loads(spec.read_text(encoding="utf-8")) if spec.is_file() else "eeg",
         "approved_hook_config": hook_config,
+        "implementation_requirements": config.get("implementation_requirements") or [],
         "python": python or torch_python(),
         "checker": file_sha256(Path(__file__).with_name("check_entry.py")),
         "objective_effectiveness_probe": file_sha256(Path(__file__).with_name("objective_effectiveness.py")),
         "objective_semantic_probe": file_sha256(Path(__file__).with_name("objective_semantics.py")),
+        "implementation_semantic_probe": file_sha256(Path(__file__).with_name("implementation_semantics.py")),
         "baseline_loss_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "model.py"),
         "objective_dispatch_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "hooks.py"),
     }
+    if isinstance(payload["input_spec"], dict) and (payload["input_spec"].get("multigpu_check") or {}).get("enabled"):
+        payload["multigpu_checker"] = file_sha256(Path(__file__).with_name("multigpu_check.py"))
+        payload["multigpu_probe"] = file_sha256(Path(__file__).with_name("multigpu_probe.py"))
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
@@ -626,16 +631,127 @@ def apply_review_filter(result: dict[str, Any], *, satisfied: set[str] | None = 
     coverage = result.get("intervention_coverage")
     def unresolved(value: Any) -> bool:
         if isinstance(value, dict):
-            if value.get("status") in {"missing", "not_implemented", "partial", "failed", "unknown"}:
+            if value.get("kind") == "scientific_hypothesis":
+                return False
+            if value.get("status") in {"missing", "not_implemented", "partial", "failed", "unknown", "contradicted", "unverified"}:
                 return True
             return any(unresolved(item) for item in value.values())
         if isinstance(value, list):
             return any(unresolved(item) for item in value)
-        return isinstance(value, str) and value in {"missing", "not_implemented", "partial", "failed", "unknown"}
+        return isinstance(value, str) and value in {"missing", "not_implemented", "partial", "failed", "unknown", "contradicted", "unverified"}
     if coverage is not None and unresolved(coverage):
         updated["status"] = "needs_fix"
         updated["coverage_unresolved"] = True
     updated["blocking_remaining"] = len(blocking)
+    return updated
+
+
+def enforce_requirement_review(workspace: Path, spec: dict[str, Any], result: dict[str, Any],
+                               checks: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Bind each core coverage item to current source/check evidence, including on reuse."""
+    from pydantic import ValidationError
+    from react_agent.eeg_research.agentic.binding import file_sha256
+    from react_agent.eeg_research.agentic.implementation_semantics import requirements_hash
+    from react_agent.eeg_research.agentic.schemas import ImplementationRequirement, RequirementCoverage
+
+    experiment = spec.get("experiment") or spec
+    declarations = experiment.get("implementation_requirements") or []
+    if not declarations:
+        return result
+    updated = dict(result)
+    issues = list(updated.get("issues") or [])
+    coverage = updated.get("requirement_coverage") or []
+    entry = workspace / "extension/eeg_candidate.py"
+    check_path = workspace / "checks.json"
+    current_source = file_sha256(entry) if entry.is_file() else ""
+    current_check = file_sha256(check_path) if check_path.is_file() else ""
+    try:
+        checks = checks if checks is not None else json.loads(check_path.read_text(encoding="utf-8"))
+        current_fingerprint = _check_fingerprint(workspace, None)
+    except (OSError, ValueError, KeyError, TypeError):
+        checks = {}
+        current_fingerprint = None
+    checks = checks if isinstance(checks, dict) else {}
+    semantic = checks.get("implementation_semantics") or {}
+    receipt_current = bool(current_source and current_check
+                           and checks.get("source_sha256") == current_source
+                           and checks.get("check_fingerprint") == current_fingerprint
+                           and semantic.get("requirements_hash") == requirements_hash(declarations))
+    evidence_current = bool(receipt_current and checks.get("ok"))
+    source_refs = {str(entry), "extension/eeg_candidate.py"}
+    source_lines = len(entry.read_text(encoding="utf-8").splitlines()) if entry.is_file() else 0
+    def valid_source_ref(reference: str) -> bool:
+        import re
+        match = re.fullmatch(r"(.+?)(?::([0-9]+)|#L([0-9]+))?", reference)
+        if not match or match.group(1) not in source_refs:
+            return False
+        line = match.group(2) or match.group(3)
+        return line is None or 1 <= int(line) <= source_lines
+    requirements = []
+    invalid_declaration = False
+    try:
+        requirements = [ImplementationRequirement.model_validate(item) for item in declarations]
+    except ValidationError:
+        invalid_declaration = True
+    invalid_coverage = False
+    rows = []
+    try:
+        rows = [RequirementCoverage.model_validate(row).model_dump() for row in coverage]
+    except (ValidationError, TypeError):
+        invalid_coverage = True
+    declared_ids = {item.requirement_id for item in requirements}
+    coverage_ids = [row["requirement_id"] for row in rows]
+    if len(coverage_ids) != len(set(coverage_ids)) or set(coverage_ids) - declared_ids:
+        invalid_coverage = True
+    probe_rows = {row.get("requirement_id"): row for row in semantic.get("requirements") or []}
+    unverifiable = invalid_declaration or invalid_coverage
+    contradictory = False
+    if unverifiable:
+        issues.append({"severity": "blocking", "kind": "implementation_requirement_contract_invalid",
+                       "error_class": "semantic_review_schema_error", "stage": "review_candidate",
+                       "detail": "Use one typed coverage item per declared core requirement; do not invent or duplicate requirement IDs."})
+    for requirement in requirements:
+        if requirement.kind != "implementation" or not requirement.core:
+            continue
+        row = next((item for item in rows if item["requirement_id"] == requirement.requirement_id), None)
+        reason = None
+        refs_current = bool(row and receipt_current and row["source_hash"] == current_source
+                            and row["check_sha256"] == current_check
+                            and row["check_ref"] in {str(check_path), "checks.json"}
+                            and row["source_refs"] and all(valid_source_ref(ref) for ref in row["source_refs"]))
+        observed_contradiction = bool(row and row["status"] == "contradicted" and refs_current)
+        if row is None or row["status"] == "unverified":
+            reason = "Core implementation is unverified; obtain the declared current code/check evidence."
+        elif row["status"] == "contradicted" and refs_current:
+            reason = row["detail"]
+        elif not (evidence_current and refs_current):
+            reason = "Implemented coverage lacks current source/check identity and valid source references."
+        if requirement.verification == "ordered_window_slots":
+            probe = probe_rows.get(requirement.requirement_id) or {}
+            if probe.get("status") == "contradicted" and receipt_current:
+                observed_contradiction = True
+                reason = "Current ordered-window counterexample contradicts the approved implementation promise."
+            elif probe.get("status") != "implemented":
+                reason = "The required ordered-window probe has no current successful receipt."
+        if reason:
+            contradictory = contradictory or observed_contradiction
+            unverifiable = unverifiable or not observed_contradiction
+            issues.append({"severity": "blocking", "kind": "core_implementation_contradicted" if observed_contradiction else "core_implementation_unverified",
+                           "requirement_id": requirement.requirement_id, "error_class": "semantic_requirement_mismatch" if observed_contradiction else "semantic_evidence_missing_or_stale",
+                           "stage": "review_candidate", "location": requirement.code_locations,
+                           "expected": requirement.expected_behavior, "actual": row,
+                           "source_hash": current_source, "check_ref": str(check_path), "check_sha256": current_check,
+                           "probe": probe_rows.get(requirement.requirement_id), "detail": reason})
+    updated["issues"] = issues
+    updated["requirements_hash"] = requirements_hash(declarations)
+    updated["requirement_evidence_current"] = evidence_current
+    if contradictory:
+        updated["status"] = "needs_fix"
+    elif unverifiable:
+        updated["status"] = "blocked"
+    updated["blocking_remaining"] = sum(row.get("severity") == "blocking" for row in issues)
+    if updated["status"] == "ready" and updated["blocking_remaining"]:
+        updated["status"] = "needs_fix"
     return updated
 
 
@@ -664,6 +780,13 @@ def review(
         "reviewer_model": model,
         "executor_model": model,
     }
+    from react_agent.eeg_research.agentic.binding import file_sha256
+    check_path = workspace / "checks.json"
+    payload["requirement_evidence_identity"] = {
+        "source_hash": file_sha256(entry) if entry.is_file() else "", "source_ref": str(entry),
+        "check_ref": str(check_path), "check_sha256": file_sha256(check_path) if check_path.is_file() else "",
+        "scope": "Reference these exact current identities in every core requirement coverage item.",
+    }
     from react_agent.eeg_research.agentic.handoffs import training_semantics
     payload["training_runtime_source"] = training_semantics()
     parent = workspace / "reference/parent.py"
@@ -691,6 +814,7 @@ def review(
             "issues": [] if format_failed else reply.get("issues") or [],
             "review_limits": None if format_failed else reply.get("review_limits"),
             "intervention_coverage": None if format_failed else reply.get("intervention_coverage"),
+            "requirement_coverage": [] if format_failed else reply.get("requirement_coverage") or [],
             "verified_invariants_with_refs": [] if format_failed else reply.get("verified_invariants_with_refs") or [],
             "unverified_invariants": [] if format_failed else reply.get("unverified_invariants") or [],
             "summary_zh": "审查回复格式不合格，按受阻处理。" if format_failed else reply.get("summary_zh"),
@@ -712,6 +836,7 @@ def review(
         result["coverage_unresolved"] = True
         result["issues"].append({"severity": "blocking", "kind": "intervention_coverage_missing",
                                  "detail": "Review must identify the approved intervention's implementation and supporting source/check refs."})
+    result = enforce_requirement_review(workspace, spec, result, checks=checks)
     from react_agent.eeg_research.agentic.identity import source_hash
 
     result["input_hash"] = source_hash(workspace)

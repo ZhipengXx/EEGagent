@@ -160,6 +160,10 @@ def build_execution_protocol(
         for image in validation_ids:
             validation_query_ids.extend(query_by_image.get(image) or [query_id(subject_fallback, image)])
     geom = geometry(design.dataset)
+    method_search = design.evaluation_mode == "loso_method_search"
+    if method_search:
+        from react_agent.eeg_training.protocol import validate_design
+        validate_design(design)
     body: dict[str, Any] = {
         "schema_version": PROTOCOL_SCHEMA,
         "dataset": design.dataset,
@@ -196,9 +200,12 @@ def build_execution_protocol(
         "final_test_enabled": False,
         "fidelity_overrides": {
             "pilot": {"epochs": PILOT_EPOCHS, "stop": "single_full"},
-            "full": {"epochs": design.epochs, "stop": "single_early"},
+            "full": {"epochs": design.epochs, "stop": "single_full" if method_search else "single_early"},
         },
     }
+    if design.evaluation_mode != "single_target" or design.checkpoint_policy != "legacy_min_delta" or design.selection_min_delta != 0.001:
+        body.update(evaluation_mode=design.evaluation_mode, checkpoint_policy=design.checkpoint_policy,
+                    selection_min_delta=design.selection_min_delta)
     body["fingerprint"] = _fingerprint({key: value for key, value in body.items() if key != "fingerprint"})
     return body
 
@@ -247,6 +254,10 @@ def design_from_protocol(protocol: dict[str, Any], *, training_seed: int | None 
         data_root=str(protocol["data_root"]),
         weight_decay=_weight_decay(protocol),
         training_strategy=str(protocol.get("training_strategy") or "pooled_subjects"),
+        evaluation_mode=str(protocol.get("evaluation_mode") or "single_target"),
+        checkpoint_policy=str(protocol.get("checkpoint_policy") or "legacy_min_delta"),
+        selection_min_delta=float(protocol.get("selection_min_delta", 0.001)),
+        stop="single_full" if protocol.get("evaluation_mode") == "loso_method_search" else "chain_early",
         policy="agentic",
     )
 
@@ -303,7 +314,7 @@ def effective_config(protocol: dict[str, Any], fidelity: str, *, training_seed: 
     """Resolved training config that must match the child argv."""
     seed = int(protocol.get("training_seed") if training_seed is None else training_seed)
     epochs, stop = fidelity_settings(protocol, fidelity)
-    return {
+    config = {
         "dataset": protocol["dataset"],
         "exp_setting": protocol["exp_setting"],
         "subject": protocol["subject"],
@@ -318,6 +329,12 @@ def effective_config(protocol: dict[str, Any], fidelity: str, *, training_seed: 
         "stop": stop,
         "negative_sampling_policy": str(protocol.get("negative_sampling_policy") or NEGATIVE_POLICY),
     }
+    mode = str(protocol.get("evaluation_mode") or "single_target")
+    policy = str(protocol.get("checkpoint_policy") or "legacy_min_delta")
+    min_delta = float(protocol.get("selection_min_delta", 0.001))
+    if mode != "single_target" or policy != "legacy_min_delta" or min_delta != 0.001:
+        config.update(evaluation_mode=mode, checkpoint_policy=policy, selection_min_delta=min_delta)
+    return config
 
 
 def _flag(command: list[str], name: str) -> str | None:
@@ -358,6 +375,14 @@ def command_matches(
                 return False
             continue
         if got != value:
+            return False
+    optional = {
+        "--evaluation-mode": (str(config.get("evaluation_mode") or "single_target"), "single_target"),
+        "--checkpoint-policy": (str(config.get("checkpoint_policy") or "legacy_min_delta"), "legacy_min_delta"),
+        "--selection-min-delta": (f"{config.get('selection_min_delta', 0.001):.8g}", "0.001"),
+    }
+    for flag, (value, default) in optional.items():
+        if (_flag(command, flag) or default) != value:
             return False
     gpu_flag = _flag(command, "--gpu")
     gpu = [int(item) for item in config["gpu"]]
@@ -402,6 +427,11 @@ def write_evaluation_identity(job_dir: Path, protocol: dict[str, Any]) -> Path:
         "val_mode": protocol.get("val_mode"),
         "schema_version": protocol.get("schema_version"),
     }
+    if protocol.get("evaluation_mode", "single_target") != "single_target" or protocol.get("checkpoint_policy", "legacy_min_delta") != "legacy_min_delta" or float(protocol.get("selection_min_delta", 0.001)) != 0.001:
+        payload.update(evaluation_mode=protocol.get("evaluation_mode", "single_target"),
+                       checkpoint_policy=protocol.get("checkpoint_policy", "legacy_min_delta"),
+                       selection_min_delta=protocol.get("selection_min_delta", 0.001),
+                       protocol_fingerprint=protocol.get("fingerprint"))
     path = job_dir / "evaluation_identity.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return path

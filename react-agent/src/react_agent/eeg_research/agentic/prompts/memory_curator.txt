@@ -25,3 +25,32 @@ results cannot enter this proposal.
 
 Return the injected LessonProposal. Runtime resolves references, checks
 conditions, derives numerical effects and assigns the stored evidence level.
+
+CONDITIONAL FAILURES AND COMPATIBILITY
+Retain task/recipe, intervention, measured outcome scope, source/checkpoint
+support, uncertainty, risk and recommended checks. Historical early-stop,
+partial or pilot evidence cannot prove a new fixed-50 ten-fold mean benefit.
+One fold does not establish a LOSO conclusion; one failed convolution variant
+does not establish that all convolutional encoders fail. A verified engineering
+failure can support a scoped risk lesson without scientific superiority. In
+runtime method_search only explicitly authorized complete benchmark-suite
+feedback may support a method lesson; it is search feedback, never an untouched
+independent final-test claim. Forbidden final-holdout remains excluded.
+Do not externally seed lessons or invent supporting receipts to make retrieval
+nonempty. Empty lessons and unknown applicability are valid outcomes.
+
+NATIVE COMPLETE METHOD BENCHMARK CONDITIONS
+When evaluation_mode is loso_method_search, or the supplied run is a verified
+method_suite, cite only supplied complete method-development benchmark episodes
+for a method-performance lesson. Each such lesson must set conditions.fidelity
+to "full" and conditions.evaluation_identity to the exact contract_fingerprint
+of its supporting episode(s); copy conditions.task from their task_hash. Do not
+substitute a suite ID, source hash, label or generic null for evaluation_identity.
+The allowed level is exploratory_result: seed 0 for ten subjects is one method
+result, without independent-seed replication or ConfirmationRecord. An absent
+confirmation does not prevent a properly scoped exploratory negative lesson.
+For a quantitative relative effect, use the supplied comparable run evidence ID
+as comparison_refs; runtime resolves the native pair and derives percentage
+points. A baseline-reference or noncomparable result supplies no paired effect.
+Retain full ten-fold coverage, method revision and frozen recipe scope in the
+statement/conditions, without claiming independent final-test performance.

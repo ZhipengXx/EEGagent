@@ -65,6 +65,9 @@ class Design:
     policy: str = "legacy_fixed"
     gpu_mode: str = "explicit"
     evaluate_only: bool = False
+    evaluation_mode: str = "single_target"
+    checkpoint_policy: str = "legacy_min_delta"
+    selection_min_delta: float = 0.001
 
     def campaign_id(self) -> str:
         """Stable directory name for this design."""
@@ -170,6 +173,23 @@ def validate_design(design: Design) -> None:
         raise SplitError("bad_gpu")
     if design.stop not in STOP_LABELS:
         raise SplitError("bad_stop")
+    if design.evaluation_mode not in {"single_target", "loso_method_search"}:
+        raise SplitError("bad_evaluation_mode")
+    if design.checkpoint_policy not in {"legacy_min_delta", "strict_best"}:
+        raise SplitError("bad_checkpoint_policy")
+    import math
+    if not math.isfinite(design.selection_min_delta) or design.selection_min_delta < 0:
+        raise SplitError("bad_selection_min_delta")
+    if design.evaluation_mode == "loso_method_search":
+        if design.dataset != "eeg" or design.exp_setting != "inter-subject" or design.training_strategy != "pooled_subjects":
+            raise SplitError("method_search_requires_eeg_pooled_inter")
+        if design.checkpoint_policy != "strict_best" or design.stop != "single_full":
+            raise SplitError("method_search_requires_strict_best_single_full")
+        if design.epochs != 50:
+            raise SplitError("method_search_requires_50_epochs")
+        chosen = design.subject.split(",")
+        if len(chosen) != 9 or not set(chosen) < set(EEG_SUBJECTS) or design.train_dir or design.test_dir:
+            raise SplitError("method_search_requires_nine_explicit_training_subjects")
     if design.weight_decay < 0:
         raise SplitError("bad_budget")
     if design.training_strategy not in {"per_subject", "pooled_subjects"}:
@@ -552,6 +572,12 @@ def train_command(design: Design, out_dir: Path, root: Path | None = None) -> li
         command.extend(["--gpu", ",".join(str(index) for index in design.gpu)])
     if design.policy == "agentic":
         command.extend(["--negative-policy", "data_parallel_local"])
+    if design.evaluation_mode != "single_target":
+        command.extend(["--evaluation-mode", design.evaluation_mode])
+    if design.checkpoint_policy != "legacy_min_delta":
+        command.extend(["--checkpoint-policy", design.checkpoint_policy])
+    if design.selection_min_delta != 0.001:
+        command.extend(["--selection-min-delta", f"{design.selection_min_delta:.8g}"])
     device = os.environ.get("EEG_TRAIN_DEVICE", "").strip().lower()
     if device in {"cpu", "cuda"}:
         command.extend(["--device", device])

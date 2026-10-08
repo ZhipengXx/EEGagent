@@ -145,7 +145,11 @@ def objective_semantic_findings(camp: Path, state: dict[str, Any], target: str,
 def verified_seed_records(camp: Path, state: dict[str, Any], protocol: dict[str, Any]) -> list[dict[str, Any]]:
     """Reuse accepted records only under each target's own current identity."""
     from react_agent.eeg_research.agentic.artifacts import file_digest
+    if protocol.get("evaluation_mode") == "loso_method_search":
+        from react_agent.eeg_research.agentic.method_suite import verified_suite_records
+        return verified_suite_records(camp, state)
     from react_agent.eeg_research.agentic.execution_protocol import effective_config
+    from react_agent.eeg_research.agentic.experiment_gate import ExperimentResolutionError
     from react_agent.eeg_research.agentic.jobs import baseline_manifest
     from react_agent.eeg_research.agentic.run_context import build_frozen_run_spec
     records = []
@@ -184,7 +188,7 @@ def verified_seed_records(camp: Path, state: dict[str, Any], protocol: dict[str,
                     or binding.get('file_sha256') != source or file_digest(source_path) != source):
                 continue
             records.append(row)
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, ExperimentResolutionError):
             continue
     return records
 
@@ -192,6 +196,10 @@ def verified_seed_records(camp: Path, state: dict[str, Any], protocol: dict[str,
 def remaining_confirmation_work(camp: Path, state: dict[str, Any], protocol: dict[str, Any], policy: dict[str, Any], *, records: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Conditional job lower bounds, never new commitments or execution rights."""
     from react_agent.eeg_research.agentic.comparison import matched_control
+    if protocol.get("evaluation_mode") == "loso_method_search":
+        return {"unit": "paired_complete_method_suites", "target_pairs": 1,
+                "independent_seed_count": 1, "required_folds_per_suite": 10,
+                "replicated": False, "candidates": [], "additional_training_jobs": 0}
     from react_agent.eeg_research.agentic.confirmation_policy import (
         policy_training_seeds,
     )
@@ -231,6 +239,63 @@ def remaining_confirmation_work(camp: Path, state: dict[str, Any], protocol: dic
 def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
                      budget: dict[str, Any], actions: list[str]) -> dict[str, Any]:
     """Count applied full-fidelity mechanisms from accepted, source-bound jobs."""
+    if goal.get("evaluation_mode") == "loso_method_search":
+        from react_agent.eeg_research.agentic.method_suite import verified_suite_records
+        from react_agent.eeg_research.agentic.planner import (
+            IMPLEMENT_CALLS, _number, design_block_reason, training_block_reason,
+        )
+        records = verified_suite_records(camp, state)
+        controls = {row["evidence_id"]: row for row in records if row.get("candidate_id") == "baseline"
+                    and row.get("seed") == 0 and row.get("fidelity") == "full"}
+        pairs = []
+        for row in records:
+            comparison = row.get("comparison") or {}
+            control = controls.get(comparison.get("control_run_id"))
+            if (row.get("candidate_id") != "baseline" and row.get("seed") == 0 and row.get("fidelity") == "full"
+                    and control and comparison.get("comparable") is True
+                    and comparison.get("paired_complete_suites") == 1 and comparison.get("required_fold_count") == 10
+                    and comparison.get("metric") == goal["primary_metric"]
+                    and row.get("suite_hash") and control.get("suite_hash")
+                    and comparison.get("candidate_suite_hash") == row.get("suite_hash")
+                    and comparison.get("control_suite_hash") == control.get("suite_hash")):
+                pairs.append(row)
+        pair_complete = bool(pairs)
+        unfinished = [] if pair_complete else [{"family": "complete_method_pair",
+            "reason": "At least one complete seed-0 baseline/nonbaseline ten-fold pair is required; partial folds and baseline alone do not address this goal."}]
+        estimate = _number(goal.get("method_suite_gpu_seconds_estimate"))
+        if estimate is None:
+            estimate = _number(_read(camp / "method_search_manifest.json").get("gpu_seconds_estimate_per_suite"))
+        remaining_suites = 1 if controls else 2
+        jobs_left = _number(budget.get("training_jobs_left"))
+        gpu_left = _number(budget.get("gpu_seconds_left"))
+        reserved = _number(budget.get("gpu_seconds_reserved")) or 0
+        calls = _number(budget.get("llm_calls_left"))
+        resources = (jobs_left is not None and jobs_left >= 10 * remaining_suites
+                     and estimate is not None and estimate > 0 and gpu_left is not None
+                     and gpu_left - reserved >= estimate * remaining_suites)
+        scope = {**goal, **state}
+        design_reason = design_block_reason(scope, budget)
+        training_reason = training_block_reason(scope, budget)
+        legal = [action for action in actions if action in {
+            "design_experiment", "propose_experiment", "implement_candidate", "repair_candidate", "run_full"}]
+        design_room = (calls is not None and calls >= 13 and design_reason is None
+                       and any(action in legal for action in ("design_experiment", "propose_experiment")))
+        implementation_room = (calls is not None and calls >= IMPLEMENT_CALLS and training_reason is None
+                               and any(action in legal for action in ("implement_candidate", "repair_candidate")))
+        training_room = (calls is not None and calls >= 3 and training_reason is None and "run_full" in legal)
+        return {"evaluation_mode": "loso_method_search", "primary_metric": goal["primary_metric"],
+                "unit": "complete_method_suite", "complete_methods": [
+                    {key: row.get(key) for key in ("candidate_id", "method_revision", "suite_id", "seed", "aggregate", "comparison", "promotion")}
+                    for row in records], "active_suite": state.get("active_suite"),
+                "independent_seed_count": len({row["seed"] for row in records}), "replicated": False,
+                "candidate_suite_job_lower_bound": 10, "partial_performance_evidence": False,
+                "required_method_pair_complete": pair_complete, "paired_complete_method_count": len(pairs),
+                "unfinished_requirements": unfinished, "budget_can_continue": bool(resources and (
+                    design_room or implementation_room or training_room)),
+                "minimum_pair_remaining_job_lower_bound": 10 * remaining_suites if not pair_complete else 0,
+                "method_suite_gpu_seconds_estimate": estimate, "legal_research_next_actions": legal,
+                "training_block_reason": training_reason, "new_design_block_reason": design_reason,
+                "remaining_resources": budget, "limitations": ["method_development_benchmark", "no_independent_final_test", "no_statistical_significance"]}
     labels={
         'encoder':'encoder', 'objective':'objective', 'statistics':'train_statistics',
         'augmentation':'train_augmentation', 'ablation':'controlled_ablation',
@@ -351,9 +416,7 @@ def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
     scope = {**goal, **state}
     design_reason = design_block_reason(scope, budget)
     training_reason = training_block_reason(scope, budget)
-    design_room=(calls is not None and calls>=13 and design_reason is None and
-                 sum(row.get('status') not in {'implementation_failed','requires_framework_extension'}
-                     for row in state.get('candidates') or [])<int(goal.get('max_candidates') or state.get('max_candidates') or 0))
+    design_room=(calls is not None and calls>=13 and design_reason is None)
     training_room=(calls is not None and calls>=3 and training_reason is None)
     can_continue=(design_room and any(action in actions for action in ('design_experiment','propose_experiment','implement_candidate','repair_candidate'))
                   or training_room and any(action in actions for action in ('run_pilot','run_full','replicate')))
@@ -378,6 +441,9 @@ def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
 def stopping_block_reason(scope: dict[str, Any], reason: Any) -> str | None:
     """Do not accept a scientific stop while requested executable work remains."""
     progress=scope.get('research_progress') or {}
+    if (progress.get('evaluation_mode') == 'loso_method_search' and reason == 'goal_addressed'
+            and not progress.get('required_method_pair_complete')):
+        return 'premature_stop:complete_baseline_and_nonbaseline_method_pair_required'
     if not progress.get('budget_can_continue'):return None
     if reason=='budget_exhausted':return 'premature_stop:authorized_budget_remains'
     if progress.get('unfinished_requirements') and reason in {

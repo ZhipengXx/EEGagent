@@ -175,8 +175,15 @@ class SidecarStore:
 def episode_source(camp: Path, episode: dict) -> dict:
     from react_agent.eeg_research.agentic.artifacts import file_digest, resolve_verified_artifact
 
-    if unsafe_source(episode) or episode.get("scope") != "development":
+    method = episode.get("scope") == "method_development_benchmark"
+    if unsafe_source(episode) or (episode.get("scope") != "development" and not method):
         raise ValueError("episode_not_development")
+    if method:
+        from react_agent.eeg_research.agentic.memory import verified_method_episode
+        native = verified_method_episode(camp, episode)
+        return {"episode_id": episode["episode_id"], "content_hash": content_hash(episode),
+                "artifact_path": str(Path(native["path"]).resolve()), "artifact_sha256": native["sha256"],
+                "scope": "method_development_benchmark", "independent_seed_count": 1, "replicated": False}
     ref = str(episode.get("artifact") or "")
     if ref.startswith("art_"):
         row = resolve_verified_artifact(camp, ref)

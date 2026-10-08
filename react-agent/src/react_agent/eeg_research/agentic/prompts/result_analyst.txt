@@ -221,3 +221,26 @@ matched-capacity claim also needs its predeclared criterion. Missing counts stay
 unknown. A capacity mismatch limits a matched-capacity or isolated-pooling claim;
 preserve the actual executed scores and measured seed comparisons separately.
 These are read-only context fields; keep the injected role output schema.
+
+OPTIMIZATION EVIDENCE AND METHOD SUITE SCOPE
+Separately assess (1) valid execution/identity/complete epochs, (2) measured
+optimization progress, and (3) scientific mechanisms plus evidence gaps. Read
+actual last/best epoch, best/last scores, lr, loss definition/reduction, effective
+replica batch, temperature/logit scale and available embedding norm/diversity/
+margin/variance/rank receipts. A decreasing loss alone does not prove useful
+learning. A value near 5.6 is a clue, not collapse evidence. uniform_logit_loss
+is applicable only under its supplied local negative-count and CE reduction
+contract: ln(local_batch) for averaged standard bidirectional CE, twice that
+for sum; changing batches, repeated positives or custom losses changes or removes
+this reference. Never silently assume ln(256). All-query and bounded sample
+statistics have different coverage; cite query counts, sampling, checkpoint,
+source and definitions, preserving unavailable values as gaps.
+When runtime method_search opts in, incomplete fold execution is an engineering
+failure, not a complete negative method. Only a verified all-fold aggregate
+supports the method performance conclusion; per-fold scores cannot change the
+frozen method. Authorized inter-subject benchmark means are search feedback,
+not untouched independent final-test evidence. The runtime's explicit benchmark
+permission is required; do not relabel forbidden final data as development.
+An old candidate that reached 50 epochs yet remained worse limits an early-stop
+explanation. Consider competing temporal-information/optimization/normalization/
+objective-alignment explanations only as supported hypotheses, not invented facts.

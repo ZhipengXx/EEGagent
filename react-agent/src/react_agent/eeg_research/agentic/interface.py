@@ -25,6 +25,15 @@ CANDIDATE_INTERFACE = {
         "optional build_training_objective(self, objective_config=None); receives EEG embedding, "
         "frozen image embedding and runtime positive relations; learnable parameters enter AdamW"
     ),
+    "implementation_requirements": {
+        "purpose": "Approved core implementation promises are checked individually; predicted Top-1 gains are scientific hypotheses, not pretraining implementation gates.",
+        "fields": "requirement_id, kind (implementation/scientific_hypothesis), core, expected_behavior, code_locations, verification, probe",
+        "verification": {
+            "source_review": "Reviewer identifies the current execution path and exact current source/check receipt references.",
+            "ordered_window_slots": "Only for an explicitly promised ordered temporal representation. Declare real input_module_path at the pool input and representation_module_path at its downstream consumer, slot_count and layout; the checker injects distinct window values at that boundary and observes the real consumer input.",
+        },
+        "limits": "No universal global-pooling ban, raw-EEG permutation rule or predicted improvement requirement. Missing core implementation evidence stays unverified and cannot authorize training.",
+    },
     "not_available": [
         "subject id or any per-subject metadata as model input",
         "image id as encoder input",
@@ -72,4 +81,16 @@ def candidate_interface(protocol: dict[str, Any] | None) -> dict[str, Any]:
             f"the validation gallery ({len(gallery)} images) and query ids are fixed by the contract fingerprint",
             *CANDIDATE_INTERFACE["runtime_guarantees"][1:],
         ]
+    if isinstance(protocol, dict) and protocol.get("evaluation_mode") == "loso_method_search":
+        total_batch = int(protocol["batch_size"])
+        samples = len(protocol.get("train_query_ids") or [])
+        payload["multigpu_check"] = {
+            "enabled": True, "evaluation_mode": "loso_method_search", "gpu": list(protocol["gpu"]),
+            "batch_size": total_batch, "training_sample_count": samples,
+            "tail_batch_size": (samples % total_batch) or total_batch,
+            "negative_sampling_policy": protocol["negative_sampling_policy"],
+            "checkpoint_policy": protocol["checkpoint_policy"], "protocol_fingerprint": protocol["fingerprint"],
+            "data_scope": "synthetic_training_inputs_only;no_held_out_EEG_or_images",
+        }
+        payload["runtime_guarantees"][-1] = "Custom objectives must explicitly support data_parallel_local; the same frozen cards, total batch and actual tail partition are tested by the native synthetic multi-GPU checker before Reviewer approval."
     return payload

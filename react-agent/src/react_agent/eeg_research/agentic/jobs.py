@@ -23,6 +23,7 @@ from react_agent.eeg_research.agentic.execution_protocol import (
 )
 from react_agent.eeg_research.agentic.runner import accept_job, research_env
 from react_agent.eeg_training.protocol import Design, train_command
+from react_agent.eeg_research.agentic.process_identity import _stat_fields, _proc_start, _process_state
 
 BASELINE_MODULE = "react_agent.eeg_research.agentic.baseline"
 PILOT_EPOCHS = 3
@@ -32,28 +33,6 @@ TERM_GRACE_S = 60.0
 def baseline_manifest() -> dict[str, Any]:
     path = Path(__file__).resolve().parent / "baseline.py"
     return manifest_for(path.parent, BASELINE_MODULE, path)
-
-
-def _stat_fields(pid: int) -> list[str] | None:
-    try:
-        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    return text.rsplit(")", 1)[1].split()
-
-
-def _proc_start(pid: int) -> str | None:
-    fields = _stat_fields(pid)
-    if fields is None or len(fields) <= 19:
-        return None
-    return fields[19]
-
-
-def _process_state(pid: int) -> str | None:
-    fields = _stat_fields(pid)
-    if not fields:
-        return None
-    return fields[0]
 
 
 _RUNNING = {"R", "S", "D"}
@@ -194,6 +173,7 @@ def start_job(
         "effective_config": None if protocol is None else effective_config(protocol, fidelity, training_seed=run_design.seed),
         "negative_sampling_policy": None if protocol is None else protocol.get("negative_sampling_policy"),
         "execution_fingerprint": None if protocol is None else protocol.get("fingerprint"),
+        "protocol_path": None if protocol_path is None else str(protocol_path.resolve()),
         "source_hash": manifest.get("entry_sha256") if isinstance(manifest, dict) else None,
     }
     (job_dir / "job.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -260,7 +240,8 @@ def reconcile(job_dir: Path) -> dict[str, Any]:
     record["ended_at"] = record.get("ended_at") or (max(marks) if marks else time.time())
     elapsed = float(record["ended_at"]) - float(record["started_at"])
     record["gpu_seconds"] = elapsed * max(1, len(record.get("gpu") or []))
-    protocol = load_protocol(job_dir.parent.parent)
+    protocol_ref = record.get("protocol_path")
+    protocol = load_protocol(Path(protocol_ref).parent) if protocol_ref else load_protocol(job_dir.parent.parent)
     accepted = accept_job(job_dir, record.get("manifest"), str(record.get("fidelity")), protocol=protocol)
     record["result"] = accepted
     if accepted.get("evaluation_valid"):

@@ -22,7 +22,8 @@ def _spec(dataset_or_path: str) -> dict[str, object]:
     return geometry(dataset_or_path)
 
 
-def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_config: dict | None = None) -> dict[str, object]:
+def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_config: dict | None = None,
+        implementation_requirements: list[dict] | None = None) -> dict[str, object]:
     import torch
 
     context = context if context is not None else {}
@@ -177,6 +178,9 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_
     with torch.no_grad():
         second = rebuilt(batch)
     round_trip = bool(torch.allclose(first, second))
+    context["stage"] = "declared_implementation_semantics"
+    from react_agent.eeg_research.agentic.implementation_semantics import probe_requirements
+    implementation_semantics = probe_requirements(encoder, geom, implementation_requirements or [])
     loaded = str(Path(inspect.getfile(type(candidate))).resolve())
     failures = []
     if not finite:
@@ -191,11 +195,14 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_
         failures.append("checkpoint_output_mismatch")
     if uses_statistics and not stats_in_state:
         failures.append("statistics_not_persistent_buffers")
+    if not implementation_semantics["ok"]:
+        failures.append("declared_implementation_semantics_failed")
     hints = {
         "statistics_not_persistent_buffers": "Initialize persistent registered buffers in the encoder constructor; update them in fit_statistics. Do not use plain attributes or new parameters.",
         "embedding_shape_mismatch": f"Expected [4, 1024], received {list(out.shape)}. Derive projection widths from actual pooling geometry.",
         "no_finite_trainable_gradients": "Keep the encoder differentiable and create trainable modules in __init__, not forward.",
         "checkpoint_output_mismatch": "Rebuild the same encoder and buffer layout before loading state_dict; use deterministic evaluation.",
+        "declared_implementation_semantics_failed": "Inspect implementation_semantics for the declared requirement, actual code boundary, counterexample, expected and observed values. Preserve the approved intervention; do not substitute a different method.",
     }
     if statistics_debug is not None and statistics_debug["forward_pre_hooks_after_fitting"] != statistics_debug["forward_pre_hooks_in_fresh_encoder"]:
         hints["checkpoint_output_mismatch"] += (
@@ -226,6 +233,7 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_
         "objective_ablation_probe": ablation_probe,
         "objective_effectiveness_probe": objective_effectiveness,
         "objective_semantics_probe": objective_semantics,
+        "implementation_semantics": implementation_semantics,
     }
     if failures:
         result["error"] = "candidate_invariant_failed"
@@ -239,7 +247,9 @@ def main() -> int:
     try:
         assigned = json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 else {}
         hook_config = assigned.get("experiment") or assigned
-        payload = run(sys.argv[1] if len(sys.argv) > 1 else "eeg", context=context, hook_config={key: hook_config.get(key) or {} for key in ("model", "objective", "transform")})
+        payload = run(sys.argv[1] if len(sys.argv) > 1 else "eeg", context=context,
+                      hook_config={key: hook_config.get(key) or {} for key in ("model", "objective", "transform")},
+                      implementation_requirements=hook_config.get("implementation_requirements") or [])
     except Exception as exc:  # noqa: BLE001
         payload = {**context, "ok": False, "error": type(exc).__name__, "detail": traceback.format_exc()[-1500:]}
         if isinstance(exc, SyntaxError):

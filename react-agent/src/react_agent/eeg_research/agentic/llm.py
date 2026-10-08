@@ -29,6 +29,7 @@ LONG_JSON_ROLES = {
     "result_auditor",
 }
 RAW_EXCERPT_LIMIT = 2048
+API_INTENTS = "llm_api_intents.jsonl"
 
 
 class LlmUnavailable(RuntimeError):
@@ -63,15 +64,111 @@ def system_prompt(role: str, *, memory=None) -> str:
     return shared + "\n\n" + mission + "\n\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object only.\n"
 
 
+def _method_api_accounting(camp: Path) -> bool:
+    path = camp / "goal.json"
+    if not path.is_file():
+        return False
+    return json.loads(path.read_text(encoding="utf-8")).get("evaluation_mode") == "loso_method_search"
+
+
+def _write_cost(camp: Path, cost: dict[str, Any]) -> None:
+    target = camp / "cost.json"
+    temp = target.with_suffix(".json.tmp")
+    temp.write_text(json.dumps(cost, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp.replace(target)
+
+
+def refresh_method_api_cost(camp: Path) -> dict[str, Any]:
+    """Reconcile native intent reservations and settled rows after a crash.
+
+    One reserved application attempt always consumes a call. If transport may
+    have occurred before persistence, the unmatched call remains uncertain and
+    is never relabeled zero/exactly-once. Tokens remain unknown until settled.
+    This opt-in reconciliation leaves GPU/external-budget fields intact.
+    """
+    cost_path = camp / "cost.json"
+    cost = json.loads(cost_path.read_text(encoding="utf-8")) if cost_path.is_file() else {}
+    if not _method_api_accounting(camp):
+        return cost
+    intents = {}
+    path = camp / API_INTENTS
+    if path.is_file():
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                row = json.loads(line)
+                if not row.get("call_id") or row.get("status") != "reserved_before_transport":
+                    raise LlmUnavailable("api_intent_ledger_invalid")
+                intents[str(row["call_id"])] = row
+    settled = {}
+    calls = camp / "llm_calls.jsonl"
+    if calls.is_file():
+        for index, line in enumerate(calls.read_text(encoding="utf-8").splitlines()):
+            if line.strip():
+                row = json.loads(line)
+                key = str(row.get("call_id") or ("legacy_row_" + str(index)))
+                if key in settled and settled[key] != row:
+                    raise LlmUnavailable("call_id_ledger_conflict")
+                settled[key] = row
+    pending = sorted(set(intents).difference(settled))
+    cost["llm_calls"] = len(set(settled).union(intents))
+    cost["llm_failures"] = sum(row.get("success") is not True for row in settled.values())
+    for key in ("input_tokens", "output_tokens", "reasoning_tokens"):
+        known = [row[key] for row in settled.values() if isinstance(row.get(key), int)]
+        if known or key in cost:
+            cost[key] = sum(known)
+        cost[key + "_known_call_count"] = len(known)
+    cost.update(api_unsettled_call_ids=pending, api_uncertain_calls=len(pending),
+                api_intent_accounting="application_attempt_reserved_before_transport_v1",
+                api_usd=None, pricing_source=None,
+                cost_status="uncertain" if pending else "unpriced")
+    cost.setdefault("gpu_seconds_used", 0.0)
+    _write_cost(camp, cost)
+    return cost
+
+
+def _reserve_api_intent(camp: Path, row: dict[str, Any]) -> None:
+    if not _method_api_accounting(camp):
+        return
+    camp.mkdir(parents=True, exist_ok=True)
+    # Durability precedes transport. A crash between fsync and cost.json rename
+    # is reconciled from the append-only intent on the next native budget read.
+    intent = {name: row.get(name) for name in
+              ("call_id", "role", "task_id", "attempt_id", "input_digest", "prompt_hash",
+               "request_trace_ref", "request_system_sha256", "request_user_sha256")}
+    intent.update(status="reserved_before_transport", recorded_at=time.time(),
+                  uncertain_if_unsettled=True)
+    with (camp / API_INTENTS).open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(intent, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    refresh_method_api_cost(camp)
+
+
 def _ledger(camp: Path, row: dict[str, Any]) -> None:
     camp.mkdir(parents=True, exist_ok=True)
+    method_mode = _method_api_accounting(camp)
+    ledger_path = camp / "llm_calls.jsonl"
+    if method_mode and row.get("call_id") and ledger_path.is_file():
+        prior = next((json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()
+                      if line.strip() and json.loads(line).get("call_id") == row["call_id"]), None)
+        if prior is not None:
+            if prior != row:
+                raise LlmUnavailable("call_id_ledger_conflict")
+            refresh_method_api_cost(camp)
+            return
     with (camp / "llm_calls.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        if method_mode:
+            handle.flush()
+            os.fsync(handle.fileno())
+    if method_mode:
+        refresh_method_api_cost(camp)
+        return
     cost_path = camp / "cost.json"
     cost = json.loads(cost_path.read_text(encoding="utf-8")) if cost_path.is_file() else {}
     cost["llm_calls"] = int(cost.get("llm_calls", 0)) + 1
     cost["llm_failures"] = int(cost.get("llm_failures", 0)) + (0 if row.get("success") else 1)
-    for key in ("input_tokens", "output_tokens"):
+    for key in ("input_tokens", "output_tokens", "reasoning_tokens"):
         value = row.get(key)
         if isinstance(value, int):
             cost[key] = int(cost.get(key, 0)) + value
@@ -95,12 +192,14 @@ def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
     system_sha = hashlib.sha256(system.encode("utf-8")).hexdigest()
     user_sha = hashlib.sha256(user.encode("utf-8")).hexdigest()
     identity = {key: row.get(key) for key in
-                ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_hash", "requested_model")}
+                ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash", "requested_model")}
     record = {**identity, "system": system, "user": user,
               "system_sha256": system_sha, "user_sha256": user_sha,
               "profile": "fast", "max_tokens": max_tokens,
               "status": "prepared_before_transport", "recorded_at": time.time(),
               "scope": "Exact application-level system/user strings supplied to complete_json; no transport credentials or HTTP wire-body claim."}
+    record["context_measurement"] = {"system_chars": len(system), "user_chars": len(user),
+                                     "total_application_chars": len(system) + len(user)}
     temp = path.with_suffix(".json.tmp")
     descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -121,7 +220,7 @@ def _response_trace(camp: Path, row: dict[str, Any], reply: Any, *, validation: 
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / (str(row["call_id"]) + ".json")
     identity = {key: row.get(key) for key in
-                ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_hash",
+                ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash",
                  "request_trace_ref", "request_system_sha256", "request_user_sha256")}
     record = {**identity, "reply": reply, "validation": validation,
               "schema_errors": schema_errors, "recorded_at": time.time()}
@@ -201,6 +300,23 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             task = task_identity_from_payload(payload, bound)
             if task is None:
                 raise LlmUnavailable("role_result_task_missing")
+            from react_agent.eeg_research.agentic.task_ledger import (
+                find_completed_task, latest, record_task_reuse, recovery_identity_digest,
+            )
+            persisted = latest(camp, str(task["task_id"]))
+            recovery = (persisted or {}).get("recovery_identity")
+            # Reuse only an explicit current identity established by the native
+            # begin-task consumer. A legacy empty prompt/digest is not guessed.
+            if (persisted and persisted.get("role") == role and isinstance(recovery, dict)
+                    and persisted.get("input_digest") == task.get("input_digest")
+                    and recovery.get("prompt_hash") == prompt_hash
+                    and persisted.get("recovery_identity_digest") == recovery_identity_digest(recovery)):
+                cached = find_completed_task(camp, role=role, recovery_identity=recovery,
+                                             candidate_id=persisted.get("candidate_id"),
+                                             input_digest=task.get("input_digest"))
+                if cached and cached["task"]["task_id"] == task["task_id"]:
+                    record_task_reuse(camp, cached)
+                    return cached["envelope"]
         last: DeepSeekParseError | None = None
         schema_error = None
         previous_domain = None
@@ -222,6 +338,12 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                                 "correction_instruction": "Return a complete corrected JSON object using only OUTPUT_SCHEMA fields. Input metadata is read-only, not output. Remove every reported forbidden field; correct every reported missing/invalid field. Keep the task, legal actions, evidence identities and business context unchanged."}
             from react_agent.eeg_research.agentic.role_examples import add_role_examples
             call_payload = add_role_examples(call_payload, role, memory)
+            from react_agent.eeg_research.agentic.handoffs import compact_role_context
+            call_payload = compact_role_context(call_payload, role, system_chars=len(system))
+            projection = call_payload["role_context_projection"]
+            if not projection["fits_budget"]:
+                raise LlmUnavailable("role_context_budget_requires_artifact_pages",
+                                     diagnostics={"role_context_projection": projection})
             goal_path = camp / "goal.json"
             if goal_path.is_file():
                 try:
@@ -236,6 +358,13 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                         used = int(json.loads(cost_path.read_text(encoding="utf-8")).get("llm_calls") or 0)
                     except (json.JSONDecodeError, TypeError, ValueError):
                         used = 0
+                if goal.get("evaluation_mode") == "loso_method_search":
+                    reconciled = refresh_method_api_cost(camp)
+                    used = int(reconciled.get("llm_calls") or 0)
+                    if reconciled.get("api_unsettled_call_ids"):
+                        raise LlmUnavailable("unsettled_api_intent_requires_recovery",
+                            diagnostics={"api_unsettled_call_ids": reconciled["api_unsettled_call_ids"],
+                                         "cost_status": "uncertain"})
                 if isinstance(limit, int) and used >= limit:
                     raise LlmUnavailable("budget_exhausted")
             started = time.time()
@@ -246,6 +375,16 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 started_at=started,
                 **bound,
             )
+            if task is not None:
+                row.update({name: task.get(name) for name in ("task_id", "attempt_id", "input_digest")})
+                row.setdefault("input_hash", task.get("input_digest"))
+            row.update(application_attempt=_attempt + 1,
+                       application_retry_kind=("domain_schema" if schema_error is not None else
+                                               "invalid_json" if last is not None else None),
+                       role_context_revision=projection["revision"],
+                       role_context_original_user_chars=projection["original_user_chars"],
+                       role_context_projected_total_chars=projection["projected_total_chars"],
+                       role_context_budget_chars=projection["budget_chars"])
             append_ui_event(
                 camp,
                 "llm_call_started",
@@ -261,6 +400,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                 user_text = json.dumps(call_payload, ensure_ascii=False, default=str, separators=(",", ":"))
                 row.update(_request_trace(camp, row, system=system, user=user_text,
                                           max_tokens=int(config.fast.max_tokens)))
+                _reserve_api_intent(camp, row)
                 reply, usage = loop.run_until_complete(
                     client.complete_json(
                         system=system,

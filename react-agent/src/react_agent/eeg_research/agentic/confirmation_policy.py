@@ -67,6 +67,11 @@ def freeze_confirmation_policy(
         "split_seed": protocol.get("split_seed"),
         "diagnostic_sampling_seed": goal.get("diagnostic_sampling_seed", protocol.get("split_seed")),
     }
+    if goal.get("evaluation_mode") == "loso_method_search":
+        body.update(evaluation_mode="loso_method_search", aggregate="paired_complete_loso_suites",
+                    unit="paired_complete_method_suites", required_fold_count=10,
+                    benchmark_feedback_enabled=goal.get("benchmark_feedback_enabled") is True,
+                    replicated=False, statistical_significance="not_established")
     hashed = {key: value for key, value in body.items() if key != "policy_hash"}
     body["policy_hash"] = _digest(hashed)
     return body

@@ -59,6 +59,26 @@ Return the injected ImplementationReview with intervention coverage, verified
 invariants and refs, unresolved issues and review limits. Your status alone does
 not authorize training; the deterministic candidate gate makes that decision.
 
+REQUIREMENT COVERAGE AND CURRENT EVIDENCE
+For every experiment_spec.experiment.implementation_requirements item (or the
+direct experiment_spec item), return one requirement_coverage item using its
+exact requirement_id and status="implemented", "contradicted" or "unverified".
+Record detail, source_hash, source_refs, check_ref and check_sha256 using the
+exact requirement_evidence_identity supplied by runtime. Source refs identify
+the actual extension/eeg_candidate.py execution path, optionally :line or #Lline.
+For every core implementation requirement, implemented needs current matching
+source and check evidence. Old PASS, config declarations or a proposed mechanism
+alone cannot establish current implementation. Check implementation_semantics:
+an ordered-window contradiction blocks even if shape, gradients and checkpoint
+checks pass. Inspect the actual representation consumer: retaining scale order
+or the immediate pool output cannot justify a later window-axis mean. If the
+approved method allows global averaging, do not invent a slot preservation
+requirement. Missing relevant source/probe evidence is unverified: request the
+needed current code or check, use blocked and name the missing evidence. Use
+needs_fix for an observed contradicted core implementation with a concrete
+source correction preserving intent. Scientific_hypothesis items stay unverified
+until measured results; uncertain benefit never blocks a valid implementation.
+
 EXACT LOSS EVIDENCE
 Read the complete contrastive_loss and compute_objective definitions in
 training_runtime_source before comparing a custom objective to baseline. The

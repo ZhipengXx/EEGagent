@@ -410,3 +410,42 @@ matched-capacity claim also needs its predeclared criterion. Missing counts stay
 unknown. A capacity mismatch limits a matched-capacity or isolated-pooling claim;
 preserve the actual executed scores and measured seed comparisons separately.
 These are read-only context fields; keep the injected role output schema.
+
+METHOD-LEVEL INTER-SUBJECT SEARCH (ONLY WHEN RUNTIME OPTS IN)
+When evaluation_mode is loso_method_search, a scientific method is frozen
+once and evaluated on all declared folds. Only a verified complete suite with
+all required fold identities and its native subject mean supports a method-level
+performance judgment or a changed scientific intervention. An incomplete suite,
+pilot or earlier incompatible early-stop record is engineering/risk context;
+never fill its missing folds or treat its best fold as a method result. Fold jobs
+and their deterministic polling are runtime work, not repeated LLM redesigns.
+For a design compare 2-4 executable essential options when they exist. Explain
+any one-option case from current resources/legal actions. Each option names the
+complete-suite gap, competing explanation, actual hook to change, retained useful
+baseline computation, outcomes that distinguish explanations, registered evidence
+and full ten-fold cost supplied by runtime. Copy cost_basis verbatim; scientific
+explanations belong in observed_gap/value_rationale. Inherited objective/transform
+{} is legal. Compound changes limit attribution; no extra ablation is authorized.
+Do not evade an exhausted revision or no-progress cap by renaming an architecture,
+rewriting a summary or repeating unchanged report/audit text. New source, schema
+feedback, artifact pages, permissions or an actually changed intervention can be
+new inputs. Preserve valid negative results without relaxing implementation gates.
+
+method_suites supplies the exact verified complete-suite scalar records: use each
+aggregate's mean_top1/mean_top5/std/ddof and its ten subject score rows, alongside
+seed/full/coverage/method revision and source/checkpoint/evaluator identities.
+These values remain structured; a JSON history prefix or artifact index alone
+does not supply a mean. suite_ref/result_hash, score_ref/score_sha256 and native
+freeze references identify immutable omitted detail, not completed artifact reads.
+The single seed belongs to the whole method; ten folds are not ten independent
+seeds. research_progress.complete_methods uses the same scalar records. Runtime
+cost_basis and components include ten full jobs, ten CPU scores and the bounded
+conditional repair allowance; estimates cannot increase the actual remaining budget.
+
+DETERMINISTIC CONTEXT VIEW
+role_context_projection describes provider-only deduplication and omitted history.
+A canonical_context_ref is a JSON pointer within this same request; follow it and
+its digest to the one supplied complete canonical value. It is not a registered
+artifact/evidence ID or a completed content read. Missing required code/evidence
+requires an allowed page/read or an explicit gap, never an inference. The schema,
+legal actions, source identities and current semantic feedback remain authoritative.

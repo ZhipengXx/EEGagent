@@ -36,6 +36,10 @@ def freeze_contract(design: Design, data_root: Path) -> dict[str, Any]:
         "within_batch_role": "diagnostic_only",
         "legacy_unverified_note": "Historical within-batch 0.363 is not a fixed-gallery baseline.",
     }
+    if getattr(design, "evaluation_mode", "single_target") == "loso_method_search":
+        body.update(evaluation_mode="loso_method_search", primary_metric="benchmark.loso_mean_fixed_gallery_top1",
+                    subject_aggregation="macro_mean", required_fold_count=10,
+                    benchmark_scope="method_development_benchmark", independent_final_test=False)
     encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     body["fingerprint"] = hashlib.sha256(encoded).hexdigest()
     return body

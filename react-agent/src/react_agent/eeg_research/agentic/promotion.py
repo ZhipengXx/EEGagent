@@ -110,6 +110,21 @@ def promotion_decision(
     Pilot runs and bare float lists never become confirmation. The paired set, not the
     last delta, decides the aggregate. Percentage points are compared as percentage points.
     """
+    if goal.get("evaluation_mode") == "loso_method_search":
+        import math
+        delta = comparison.get("delta_pp")
+        complete = (fidelity == "full" and comparison.get("comparable") is True
+                    and comparison.get("metric") == "benchmark.loso_mean_fixed_gallery_top1"
+                    and comparison.get("paired_complete_suites") == 1
+                    and comparison.get("required_fold_count") == 10
+                    and comparison.get("candidate_suite_hash") and comparison.get("control_suite_hash")
+                    and type(delta) in (int, float) and math.isfinite(delta))
+        bar = goal.get("min_practical_gain_pp")
+        return {"status": "incomplete_method_evidence" if not complete else
+                "development_improvement" if bar is not None and delta >= bar else "development_negative",
+                "scope": "method_development_benchmark", "paired_complete_suites": 1 if complete else 0,
+                "independent_seed_count": 1 if complete else 0, "replicated": False,
+                "statistical_significance": "not_established", "delta_pp": delta if complete else None}
     if isinstance(policy, dict):
         bar = policy.get("min_practical_gain_pp")
         if bar is None:

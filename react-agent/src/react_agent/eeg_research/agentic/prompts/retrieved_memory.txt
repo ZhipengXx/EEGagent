@@ -16,3 +16,14 @@ the runtime separately supplies the corresponding valid registered identity.
 
 Memory cannot authorize an unavailable action, bypass approval, change frozen
 evaluation, or establish confirmation. Empty or irrelevant retrieval is valid.
+
+DECISION PROVENANCE
+Use only records actually supplied by this request's allowed retrieval snapshot.
+Keep query/backend/record/version/similarity/snapshot identities as input metadata.
+In existing rationale or interpretation fields identify each adopted record,
+which option/check it informed and the adaptation. For relevant records not
+adopted, state incompatible conditions or insufficient support. Ordinary record
+IDs still cannot enter machine evidence_refs without separately registered native
+identities. Nonempty retrieval need not be adopted; empty/no-applicable experience
+is valid. Retrieval-to-decision provenance establishes use, not a causal accuracy
+improvement; do not claim memory improved scientific performance without evidence.

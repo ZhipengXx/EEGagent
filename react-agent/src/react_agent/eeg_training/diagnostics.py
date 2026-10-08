@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,8 @@ def training_dynamics(job_dir: Path) -> dict[str, Any]:
             "fixed_bank_top1": [row.get("fixed_bank_top1") for row in rows],
             "sample_count": len(rows),
             "definition": "epoch_series_from_history",
+            "checkpoint_selection": _read_object(job_dir / "selected_checkpoint.json"),
+            "training_execution": training_execution(job_dir),
         },
     )
 
@@ -328,6 +331,8 @@ def write_validation_artifacts(
     limit: int = 32,
     checkpoint_id: str | None = None,
     sample_seed: int | None = None,
+    total_query_count: int | None = None,
+    sampling_policy: str = "prefix_of_supplied_queries",
 ) -> dict[str, Any]:
     """Write retrieval_queries.jsonl and a bounded embeddings.json from a real evaluator pass."""
     job_dir = Path(job_dir)
@@ -347,13 +352,78 @@ def write_validation_artifacts(
                 "source": "selected_checkpoint",
                 "checkpoint_id": checkpoint_id,
                 "sample_seed": sample_seed,
+                "total_query_count": total_query_count if total_query_count is not None else len(queries),
+                "query_coverage": len(vectors) / (total_query_count or len(queries)) if (total_query_count or queries) else None,
+                "sampling_policy": sampling_policy,
+                "limitations": "Bounded sample variance/rank are not all-query statistics.",
                 "schema_version": "eeg_research.validation_embeddings.v2",
             },
             ensure_ascii=False,
         ),
         encoding="utf-8",
     )
-    return {"query_rows": len(rows), "embedding_sample": len(vectors), "checkpoint_id": checkpoint_id}
+    coverage = {"query_rows": len(rows), "embedding_sample": len(vectors), "checkpoint_id": checkpoint_id,
+                "total_query_count": total_query_count if total_query_count is not None else len(queries),
+                "sampling_policy": sampling_policy, "sample_seed": sample_seed,
+                "limitations": "Retrieval margins/ranks use sampled queries against the full frozen gallery; embedding rank covers at most 16 sampled queries."}
+    binding = _read_object(job_dir / "source_binding.json")
+    coverage["source_sha256"] = binding.get("file_sha256")
+    identity = _read_object(job_dir / "training_inference_identity.json")
+    coverage["training_inference_identity_fingerprint"] = identity.get("fingerprint")
+    (job_dir / "validation_sampling.json").write_text(json.dumps(coverage, ensure_ascii=False, indent=2), encoding="utf-8")
+    return coverage
+
+
+def uniform_logit_reference(local_batch_sizes: list[int], *, direction_reduction: str = "mean", replica_reduction: str = "mean", objective_is_custom: bool = False) -> dict[str, Any]:
+    """Derive diagonal-CE loss for actual replica sizes; custom losses are not inferred."""
+    if objective_is_custom:
+        return _item(UNAVAILABLE, reason="custom_loss_uniform_reference_not_defined")
+    if not local_batch_sizes or any(size < 1 for size in local_batch_sizes):
+        return _item(UNAVAILABLE, reason="local_batch_sizes_missing")
+    if direction_reduction not in {"mean", "sum"} or replica_reduction not in {"mean", "sum"}:
+        return _item(UNAVAILABLE, reason="loss_reduction_unknown")
+    multiplier = 1 if direction_reduction == "mean" else 2
+    local = [multiplier * math.log(size) for size in local_batch_sizes]
+    value = sum(local) / len(local) if replica_reduction == "mean" else sum(local)
+    return _item("derived", {"uniform_logit_loss": value, "local_batch_sizes": local_batch_sizes,
+                "per_replica_reference": local, "direction_reduction": direction_reduction,
+                "replica_reduction": replica_reduction,
+                "definition": "diagonal_target_bidirectional_cross_entropy_at_uniform_logits",
+                "limitations": "Reference for the declared diagonal CE only; repeated images remain separate diagonal targets. No collapse diagnosis follows from proximity to this value."})
+
+
+def _read_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def training_execution(job_dir: Path) -> dict[str, Any]:
+    """Report observed first/tail replica batches and the matching loss reference."""
+    receipt = _read_object(job_dir / "training_devices.json")
+    if not receipt:
+        return _item(UNAVAILABLE, reason="training_devices_receipt_missing")
+    batches = []
+    for row in receipt.get("batches") or []:
+        sizes = [int(replica["local_batch_size"]) for replica in row.get("replicas") or []]
+        batches.append({**row, "uniform_logit_reference": uniform_logit_reference(sizes,
+            direction_reduction=str(receipt.get("loss_direction_reduction") or "unknown"),
+            replica_reduction=str(receipt.get("loss_replica_reduction") or "unknown"),
+            objective_is_custom=receipt.get("objective_is_custom") is not False)})
+    return _item("observed", {"loss_definition": receipt.get("loss_definition"),
+                 "loss_direction_reduction": receipt.get("loss_direction_reduction"),
+                 "loss_replica_reduction": receipt.get("loss_replica_reduction"),
+                 "negative_sampling_policy": receipt.get("negative_sampling_policy"),
+                 "objective_is_custom": receipt.get("objective_is_custom"),
+                 "optimizer_learning_rates": receipt.get("optimizer_learning_rates"),
+                 "embedding_dtype": receipt.get("embedding_dtype"),
+                 "epoch_reduction": receipt.get("loss_epoch_reduction"), "batches": batches,
+                 "coverage": "first_and_tail_training_batches_of_first_epoch",
+                 "limitations": "Sampled replica reference is not the uniform reference for the complete epoch, and loss alone cannot identify a mechanism."})
 
 
 def compute_job_diagnostics(job_dir: Path, *, batches: list[list[str]] | None = None) -> dict[str, Any]:
@@ -371,6 +441,13 @@ def compute_job_diagnostics(job_dir: Path, *, batches: list[list[str]] | None = 
     capabilities = job_dir / "capabilities_used.json"
     if batches is None:
         batches = _load_duplicate_batches(job_dir)
+    representation = representation_from_vectors(_load_embedding_matrix(job_dir))
+    retrieval = retrieval_from_rows([row for row in _load_jsonl(job_dir / "retrieval_queries.jsonl") if isinstance(row, dict)])
+    sampling = _read_object(job_dir / "validation_sampling.json")
+    if representation.get("payload") is not None:
+        representation["payload"]["coverage"] = sampling or _read_object(job_dir / "embeddings.json")
+    if retrieval.get("payload") is not None:
+        retrieval["payload"]["coverage"] = sampling
     return {
         "schema_version": "eeg_research.diagnostic_bundle.v1",
         "data_audit": _item(UNAVAILABLE, reason="raw_eeg_not_in_job_dir") if not identity.is_file() else _item(
@@ -385,8 +462,8 @@ def compute_job_diagnostics(job_dir: Path, *, batches: list[list[str]] | None = 
             },
         ),
         "training_dynamics": training_dynamics(job_dir),
-        "retrieval_errors": retrieval_from_rows([row for row in _load_jsonl(job_dir / "retrieval_queries.jsonl") if isinstance(row, dict)]),
-        "representation": representation_from_vectors(_load_embedding_matrix(job_dir)),
+        "retrieval_errors": retrieval,
+        "representation": representation,
         "group_results": _item(UNAVAILABLE, reason="subject_metadata_not_trusted")
         if not (job_dir / "subject_groups.json").is_file()
         else _item("observed", json.loads((job_dir / "subject_groups.json").read_text(encoding="utf-8"))),

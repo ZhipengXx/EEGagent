@@ -192,8 +192,16 @@ def training_block_reason(state: dict[str, Any], budget: dict[str, Any] | None =
 
 def design_block_reason(state: dict[str, Any], budget: dict[str, Any] | None = None) -> str | None:
     """Preserve the offline design path for an explicitly training-free scope."""
+    candidate_limit = _number(state.get("max_candidates", 4))
+    if candidate_limit is not None and submitted_candidates(state) >= candidate_limit:
+        return "candidate_budget"
     if state.get("allowed_training_actions") == []:
         return None
+    if state.get("evaluation_mode") == "loso_method_search":
+        jobs_left = (budget or state.get("budget") or {}).get("training_jobs_left",
+                    state.get("max_training_jobs", 0) - state.get("training_jobs", 0))
+        if jobs_left < 10:
+            return "method_suite_requires_ten_job_slots"
     reason = training_block_reason(state, budget)
     if reason:
         return reason
@@ -221,7 +229,10 @@ def submitted_candidates(state: dict[str, Any]) -> int:
     return sum(
         1
         for row in state.get("candidates") or []
-        if row.get("status") not in unwritten and row.get("candidate_id") != "baseline"
+        if row.get("candidate_id") != "baseline" and (
+            row.get("status") not in unwritten or row.get("source_hash")
+            or isinstance(row.get("check"), dict) and row["check"].get("source_sha256")
+        )
     )
 
 
@@ -282,6 +293,11 @@ def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
     if declared is None:
         declared = [int(item) for item in state.get("training_seeds") or []]
     for name in dict.fromkeys(names):
+        if state.get("evaluation_mode") == "loso_method_search":
+            if not _has(evidence, name, "full") and state.get("max_training_jobs", 0) - state.get("training_jobs", 0) >= 10:
+                if "run_full" in permitted:
+                    targets["run_full"].append(name)
+            continue
         if not _has(evidence, name, "pilot") and "run_pilot" in permitted:
             targets["run_pilot"].append(name)
         elif _has(evidence, name, "pilot") and not _has(evidence, name, "full") and "run_full" in permitted:
@@ -613,6 +629,11 @@ def _validate_reply(
     parsed = _parse(reply, allowed, known, trainable, eligible)
     if not parsed.get("ok"):
         return parsed
+    if parsed["action"] in {"design_experiment", "propose_experiment"}:
+        goal = observation.get("goal") if isinstance(observation.get("goal"), dict) else {}
+        reason = design_block_reason({**goal, **observation}, observation.get("budget"))
+        if reason:
+            return {"ok": False, "detail": "design_blocked:" + reason}
     implicit = parsed["action"] in {"implement_candidate", "repair_candidate"} and reply.get("target_id") is None and not reply.get("options")
     target_error = action_target_error(observation, parsed["action"], reply.get("target_id"),
         check_eligible=eligible is not None, legacy_implicit=implicit)
@@ -831,6 +852,9 @@ def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=N
     import math
     from pathlib import Path
     from react_agent.eeg_research.agentic.execution_protocol import load_protocol, next_unused_training_seed
+    if state.get("evaluation_mode") == "loso_method_search":
+        from react_agent.eeg_research.agentic.method_suite import suite_cost_estimates
+        return suite_cost_estimates(camp, state, observation)
     estimates = {}
     protocol = load_protocol(camp) if camp else {}
     protocol = protocol or {}

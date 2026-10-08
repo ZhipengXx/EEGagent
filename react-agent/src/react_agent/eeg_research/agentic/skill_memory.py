@@ -36,6 +36,9 @@ def artifact_source(camp: Path, artifact_id: str) -> dict:
     from react_agent.eeg_research.agentic.semantic_memory import read_json, unsafe_source, unsafe_source_path
 
     row = resolve_verified_artifact(camp, artifact_id)
+    if row.get("kind") in {"method_suite", "analysis", "lessons"}:
+        from react_agent.eeg_research.agentic.handoffs import development_artifact
+        development_artifact(camp, artifact_id)
     path = Path(row["path"])
     if (not path.resolve().is_relative_to(camp.resolve()) or unsafe_source(read_json(path))
             or unsafe_source_path(path)):
