@@ -12,7 +12,23 @@ from react_agent.eeg_research.agentic.loso_study import (
 )
 
 
-def verified_history(study: Path) -> dict:
+def _authorized_caps(additional: dict | None = None) -> tuple[dict, dict]:
+    """Apply only explicit native authorization increments; retain legacy caps."""
+    import math
+    supplied = {} if additional is None else additional
+    if not isinstance(supplied, dict) or set(supplied) - set(CAPS):
+        raise ValueError("invalid_additional_budget_authorization")
+    extras = {key: supplied.get(key, 0) for key in CAPS}
+    for key, value in extras.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError("invalid_additional_budget_authorization")
+        if key in {"llm_calls", "training_jobs"} and not isinstance(value, int):
+            raise ValueError("invalid_additional_budget_authorization")
+    return {key: CAPS[key] + extras[key] for key in CAPS}, extras
+
+
+def verified_history(study: Path, *, additional_authorization: dict | None = None) -> dict:
+    caps, extras = _authorized_caps(additional_authorization)
     study = study.resolve()
     body = manifest(study)
     dependencies = []
@@ -46,12 +62,15 @@ def verified_history(study: Path) -> dict:
                 dependencies.append({"path": str(dep), "sha256": digest(dep)})
     dependencies.append({"path": str(study / "study_manifest.json"), "sha256": digest(study / "study_manifest.json")})
     used = usage(study, body)
-    remaining = {key: CAPS[key] - used[key] for key in CAPS}
+    remaining = {key: caps[key] - used[key] for key in CAPS}
     if any(value < 0 for value in remaining.values()):
         raise ValueError("historical_authorization_exhausted")
-    result = {"schema_version": "eeg_research.budget_inheritance.v1", "source_study": str(study),
-              "authorization_caps": CAPS, "historical_usage": used, "remaining": remaining,
+    extended = any(extras.values())
+    result = {"schema_version": "eeg_research.budget_inheritance.v2" if extended else "eeg_research.budget_inheritance.v1",
+              "source_study": str(study), "authorization_caps": caps, "historical_usage": used, "remaining": remaining,
               "dependencies": dependencies, "accounting": "historical_reference_plus_successor_incremental"}
+    if extended:
+        result["additional_authorization"] = extras
     result["receipt_hash"] = identity(result)
     return result
 
@@ -122,8 +141,17 @@ def validate_inheritance(camp: Path) -> dict:
     body = {key: value for key, value in receipt.items() if key != "receipt_hash"}
     if identity(body) != receipt["receipt_hash"]:
         raise ValueError("budget_inheritance_receipt_invalid")
-    if receipt["authorization_caps"] != CAPS or any(
-            receipt["remaining"][key] != CAPS[key] - receipt["historical_usage"][key] for key in CAPS):
+    version = receipt.get("schema_version")
+    if version == "eeg_research.budget_inheritance.v1" and "additional_authorization" not in receipt:
+        expected_caps = CAPS
+    elif version == "eeg_research.budget_inheritance.v2" and "additional_authorization" in receipt:
+        expected_caps, extras = _authorized_caps(receipt["additional_authorization"])
+        if extras != receipt["additional_authorization"] or not any(extras.values()):
+            raise ValueError("budget_inheritance_authorization_mismatch")
+    else:
+        raise ValueError("budget_inheritance_authorization_mismatch")
+    if receipt["authorization_caps"] != expected_caps or any(
+            receipt["remaining"][key] != expected_caps[key] - receipt["historical_usage"][key] for key in CAPS):
         raise ValueError("budget_inheritance_authorization_mismatch")
     claim_successor(camp, receipt)
     return receipt

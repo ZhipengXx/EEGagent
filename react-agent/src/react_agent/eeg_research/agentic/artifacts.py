@@ -198,3 +198,55 @@ def _under(path: Path, camp: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def input_dependency_manifest(camp: Path, *, paths: list[Path],
+                              artifacts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Bind declared file bytes and authoritative registered artifact versions."""
+    import os
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    for supplied in paths:
+        path = Path(os.path.abspath(supplied))
+        exists = path.is_file()
+        rows[("file", str(path))] = {"kind": "file", "path": str(path),
+            "exists": exists, "sha256": file_digest(path) if exists else None}
+    for supplied in artifacts or []:
+        if not isinstance(supplied, dict) or not supplied.get("artifact_id"):
+            raise ValueError("input_artifact_id_missing")
+        artifact_id = str(supplied["artifact_id"])
+        registered = resolve_verified_artifact(camp, artifact_id)
+        advertised = supplied.get("content_sha256") or supplied.get("sha256")
+        if advertised is not None and advertised != registered["sha256"]:
+            raise ValueError("input_artifact_hash_mismatch")
+        path = Path(os.path.abspath(registered["path"]))
+        schema = registered.get("schema_version")
+        if path.suffix == ".json":
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(value, dict):
+                    schema = value.get("schema_version", schema)
+            except (ValueError, UnicodeError):
+                pass
+        if supplied.get("schema_version") is not None and supplied["schema_version"] != schema:
+            raise ValueError("input_artifact_schema_mismatch")
+        rows[("artifact", artifact_id)] = {"kind": "artifact", "artifact_id": artifact_id,
+            "artifact_kind": registered["kind"], "path": str(path),
+            "sha256": registered["sha256"], "schema_version": schema}
+    return [rows[key] for key in sorted(rows)]
+
+
+def verify_input_dependencies(camp: Path, manifest: list[dict[str, Any]]) -> bool:
+    """Re-read dependencies; missing or unverified inputs cannot be cached success."""
+    try:
+        if not isinstance(manifest, list) or any(not isinstance(row, dict) for row in manifest):
+            return False
+        if any(row.get("kind") not in {"file", "artifact"} for row in manifest):
+            return False
+        if any(row.get("kind") == "file" and row.get("exists") is not True for row in manifest):
+            return False
+        current = input_dependency_manifest(camp,
+            paths=[Path(row["path"]) for row in manifest if row["kind"] == "file"],
+            artifacts=[{"artifact_id": row["artifact_id"]} for row in manifest if row["kind"] == "artifact"])
+        return current == manifest
+    except (OSError, ValueError, KeyError, TypeError):
+        return False

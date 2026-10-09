@@ -54,3 +54,15 @@ as comparison_refs; runtime resolves the native pair and derives percentage
 points. A baseline-reference or noncomparable result supplies no paired effect.
 Retain full ten-fold coverage, method revision and frozen recipe scope in the
 statement/conditions, without claiming independent final-test performance.
+
+COMPACTED HANDOFF
+When compacted_context is supplied, it is a model-written delivery summary of
+the complete linked material, not new evidence. Literal run/episode/comparison/
+confirmation records and benchmark_population take precedence over its prose
+and over Analysis interpretations. Benchmark query counts are distinct from
+source-subject development validation counts. Preserve any observed disagreement.
+input_part refs and context_compaction artifact/task IDs identify the delivery
+operation only: never cite them as supporting episodes, comparisons, confirmation
+or completed scientific subtasks. Use the original supplied evidence references
+and allowed_source_refs. If the summary lacks support or leaves a material
+condition unresolved, retain that uncertainty or propose no lesson/skill.

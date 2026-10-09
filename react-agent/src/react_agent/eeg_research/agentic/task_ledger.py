@@ -118,12 +118,14 @@ def identity_reusable(payload: Any, *, candidate_id: str, attempt_id: str, phase
     )
 
 
-RECOVERY_IDENTITY_VERSION = "eeg_research.role_recovery_identity.v1"
+RECOVERY_IDENTITY_VERSION = "eeg_research.role_recovery_identity.v2"
+_LEGACY_RECOVERY_IDENTITY_VERSION = "eeg_research.role_recovery_identity.v1"
 _RECOVERY_REQUIRED = frozenset({
     "role", "action", "target_id", "source", "config", "approval", "prompt_hash",
     "schema_hash", "evaluator", "evidence", "memory_snapshot", "legal_actions",
-    "budget_feasibility", "request_semantics", "feedback",
+    "budget_feasibility", "request_semantics", "feedback", "input_dependencies",
 })
+_LEGACY_RECOVERY_REQUIRED = _RECOVERY_REQUIRED - {"input_dependencies"}
 
 
 def recovery_identity_digest(identity: dict[str, Any]) -> str:
@@ -135,8 +137,14 @@ def recovery_identity_digest(identity: dict[str, Any]) -> str:
     semantic rejections and new artifact-page digests so legitimate recovery is
     a new input. Callers must supply even inapplicable fields explicitly as null.
     """
-    if not isinstance(identity, dict) or _RECOVERY_REQUIRED.difference(identity):
+    if not isinstance(identity, dict):
         raise ValueError("incomplete_role_recovery_identity")
+    required = _RECOVERY_REQUIRED if "input_dependencies" in identity else _LEGACY_RECOVERY_REQUIRED
+    version = RECOVERY_IDENTITY_VERSION if "input_dependencies" in identity else _LEGACY_RECOVERY_IDENTITY_VERSION
+    if required.difference(identity):
+        raise ValueError("incomplete_role_recovery_identity")
+    if "input_dependencies" in identity and not isinstance(identity["input_dependencies"], list):
+        raise ValueError("invalid_role_recovery_dependencies")
     if not identity.get("role") or not identity.get("action") or not identity.get("prompt_hash") or not identity.get("schema_hash"):
         raise ValueError("invalid_role_recovery_identity")
     if not isinstance(identity["legal_actions"], list) or not isinstance(identity["budget_feasibility"], dict):
@@ -144,9 +152,9 @@ def recovery_identity_digest(identity: dict[str, Any]) -> str:
     from react_agent.eeg_research.agentic.artifacts import stable_request
     # Free-form metadata (summary, tick/PID, raw usage) cannot create a new input.
     # Scientific narrative belongs only in the explicit request_semantics field.
-    normalized = stable_request({key: identity[key] for key in _RECOVERY_REQUIRED})
+    normalized = stable_request({key: identity[key] for key in required})
     normalized["legal_actions"] = sorted(normalized["legal_actions"])
-    encoded = json.dumps({"version": RECOVERY_IDENTITY_VERSION, "identity": normalized},
+    encoded = json.dumps({"version": version, "identity": normalized},
                          ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -240,7 +248,12 @@ def find_completed_task(camp: Path, *, role: str,
     No task, API, check, job, or score is created by this read-only lookup.
     """
     digest = recovery_identity_digest(recovery_identity)
-    from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
+    from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact, verify_input_dependencies
+    dependencies = recovery_identity.get("input_dependencies")
+    if dependencies is None or not verify_input_dependencies(camp, dependencies):
+        return None
+    legacy_digest = recovery_identity_digest({key: value for key, value in recovery_identity.items()
+                                             if key != "input_dependencies"})
     from react_agent.eeg_research.agentic.roles import RoleResultError, validate_role_result
     for task in reversed(task_snapshots(camp)):
         if task.get("role") != role or task.get("status") != "completed":
@@ -249,9 +262,16 @@ def find_completed_task(camp: Path, *, role: str,
             continue
         old_digest = task.get("recovery_identity_digest")
         if old_digest != digest and not (
-            old_digest is None and input_digest and task.get("input_digest") == input_digest
+            old_digest in {None, legacy_digest} and input_digest and task.get("input_digest") == input_digest
         ):
             continue
+        old_identity = task.get("recovery_identity")
+        if isinstance(old_identity, dict):
+            try:
+                if recovery_identity_digest(old_identity) != old_digest:
+                    continue
+            except (ValueError, TypeError):
+                continue
         artifact_id = task.get("artifact_id")
         if not artifact_id:
             continue
@@ -301,6 +321,10 @@ def no_progress_repetitions(camp: Path, *, recovery_identity: dict[str, Any]) ->
     Existing caller-specific parse/repair caps remain the authority.
     """
     digest = recovery_identity_digest(recovery_identity)
-    return sum(row.get("recovery_identity_digest") == digest and
+    # v1 cannot prove dependency changes. Preserve its semantic cap
+    # conservatively; migration must not replenish paid retry opportunities.
+    legacy = recovery_identity_digest({key: value for key, value in recovery_identity.items()
+                                       if key != "input_dependencies"})
+    return sum(row.get("recovery_identity_digest") in {digest, legacy} and
                row.get("status") in {"completed", "partial", "blocked", "failed"}
                for row in task_snapshots(camp))

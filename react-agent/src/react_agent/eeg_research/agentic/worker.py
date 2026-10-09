@@ -35,7 +35,12 @@ from react_agent.eeg_training.protocol import data_root
 _TERMINAL = {"paused", "finished", "blocked", "cancelled"}
 CODER_STEPS = 8
 IMPLEMENT_ATTEMPTS = 3
-_METHOD_ROLE_HARD_BLOCKS = {"role_no_progress_retry_limit", "unsettled_api_intent_requires_recovery"}
+_METHOD_ROLE_HARD_BLOCKS = {
+    "role_no_progress_retry_limit", "unsettled_api_intent_requires_recovery",
+    "handoff_compaction_failed", "handoff_compaction_forbidden_input",
+    "handoff_compaction_already_compacted", "handoff_compaction_output_budget_exceeded",
+    "handoff_compaction_protected_budget_exceeded", "budget_exhausted",
+}
 
 
 def _lesson_proposal(reply: Any) -> dict[str, Any]:
@@ -817,7 +822,18 @@ def build_services(camp: Path) -> dict[str, Any]:
             curation_inputs = [camp_dir / "goal.json"]
             if method_mode:
                 curation_inputs.extend([Path(latest["suite_ref"]), target])
-            task = begin_role_task(camp_dir, role="memory_curator", inputs=curation_inputs, request=curation_context)
+            compaction_artifacts = []
+            prepare = getattr(curator, "prepare_context", None)
+            if method_mode and callable(prepare):
+                curation_context = prepare(curation_context, inputs=curation_inputs)
+                receipt = curation_context.get("context_compaction")
+                if receipt:
+                    # Original files remain dependencies. Also pin the exact
+                    # registered model summary actually delivered to curator.
+                    compaction_artifacts.append(
+                        {"artifact_id": receipt["artifact_id"], "sha256": receipt["sha256"]})
+            task = begin_role_task(camp_dir, role="memory_curator", inputs=curation_inputs,
+                                   artifacts=compaction_artifacts, request=curation_context)
             try:
                 proposal = curator(
                     {

@@ -228,12 +228,15 @@ def begin_role_task(
     # The request hash remains exact. Recovery additionally names the current
     # source, approval, prompt/schema, evidence, memory and action feasibility.
     # A clock tick or remaining-call decrement alone is not a new decision.
-    if request is not None:
-        recovery_identity = recovery_identity or role_recovery_identity(camp, role, candidate_id, request, digest)
+    if request is not None or recovery_identity is not None:
+        from react_agent.eeg_research.agentic.artifacts import input_dependency_manifest
+        dependencies = input_dependency_manifest(camp, paths=inputs, artifacts=artifacts)
+        recovery_identity = {**(recovery_identity or role_recovery_identity(
+            camp, role, candidate_id, request or {}, digest)), "input_dependencies": dependencies}
         from react_agent.eeg_research.agentic.task_ledger import find_completed_task, no_progress_repetitions
         cached = find_completed_task(camp, role=role, recovery_identity=recovery_identity,
                                      candidate_id=candidate_id, input_digest=digest)
-        if cached and cached["task"].get("recovery_identity") is not None:
+        if cached and "input_dependencies" in (cached["task"].get("recovery_identity") or {}):
             task = dict(cached["task"])
             task["_cached_role_result"] = cached
             return task
@@ -278,7 +281,7 @@ def role_recovery_identity(camp: Path, role: str, target: str | None, request: d
         if isinstance(value, list):
             return [semantic_view(item) for item in value]
         return value
-    return {"role": role, "action": request.get("action") or request.get("analysis_trigger") or role,
+    return {"input_dependencies": [], "role": role, "action": request.get("action") or request.get("analysis_trigger") or role,
             "target_id": target, "source": source_hash or request.get("source_hash") or request.get("run_identity"),
             "config": {"hooks": {key: (binding or {}).get(key) or {} for key in ("model", "objective", "transform")},
                        "scientific_request": semantic_view(request.get("experiment") or request.get("contract") or request.get("effective_config"))},
@@ -305,6 +308,20 @@ def finish_role_task(
     candidate_id: str | None = None,
 ) -> dict[str, Any]:
     """Write the final envelope once, then register those exact bytes."""
+    try:
+        assert_role_task_dependencies(camp, task)
+    except RoleResultError as exc:
+        # Never rewrite a reused historical successful receipt. For a new task,
+        # dependency loss must still terminate the attempt and its retry count.
+        if task.get("_cached_role_result"):
+            raise
+        if payload.get("status", "completed") not in {"failed", "blocked"}:
+            mark(camp, task["task_id"], "failed", role=task.get("role"),
+                 attempt_id=task.get("attempt_id"), dependency_error=str(exc))
+            raise
+        payload = {"status": "failed", "prompt_hash": payload.get("prompt_hash", ""),
+                   "summary_zh": str(payload.get("summary_zh") or str(exc)),
+                   "dependency_error": str(exc)}
     cached = task.get("_cached_role_result")
     if cached:
         from react_agent.eeg_research.agentic.task_ledger import find_completed_task
@@ -348,3 +365,15 @@ def finish_role_task(
     mark(camp, task["task_id"], task_status, role=task.get("role"), attempt_id=task.get("attempt_id"),
          candidate_id=candidate_id or task.get("candidate_id"), artifact_id=artifact["artifact_id"], path=str(path))
     return envelope
+
+
+def assert_role_task_dependencies(camp: Path, task: dict[str, Any]) -> None:
+    """Reject a stale task at consumption without rewriting its original receipt."""
+    from react_agent.eeg_research.agentic.artifacts import verify_input_dependencies
+    identity = task.get("recovery_identity") or {}
+    if "input_dependencies" not in identity:
+        if task.get("_cached_role_result"):
+            raise RoleResultError("completed_role_cache_dependency_proof_missing")
+        return
+    if not verify_input_dependencies(camp, identity["input_dependencies"]):
+        raise RoleResultError("role_task_input_dependencies_changed")

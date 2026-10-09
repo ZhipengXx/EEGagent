@@ -135,6 +135,8 @@ def _reserve_api_intent(camp: Path, row: dict[str, Any]) -> None:
     intent = {name: row.get(name) for name in
               ("call_id", "role", "task_id", "attempt_id", "input_digest", "prompt_hash",
                "request_trace_ref", "request_system_sha256", "request_user_sha256")}
+    if row.get("operation"):
+        intent["operation"] = row["operation"]
     intent.update(status="reserved_before_transport", recorded_at=time.time(),
                   uncertain_if_unsettled=True)
     with (camp / API_INTENTS).open("a", encoding="utf-8") as handle:
@@ -193,6 +195,8 @@ def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
     user_sha = hashlib.sha256(user.encode("utf-8")).hexdigest()
     identity = {key: row.get(key) for key in
                 ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash", "requested_model")}
+    if row.get("operation"):
+        identity["operation"] = row["operation"]
     record = {**identity, "system": system, "user": user,
               "system_sha256": system_sha, "user_sha256": user_sha,
               "profile": "fast", "max_tokens": max_tokens,
@@ -222,6 +226,8 @@ def _response_trace(camp: Path, row: dict[str, Any], reply: Any, *, validation: 
     identity = {key: row.get(key) for key in
                 ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash",
                  "request_trace_ref", "request_system_sha256", "request_user_sha256")}
+    if row.get("operation"):
+        identity["operation"] = row["operation"]
     record = {**identity, "reply": reply, "validation": validation,
               "schema_errors": schema_errors, "recorded_at": time.time()}
     if normalization:
@@ -260,6 +266,87 @@ def _fail_row(row: dict[str, Any], exc: BaseException, started: float) -> dict[s
     return row
 
 
+def _check_api_budget(camp: Path) -> None:
+    """Apply the same native intent reconciliation to roles and compaction."""
+    goal_path = camp / "goal.json"
+    if not goal_path.is_file():
+        return
+    try:
+        goal = json.loads(goal_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        goal = {}
+    used = 0
+    cost_path = camp / "cost.json"
+    if cost_path.is_file():
+        try:
+            used = int(json.loads(cost_path.read_text(encoding="utf-8")).get("llm_calls") or 0)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            used = 0
+    if goal.get("evaluation_mode") == "loso_method_search":
+        reconciled = refresh_method_api_cost(camp)
+        used = int(reconciled.get("llm_calls") or 0)
+        if reconciled.get("api_unsettled_call_ids"):
+            raise LlmUnavailable("unsettled_api_intent_requires_recovery",
+                diagnostics={"api_unsettled_call_ids": reconciled["api_unsettled_call_ids"],
+                             "cost_status": "uncertain"})
+    limit = goal.get("max_llm_calls")
+    if isinstance(limit, int) and used >= limit:
+        raise LlmUnavailable("budget_exhausted")
+
+
+def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_tokens: int,
+                       system: str, payload: dict, task: dict, validate: Callable,
+                       context_budget_chars: int) -> dict:
+    """One bounded delivery operation through the existing durable API ledger."""
+    from react_agent.fmri.llm.deepseek import DeepSeekParseError
+    from react_agent.eeg_research.agentic.roles import assert_role_task_dependencies
+    error = None
+    for attempt in range(2):
+        assert_role_task_dependencies(camp, task)
+        request = dict(payload)
+        if error is not None:
+            request["summary_validation_error"] = error
+        user = json.dumps(request, ensure_ascii=False, default=str, separators=(",", ":"))
+        if len(system) + len(user) > context_budget_chars:
+            raise LlmUnavailable("compaction_context_budget_exceeded")
+        _check_api_budget(camp)
+        started = time.time()
+        row = new_call_row(role="memory_curator", operation="handoff_compaction",
+            prompt_hash=hashlib.sha256(system.encode()).hexdigest()[:16],
+            requested_model=model, started_at=started,
+            **{key: task[key] for key in ("task_id", "attempt_id", "input_digest")})
+        row.update(application_attempt=attempt + 1,
+                   application_retry_kind="compaction_validation" if error else None)
+        try:
+            row.update(_request_trace(camp, row, system=system, user=user, max_tokens=max_tokens))
+            _reserve_api_intent(camp, row)
+            reply, usage = loop.run_until_complete(client.complete_json(
+                system=system, user=user, profile="fast", role="memory_curator"))
+        except DeepSeekParseError as exc:
+            _ledger(camp, _fail_row(row, exc, started))
+            _response_trace(camp, row, getattr(exc, "raw", None), validation="invalid_json")
+            error = "Return one complete JSON object matching OUTPUT_SCHEMA."
+            continue
+        except Exception as exc:
+            _ledger(camp, _fail_row(row, exc, started))
+            raise LlmUnavailable(type(exc).__name__) from exc
+        row.update(success=True, response_model=usage.response_model,
+                   input_tokens=usage.input_tokens, output_tokens=usage.output_tokens,
+                   reasoning_tokens=usage.reasoning_tokens, finish_reason=usage.finish_reason,
+                   elapsed_seconds=round(time.time() - started, 3))
+        _ledger(camp, row)
+        _response_trace(camp, row, reply, validation="pending")
+        try:
+            checked = validate(reply)
+        except (ValueError, TypeError, KeyError) as exc:
+            error = str(exc)[:3000]
+            _response_trace(camp, row, reply, validation="compaction_invalid", schema_errors=error)
+            continue
+        _response_trace(camp, row, reply, validation="valid")
+        return checked
+    raise LlmUnavailable("compaction_validation_failed", diagnostics={"reason": error})
+
+
 def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, Any]]:
     """Return a callable that sends one structured input to DeepSeek for this role."""
     from dotenv import load_dotenv
@@ -292,6 +379,40 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
         bound.clear()
         bound.update({key: value for key, value in fields.items() if value is not None})
 
+    def prepare_context(payload: dict[str, Any], *, inputs: list[Path]) -> dict:
+        # Called before begin_role_task: the consumer digest binds the actual
+        # semantic summary and its original dependencies, not an invisible view.
+        if (role != "memory_curator" or payload.get("evaluation_mode") != "loso_method_search"
+                or os.environ.get("EEG_HANDOFF_COMPACTION", "0").lower() not in {"1", "true", "on"}):
+            return payload
+        from react_agent.eeg_research.agentic.handoffs import compact_role_context
+        from react_agent.eeg_research.agentic.role_examples import add_role_examples
+
+        def fits(value: dict) -> bool:
+            # Reserve exact-length task identity strings used by the native
+            # ledger. Include system/schema/examples and the final JSON bytes.
+            probe = {**value, "task_id": "task_" + "0" * 12,
+                     "attempt_id": "0" * 12, "input_digest": "0" * 64}
+            probe = compact_role_context(add_role_examples(probe, role, memory),
+                                         role, system_chars=len(system))
+            return bool(probe["role_context_projection"]["fits_budget"])
+
+        if fits(payload):
+            return payload
+        from react_agent.eeg_research.agentic.compaction import compact_for_curator, protected_context
+        if not fits(protected_context(payload)):
+            raise LlmUnavailable("handoff_compaction_protected_budget_exceeded")
+
+        def invoke(**kwargs):
+            return _invoke_compaction(camp, client, loop, model=config.fast.model,
+                                      max_tokens=int(config.fast.max_tokens), **kwargs)
+
+        prepared = compact_for_curator(camp, payload, inputs=inputs,
+                                        model=config.fast.model, invoke=invoke)
+        if not fits(prepared):
+            raise LlmUnavailable("handoff_compaction_output_budget_exceeded")
+        return prepared
+
     def call(payload: dict[str, Any]) -> dict[str, Any]:
         task = None
         if role in ENVELOPE_ROLES:
@@ -305,6 +426,16 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             )
             persisted = latest(camp, str(task["task_id"]))
             recovery = (persisted or {}).get("recovery_identity")
+            if persisted and str((recovery or {}).get("action") or "").startswith("handoff_compaction:"):
+                raise LlmUnavailable("delivery_operation_task_not_role_task")
+            if persisted and persisted.get("role") == role and persisted.get("input_digest") == task.get("input_digest"):
+                from react_agent.eeg_research.agentic.roles import assert_role_task_dependencies, RoleResultError
+                if persisted.get("status") == "completed" and "input_dependencies" not in (recovery or {}):
+                    raise LlmUnavailable("completed_role_cache_dependency_proof_missing")
+                try:
+                    assert_role_task_dependencies(camp, persisted)
+                except RoleResultError as exc:
+                    raise LlmUnavailable(str(exc)) from exc
             # Reuse only an explicit current identity established by the native
             # begin-task consumer. A legacy empty prompt/digest is not guessed.
             if (persisted and persisted.get("role") == role and isinstance(recovery, dict)
@@ -344,29 +475,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             if not projection["fits_budget"]:
                 raise LlmUnavailable("role_context_budget_requires_artifact_pages",
                                      diagnostics={"role_context_projection": projection})
-            goal_path = camp / "goal.json"
-            if goal_path.is_file():
-                try:
-                    goal = json.loads(goal_path.read_text(encoding="utf-8"))
-                except json.JSONDecodeError:
-                    goal = {}
-                limit = goal.get("max_llm_calls")
-                cost_path = camp / "cost.json"
-                used = 0
-                if cost_path.is_file():
-                    try:
-                        used = int(json.loads(cost_path.read_text(encoding="utf-8")).get("llm_calls") or 0)
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        used = 0
-                if goal.get("evaluation_mode") == "loso_method_search":
-                    reconciled = refresh_method_api_cost(camp)
-                    used = int(reconciled.get("llm_calls") or 0)
-                    if reconciled.get("api_unsettled_call_ids"):
-                        raise LlmUnavailable("unsettled_api_intent_requires_recovery",
-                            diagnostics={"api_unsettled_call_ids": reconciled["api_unsettled_call_ids"],
-                                         "cost_status": "uncertain"})
-                if isinstance(limit, int) and used >= limit:
-                    raise LlmUnavailable("budget_exhausted")
+            _check_api_budget(camp)
             started = time.time()
             row = new_call_row(
                 role=role,
@@ -505,4 +614,5 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
 
     call.model = config.fast.model  # type: ignore[attr-defined]
     call.bind = bind  # type: ignore[attr-defined]
+    call.prepare_context = prepare_context  # type: ignore[attr-defined]
     return call

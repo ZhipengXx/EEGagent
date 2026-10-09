@@ -53,6 +53,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-partial", action="store_true", help="Freeze valid pairs with explicitly incomplete fold coverage")
     parser.add_argument("--allow-shared-gpus", action="store_true", help="Explicit authorization to use occupied GPUs without terminating their processes")
     parser.add_argument("--inherit-study", type=Path, help="Native verified budget source for a new method-level LOSO campaign")
+    parser.add_argument("--additional-llm-calls", type=int, default=0,
+                        help="Explicit additional authorization for inherited method-campaign API attempts; create only")
+    parser.add_argument("--additional-training-jobs", type=int, default=0,
+                        help="Explicit additional authorization for inherited actual training jobs; create only")
+    parser.add_argument("--additional-gpu-seconds", type=float, default=0,
+                        help="Explicit additional occupied-GPU seconds authorization; create only")
     parser.add_argument("--suite", default=None, help="Frozen method suite ID for an engineering retry")
     parser.add_argument("--fold", default=None, help="Fold ID for an engineering retry")
     parser.add_argument("--retry-reason", default="", help="Observed engineering failure that requires a fresh fold process")
@@ -187,6 +193,12 @@ def status_view(camp: Path) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    additional = {"llm_calls": args.additional_llm_calls,
+                  "training_jobs": args.additional_training_jobs,
+                  "gpu_seconds": args.additional_gpu_seconds}
+    if any(additional.values()) and (args.command != "create" or args.inherit_study is None):
+        print(json.dumps({"error": "additional_authorization_requires_new_inherited_method_campaign"}))
+        return 2
     if args.command.startswith("study-"):
         from react_agent.eeg_research.agentic import loso_study
         from react_agent.eeg_training.protocol import data_root, parse_gpu_list
@@ -319,7 +331,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.inherit_study is None:
                 print(json.dumps({"error": "method_search_requires_native_budget_inheritance"}))
                 return 2
-            inherited = verified_history(args.inherit_study)
+            try:
+                inherited = verified_history(args.inherit_study, additional_authorization=additional)
+            except (OSError, ValueError, KeyError) as exc:
+                print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+                return 2
             submitted = derive_limits(submitted, inherited)
             estimate, estimate_basis = estimate_suite(inherited, len(selected_gpus))
             submitted["method_suite_gpu_seconds_estimate"] = max(estimate, submitted.get("method_suite_gpu_seconds_estimate") or 0)

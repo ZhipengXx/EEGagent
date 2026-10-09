@@ -103,6 +103,7 @@ def method_suite_role_view(payload: dict[str, Any]) -> dict[str, Any]:
                            if isinstance(fold, dict) else fold for fold in diagnostics["folds"]]
         if aggregate.get("scope") == "method_development_benchmark":
             _share_representation_columns(result)
+            _share_training_diagnostic_columns(result)
         return result
 
     def visit(value: Any) -> Any:
@@ -191,6 +192,57 @@ def _share_representation_columns(diagnostics: dict[str, Any]) -> None:
             "For an existing per-fold representation, merge shared_representation_fields then its fields; "
             "merge shared_representation_coverage then its existing coverage. Shared values are exact equal "
             "native columns. Do not create a missing item or coverage.")
+
+
+def _share_training_diagnostic_columns(diagnostics: dict[str, Any]) -> None:
+    """Share exact observed training columns without filling missing records."""
+    folds = diagnostics.get("folds")
+    if not isinstance(folds, list) or not all(isinstance(fold, dict) for fold in folds):
+        return
+    identity = _shared_scalar_fields(folds, excluded={
+        "fold_id", "held_out_subject", "train_subjects", "diagnostics",
+        "development_metrics", "selected_checkpoint", "training_detail_projection"})
+    if identity:
+        diagnostics.setdefault("shared_fold_identity", {}).update(identity)
+    for field, shared_name in (("development_metrics", "shared_development_metrics"),
+                               ("selected_checkpoint", "shared_selected_checkpoint")):
+        records = [fold[field] for fold in folds if isinstance(fold.get(field), dict)]
+        common = _shared_scalar_fields(records)
+        if common:
+            diagnostics.setdefault(shared_name, {}).update(common)
+    executions = []
+    for fold in folds:
+        bundle = fold.get("diagnostics")
+        items = bundle.get("items") if isinstance(bundle, dict) else None
+        dynamics = items.get("training_dynamics") if isinstance(items, dict) else None
+        execution = dynamics.get("training_execution") if isinstance(dynamics, dict) else None
+        payload = execution.get("payload") if isinstance(execution, dict) else None
+        if isinstance(payload, dict):
+            executions.append(payload)
+    common = _shared_scalar_fields(executions, excluded={"batches"})
+    if common:
+        diagnostics.setdefault("shared_training_execution_payload", {}).update(common)
+    by_position = {}
+    for payload in executions:
+        for batch in payload.get("batches") or []:
+            if isinstance(batch, dict) and isinstance(batch.get("batch_position"), str):
+                by_position.setdefault(batch["batch_position"], []).append(batch)
+    for position, batches in by_position.items():
+        common = _shared_scalar_fields(batches, excluded={"batch_position"})
+        if common:
+            diagnostics.setdefault("shared_training_batch_fields", {}).setdefault(position, {}).update(common)
+    names = ("shared_fold_identity", "shared_development_metrics", "shared_selected_checkpoint",
+             "shared_training_execution_payload", "shared_training_batch_fields")
+    if any(diagnostics.get(name) for name in names):
+        diagnostics["training_scalar_merge_rule"] = (
+            "For each existing fold, merge shared_fold_identity then its literal fields. "
+            "Only for existing development_metrics/selected_checkpoint dicts, merge the corresponding "
+            "shared_development_metrics/shared_selected_checkpoint then local fields. Only for an existing "
+            "diagnostics.items.training_dynamics.training_execution.payload, merge shared_training_execution_payload "
+            "then local fields. For each existing batches item, use shared_training_batch_fields at its literal "
+            "batch_position then local fields. All shared values were exactly equal JSON columns. "
+            "Do not create a missing fold, dict, execution payload, batch, observation or coverage; "
+            "retain every different scientific value and provenance identity.")
 
 
 def method_suite_scalar_view(row: dict[str, Any], *,
@@ -290,6 +342,36 @@ def method_benchmark_origin(row: dict[str, Any]) -> dict[str, Any]:
             "independent_final_test": False}
 
 
+def _audit_dependency_role_view(value: Any) -> Any:
+    """Share only exactly equal manifest fields, preserving every missing field."""
+    import copy
+    if isinstance(value, list):
+        return [_audit_dependency_role_view(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {key: _audit_dependency_role_view(item) for key, item in value.items()}
+    rows = result.get("dependency_manifest")
+    if not isinstance(rows, list) or len(rows) < 2 or not all(isinstance(row, dict) for row in rows):
+        return result
+    original = copy.deepcopy(rows)
+    shared = {}
+    for field in ("scope", "verification_status", "data_use"):
+        present = [row[field] for row in rows if field in row]
+        if len(present) < 2 or any(_context_json(item) != _context_json(present[0]) for item in present[1:]):
+            continue
+        absent = [index for index, row in enumerate(rows) if field not in row]
+        shared[field] = {"value": copy.deepcopy(present[0]), "absent_indices": absent}
+        for row in rows:
+            row.pop(field, None)
+    if shared:
+        result["dependency_manifest_shared_fields"] = shared
+        result["dependency_manifest_projection"] = {
+            "revision": "exact_audit_dependency_fields.v1",
+            "original_manifest_sha256": hashlib.sha256(_context_json(original).encode()).hexdigest(),
+            "merge_rule": "For each dependency_manifest row index, restore each dependency_manifest_shared_fields value unless the index is in its absent_indices. Missing fields remain absent; paths, content_hash, kind, payload and differing fields are literal. The reconstructed manifest SHA-256 must match original_manifest_sha256. Raw registry/report/hash and verification authority are unchanged."}
+    return result
+
+
 def compact_role_context(payload: dict[str, Any], role: str, *,
                          system_chars: int = 0, target_chars: int | None = None) -> dict[str, Any]:
     """Return a deterministic derived view with one copy of large identical facts.
@@ -306,6 +388,8 @@ def compact_role_context(payload: dict[str, Any], role: str, *,
     working = method_suite_role_view(original) if role in {
         "research_planner", "result_analyst", "memory_curator", "experiment_designer", "result_auditor",
     } else original
+    if role == "result_auditor" and original.get("evaluation_mode") == "loso_method_search":
+        working = _audit_dependency_role_view(working)
     budget = target_chars if target_chars is not None else ROLE_CONTEXT_BUDGETS.get(role, 160_000)
     if budget <= 0 or system_chars < 0:
         raise ValueError("invalid_role_context_budget")
@@ -728,6 +812,8 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
     """Memory reading has a stricter boundary than approved external source consumers."""
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
     row = resolve_verified_artifact(camp, artifact_id)
+    if row.get("kind") in {"handoff_compaction_input", "handoff_compaction"}:
+        raise ValueError("delivery_artifact_not_development_evidence")
     path = Path(str(row["path"])).resolve()
     if not path.is_relative_to(camp.resolve()):
         raise ValueError("artifact_outside_campaign")
