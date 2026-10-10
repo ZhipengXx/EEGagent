@@ -219,6 +219,23 @@ def _research_limits(camp: Path) -> dict:
              ("max_concurrent_training_jobs", 1))}
 
 
+def untrained_candidates(camp: Path, state: dict) -> list[str] | None:
+    """Candidate IDs that never reached training, or None if any candidate has jobs or suites.
+
+    A resource handoff carries budget, never candidate results. Candidates that
+    stopped before training produced no evidence, and their API spending is
+    already in cost.json, so they do not block a handoff; they are only listed.
+    """
+    ids = [str(row.get("candidate_id") if isinstance(row, dict) else row) for row in state.get("candidates") or []]
+    for path in (camp / "jobs").glob("*/job.json"):
+        candidate = read(path).get("candidate_id")
+        if candidate and candidate != "baseline":
+            return None
+    if any(not suite.name.startswith("baseline_") for suite in (camp / "suites").glob("*") if suite.is_dir()):
+        return None
+    return ids
+
+
 def _method_consumption(camp: Path) -> dict:
     """Read settled incremental costs; never reset or reconcile them to zero."""
     import math
@@ -227,7 +244,7 @@ def _method_consumption(camp: Path) -> dict:
     if (state.get("status") not in {"paused", "blocked", "finished", "cancelled"}
             or state.get("live_job") or state.get("gpu_seconds_reserved", 0)):
         raise ValueError("historical_study_not_quiescent")
-    if state.get("candidates"):
+    if untrained_candidates(camp, state) is None:
         raise ValueError("resource_handoff_requires_no_candidates")
     calls_path, intents_path = camp / "llm_calls.jsonl", camp / "llm_api_intents.jsonl"
     calls = {json.loads(line)["call_id"] for line in calls_path.read_text().splitlines() if line.strip()} \
@@ -317,6 +334,7 @@ def verified_method_history(camp: Path) -> dict:
             "authorization_caps": caps, "historical_usage": used,
             "source_incremental_usage": own, "remaining": remaining,
             "research_limits": _research_limits(camp),
+            "abandoned_untrained_candidates": untrained_candidates(camp, read(camp / "campaign_state.json")),
             "dependencies": list(dependencies.values()),
             "accounting": "transitive_historical_reference_plus_successor_incremental"}
         result["receipt_hash"] = identity(result)
