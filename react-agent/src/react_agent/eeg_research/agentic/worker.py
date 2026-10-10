@@ -34,6 +34,7 @@ from react_agent.eeg_training.protocol import data_root
 
 _TERMINAL = {"paused", "finished", "blocked", "cancelled"}
 CODER_STEPS = 8
+POLLS_PER_DECISION_TICK = 50
 IMPLEMENT_ATTEMPTS = 3
 _METHOD_ROLE_HARD_BLOCKS = {
     "role_no_progress_retry_limit", "unsettled_api_intent_requires_recovery",
@@ -1239,27 +1240,37 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
             save_state(camp, state)
         return state
     retries: dict[str, int] = {}
-    for tick_index in range(max_ticks):
+    # max_ticks bounds decision ticks. A tick that only polls a running job
+    # (status stays "training") is not a decision, so a long suite cannot
+    # exhaust that bound; polls have their own, much larger bound so a hung
+    # job still ends in a recorded suspension.
+    decisions = polls = 0
+    tick_index = 0
+    while decisions < max_ticks and polls < max_ticks * POLLS_PER_DECISION_TICK:
         from react_agent.eeg_research.agentic.verification_cache import verification_scope
         with verification_scope():
             state = tick(camp, planner, services=services)
         (camp / "worker.json").write_text(
-            json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "tick": tick_index, "resumable": bool(state.get("live_job"))}),
+            json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "tick": tick_index,
+                        "decision_ticks": decisions, "resumable": bool(state.get("live_job"))}),
             encoding="utf-8",
         )
+        tick_index += 1
         if state.get("status") in _TERMINAL:
             if _auto_resume(camp, state, retries):
                 continue
             break
         retries.clear()
         if state.get("status") == "training":
+            polls += 1
             time.sleep(poll_seconds)
+        else:
+            decisions += 1
     else:
         state = load_state(camp)
-        if state.get("live_job"):
-            (camp / "worker.json").write_text(
-                json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "resumable": True, "detail": "worker_tick_limit"}),
-                encoding="utf-8",
-            )
-            event(camp, "worker_suspended", reason="tick_limit", live_job=state.get("live_job"))
+        (camp / "worker.json").write_text(
+            json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "resumable": True, "detail": "worker_tick_limit"}),
+            encoding="utf-8",
+        )
+        event(camp, "worker_suspended", reason="tick_limit", live_job=state.get("live_job"))
     return state
