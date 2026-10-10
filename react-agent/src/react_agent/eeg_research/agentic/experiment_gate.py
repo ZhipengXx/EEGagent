@@ -179,9 +179,11 @@ def scientific_identity(spec: dict[str, Any] | None) -> dict[str, Any]:
         "objective": spec.get("objective") if isinstance(spec.get("objective"), dict) else {},
         "transform": spec.get("transform") if isinstance(spec.get("transform"), dict) else {},
         "negative_sampling_policy": spec.get("negative_sampling_policy"),
+        # Runtime bindings record an absent optional requirement list as [].
+        # That representation must not turn a legal same-design repair into a
+        # scientific intervention change; declared non-empty lists stay exact.
+        "implementation_requirements": spec.get("implementation_requirements", []),
     }
-    if "implementation_requirements" in spec:
-        identity["implementation_requirements"] = spec["implementation_requirements"]
     return identity
 
 

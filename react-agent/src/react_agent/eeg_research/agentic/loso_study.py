@@ -17,11 +17,17 @@ TERMINAL = {"finished", "blocked", "cancelled"}
 
 def read(path: Path) -> dict:
     """Read required JSON without replacing missing records with zero usage."""
-    return json.loads(path.read_text(encoding="utf-8"))
+    from react_agent.eeg_research.agentic.verification_cache import read_json
+    return read_json(path, lambda source: json.loads(source.read_text(encoding="utf-8")))
 
 
 def digest(path: Path) -> str:
     """Hash a dependency without loading its data as EEG samples."""
+    from react_agent.eeg_research.agentic.verification_cache import file_hash
+    return file_hash(path, _digest_bytes)
+
+
+def _digest_bytes(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -31,8 +37,10 @@ def digest(path: Path) -> str:
 
 def identity(value: dict) -> str:
     """Hash a canonical study or evaluation identity."""
-    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
-                                     ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+    from react_agent.eeg_research.agentic.verification_cache import object_identity
+    return object_identity(value, lambda body: hashlib.sha256(json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False).encode()).hexdigest())
 
 
 def write_once(path: Path, payload: dict) -> None:

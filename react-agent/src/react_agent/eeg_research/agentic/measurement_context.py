@@ -16,12 +16,26 @@ def evaluation_population_context(protocol: dict[str, Any] | None) -> dict[str, 
             return {'status': 'unavailable', 'reason': 'missing_or_invalid_' + key,
                     'scope': 'No evaluation count inferred from image count or diagnostics.'}
     queries, images = len(groups['validation_query_ids']), len(groups['gallery_image_ids'])
-    return {'status': 'frozen_protocol_bound', 'execution_fingerprint': protocol.get('fingerprint'),
+    result = {'status': 'frozen_protocol_bound', 'execution_fingerprint': protocol.get('fingerprint'),
             'development_query_count': queries, 'gallery_image_count': images,
             'one_query_hit_delta_pp': 100.0 / queries,
             'uniform_gallery_chance_top1': 1.0 / images,
             'count_basis': 'Frozen validation query IDs and gallery image IDs.',
             'scope': 'Development evaluation identities. Diagnostic sample sizes do not change the score denominator; no final-subject data read.'}
+    if protocol.get('evaluation_mode') == 'loso_method_search':
+        # This mode freezes ten equal-weight 200-query benchmark folds. The
+        # protocol's validation IDs describe the nine-source-subject monitor,
+        # rather than the primary method benchmark's hit denominator.
+        result.update(primary_metric='benchmark.loso_mean_fixed_gallery_top1',
+            development_gallery_image_count=images,
+            development_one_query_hit_delta_pp=100.0 / queries,
+            benchmark_query_count_per_fold=200, benchmark_fold_count=10,
+            benchmark_query_count_total=2000, gallery_image_count=200,
+            one_query_hit_delta_pp=0.05, per_fold_one_query_hit_delta_pp=0.5,
+            uniform_gallery_chance_top1=0.005,
+            count_basis='Frozen native method contract: ten equal-weight folds, 200 held-out queries and 200 gallery items per fold. Actual complete-suite counts remain in aggregate.scores; validation_query_ids belong to the separate source-subject development monitor.',
+            scope='Method-development benchmark primary metric; one extra hit in one fold changes the ten-fold mean by 0.05 percentage points. Declared contract counts, not a new measurement or independent final test.')
+    return result
 
 
 def parameter_count_comparison(report: dict[str, Any]) -> dict[str, Any]:

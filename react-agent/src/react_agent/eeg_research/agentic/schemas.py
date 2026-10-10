@@ -302,8 +302,18 @@ class ResultAnalysis(DomainOutput):
 
 
 class LessonProposal(DomainOutput):
-    proposed_lessons: list[dict[str, Any]] = Field(default_factory=list)
+    proposed_lessons: list[dict[str, Any]] = Field(default_factory=list,
+        description="Every lesson requires a non-empty statement string; statement_zh or statement_en are literal-text legacy aliases.")
     summary_zh: str = ""
+
+    @model_validator(mode="after")
+    def lesson_statements_present(self):
+        from react_agent.eeg_research.agentic.memory import canonicalize_lesson_proposal
+        for proposal in self.proposed_lessons:
+            lesson = canonicalize_lesson_proposal(proposal)
+            if not isinstance(lesson.get("statement"), str) or not lesson["statement"].strip():
+                raise ValueError("lesson_statement_missing")
+        return self
 
 
 class AuditIssueResolution(DomainOutput):
@@ -352,6 +362,7 @@ class GoalSpec(BaseModel):
     research_scope: str = "pooled_subject_retrieval"
     evaluation_mode: Literal["single_target", "loso_method_search"] = "single_target"
     benchmark_feedback_enabled: bool = False
+    allow_shared_gpus: bool = False
     subject_aggregation: Literal["none", "macro_mean"] = "none"
     benchmark_subjects: list[str] = Field(default_factory=list)
     required_fold_count: int = Field(default=1, ge=1)

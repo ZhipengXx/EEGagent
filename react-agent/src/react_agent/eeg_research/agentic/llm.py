@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +39,162 @@ class LlmUnavailable(RuntimeError):
         self.diagnostics = diagnostics or {}
 
 
+def context_budget_trace(camp: Path, role: str, *, system: str,
+                        payload: dict, projected: dict) -> dict:
+    """Preserve a complete local failed preflight without reserving an API call."""
+    preflight_id = "ctx_" + uuid.uuid4().hex[:12]
+    target = camp / "context_diagnostics" / (preflight_id + ".json")
+    record = {"preflight_id": preflight_id, "role": role, "recorded_at": time.time(),
+        "system": system, "original_payload": payload, "projected_payload": projected,
+        "scope": "Local context budget failure only; not a paid request, role result, artifact read, or scientific evidence."}
+    encoded = json.dumps(record, ensure_ascii=False, default=str, indent=2).encode("utf-8")
+    try:
+        target.parent.mkdir(exist_ok=True)
+        with target.open("xb") as stream:
+            stream.write(encoded)
+        return {"preflight_id": preflight_id, "path": str(target),
+                "sha256": hashlib.sha256(encoded).hexdigest()}
+    except OSError as exc:
+        return {"preflight_id": preflight_id, "trace_write_failed": type(exc).__name__}
+
+
+def project_correction_context(payload: dict[str, Any], role: str, *, system_chars: int,
+                               target_chars: int | None = None) -> dict:
+    """Keep authoritative inputs and complete feedback within the same hard cap.
+
+    Planner examples are optional on initial calls as well as corrections. A
+    failed draft is an optional correction aid, not source evidence. Omit whole
+    aids when needed; never slice them or scientific input.
+    The native response journal retains the complete original model reply.
+    """
+    import copy
+    from react_agent.eeg_research.agentic.handoffs import compact_role_context
+
+    def referenced_subtree(value, pointer):
+        if isinstance(value, dict):
+            reference = value.get("canonical_context_ref")
+            if isinstance(reference, str) and (reference == pointer or reference.startswith(pointer + "/")):
+                return True
+            return any(referenced_subtree(child, pointer) for child in value.values())
+        if isinstance(value, list):
+            return any(referenced_subtree(child, pointer) for child in value)
+        return False
+
+    def project(value):
+        result = compact_role_context(value, role, system_chars=system_chars, target_chars=target_chars)
+        report = result["role_context_projection"]
+        if role != "research_planner" or report["fits_budget"]:
+            return result
+        # These are optional layout/debug reports, not original observations,
+        # scientific data or constraints. Every canonical ref/hash remains in
+        # the actual request, so removing the duplicate log changes no fact.
+        omitted = []
+
+        for parent, key, path in ((result, "planner_context_projection", "planner_context_projection"),
+                                  (report, "duplicate_views", "role_context_projection.duplicate_views")):
+            if key in parent and len(json.dumps(parent[key], ensure_ascii=False, sort_keys=True,
+                                                 default=str, separators=(",", ":"))) >= 400 and not referenced_subtree(result, "/" + path.replace(".", "/")):
+                detail = parent.pop(key)
+                omitted.append({"field": path, "sha256": hashlib.sha256(json.dumps(detail,
+                    ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()})
+        if omitted:
+            report["omitted_optional_diagnostic_reports"] = omitted
+            report["diagnostic_omission_scope"] = "Whole delivery debug reports only; every scientific/control value and canonical_context_ref/sha256 remains in this request. Full original input is retained for local failed preflight diagnostics."
+            report.pop("projected_total_chars", None)
+            report.pop("fits_budget", None)
+            report.pop("missing_inputs", None)
+            total = len(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str,
+                                   separators=(",", ":"))) + system_chars
+            report["projected_total_chars"] = total
+            report["fits_budget"] = total + 100 <= report["budget_chars"]
+            if not report["fits_budget"]:
+                report["missing_inputs"] = ["essential_context_exceeds_role_budget: obtain permitted digest-bound pages or narrow the task; do not infer omitted code"]
+        if not report["fits_budget"]:
+            # Keep the budget contract, pointer instruction and actual history
+            # omissions; compact the remaining optional delivery debug report.
+            retained = {"revision", "role", "budget_chars", "system_chars", "original_user_chars",
+                        "canonical_reference_instruction", "omissions",
+                        "source_metrics_gates_and_schema_feedback_preserved"}
+            detail = {key: report.pop(key) for key in list(report) if key not in retained}
+            report["optional_delivery_metadata_sha256"] = hashlib.sha256(json.dumps(detail,
+                ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+            total = len(json.dumps(result, ensure_ascii=False, sort_keys=True, default=str,
+                                   separators=(",", ":"))) + system_chars
+            report["projected_total_chars"] = total
+            report["fits_budget"] = total + 100 <= report["budget_chars"]
+            if not report["fits_budget"]:
+                report["missing_inputs"] = ["essential_context_exceeds_role_budget: obtain permitted digest-bound pages or narrow the task; do not infer omitted code"]
+        return result
+
+    view = project(payload)
+    if view["role_context_projection"]["fits_budget"] or role != "research_planner":
+        return view
+    correcting = bool(payload.get("schema_error"))
+    if not correcting and "illustrative_examples" not in payload:
+        return view
+    reduced = copy.deepcopy(payload)
+    notice = {"scope": "Optional delivery aids only; original evidence, gates and full schema feedback retained.",
+              "omitted_optional_blocks": []}
+    reduced["correction_delivery" if correcting else "optional_context_delivery"] = notice
+    if "illustrative_examples" in reduced:
+        reduced.pop("illustrative_examples")
+        notice["omitted_optional_blocks"].append("illustrative_examples")
+        view = project(reduced)
+        if view["role_context_projection"]["fits_budget"]:
+            return view
+    if not correcting or "previous" not in reduced:
+        return view
+    previous = reduced.pop("previous")
+    notice["omitted_optional_blocks"].append("previous_full_invalid_draft")
+    notice["previous_reply_sha256"] = hashlib.sha256(json.dumps(previous, ensure_ascii=False,
+        sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
+    notice["instruction"] = "Return a complete corrected response. Previous proposals are unapproved model output, not facts. Resolve every mechanical error against the current original observation. The full invalid reply remains in the native response journal."
+    if isinstance(previous, dict):
+        core = {key: copy.deepcopy(previous[key]) for key in (
+            "action", "target_id", "question_id", "selected_option_id", "hypothesis_draft", "experiment_draft")
+            if key in previous}
+        reduced["previous_execution_fields"] = core
+        view = project(reduced)
+        if view["role_context_projection"]["fits_budget"]:
+            return view
+        # Even a very large hypothesis is an optional failed proposal. Omit
+        # this entire block instead of truncating its meaning or source facts.
+        reduced.pop("previous_execution_fields")
+        notice["omitted_optional_blocks"].append("previous_execution_fields")
+    view = project(reduced)
+    if not view["role_context_projection"]["fits_budget"]:
+        # Last correction fallback: compact only optional formatting/debug
+        # metadata. Complete validation errors and every scientific/control
+        # field remain. OUTPUT_SCHEMA already supplies the allowed field names.
+        removed = {}
+        feedback = view.get("schema_repair_context")
+        if (isinstance(feedback, dict) and "allowed_top_level_fields" in feedback
+                and not referenced_subtree(view, "/schema_repair_context/allowed_top_level_fields")):
+            removed["allowed_top_level_fields"] = feedback.pop("allowed_top_level_fields")
+        if "correction_instruction" in view and not referenced_subtree(view, "/correction_instruction"):
+            removed["correction_instruction"] = view.pop("correction_instruction")
+        delivery = view.get("correction_delivery") or {}
+        for key in ("scope", "instruction"):
+            if key in delivery and not referenced_subtree(view, "/correction_delivery/" + key):
+                removed["correction_delivery." + key] = delivery.pop(key)
+        report = view["role_context_projection"]
+        retained = {"revision", "role", "budget_chars", "system_chars", "original_user_chars",
+                    "canonical_reference_instruction", "omissions",
+                    "source_metrics_gates_and_schema_feedback_preserved"}
+        for key in list(report):
+            if key not in retained:
+                removed["role_context_projection." + key] = report.pop(key)
+        report["optional_correction_metadata_sha256"] = hashlib.sha256(json.dumps(removed,
+            ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
+        total = len(json.dumps(view, ensure_ascii=False, sort_keys=True, default=str,
+                               separators=(",", ":"))) + system_chars
+        report["projected_total_chars"] = total
+        report["fits_budget"] = total + 100 <= report["budget_chars"]
+        if not report["fits_budget"]:
+            report["missing_inputs"] = ["essential_context_exceeds_role_budget: obtain permitted digest-bound pages or narrow the task; do not infer omitted code"]
+    return view
+
+
 def domain_model_for(role: str, memory=None):
     from react_agent.eeg_research.agentic.schemas import DOMAIN_OUTPUT_MODELS
 
@@ -53,6 +210,8 @@ def system_prompt(role: str, *, memory=None) -> str:
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
     mission = (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
     schema = role_output_schema(role)
+    if role == "research_planner":
+        schema = json.dumps(json.loads(schema), ensure_ascii=False, separators=(",", ":"))
     if memory is not None and memory.enabled:
         extension = {"research_planner": "retrieved_memory", "experiment_designer": "retrieved_procedural_hints",
                      "candidate_coder": "retrieved_procedural_hints"}.get(role)
@@ -110,6 +269,8 @@ def refresh_method_api_cost(camp: Path) -> dict[str, Any]:
                     raise LlmUnavailable("call_id_ledger_conflict")
                 settled[key] = row
     pending = sorted(set(intents).difference(settled))
+    abandoned = sorted(key for key, row in settled.items()
+                       if row.get("transport_outcome") == "unknown_after_process_exit")
     cost["llm_calls"] = len(set(settled).union(intents))
     cost["llm_failures"] = sum(row.get("success") is not True for row in settled.values())
     for key in ("input_tokens", "output_tokens", "reasoning_tokens"):
@@ -117,10 +278,11 @@ def refresh_method_api_cost(camp: Path) -> dict[str, Any]:
         if known or key in cost:
             cost[key] = sum(known)
         cost[key + "_known_call_count"] = len(known)
-    cost.update(api_unsettled_call_ids=pending, api_uncertain_calls=len(pending),
+    cost.update(api_unsettled_call_ids=pending, api_abandoned_call_ids=abandoned,
+                api_uncertain_calls=len(pending) + len(abandoned),
                 api_intent_accounting="application_attempt_reserved_before_transport_v1",
                 api_usd=None, pricing_source=None,
-                cost_status="uncertain" if pending else "unpriced")
+                cost_status="uncertain" if pending or abandoned else "unpriced")
     cost.setdefault("gpu_seconds_used", 0.0)
     _write_cost(camp, cost)
     return cost
@@ -266,8 +428,15 @@ def _fail_row(row: dict[str, Any], exc: BaseException, started: float) -> dict[s
     return row
 
 
+def external_api_disabled() -> bool:
+    """Operator process policy; local GPU execution remains independent."""
+    return os.environ.get("EEG_EXTERNAL_API_DISABLED", "0").lower() in {"1", "true", "on"}
+
+
 def _check_api_budget(camp: Path) -> None:
     """Apply the same native intent reconciliation to roles and compaction."""
+    if external_api_disabled():
+        raise LlmUnavailable("external_api_disabled_by_operator")
     goal_path = camp / "goal.json"
     if not goal_path.is_file():
         return
@@ -301,11 +470,19 @@ def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_to
     from react_agent.fmri.llm.deepseek import DeepSeekParseError
     from react_agent.eeg_research.agentic.roles import assert_role_task_dependencies
     error = None
+    previous_summary = None
     for attempt in range(2):
         assert_role_task_dependencies(camp, task)
         request = dict(payload)
         if error is not None:
             request["summary_validation_error"] = error
+        if previous_summary is not None:
+            request["previous_compaction_summary"] = previous_summary
+            probe = json.dumps(request, ensure_ascii=False, default=str, separators=(",", ":"))
+            if len(system) + len(probe) > context_budget_chars:
+                # Optional invalid draft is omitted wholly; original source
+                # and measured repair feedback are still delivered in full.
+                request.pop("previous_compaction_summary")
         user = json.dumps(request, ensure_ascii=False, default=str, separators=(",", ":"))
         if len(system) + len(user) > context_budget_chars:
             raise LlmUnavailable("compaction_context_budget_exceeded")
@@ -339,8 +516,13 @@ def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_to
         try:
             checked = validate(reply)
         except (ValueError, TypeError, KeyError) as exc:
-            error = str(exc)[:3000]
-            _response_trace(camp, row, reply, validation="compaction_invalid", schema_errors=error)
+            from react_agent.eeg_research.agentic.compaction import canonical, summary_budget
+            schema_error = str(exc)[:3000]
+            previous_summary = reply
+            error = {"validation_error": schema_error, "previous_output_chars": len(canonical(reply)),
+                     "hard_output_chars": summary_budget(payload.get("stage", "map")), "target_output_chars": 6000,
+                     "instruction": "Fix the reported validation errors against the original input. For source_quotes copy an exact path from analysis_quote_catalog and a verbatim substring of its text, never an evidence ID or observation object path. Rewrite the full draft with shorter synthesized notes and fewer repeated facts; retain all distinct findings, contradictions, scope limits and expected source refs. Follow every OUTPUT_SCHEMA length/item limit. Do not truncate."}
+            _response_trace(camp, row, reply, validation="compaction_invalid", schema_errors=schema_error)
             continue
         _response_trace(camp, row, reply, validation="valid")
         return checked
@@ -402,6 +584,8 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
         from react_agent.eeg_research.agentic.compaction import compact_for_curator, protected_context
         if not fits(protected_context(payload)):
             raise LlmUnavailable("handoff_compaction_protected_budget_exceeded")
+        if external_api_disabled():
+            raise LlmUnavailable("external_api_disabled_by_operator")
 
         def invoke(**kwargs):
             return _invoke_compaction(camp, client, loop, model=config.fast.model,
@@ -470,11 +654,14 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             from react_agent.eeg_research.agentic.role_examples import add_role_examples
             call_payload = add_role_examples(call_payload, role, memory)
             from react_agent.eeg_research.agentic.handoffs import compact_role_context
-            call_payload = compact_role_context(call_payload, role, system_chars=len(system))
+            call_payload = project_correction_context(call_payload, role, system_chars=len(system))
             projection = call_payload["role_context_projection"]
             if not projection["fits_budget"]:
+                trace = context_budget_trace(camp, role, system=system,
+                    payload=payload, projected=call_payload)
                 raise LlmUnavailable("role_context_budget_requires_artifact_pages",
-                                     diagnostics={"role_context_projection": projection})
+                                     diagnostics={"role_context_projection": projection,
+                                                  "preflight_trace": trace})
             _check_api_budget(camp)
             started = time.time()
             row = new_call_row(
@@ -602,6 +789,23 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
                         append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
                                         status="failed", error="domain_schema_invalid")
                         continue
+                    if role == "candidate_reviewer":
+                        from react_agent.eeg_research.agentic.review_context import review_reference_errors
+                        errors = review_reference_errors(body, payload)
+                        if errors:
+                            schema_error = json.dumps(errors, ensure_ascii=False)
+                            previous_domain = body
+                            schema_feedback = {
+                                "validation_errors": errors,
+                                "required_evidence_identity": payload.get("requirement_evidence_identity"),
+                                "instruction": "Correct only review evidence metadata against the injected current source/check identities. Keep the scientific judgment and unresolved issues; a malformed reference is not a candidate source defect and does not require a code edit.",
+                            }
+                            _response_trace(camp, row, reply, validation="review_evidence_reference_invalid",
+                                            schema_errors=errors)
+                            append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
+                                            status="failed", error="review_evidence_reference_invalid")
+                            last = None
+                            continue
             _response_trace(camp, row, reply, validation="valid", normalization=normalization)
             append_ui_event(camp, "llm_call_finished", role=role, call_id=row.get("call_id"),
                             candidate_id=bound.get("candidate_id"), status="completed")

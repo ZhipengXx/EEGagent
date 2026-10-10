@@ -473,17 +473,11 @@ def duplicate_option_feedback(reply: Any) -> dict[str, Any]:
 
 
 def _correction_view(reply: Any) -> dict[str, Any]:
-    """Bound narrative text while preserving the complete output schema shape."""
+    """Preserve the full invalid draft; transport may omit it only as a whole."""
     if not isinstance(reply, dict):
         return {"invalid_reply_type": type(reply).__name__}
-    narrative = {"decision_rationale", "reason_zh", "summary_zh", "selection_rationale", "expected_information"}
-    view = {key: value[:600] if key in narrative and isinstance(value, str) else value
-            for key, value in reply.items()}
-    if isinstance(reply.get("options"), list):
-        view["options"] = [{key: value[:600] if key in {"value_rationale", "reason_zh"} and isinstance(value, str)
-                           else value for key, value in option.items()}
-                           if isinstance(option, dict) else option for option in reply["options"]]
-    return view
+    import copy
+    return copy.deepcopy(reply)
 
 
 def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -> dict[str, Any]:

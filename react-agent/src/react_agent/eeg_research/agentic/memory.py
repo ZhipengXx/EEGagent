@@ -157,6 +157,13 @@ def canonicalize_lesson_proposal(lesson: dict[str, Any]) -> dict[str, Any]:
             copied[new] = copied[old]
         elif old in copied and copied[new] != copied[old]:
             raise ValueError(f"lesson_alias_conflict:{old}")
+    # Older curator replies may name a literal translation instead of the
+    # canonical field. Preserve its text; do not infer a lesson from a summary.
+    if "statement" not in copied:
+        for field in ("statement_zh", "statement_en"):
+            if isinstance(copied.get(field), str) and copied[field].strip():
+                copied["statement"] = copied[field]
+                break
     return copied
 
 
@@ -265,6 +272,9 @@ def query_lessons(context: dict[str, Any], lessons: list[dict[str, Any]]) -> dic
         "fidelity",
     )
     for lesson in lessons:
+        if not isinstance(lesson.get("statement"), str) or not lesson["statement"].strip():
+            # Keep historical rows for audit, but never retrieve empty lessons.
+            continue
         conditions = lesson.get("conditions")
         if not isinstance(conditions, dict) or not conditions:
             continue
@@ -445,6 +455,9 @@ class EpisodeStore:
                 supporting = [str(item) for item in lesson.get("supporting_episode_ids") or proposal.get("supporting_episode_ids") or []]
                 contradicting = [str(item) for item in lesson.get("contradicting_episode_ids") or []]
                 reasons: list[str] = []
+                statement = lesson.get("statement") or proposal.get("statement")
+                if not isinstance(statement, str) or not statement.strip():
+                    reasons.append("statement_missing")
                 if not supporting:
                     reasons.append("supporting_missing")
                 missing = [item for item in supporting if item not in episodes]
@@ -523,7 +536,7 @@ class EpisodeStore:
                     rejected.append({"reason": reasons[0], "reasons": reasons, "ids": missing + missing_counter, "requested": requested})
                     continue
                 stored = {
-                    "statement": lesson.get("statement") or proposal.get("statement") or "",
+                    "statement": statement,
                     "uncertainty": lesson.get("uncertainty") if "uncertainty" in lesson else proposal.get("uncertainty"),
                     "requested_evidence_level": requested,
                     "evidence_level": LEVEL_ORDER[group_level] if cited else requested,

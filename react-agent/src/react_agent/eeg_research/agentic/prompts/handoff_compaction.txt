@@ -28,12 +28,29 @@ benchmark evidence with replicated/independent-final-test performance.
 
 OUTPUT
 Return the exact injected schema. Every note cites supplied source_refs.
-Put quantitative claims in facts as exact values with JSON pointers into the
-ORIGINAL full input, e.g. /run/aggregate/mean_top1. Do not reconstruct quantities
-from a partial range, calculate new effects, or guess a pointer. Omit a fact
-that cannot be located, and preserve the gap in uncertainties/open_questions.
-Use short prose with sufficient detail, not a fixed prefix of the source.
+Copy structured facts ONLY from fact_catalog: exact path and exact value.
+The catalogue is non-exhaustive citation guidance; it does not replace part.text
+or permit ignoring uncatalogued findings. Put [] in facts when no catalogue
+entry fits, and retain qualitative findings/limitations in the note. Never
+guess an array index or JSON pointer. native_benchmark_population is computed
+from native held-out score counts; it is distinct from source-subject development
+validation. Flag conflicting Analysis numbers instead of repeating them as facts.
+Aim for 6000 compact JSON characters (10000 is the hard rejection limit).
+Use at most six observations and at most three notes in each other category.
+Each note text is at most 400 characters. Each note cites at most three exact
+facts. State the finding, its scope and the important exception succinctly;
+combine repeated fold patterns. Native numeric tables remain literal beside
+the final summary, so do not duplicate those tables as long fact lists.
+Combine repeated diagnostic patterns; do not restate every fold score, hash,
+checkpoint or replica batch already preserved in literal native records.
+Preserve meaningful exceptions, disagreement, sampling scope and missing
+support. Keep short prose with sufficient detail, not a prefix of the source.
 The complete output must fit 10000 compact JSON characters. All list fields are
 required, and empty lists are valid when that category has no observed content.
 Retain at least one substantive cited note. Do not add task identity, permission,
 completion flags, or a proposed lesson to the summary.
+If summary_validation_error is present, obey its measured character budget and
+schema feedback. Rewrite previous_compaction_summary semantically: preserve
+distinct findings, dissent, limitations and source coverage while combining
+repetition and shortening wording. Do not take a prefix or discard inconvenient
+evidence. Use plain prose, valid JSON escaping and no unescaped LaTeX sequences.

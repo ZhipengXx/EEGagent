@@ -66,3 +66,9 @@ operation only: never cite them as supporting episodes, comparisons, confirmatio
 or completed scientific subtasks. Use the original supplied evidence references
 and allowed_source_refs. If the summary lacks support or leaves a material
 condition unresolved, retain that uncertainty or propose no lesson/skill.
+
+For procedural skills, order steps by when their inputs actually exist. Freeze
+source/split/evaluator identities before execution, and freeze a trained
+checkpoint's hash only after that checkpoint exists and before its scoring.
+Do not invent a validated workflow or treat a summary's unresolved question as
+unknown when the literal native records already settle it.

@@ -1,0 +1,66 @@
+# Resource-only successor on idle GPUs 0,1,5,7 with a new matched ten-fold baseline.
+# Existing total authorization is inherited transitively; no additional budget flags.
+goal_id: eeg_loso_method_compaction_freegpu_20261010
+objective: EEGagent设计一种通用EEG检索方法，以同一冻结实现进行九训一评十折训练，按十个留出被试等权均值与matched baseline比较，并依据完整方法结果分析与再规划。
+task_type: eeg_image_retrieval
+research_scope: subject_generalization
+evaluation_mode: loso_method_search
+primary_metric: benchmark.loso_mean_fixed_gallery_top1
+benchmark_feedback_enabled: true
+subject_aggregation: macro_mean
+benchmark_subjects:
+- sub-01
+- sub-02
+- sub-03
+- sub-04
+- sub-05
+- sub-06
+- sub-07
+- sub-08
+- sub-09
+- sub-10
+required_fold_count: 10
+checkpoint_policy: strict_best
+selection_min_delta: 0.001
+direction: maximize
+min_practical_gain_pp: 0.5
+final_test_enabled: false
+planner_mode: compare_options
+max_candidates: 2
+max_training_jobs: 96
+max_llm_calls: 700
+max_gpu_seconds: 345600
+max_concurrent_training_jobs: 1
+max_api_usd: null
+max_repairs_per_candidate: 2
+require_audit_before_completion: true
+allowed_training_actions:
+- run_pilot
+- run_full
+confirmation_target_pairs: 1
+training_seeds:
+- 0
+allowed_changes:
+- eeg_encoder
+- temporal_pooling
+- projection_head
+- training_loss
+- training_only_augmentation
+frozen_components:
+- split_manifest
+- query_gallery_manifest
+- evaluator
+- metric_definition
+- image_feature_target
+memory:
+  enabled: true
+  skills_enabled: true
+  model_id: sentence-transformers/all-MiniLM-L6-v2
+  model_revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+  device: cpu
+  batch_size: 32
+  top_k: 5
+  min_similarity: 0.3
+  context_chars_budget: 6000
+  allow_model_download: false
+  fallback: legacy

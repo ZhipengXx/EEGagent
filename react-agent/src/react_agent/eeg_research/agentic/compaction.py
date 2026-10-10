@@ -11,17 +11,20 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Callable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-REVISION = "curator_semantic_compaction.v1"
+REVISION = "curator_semantic_compaction.v3"
+REDUCE_REVISION = "curator_semantic_compaction.reduce.v7"
 ROLE = "memory_curator"
 OPERATION = "handoff_compaction"
 INPUT_CHARS = 100_000
 PART_CHARS = 60_000
 SUMMARY_CHARS = 10_000
+REDUCE_SUMMARY_CHARS = 12_000
 MAX_PARTS = 8
 
 
@@ -36,36 +39,108 @@ def digest(value: Any) -> str:
 
 class SourceFact(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    path: str = Field(min_length=1)
+    path: str = Field(min_length=1, max_length=160)
     value: int | float
 
 
 class CitedNote(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    text: str = Field(min_length=1, max_length=2000)
+    text: str = Field(min_length=1, max_length=400)
     source_refs: list[str] = Field(min_length=1, max_length=MAX_PARTS)
-    facts: list[SourceFact] = Field(default_factory=list, max_length=20)
+    facts: list[SourceFact] = Field(default_factory=list, max_length=3)
 
 
 class CompactionSummary(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     source_refs: list[str] = Field(min_length=1, max_length=MAX_PARTS)
-    observations: list[CitedNote] = Field(max_length=20)
-    interpretations: list[CitedNote] = Field(max_length=20)
-    contradictions: list[CitedNote] = Field(max_length=20)
-    uncertainties: list[CitedNote] = Field(max_length=20)
-    applicability: list[CitedNote] = Field(max_length=20)
-    open_questions: list[CitedNote] = Field(max_length=20)
+    observations: list[CitedNote] = Field(max_length=6)
+    interpretations: list[CitedNote] = Field(max_length=3)
+    contradictions: list[CitedNote] = Field(max_length=3)
+    uncertainties: list[CitedNote] = Field(max_length=3)
+    applicability: list[CitedNote] = Field(max_length=3)
+    open_questions: list[CitedNote] = Field(max_length=3)
+
+
+class SourceQuote(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    path: str = Field(min_length=1, max_length=160)
+    text: str = Field(min_length=1, max_length=400)
+
+
+class GroundedNote(CitedNote):
+    source_quotes: list[SourceQuote] = Field(default_factory=list, max_length=2)
+
+
+class ReduceSummary(CompactionSummary):
+    observations: list[GroundedNote] = Field(max_length=6)
+    interpretations: list[GroundedNote] = Field(max_length=3)
+    contradictions: list[GroundedNote] = Field(max_length=3)
+    uncertainties: list[GroundedNote] = Field(max_length=3)
+    applicability: list[GroundedNote] = Field(max_length=3)
+    open_questions: list[GroundedNote] = Field(max_length=3)
+
+
+def summary_schema(stage: str):
+    return ReduceSummary if stage == "reduce" else CompactionSummary
 
 
 NOTE_FIELDS = ("observations", "interpretations", "contradictions", "uncertainties",
                "applicability", "open_questions")
 
 
-def compaction_prompt() -> str:
+def summary_budget(stage: str) -> int:
+    return REDUCE_SUMMARY_CHARS if stage == "reduce" else SUMMARY_CHARS
+
+
+def compaction_prompt(max_output_chars: int = SUMMARY_CHARS, *, stage: str = "map") -> str:
     path = Path(__file__).parent / "prompts" / "handoff_compaction.txt"
-    return path.read_text(encoding="utf-8") + "\nOUTPUT_SCHEMA\n" + canonical(
-        CompactionSummary.model_json_schema()) + "\nReturn one JSON object only."
+    return path.read_text(encoding="utf-8").replace("10000", str(max_output_chars)) + "\nOUTPUT_SCHEMA\n" + canonical(
+        summary_schema(stage).model_json_schema()) + "\nReturn one JSON object only."
+
+
+def reduce_prompt() -> str:
+    return compaction_prompt(REDUCE_SUMMARY_CHARS, stage="reduce") + """\nREDUCE GROUNDING
+delivery_coverage describes complete delivery of the original input across ALL
+maps. A boundary or a field absent from ONE map is a delivery partition, not a
+missing research measurement. Resolve those partial-map caveats across the full
+summary set; do not present them as globally missing source data.
+original_analyses repeats the original unadjudicated Analysis for comparison.
+Explicitly preserve conflicts between its prose and native_benchmark_population
+or fact_catalog, including count/fold claims; native measurements have authority.
+fold_identities supplies literal fold IDs beside zero-based JSON array paths.
+Use the supplied fold_id/held_out_subject, never infer fold IDs from array indices.
+Do not attribute a new mechanism explanation to Analysis unless that original
+Analysis states it. Mark new hypotheses as untested interpretation, not findings.
+The consumer receives native records literally. Preserve distinct qualitative
+findings and limits; avoid copying every numeric table again.
+For any claim attributed to Analysis, cite a literal excerpt in source_quotes
+with its original /analyses/... JSON pointer. These quotations are checked
+verbatim against the original full input, never against earlier map summaries.
+analysis_quote_catalog gives exact original JSON pointers and literal source
+strings. Copy its path and a sufficient verbatim substring of its text. The
+original analyses value is an ARRAY: its paths use zero-based numeric indices.
+An evidence_id or artifact_id is a value, never a JSON-pointer array index.
+An observation is an object: cite its /note, /value or /item string field, not
+the whole observation object. Never guess a quotation pointer.
+Put the original Analysis's disputed quantities in that quotation, not in a
+paraphrase of what it supposedly said. In text, explain the conflict with the
+native measurement. Do not invent a source quotation or a source attribution.
+The fields source_quotes may be empty for notes that do not attribute a claim
+to Analysis. Use a short sufficient excerpt, without copying entire analyses.
+Check distinct population-count AND fold-count claims in original Analysis
+against native records; combine conflicts concisely but do not drop one of them.
+A verbatim quotation containing a loss value does not support an attributed
+conclusion that the Analysis never stated. Label any new inference as your
+untested interpretation, without attributing it to that source.
+native_benchmark_population settles the native held-out query population.
+Do not reopen that settled authority as an open question; the source-subject
+development population is a different population, not an alternative total.
+Nonzero patience/stall telemetry and epochs_completed alone prove no stopping
+policy violation. Require an explicit incompatible stopping policy before
+labeling them a bookkeeping contradiction or an execution failure.
+An unavailable diagnostic or duplicate-rate statistic alone is not evidence
+of a causal contributor. Preserve genuine source hypotheses as untested.
+"""
 
 
 def source_value(payload: Any, pointer: str) -> Any:
@@ -86,13 +161,37 @@ def source_value(payload: Any, pointer: str) -> Any:
     return value
 
 
-def validate_summary(reply: dict, payload: dict, expected_refs: list[str]) -> dict:
+def analysis_quote_catalog(payload: dict) -> list[dict]:
+    """Exact pointer hints for original narrative strings, not edited evidence.
+
+    All original Analysis material remains in original_analyses and the full
+    map delivery, including strings whose pointer is too long for SourceQuote.
+    """
+    quotes = []
+
+    def visit(value, path):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                token = str(key).replace("~", "~0").replace("/", "~1")
+                visit(item, path + "/" + token)
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, path + "/" + str(index))
+        elif isinstance(value, str) and value.strip() and len(path) <= 160:
+            quotes.append({"path": path, "text": value})
+
+    visit(payload.get("analyses", []), "/analyses")
+    return quotes
+
+
+def validate_summary(reply: dict, payload: dict, expected_refs: list[str], *, max_chars: int = SUMMARY_CHARS,
+                     stage: str = "map") -> dict:
     """Check declared coverage, exact structured facts, and finite output size.
 
     Citation/number validation is not a proof of faithful natural-language
     interpretation. A real model summary still requires source review.
     """
-    result = CompactionSummary.model_validate(reply).model_dump()
+    result = summary_schema(stage).model_validate(reply).model_dump()
     if (len(result["source_refs"]) != len(set(result["source_refs"]))
             or set(result["source_refs"]) != set(expected_refs)):
         raise ValueError("compaction_source_coverage_mismatch")
@@ -102,15 +201,28 @@ def validate_summary(reply: dict, payload: dict, expected_refs: list[str]) -> di
     for note in notes:
         if not set(note["source_refs"]).issubset(expected_refs):
             raise ValueError("compaction_unknown_source")
+        quotes = note.get("source_quotes", [])
+        if stage == "reduce" and re.search(
+                r"original analysis|analysis\s*(?::|reads\b|treats\b|states\b|claims\b|says\b|reports\b|frames\b|attributes\b|warns\b)",
+                note["text"], re.IGNORECASE) and not quotes:
+            raise ValueError("compaction_analysis_quote_missing")
+        for quote in quotes:
+            try:
+                original = source_value(payload, quote["path"])
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                raise ValueError("compaction_quote_pointer_invalid:" + quote["path"]) from exc
+            if (not quote["path"].startswith("/analyses/") or not isinstance(original, str)
+                    or not quote["text"].strip() or quote["text"] not in original):
+                raise ValueError("compaction_source_quote_mismatch:" + quote["path"])
         for fact in note["facts"]:
             try:
                 original = source_value(payload, fact["path"])
             except (KeyError, IndexError, TypeError, ValueError) as exc:
-                raise ValueError("compaction_fact_pointer_invalid") from exc
+                raise ValueError("compaction_fact_pointer_invalid:" + fact["path"]) from exc
             if (isinstance(original, bool) or not isinstance(original, (int, float))
                     or original != fact["value"]):
-                raise ValueError("compaction_fact_mismatch")
-    if len(canonical(result)) > SUMMARY_CHARS:
+                raise ValueError("compaction_fact_mismatch:" + fact["path"])
+    if len(canonical(result)) > max_chars:
         raise ValueError("compaction_summary_budget_exceeded")
     return result
 
@@ -167,6 +279,34 @@ def protected_context(payload: dict) -> dict:
                 "source": "/run/aggregate/scores/*/metrics/query_count",
                 "basis": "Sum of native held-out benchmark query counts; not source-subject development validation.",
             }
+    return result
+
+
+def fact_catalog(payload: dict) -> list[dict]:
+    """Citation hints only. Full input is still read; this is not an evidence filter."""
+    result = []
+
+    def add(path):
+        try:
+            value = source_value(payload, path)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            result.append({"path": path, "value": value})
+
+    for key in ("mean_top1", "mean_top5", "std_top1", "std_top5", "coverage", "seed",
+                "independent_seed_count", "required_fold_count"):
+        add("/run/aggregate/" + key)
+    for index, _row in enumerate((payload.get("run", {}).get("aggregate") or {}).get("scores") or []):
+        for key in ("top1", "top5", "query_count", "candidate_count"):
+            add(f"/run/aggregate/scores/{index}/metrics/{key}")
+    for index, _row in enumerate((payload.get("diagnostics") or {}).get("folds") or []):
+        for key in ("sample_count", "effective_rank"):
+            add(f"/diagnostics/folds/{index}/diagnostics/items/representation/{key}")
+        for key in ("sample_count", "mean_margin"):
+            add(f"/diagnostics/folds/{index}/diagnostics/items/retrieval_errors/{key}")
+        for key in ("last_epoch", "selected_checkpoint_epoch", "query_count"):
+            add(f"/diagnostics/folds/{index}/development_metrics/{key}")
     return result
 
 
@@ -243,7 +383,7 @@ def _recover_stage(camp: Path, request: dict, *, original: dict, refs: list[str]
                    for key in ("task_id", "attempt_id", "input_digest")):
                 continue
             base = {key: value for key, value in parsed.items() if key not in
-                    {"task_id", "attempt_id", "input_digest", "summary_validation_error"}}
+                    {"task_id", "attempt_id", "input_digest", "summary_validation_error", "previous_compaction_summary"}}
             if (base != request or traced["system"] != system or response.get("validation") != "valid"
                     or traced.get("operation") != OPERATION or response.get("operation") != OPERATION
                     or hashlib.sha256(traced["system"].encode()).hexdigest() != call.get("request_system_sha256")
@@ -251,7 +391,7 @@ def _recover_stage(camp: Path, request: dict, *, original: dict, refs: list[str]
                     or traced.get("system_sha256") != call.get("request_system_sha256")
                     or traced.get("user_sha256") != call.get("request_user_sha256")):
                 continue
-            summary = validate_summary(response["reply"], original, refs)
+            summary = validate_summary(response["reply"], original, refs, max_chars=summary_budget(request["stage"]), stage=request["stage"])
         except (OSError, ValueError, KeyError, TypeError):
             continue
         # Crash after artifact registration but before the completed ledger row:
@@ -279,7 +419,7 @@ def _recover_stage(camp: Path, request: dict, *, original: dict, refs: list[str]
         # recovery artifact; any partial original output remains unchanged.
         envelope = finish_role_task(camp, task,
             {"status": "completed", "prompt_hash": identity["prompt_hash"],
-             "operation": OPERATION, "revision": REVISION,
+             "operation": OPERATION, "revision": request["revision"],
              "original_input_sha256": request["original_input_sha256"],
              "stage": request["stage"], "compaction_summary": summary,
              "recovered_transport_call_id": call["call_id"]},
@@ -298,9 +438,9 @@ def _stage(camp: Path, request: dict, *, original: dict, refs: list[str],
     identity = {
         "role": ROLE, "action": OPERATION + ":" + request["stage"], "target_id": None,
         "source": request["original_input_sha256"],
-        "config": {"revision": REVISION, "model": model, "summary_chars": SUMMARY_CHARS},
+        "config": {"revision": request["revision"], "model": model, "summary_chars": summary_budget(request["stage"])},
         "approval": None, "prompt_hash": hashlib.sha256(system.encode()).hexdigest()[:16],
-        "schema_hash": digest(CompactionSummary.model_json_schema()), "evaluator": None,
+        "schema_hash": digest(summary_schema(request["stage"]).model_json_schema()), "evaluator": None,
         "evidence": refs, "memory_snapshot": None, "legal_actions": [],
         "budget_feasibility": {"bounded_delivery_operation": True},
         "request_semantics": digest(request), "feedback": None,
@@ -313,7 +453,8 @@ def _stage(camp: Path, request: dict, *, original: dict, refs: list[str],
                            recovery_identity=identity)
     if task.get("_cached_role_result"):
         cached = task["_cached_role_result"]
-        summary = validate_summary(cached["envelope"]["payload"]["compaction_summary"], original, refs)
+        summary = validate_summary(cached["envelope"]["payload"]["compaction_summary"], original, refs,
+                                   max_chars=summary_budget(request["stage"]), stage=request["stage"])
         envelope = finish_role_task(camp, task, {}, kind="handoff_compaction",
                                      path=Path(cached["artifact"]["path"]))
         return summary, resolve_verified_artifact(camp, envelope["artifact_refs"][-1])
@@ -321,19 +462,19 @@ def _stage(camp: Path, request: dict, *, original: dict, refs: list[str],
         summary = invoke(
             system=system, payload={**request, **{key: task[key] for key in
                 ("task_id", "attempt_id", "input_digest")}}, task=task,
-            validate=lambda reply: validate_summary(reply, original, refs),
+            validate=lambda reply: validate_summary(reply, original, refs, max_chars=summary_budget(request["stage"]), stage=request["stage"]),
             context_budget_chars=INPUT_CHARS,
         )
         envelope = finish_role_task(camp, task,
             {"status": "completed", "prompt_hash": identity["prompt_hash"],
-             "operation": OPERATION, "revision": REVISION,
+             "operation": OPERATION, "revision": request["revision"],
              "original_input_sha256": request["original_input_sha256"],
              "stage": request["stage"], "compaction_summary": summary},
             kind="handoff_compaction", path=camp / "compaction" / (task["task_id"] + ".json"))
     except Exception as exc:
         finish_role_task(camp, task,
             {"status": "failed", "prompt_hash": identity["prompt_hash"],
-             "operation": OPERATION, "revision": REVISION,
+             "operation": OPERATION, "revision": request["revision"],
              "original_input_sha256": request["original_input_sha256"],
              "summary_zh": "交接压缩失败：" + str(exc)},
             kind="handoff_compaction", path=camp / "compaction" / (task["task_id"] + "_failed.json"))
@@ -364,10 +505,13 @@ def compact_for_curator(camp: Path, payload: dict, *, inputs: list[Path], model:
     dependencies = list(dict.fromkeys([*inputs, snapshot]))
     summaries = []
     artifacts = []
+    catalog = fact_catalog(payload)
+    population = protected_context(payload).get("benchmark_population")
     for part in parts:
         request = {"operation": OPERATION, "revision": REVISION, "stage": "map",
                    "original_input_sha256": original_sha, "total_parts": len(parts),
-                   "part": part, "expected_source_refs": [part["ref"]]}
+                   "part": part, "expected_source_refs": [part["ref"]],
+                   "fact_catalog": catalog, "native_benchmark_population": population}
         summary, artifact = _stage(camp, request, original=payload, refs=[part["ref"]],
             inputs=dependencies, system=system, model=model, invoke=invoke)
         summaries.append(summary)
@@ -376,16 +520,29 @@ def compact_for_curator(camp: Path, payload: dict, *, inputs: list[Path], model:
     if len(summaries) == 1:
         summary, artifact = summaries[0], artifacts[0]
     else:
-        request = {"operation": OPERATION, "revision": REVISION, "stage": "reduce",
+        identities = []
+        for index, row in enumerate(payload.get("run", {}).get("aggregate", {}).get("scores", [])):
+            identities.append({"path": f"/run/aggregate/scores/{index}",
+                               "fold_id": row.get("fold_id"), "held_out_subject": row.get("held_out_subject")})
+        for index, row in enumerate((payload.get("diagnostics") or {}).get("folds", [])):
+            identities.append({"path": f"/diagnostics/folds/{index}",
+                               "fold_id": row.get("fold_id"), "held_out_subject": row.get("held_out_subject")})
+        request = {"operation": OPERATION, "revision": REDUCE_REVISION, "stage": "reduce",
                    "original_input_sha256": original_sha, "summaries": summaries,
-                   "expected_source_refs": refs}
+                   "expected_source_refs": refs, "fact_catalog": catalog,
+                   "native_benchmark_population": population,
+                   "delivery_coverage": {"original_input_chars": len(text), "all_input_parts_delivered": True,
+                       "basis": "Exact contiguous source ranges cover the canonical original once; every map passed validation.",
+                       "source_ranges": [{key: part[key] for key in ("ref", "start", "end", "sha256")} for part in parts]},
+                   "original_analyses": payload.get("analyses", []),
+                   "analysis_quote_catalog": analysis_quote_catalog(payload), "fold_identities": identities}
         summary, artifact = _stage(camp, request, original=payload, refs=refs,
             inputs=[*dependencies, *[Path(row["path"]) for row in artifacts]],
-            system=system, model=model, invoke=invoke)
+            system=reduce_prompt(), model=model, invoke=invoke)
     result = protected_context(payload)
     result["compacted_context"] = summary
     result["context_compaction"] = {
-        "revision": REVISION, "operation": OPERATION,
+        "revision": REDUCE_REVISION if len(parts) > 1 else REVISION, "operation": OPERATION,
         "artifact_id": artifact["artifact_id"], "sha256": artifact["sha256"],
         "input_artifact_id": input_artifact["artifact_id"],
         "original_input_sha256": original_sha, "source_refs": refs,

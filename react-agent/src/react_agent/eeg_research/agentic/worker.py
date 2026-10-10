@@ -133,6 +133,8 @@ def _review_or_reuse(
     summary: dict[str, Any],
     reviewer: Any,
     state: dict[str, Any],
+    *,
+    revalidation_reason: str | None = None,
 ) -> dict[str, Any] | None:
     """Use a stored review, or call the reviewer once. None means the campaign is already blocked."""
     attempt = ensure_attempt(workspace, str(workspace.name))
@@ -154,9 +156,25 @@ def _review_or_reuse(
             recoverable=False,
         )
         return None
-    if stored is not None:
+    if stored is not None and revalidation_reason is None:
         from react_agent.eeg_research.agentic.native_patch import enforce_requirement_review
         return enforce_requirement_review(workspace, spec, stored)
+    if revalidation_reason is not None:
+        from react_agent.eeg_research.agentic.binding import file_sha256
+        previous = workspace / "review.json"
+        if not revalidation_reason.strip() or stored is None:
+            raise ValueError("review_revalidation_requires_matching_prior_receipt_and_reason")
+        archive = workspace / "review_history" / (file_sha256(previous) + ".json")
+        archive.parent.mkdir(exist_ok=True)
+        data = previous.read_bytes()
+        if archive.exists():
+            if archive.read_bytes() != data:
+                raise ValueError("review_history_identity_conflict")
+        else:
+            with archive.open("xb") as target:
+                target.write(data)
+        event(camp_dir, "review_revalidation_requested", candidate_id=workspace.name,
+              prior_review_ref=str(archive), reason=revalidation_reason)
     cost_path = camp_dir / "cost.json"
     used = json.loads(cost_path.read_text(encoding="utf-8")).get("llm_calls", 0) if cost_path.is_file() else 0
     if int(state.get("max_llm_calls", 100)) - int(used) <= 0:
@@ -231,12 +249,22 @@ def build_services(camp: Path) -> dict[str, Any]:
     def settle(camp_dir: Path, job_id: str) -> dict[str, Any]:
         return jobs.reconcile(camp_dir / "jobs" / job_id)
 
-    def do_implement(camp_dir: Path, state: dict[str, Any]) -> None:
+    def do_implement(camp_dir: Path, state: dict[str, Any], *,
+                     review_candidate_id: str | None = None,
+                     review_reason: str | None = None) -> None:
         if state.get("status") in {"paused", "cancelled"}:
             return
+        if state.get("evaluation_mode") == "loso_method_search":
+            from react_agent.eeg_research.agentic.resource_guard import require_idle_gpus
+            try:
+                require_idle_gpus(camp_dir, state)
+            except (ValueError, OSError) as exc:
+                persist_failure(camp_dir, state, phase="resources", error_type="gpu_unavailable",
+                                detail=str(exc), recoverable=True)
+                return
         repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else None
         repairing = bool(repair and int(repair.get("remaining") or 0) > 0 and repair.get("candidate_id"))
-        candidate_id = candidate_implementation_target(camp_dir, state)
+        candidate_id = review_candidate_id or candidate_implementation_target(camp_dir, state)
         selected_target = state.get("active_implementation_target_id")
         if selected_target and selected_target != candidate_id:
             persist_failure(camp_dir, state, phase="implement_candidate", error_type="implementation_target_changed",
@@ -297,7 +325,7 @@ def build_services(camp: Path) -> dict[str, Any]:
             )
             return
         evidence_id = f"ev_impl_{candidate_id}"
-        if not repairing and any(row.get("evidence_id") == evidence_id for row in state.get("evidence") or []):
+        if not repairing and review_reason is None and any(row.get("evidence_id") == evidence_id for row in state.get("evidence") or []):
             return
         max_calls = int(state.get("max_llm_calls", 100))
 
@@ -414,6 +442,8 @@ def build_services(camp: Path) -> dict[str, Any]:
                 )
         row = {"candidate_id": candidate_id, "status": outcome["status"], "steps": outcome.get("steps"), "detail": outcome.get("detail")}
         check = outcome.get("check") if isinstance(outcome.get("check"), dict) else {}
+        if not check and outcome.get("status") == "ready_for_review":
+            check = read_json(workspace / "checks.json")
         row["check"] = {key: check.get(key) for key in ("ok", "error", "stage", "location", "failures", "source_sha256", "check_fingerprint")}
         row["check"]["detail"] = str(check.get("detail") or "")[-2000:]
         if (state.get("failure") or {}).get("phase") in {"implement_candidate", "repair_candidate", "review_candidate"}:
@@ -442,7 +472,9 @@ def build_services(camp: Path) -> dict[str, Any]:
             state["repair_task"] = None
             state["experiment_failed"] = True
         if outcome["status"] == "ready_for_review":
-            verdict = _review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state)
+            verdict = (_review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state,
+                        revalidation_reason=review_reason) if review_reason is not None
+                       else _review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state))
             if verdict is None:
                 return
             row["review"] = verdict["status"]
@@ -518,7 +550,59 @@ def build_services(camp: Path) -> dict[str, Any]:
             state["evidence"].append(evidence_row)
         event(camp_dir, "implemented", **row)
 
-    def _analyze_run(camp_dir: Path, state: dict[str, Any], latest: dict[str, Any], *, trigger: dict[str, Any]) -> None:
+    def revalidate_review(camp_dir: Path, state: dict[str, Any], *, candidate_id: str, reason: str) -> dict:
+        """Re-review current checked code after a recorded review metadata failure."""
+        import re
+        from react_agent.eeg_research.agentic.binding import file_sha256
+        from react_agent.eeg_research.agentic.native_patch import _check_fingerprint
+        from react_agent.eeg_research.agentic.review_context import review_reference_errors
+        if (state.get("evaluation_mode") != "loso_method_search" or state.get("live_job")
+                or state.get("active_suite") or state.get("repair_task")
+                or state.get("status") == "cancelled" or not reason.strip()
+                or not re.fullmatch(r"c[1-9][0-9]*", candidate_id)):
+            raise ValueError("review_revalidation_requires_quiescent_checked_candidate_and_reason")
+        workspace = camp_dir / "candidates" / candidate_id
+        row = next((item for item in state.get("candidates") or [] if item.get("candidate_id") == candidate_id), None)
+        source = workspace / "extension/eeg_candidate.py"
+        check_path = workspace / "checks.json"
+        spec = json.loads((workspace / "spec.json").read_text())
+        checks = json.loads(check_path.read_text())
+        prior = json.loads((workspace / "review.json").read_text())
+        impl = json.loads((workspace / "implementation.json").read_text())
+        if (not row or row.get("status") != "review_blocked" or prior.get("status") != "blocked"
+                or checks.get("ok") is not True or checks.get("source_sha256") != file_sha256(source)
+                or checks.get("check_fingerprint") != _check_fingerprint(workspace, None)
+                or impl.get("status") != "ready_for_review" or impl.get("input_hash") != source_hash(workspace)
+                or (spec.get("experiment") or {}).get("spec_hash") != (state.get("experiment") or {}).get("spec_hash")):
+            raise ValueError("review_revalidation_requires_current_source_checks_and_same_approved_spec")
+        metadata = {"candidate_source": source.read_text(), "requirement_evidence_identity": {
+            "source_ref": str(source), "source_hash": file_sha256(source),
+            "check_ref": str(check_path), "check_sha256": file_sha256(check_path)}}
+        if not review_reference_errors(prior, metadata):
+            raise ValueError("review_revalidation_requires_recorded_reference_contract_failure")
+        pinned_source = file_sha256(source)
+        pinned_check = file_sha256(check_path)
+        was_paused = state.get("status") == "paused"
+        if was_paused:
+            state["status"] = "planning"
+        try:
+            do_implement(camp_dir, state, review_candidate_id=candidate_id, review_reason=reason)
+            if file_sha256(source) != pinned_source or file_sha256(check_path) != pinned_check:
+                raise ValueError("review_revalidation_changed_candidate_source_or_checks")
+            if state.get("candidate_ready") or state.get("repair_task"):
+                state["experiment_failed"] = False
+        finally:
+            if was_paused and state.get("status") == "planning":
+                state["status"] = "paused"
+            _sync_ledger(camp_dir, state)
+        return {"status": next(item["status"] for item in state["candidates"] if item["candidate_id"] == candidate_id),
+                "candidate_id": candidate_id, "reason": reason,
+                "source_hash": file_sha256(source), "candidate_source_rewritten": False}
+
+    def _analyze_run(camp_dir: Path, state: dict[str, Any], latest: dict[str, Any], *,
+                     trigger: dict[str, Any], prepare_only: bool = False,
+                     revalidation_reason: str | None = None) -> dict | None:
+        curation_result = None
         comparison = latest.get("comparison")
         diagnostics = latest.get("diagnostics")
         if not latest.get("evaluation_valid"):
@@ -716,7 +800,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                     if not method_mode:
                         return
                     from react_agent.eeg_research.agentic.method_suite import scientific_feedback_records
-                    if "curation" in scientific_feedback_records(camp_dir, state, latest):
+                    if not prepare_only and not revalidation_reason and "curation" in scientific_feedback_records(camp_dir, state, latest):
                         return
                     # Native begin-task reuses this completed Analyst envelope.
                     # Continue its missing curator stage without new transport.
@@ -822,6 +906,11 @@ def build_services(camp: Path) -> dict[str, Any]:
             curation_inputs = [camp_dir / "goal.json"]
             if method_mode:
                 curation_inputs.extend([Path(latest["suite_ref"]), target])
+            if revalidation_reason:
+                curation_context["feedback_revalidation"] = {
+                    "reason": revalidation_reason, "authority": "runtime_delivery_retry_only",
+                    "policy": "Reuse the immutable native analysis. Generate a new curator proposal; preserve prior outputs and episodes.",
+                }
             compaction_artifacts = []
             prepare = getattr(curator, "prepare_context", None)
             if method_mode and callable(prepare):
@@ -832,6 +921,12 @@ def build_services(camp: Path) -> dict[str, Any]:
                     # registered model summary actually delivered to curator.
                     compaction_artifacts.append(
                         {"artifact_id": receipt["artifact_id"], "sha256": receipt["sha256"]})
+            if prepare_only:
+                _sync_ledger(camp_dir, state)
+                return {"status": "handoff_prepared", "candidate_id": latest["candidate_id"],
+                        "suite_id": latest["suite_id"],
+                        "context_compaction": curation_context.get("context_compaction"),
+                        "curator_called": False}
             task = begin_role_task(camp_dir, role="memory_curator", inputs=curation_inputs,
                                    artifacts=compaction_artifacts, request=curation_context)
             try:
@@ -876,7 +971,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                         skills_metadata["memory_indexing"] = {"status": "pending", "reason": type(exc).__name__}
                 if proposal_status != "completed":
                     store.mark_pending_curation("curator_incomplete")
-                finish_role_task(
+                completed_curation = finish_role_task(
                     camp_dir,
                     task,
                     {"status": proposal_status, "summary_zh": "已校验条件化经验提议", "proposal": _lesson_proposal(proposal), "accepted": accepted,
@@ -884,6 +979,10 @@ def build_services(camp: Path) -> dict[str, Any]:
                     kind="lessons",
                     path=camp_dir / "memory" / f"lessons_{task['task_id']}.json",
                 )
+                curation_result = {"status": proposal_status, "task_id": task["task_id"],
+                    "artifact_id": completed_curation["artifact_refs"][-1],
+                    "accepted_lessons": len(accepted["accepted"]), "rejected_lessons": len(accepted["rejected"]),
+                    "curator_called": True, "context_compaction": curation_context.get("context_compaction")}
         except LlmUnavailable as exc:
             store.mark_pending_curation("curator_unavailable")
             if method_mode and str(exc) in _METHOD_ROLE_HARD_BLOCKS:
@@ -895,8 +994,12 @@ def build_services(camp: Path) -> dict[str, Any]:
         if not (camp_dir / "cost.json").is_file():
             state["llm_calls"] = int(state.get("llm_calls", 0)) + billed
             state["llm_calls_left"] = int(state.get("llm_calls_left", 0)) - billed
+        return curation_result
 
     def analyze(camp_dir: Path, state: dict[str, Any]) -> None:
+        from react_agent.eeg_research.agentic.llm import external_api_disabled
+        if external_api_disabled():
+            raise LlmUnavailable("external_api_disabled_by_operator")
         scientific_rows = state.get("evidence") or []
         if state.get("evaluation_mode") == "loso_method_search":
             from react_agent.eeg_research.agentic.method_suite import verified_suite_records
@@ -917,11 +1020,80 @@ def build_services(camp: Path) -> dict[str, Any]:
 
         return call
 
+    def prepare_handoff(camp_dir: Path, state: dict[str, Any]) -> dict:
+        from react_agent.eeg_research.agentic.method_suite import (
+            verified_suite_records, scientific_feedback_records,
+        )
+        if state.get("evaluation_mode") != "loso_method_search" or state.get("live_job"):
+            raise ValueError("handoff_preparation_requires_quiescent_method_campaign")
+        rows = verified_suite_records(camp_dir, state)
+        if not rows or "analysis" not in scientific_feedback_records(camp_dir, state, rows[-1]):
+            raise ValueError("handoff_preparation_requires_completed_native_analysis")
+        latest = rows[-1]
+        result = _analyze_run(camp_dir, state, latest, prepare_only=True,
+            trigger={"kind": "settled_run", "upstream_evidence_id": latest["evidence_id"],
+                     "upstream_job_id": latest.get("job_id")})
+        if not result:
+            raise ValueError("handoff_preparation_incomplete")
+        return result
+
+    def revalidate_feedback(camp_dir: Path, state: dict[str, Any], *, reason: str) -> dict:
+        from react_agent.eeg_research.agentic.method_suite import verified_suite_records, scientific_feedback_records
+        if (state.get("evaluation_mode") != "loso_method_search" or state.get("live_job")
+                or state.get("active_suite") or not reason.strip()):
+            raise ValueError("feedback_revalidation_requires_quiescent_method_campaign_and_reason")
+        rows = verified_suite_records(camp_dir, state)
+        if not rows or "analysis" not in scientific_feedback_records(camp_dir, state, rows[-1]):
+            raise ValueError("feedback_revalidation_requires_completed_native_analysis")
+        latest = rows[-1]
+        result = _analyze_run(camp_dir, state, latest, revalidation_reason=reason,
+            trigger={"kind": "settled_run", "upstream_evidence_id": latest["evidence_id"],
+                     "upstream_job_id": latest.get("job_id")})
+        if not result or result["status"] != "completed":
+            raise ValueError("feedback_revalidation_incomplete")
+        from react_agent.eeg_research.agentic.method_suite import complete_scientific_feedback
+        complete_scientific_feedback(camp_dir, state, latest, {})
+        return result
+
+    def retry_design(camp_dir: Path, state: dict[str, Any], *, reason: str) -> dict:
+        """Retry only an unapproved framework-blocked design using its saved Planner input."""
+        from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact, request_digest
+        from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
+        from react_agent.eeg_research.agentic.loop import _design_experiment
+        if (state.get("evaluation_mode") != "loso_method_search" or state.get("live_job")
+                or state.get("active_suite") or not reason.strip() or experiment_is_approved(state.get("experiment"))):
+            raise ValueError("designer_retry_requires_quiescent_unapproved_method_design")
+        artifact = resolve_verified_artifact(camp_dir, str(state.get("experiment_ref") or ""))
+        prior = json.loads(Path(artifact["path"]).read_text())
+        failure = (prior.get("payload") or {}).get("design_failure") or {}
+        decision = (state.get("decisions") or [{}])[-1]
+        if (artifact.get("kind") != "experiment_spec" or prior.get("status") != "blocked"
+                or failure.get("error_type") != "role_context_budget_requires_artifact_pages"
+                or decision.get("action") != "design_experiment" or decision.get("ok") is not True):
+            raise ValueError("designer_retry_requires_recorded_framework_budget_failure")
+        decision_id = str(decision.get("decision_id") or "")
+        if not decision_id.startswith("d") or not decision_id[1:].isdigit():
+            raise ValueError("designer_retry_planner_input_changed")
+        saved = json.loads((camp_dir / "decisions" / (decision["decision_id"] + ".json")).read_text())
+        raw = saved.get("raw")
+        if (not isinstance(raw, dict) or request_digest(request=raw) != decision.get("raw_digest")
+                or (saved.get("decision") or {}).get("decision_id") != decision["decision_id"]):
+            raise ValueError("designer_retry_planner_input_changed")
+        _design_experiment(camp_dir, state, decision, raw, {"designer": _lazy("experiment_designer")})
+        _sync_ledger(camp_dir, state)
+        return {"status": (state.get("experiment") or {}).get("status"),
+                "experiment_ref": state.get("experiment_ref"), "original_decision_id": decision["decision_id"],
+                "prior_artifact_id": artifact["artifact_id"], "reason": reason}
+
     return {
         "launch": launch,
         "settle": settle,
         "implement": do_implement,
         "analyze": analyze,
+        "prepare_handoff": prepare_handoff,
+        "revalidate_feedback": revalidate_feedback,
+        "retry_design": retry_design,
+        "revalidate_review": revalidate_review,
         "librarian": _lazy("research_librarian"),
         "designer": _lazy("experiment_designer"),
         "auditor": _lazy("result_auditor"),
@@ -930,6 +1102,10 @@ def build_services(camp: Path) -> dict[str, Any]:
 
 def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) -> dict[str, Any]:
     """Advance until a terminal state. A second worker for the same campaign exits at once."""
+    from react_agent.eeg_research.agentic.budget_inheritance import delegated_successor
+    successor = delegated_successor(camp)
+    if successor:
+        return {"status": "budget_delegated", "successor": successor}
     lock_path = camp / "worker.lock"
     handle = lock_path.open("a", encoding="utf-8")
     try:
@@ -938,11 +1114,13 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
         return {"status": "worker_already_running"}
     (camp / "worker.json").write_text(json.dumps({"pid": os.getpid(), "started_at": time.time()}), encoding="utf-8")
     state = load_state(camp)
-    if resolve_worker_design(camp, state) is None:
-        if state.get("status") not in {"paused", "cancelled"}:
-            save_state(camp, state)
-        return state
-    align_interrupt(camp)
+    from react_agent.eeg_research.agentic.verification_cache import verification_scope
+    with verification_scope():
+        if resolve_worker_design(camp, state) is None:
+            if state.get("status") not in {"paused", "cancelled"}:
+                save_state(camp, state)
+            return state
+        align_interrupt(camp)
     state = load_state(camp)
     if state.get("status") in _TERMINAL:
         return state
@@ -957,7 +1135,9 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
             save_state(camp, state)
         return state
     for tick_index in range(max_ticks):
-        state = tick(camp, planner, services=services)
+        from react_agent.eeg_research.agentic.verification_cache import verification_scope
+        with verification_scope():
+            state = tick(camp, planner, services=services)
         (camp / "worker.json").write_text(
             json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "tick": tick_index, "resumable": bool(state.get("live_job"))}),
             encoding="utf-8",

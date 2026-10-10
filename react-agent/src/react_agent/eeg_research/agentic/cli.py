@@ -30,7 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m react_agent.eeg_research.agentic.cli")
     parser.add_argument(
         "command",
-        choices=["create", "start", "run", "status", "pause", "resume", "stop", "validate-goal", "evaluate-export", "evaluate-pack",
+        choices=["create", "start", "run", "status", "pause", "resume", "stop", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents", "validate-goal", "evaluate-export", "evaluate-pack",
                  "study-create", "study-status", "study-run", "study-freeze", "study-evaluate", "study-aggregate",
                  "suite-retry-fold"],
     )
@@ -41,6 +41,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--subject", type=parse_subject_selection, default="all",
                         help="Training subjects, comma-separated; LOSO selects nine source subjects")
     parser.add_argument("--poll-seconds", type=float, default=30.0)
+    parser.add_argument("--max-ticks", type=int, default=200,
+                        help="Native worker step limit; run/start/resume only, positive integer")
     parser.add_argument("--reopen-reason", default="", help="Reopen a finished campaign after a framework fix; the reason is logged")
     parser.add_argument("--goal", type=Path, default=None, help="GoalSpec YAML. validate-goal prints it and does not start a worker.")
     parser.add_argument("--planner-mode", choices=["single_action", "compare_options"], default=None,
@@ -52,7 +54,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--study", type=Path, default=None, help="Native sequential ten-fold LOSO study directory")
     parser.add_argument("--allow-partial", action="store_true", help="Freeze valid pairs with explicitly incomplete fold coverage")
     parser.add_argument("--allow-shared-gpus", action="store_true", help="Explicit authorization to use occupied GPUs without terminating their processes")
-    parser.add_argument("--inherit-study", type=Path, help="Native verified budget source for a new method-level LOSO campaign")
+    parser.add_argument("--inherit-study", type=Path,
+                        help="Native verified budget source: legacy study or quiescent method campaign")
     parser.add_argument("--additional-llm-calls", type=int, default=0,
                         help="Explicit additional authorization for inherited method-campaign API attempts; create only")
     parser.add_argument("--additional-training-jobs", type=int, default=0,
@@ -61,7 +64,10 @@ def _parser() -> argparse.ArgumentParser:
                         help="Explicit additional occupied-GPU seconds authorization; create only")
     parser.add_argument("--suite", default=None, help="Frozen method suite ID for an engineering retry")
     parser.add_argument("--fold", default=None, help="Fold ID for an engineering retry")
-    parser.add_argument("--retry-reason", default="", help="Observed engineering failure that requires a fresh fold process")
+    parser.add_argument("--candidate", default=None, help="Existing checked candidate for review revalidation")
+    parser.add_argument("--retry-reason", default="", help="Observed engineering failure requiring a fresh fold or feedback validation")
+    parser.add_argument("--max-existing-gpu-memory-mib", type=int, default=1024,
+                        help="Explicit authorize-gpu-sharing only: maximum memory already used on each frozen card")
     return parser
 
 
@@ -103,11 +109,12 @@ def goal(campaign: str, design=None) -> dict:
     }
 
 
-def spawn_worker(root: Path, campaign: str, poll_seconds: float) -> int:
+def spawn_worker(root: Path, campaign: str, poll_seconds: float, *, max_ticks: int = 200) -> int:
     camp = root / campaign
     log = (camp / "worker.log").open("ab")
     proc = subprocess.Popen(  # noqa: S603
-        [sys.executable, "-m", "react_agent.eeg_research.agentic.cli", "run", "--campaign", campaign, "--root", str(root), "--poll-seconds", str(poll_seconds)],
+        [sys.executable, "-m", "react_agent.eeg_research.agentic.cli", "run", "--campaign", campaign,
+         "--root", str(root), "--poll-seconds", str(poll_seconds), "--max-ticks", str(max_ticks)],
         stdout=log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -193,6 +200,9 @@ def status_view(camp: Path) -> dict:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.max_ticks < 1:
+        print(json.dumps({"error": "max_ticks_must_be_positive"}))
+        return 2
     additional = {"llm_calls": args.additional_llm_calls,
                   "training_jobs": args.additional_training_jobs,
                   "gpu_seconds": args.additional_gpu_seconds}
@@ -322,6 +332,8 @@ def main(argv: list[str] | None = None) -> int:
             submitted["goal_id"] = args.campaign
         if args.planner_mode is not None:
             submitted["planner_mode"] = args.planner_mode
+        if submitted.get("evaluation_mode") == "loso_method_search":
+            submitted["allow_shared_gpus"] = args.allow_shared_gpus
         inherited = None
         estimate_basis = []
         if submitted.get("evaluation_mode") == "loso_method_search":
@@ -393,6 +405,13 @@ def main(argv: list[str] | None = None) -> int:
     if not (camp / "campaign_state.json").is_file():
         print(json.dumps({"error": "campaign_missing"}))
         return 2
+    if args.command in {"start", "resume", "run", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents"}:
+        from react_agent.eeg_research.agentic.budget_inheritance import delegated_successor
+        successor = delegated_successor(camp)
+        if successor:
+            print(json.dumps({"error": "campaign_budget_delegated_to_successor",
+                              "successor": successor}))
+            return 2
     if args.command in {"start", "resume", "run"} and (root.parent / "benchmark_freeze.json").is_file():
         manifest_path = root.parent / "study_manifest.json"
         if manifest_path.is_file():
@@ -403,13 +422,87 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "run":
         from react_agent.eeg_research.agentic.worker import run_worker
 
-        state = run_worker(camp, poll_seconds=args.poll_seconds)
+        state = run_worker(camp, poll_seconds=args.poll_seconds, max_ticks=args.max_ticks)
         print(json.dumps({"status": state.get("status"), "detail": state.get("detail")}, ensure_ascii=False))
         return 0
     if args.command == "status":
         print(json.dumps(status_view(camp), ensure_ascii=False, indent=2))
         return 0
     state = load_state(camp)
+    if args.command == "authorize-gpu-sharing":
+        import fcntl
+        from react_agent.eeg_research.agentic.resource_guard import authorize_low_memory_sharing
+        with (camp / "worker.lock").open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                receipt = authorize_low_memory_sharing(camp, state,
+                    max_memory_mib=args.max_existing_gpu_memory_mib, reason=args.retry_reason)
+                event(camp, "gpu_sharing_authorized", authorization_sha256=receipt["sha256"],
+                    gpu=receipt["gpu"], max_existing_memory_mib=receipt["max_existing_memory_mib"],
+                    reason=receipt["reason"])
+            except (BlockingIOError, OSError, ValueError, KeyError) as exc:
+                print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+                return 2
+        print(json.dumps({"status": "gpu_sharing_authorized", "authorization": receipt}, ensure_ascii=False))
+        return 0
+    if args.command == "recover-api-intents":
+        import fcntl
+        from react_agent.eeg_research.agentic.api_recovery import abandon_orphaned_intents
+        with (camp / "worker.lock").open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                cost = abandon_orphaned_intents(camp, reason=args.retry_reason)
+            except (BlockingIOError, OSError, ValueError, RuntimeError) as exc:
+                print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+                return 2
+            state["llm_calls"] = cost["llm_calls"]
+            state["llm_calls_left"] = state["max_llm_calls"] - cost["llm_calls"]
+            save_state(camp, state)
+            event(camp, "orphaned_api_intents_abandoned", reason=args.retry_reason,
+                  call_ids=cost["api_abandoned_call_ids"], unknown_outcomes_preserved=True)
+        print(json.dumps({"status": "recovered", "llm_calls": cost["llm_calls"],
+                          "unknown_outcome_call_ids": cost["api_abandoned_call_ids"]}))
+        return 0
+    if args.command in {"prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design"}:
+        import fcntl
+        from react_agent.eeg_research.agentic.worker import build_services
+        from react_agent.eeg_research.agentic.llm import LlmUnavailable
+        from react_agent.eeg_research.agentic.budget_inheritance import validate_inheritance
+        from react_agent.eeg_research.agentic.verification_cache import verification_scope
+        revalidate = args.command == "revalidate-feedback"
+        retry_design = args.command == "retry-design"
+        revalidate_review = args.command == "revalidate-review"
+        if (revalidate or retry_design or revalidate_review) and not args.retry_reason.strip():
+            print(json.dumps({"error": "feedback_revalidation_reason_required"}))
+            return 2
+        with (camp / "worker.lock").open("a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                print(json.dumps({"error": "worker_already_running"}))
+                return 2
+            try:
+                state = load_state(camp)
+                with verification_scope():
+                    validate_inheritance(camp)
+                    services = build_services(camp)
+                    if retry_design:
+                        result = services["retry_design"](camp, state, reason=args.retry_reason)
+                    elif revalidate_review:
+                        result = services["revalidate_review"](camp, state,
+                            candidate_id=args.candidate or "", reason=args.retry_reason)
+                    else:
+                        result = (services["revalidate_feedback"](camp, state, reason=args.retry_reason)
+                                  if revalidate else services["prepare_handoff"](camp, state))
+                save_state(camp, state)
+                event(camp, "review_revalidated" if revalidate_review else "designer_retried" if retry_design else "feedback_revalidated" if revalidate else "handoff_prepared", **result)
+            except (LlmUnavailable, OSError, ValueError, KeyError) as exc:
+                save_state(camp, state)
+                event(camp, "review_revalidation_failed" if revalidate_review else "designer_retry_failed" if retry_design else "feedback_revalidation_failed" if revalidate else "handoff_preparation_failed", detail=str(exc))
+                print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+                return 2
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if args.command == "suite-retry-fold":
         import fcntl
         from react_agent.eeg_research.agentic.method_suite import retry_fold
@@ -439,7 +532,9 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"status": "worker_already_running", "pid": pid}, ensure_ascii=False))
             return 0
         request_control(camp, "resume")
-        align_interrupt(camp)
+        from react_agent.eeg_research.agentic.verification_cache import verification_scope
+        with verification_scope():
+            align_interrupt(camp)
         state = load_state(camp)
         failure = state.get("failure") if isinstance(state.get("failure"), dict) else {}
         if args.command == "resume" and state.get("status") == "blocked" and failure.get("recoverable") is False:
@@ -460,7 +555,8 @@ def main(argv: list[str] | None = None) -> int:
             event(camp, "reopened", reason=args.reopen_reason)
         state["pause_after_step"] = False
         save_state(camp, state)
-        pid = spawn_worker(root, args.campaign, args.poll_seconds)
+        pid = (spawn_worker(root, args.campaign, args.poll_seconds) if args.max_ticks == 200
+               else spawn_worker(root, args.campaign, args.poll_seconds, max_ticks=args.max_ticks))
         event(camp, args.command, worker_pid=pid)
         print(json.dumps({"status": "worker_started", "pid": pid}, ensure_ascii=False))
         return 0

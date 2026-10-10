@@ -866,9 +866,11 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     if state.get("evaluation_mode") == "loso_method_search":
         from react_agent.eeg_research.agentic.budget_inheritance import validate_inheritance
         from react_agent.eeg_research.agentic.method_suite import advance
-        from react_agent.eeg_research.agentic.llm import LlmUnavailable
         try:
             validate_inheritance(camp)
+            from react_agent.eeg_research.agentic.resource_guard import advance_needs_gpus, require_idle_gpus
+            if advance_needs_gpus(camp, state):
+                require_idle_gpus(camp, state)
             if advance(camp, state, services):
                 return load_state(camp)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
@@ -1401,6 +1403,21 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     parent = str(spec.get("parent_candidate_id") or "baseline")
     control = str(spec.get("control_candidate_id") or "baseline")
     diagnostics = matched_diagnostics(state, parent)
+    method_parent = None
+    if state.get("evaluation_mode") == "loso_method_search":
+        from react_agent.eeg_research.agentic.method_suite import verified_suite_records
+        from react_agent.eeg_research.agentic.handoffs import method_suite_scalar_view
+        # Designer receives a matched_diagnostics summary wrapper, rather than
+        # the Analyst's aggregate/sibling shape. Use the same verified scalar
+        # view as Planner before wrapping it, keeping every fold and measured
+        # scalar while referring to immutable raw freeze detail by hash.
+        rows = verified_suite_records(camp, state)
+        source = next((row for row in reversed(rows) if row.get("candidate_id") == parent), None)
+        if source is not None:
+            method_parent = method_suite_scalar_view(source)
+            diagnostics = matched_diagnostics({"evidence": [method_parent]}, parent)
+        else:
+            diagnostics = None
     if diagnostics is None:
         missing.append("diagnostics")
     methods = state.get("method_hits") or []
@@ -1450,6 +1467,12 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
         "budget": budget_snapshot(camp, state),
         "missing_inputs": missing,
     })
+    if method_parent is not None:
+        context.update(method_suite=method_parent["aggregate"],
+            method_suite_identity={key: method_parent.get(key) for key in (
+                "evidence_id", "suite_id", "suite_ref", "suite_hash", "method_revision",
+                "source_hash", "result_hash", "contract_fingerprint")},
+            scientific_unit="one_complete_method_suite_seed0")
     from react_agent.eeg_research.agentic.semantic_memory import role_memory, standalone_delivery
     bundle = role_memory(camp, state=state, experiment=spec)
     if bundle is not None:
@@ -2434,6 +2457,8 @@ def _train(
         try:
             if action != "run_full" or target not in _reviewed_ids(state):
                 raise ValueError("method_suite_requires_reviewed_full_target")
+            from react_agent.eeg_research.agentic.resource_guard import require_idle_gpus
+            require_idle_gpus(camp, state)
             begin(camp, state, target)
         except (OSError, ValueError, KeyError) as exc:
             persist_failure(camp, state, phase="method_suite", error_type="method_suite_admission_failed", detail=str(exc), recoverable=True)

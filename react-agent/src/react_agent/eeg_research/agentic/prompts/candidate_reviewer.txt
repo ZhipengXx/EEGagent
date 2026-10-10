@@ -66,6 +66,9 @@ exact requirement_id and status="implemented", "contradicted" or "unverified".
 Record detail, source_hash, source_refs, check_ref and check_sha256 using the
 exact requirement_evidence_identity supplied by runtime. Source refs identify
 the actual extension/eeg_candidate.py execution path, optionally :line or #Lline.
+Do not copy ::Class.method from an approved requirement's code_locations into
+source_refs. Those are symbolic design locations; evidence references must be
+the injected current file path, optionally a valid numeric line or #L anchor.
 For every core implementation requirement, implemented needs current matching
 source and check evidence. Old PASS, config declarations or a proposed mechanism
 alone cannot establish current implementation. Check implementation_semantics:
@@ -129,13 +132,22 @@ objective_variant_on is an executable ablation switch even when no separate
 ablation_switch key exists. Read the source-bound effectiveness and off-identity
 receipts. A changed gradient is necessary but does not establish the approved
 loss formula. Trace the positive and total probability masses, symmetry,
-diagonal membership and actual baseline EEG normalization literally. An active
-method must still implement its assigned positive-mass contrastive design;
+diagonal membership and actual baseline EEG normalization literally. When the
+approved spec explicitly assigns a positive-mass contrastive design, the active
+method must implement that exact design;
 a negative-only denominator or an unapproved normalization change needs a
 concrete source-based issue. Do not infer them from the method's name.
 
 EXPLICIT PROBABILITY-LOSS SEMANTICS
 Read objective_semantics_probe / objective_semantic_findings when provided.
+First quote the approved spec's actual mathematical requirement. A probe's
+reference_definition names its comparator, and does not add an approved loss
+requirement. A generic image-bound custom contrastive objective does not by
+itself specify logsumexp-positive-mass InfoNCE. A mismatch with that comparator
+is descriptive unless the approved spec actually pins that formula. Do not
+silently replace an approved or unspecified average-positive cross entropy with
+another objective to make matches_reference true. Preserve all observed probe
+results and state their actual scope.
 A changed gradient proves only computation change. Positive-mass InfoNCE uses
 log(total local mass)-log(all same-ID positive mass), includes the diagonal, and
 specifies whether both directions are averaged. A negative-only denominator is
@@ -156,3 +168,14 @@ matched-capacity claim also needs its predeclared criterion. Missing counts stay
 unknown. A capacity mismatch limits a matched-capacity or isolated-pooling claim;
 preserve the actual executed scores and measured seed comparisons separately.
 These are read-only context fields; keep the injected role output schema.
+
+CONVOLUTION AXIS
+Trace the actual tensor layout and the spatial axis over which the kernel
+slides. Conv1d on [batch, channels, time] slides over time. groups=channels makes
+it independent per channel; it does not make the kernel slide over the channel
+axis. Compare that actual operation with the approved conv_axis and literal
+expected_behavior, not the class name or the word channelwise. If an explicit
+channel-axis convolution is implemented as per-channel temporal convolution,
+report the concrete source mismatch. Global time pooling also removes the final
+embedding's absolute temporal position; distinguish the internal time axis from
+the final representation.

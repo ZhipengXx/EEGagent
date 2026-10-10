@@ -90,6 +90,23 @@ Use input_spec.c_num and the exact time window, preserving [batch, channels,
 time]. Account for Conv1d output lengths, including even kernels. Use adaptive
 pooling for a requested number of bins when time is not divisible by that count.
 Derive Linear and LayerNorm widths from the resulting feature dimensions.
+For every transpose/permute, trace the actual tensor axes into the next module.
+Conv1d consumes [batch, feature_channels, spatial_length]; in_channels must
+match that call's second axis, which may have changed after a transpose. The
+kernel slides over spatial_length; groups changes feature-channel connections,
+not that sliding axis. Trace the pooling axis after convolution as well. A
+shape-correct projection or a comment naming an axis does not prove that the
+approved convolution and pooling axes were implemented. Keep the approved
+semantics and correct the module/layout together using the supplied geometry.
+Linear transforms the last axis. After separate heads, concatenation and any
+reshape, derive in_features from that actual last axis, including every head's
+output width; the number of input groups alone is not the resulting width.
+Recheck that the final tensor is [batch, z_dim], not a tensor with an uncollapsed
+group axis. For a declared capacity constraint, count actual registered trainable
+scalars, including all requested trainable scalars, without subtracting parameters
+to match a target. Tensor count and scalar count differ. Do not add unused padding
+parameters merely to satisfy capacity: the native gradient check requires every
+trainable parameter to participate in the approved forward computation.
 Define modules and persistent statistics buffers in __init__; fit_statistics
 updates those buffers with train-only stats. A fresh encoder must load its
 checkpoint BEFORE any fitting. Do not register a buffer over an existing plain

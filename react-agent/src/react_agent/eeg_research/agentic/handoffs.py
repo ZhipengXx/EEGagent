@@ -245,6 +245,50 @@ def _share_training_diagnostic_columns(diagnostics: dict[str, Any]) -> None:
             "retain every different scientific value and provenance identity.")
 
 
+def _share_diagnostic_columns(diagnostics: dict[str, Any]) -> None:
+    """Factor exact equal dictionary columns, preserving missing nodes and values.
+
+    Dictionary paths are relative to each existing native fold. Reconstruction
+    merges shared fields before local fields, only at dictionaries that already
+    exist. This is delivery layout only, without aggregation or interpretation.
+    """
+    import copy
+    folds = diagnostics.get("folds")
+    if not isinstance(folds, list) or not all(isinstance(item, dict) for item in folds):
+        return
+    shared = copy.deepcopy(diagnostics.get("shared_diagnostic_columns") or [])
+
+    def visit(records, path):
+        if len(records) < 2:
+            return
+        common = {key: copy.deepcopy(value) for key, value in records[0].items()
+                  if key not in {"fold_id", "held_out_subject", "train_subjects"}
+                  and all(key in other and _context_json(other[key]) == _context_json(value)
+                          for other in records[1:])}
+        # A small column repeated ten times is useful even below the generic
+        # shared-field threshold. Account for its path and delivery overhead.
+        if common and (len(records) - 1) * len(_context_json(common)) > len(_context_json(path)) + 120:
+            previous = next((item for item in shared if item["path"] == path), None)
+            if previous is None:
+                shared.append({"path": list(path), "fields": common})
+            else:
+                previous["fields"].update(common)
+            for record in records:
+                for key in common:
+                    record.pop(key)
+        keys = set().union(*(record.keys() for record in records))
+        for key in sorted(keys):
+            visit([record[key] for record in records if isinstance(record.get(key), dict)], [*path, key])
+
+    visit(folds, [])
+    if shared:
+        diagnostics["shared_diagnostic_columns"] = shared
+        diagnostics["diagnostic_columns_merge_rule"] = (
+            "For each existing fold dictionary at a listed path, merge fields then its local fields. "
+            "Do not create missing dictionaries, fields in missing dictionaries, or observations; "
+            "all shared columns were exactly equal native fields. Preserve every differing value and identity.")
+
+
 def method_suite_scalar_view(row: dict[str, Any], *,
                              score_dependencies: list[dict[str, Any]] | None = None,
                              historical_diagnostics: bool = False) -> dict[str, Any]:
@@ -388,6 +432,46 @@ def compact_role_context(payload: dict[str, Any], role: str, *,
     working = method_suite_role_view(original) if role in {
         "research_planner", "result_analyst", "memory_curator", "experiment_designer", "result_auditor",
     } else original
+    if role == "research_planner" and original.get("evaluation_mode") == "loso_method_search":
+        # Keep this additional layout entirely at the final Planner delivery
+        # boundary. Analyst/Curator construction and native scalar consumers
+        # keep their established field layouts.
+        def planner_diagnostics(value):
+            if isinstance(value, list):
+                return [planner_diagnostics(item) for item in value]
+            if not isinstance(value, dict):
+                return value
+            result = {key: planner_diagnostics(child) for key, child in value.items()}
+            aggregate = result.get("aggregate") or {}
+            if (result.get("kind") == "method_suite" and aggregate.get("status") == "complete"
+                    and aggregate.get("coverage") == 10 and isinstance(result.get("diagnostics"), dict)):
+                _share_diagnostic_columns(result["diagnostics"])
+            if result.get("evaluation_mode") == "loso_method_search" and isinstance(result.get("latest_diagnostics"), dict):
+                _share_diagnostic_columns(result["latest_diagnostics"])
+            return result
+        working = planner_diagnostics(working)
+        rows = working.get("artifact_index")
+        if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+            shared = []
+            for field in ("kind", "verification_status", "completion_status", "scope", "missing_inputs"):
+                groups = {}
+                for index, row in enumerate(rows):
+                    if field in row:
+                        groups.setdefault(_context_json(row[field]), []).append(index)
+                for encoded, indices in groups.items():
+                    value = json.loads(encoded)
+                    entry = {"field": field, "row_indices": indices, "value": value}
+                    if (len(indices) > 1 and (len(indices) - 1) * (len(encoded) + len(field) + 4)
+                            > len(_context_json(entry)) + 30):
+                        shared.append(entry)
+                        for index in indices:
+                            rows[index].pop(field)
+            if shared:
+                working["artifact_index_shared_columns"] = shared
+                working["artifact_index_column_merge_rule"] = (
+                    "For each row index, restore applicable artifact_index_shared_columns fields, then its literal fields; "
+                    "then apply artifact_index_defaults only to fields still missing. This preserves every exception "
+                    "and original status; it is not content read or permission.")
     if role == "result_auditor" and original.get("evaluation_mode") == "loso_method_search":
         working = _audit_dependency_role_view(working)
     budget = target_chars if target_chars is not None else ROLE_CONTEXT_BUDGETS.get(role, 160_000)
@@ -396,7 +480,8 @@ def compact_role_context(payload: dict[str, Any], role: str, *,
     canonical: dict[str, tuple[str, str, str]] = {}
     duplicates: list[dict[str, Any]] = []
     method_context = original.get("evaluation_mode") == "loso_method_search"
-    canonical_min_chars = 400 if method_context else 1200
+    canonical_min_chars = (180 if method_context and role == "research_planner" else
+                           400 if method_context else 1200)
 
     def pointer(path: str, key: Any) -> str:
         return path + "/" + str(key).replace("~", "~0").replace("/", "~1")
@@ -410,11 +495,13 @@ def compact_role_context(payload: dict[str, Any], role: str, *,
             digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
             prior = canonical.get(digest)
             if prior is not None and prior[1] == encoded:
-                duplicates.append({"path": path, "canonical_pointer": prior[0],
-                                   "sha256": prior[2], "original_chars": len(encoded)})
                 reference = {"canonical_context_ref": prior[0], "sha256": prior[2]}
                 if not method_context:
                     reference["scope"] = "Exact duplicate already present in this request; follow the JSON pointer. Not an artifact read."
+                if len(_context_json(reference)) >= len(encoded):
+                    return value  # No space saving; retain the whole literal.
+                duplicates.append({"path": path, "canonical_pointer": prior[0],
+                                   "sha256": prior[2], "original_chars": len(encoded)})
                 return reference
         if isinstance(value, dict):
             projected = {key: project(child, pointer(path, key)) for key, child in value.items()}
