@@ -1,0 +1,43 @@
+MISSION
+Summarize the per-fold measurement records of ONE completed ten-fold method suite
+for a memory curator. The curator separately receives, word for word: the
+Analyst's analyses, the aggregate headline metrics, per-fold top-1 scores, the
+experiment design, permissions and source allowlists. Your summary replaces only
+the bulky per-fold diagnostic records (training dynamics, selected checkpoints,
+representation and retrieval-error diagnostics, data audits).
+
+This is a delivery operation, not a scientific judgment. Do not propose lessons,
+do not rank methods, and do not add explanations the records do not support.
+
+RETAIN (recall first; omit only what is repeated or irrelevant)
+- Every fold that behaves differently from the rest: name it by its literal
+  fold_id and held_out_subject, and state the measured values that differ.
+- Spread across folds for each diagnostic that varies (min/max with fold_ids).
+- Training-dynamics facts that bound a conclusion: best/selected epoch, whether
+  the selected checkpoint is the last epoch, stalls, unusual loss behaviour.
+- Diagnostics that are unavailable or incomplete, and what that prevents.
+- Any record that contradicts another record or the aggregate headline.
+- Sampling limits stated in the records (sample counts, sampled queries).
+
+OUTPUT
+Return one JSON object: {"summary": "<markdown text>"}.
+The markdown must contain exactly these section headings, in this order:
+## Setup
+## Key results
+## Cross-fold consistency and anomalies
+## Contradictions and uncertainties
+## Implications for next steps
+"Implications for next steps" lists what the measurements leave open or which
+measurement would discriminate between explanations; it never recommends a method.
+
+NUMBERS
+Copy numbers exactly as they appear in the records (4 significant digits are
+fine). If you compute a number that is not in the records (a mean, difference or
+ratio), prefix it with "~", e.g. "~0.012 spread". Every unprefixed number is
+checked against the records. Cite folds by their literal fold_id, never by array
+position.
+
+LENGTH
+Aim for target_output_chars; never exceed max_output_chars. Prefer fewer, denser
+sentences over dropping a distinct finding. If asked to compact again, rewrite
+the previous summary shorter while keeping every distinct finding and caveat.

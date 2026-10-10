@@ -128,7 +128,7 @@ def compact_planner_context(observation: dict[str, Any], *, target_chars: int = 
 # role budget. Each stage is cumulative and recorded in the delivered payload.
 SERIES_KEEP = 12
 SOURCE_KEYS = frozenset({"implementation_source", "parent_source", "control_source"})
-SOURCE_HEAD, SOURCE_TAIL = 6000, 1500
+SOURCE_VERBATIM_CHARS = 6000
 
 
 def _slim_scores(value: Any) -> Any:
@@ -163,20 +163,76 @@ def _summarize_series(value: Any) -> Any:
     return value
 
 
-def _cap_sources(value: Any) -> Any:
-    if isinstance(value, dict):
-        out = {}
-        for key, child in value.items():
-            if key in SOURCE_KEYS and isinstance(child, str) and len(child) > SOURCE_HEAD + SOURCE_TAIL:
-                omitted = len(child) - SOURCE_HEAD - SOURCE_TAIL
-                out[key] = (child[:SOURCE_HEAD] + f"\n# ... [{omitted} chars omitted in planner view; "
-                            "full source is in the candidate artifact] ...\n" + child[-SOURCE_TAIL:])
-            else:
-                out[key] = _cap_sources(child)
-        return out
-    if isinstance(value, list):
-        return [_cap_sources(child) for child in value]
-    return value
+def code_outline(source: str) -> str | None:
+    """Class/function signatures with first docstring lines; None if unparsable."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    lines = source.splitlines()
+    out: list[str] = []
+
+    def visit(nodes, depth):
+        for node in nodes:
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                header = lines[node.lineno - 1].strip()
+                doc = ast.get_docstring(node)
+                out.append("    " * depth + f"L{node.lineno}: {header}"
+                           + (f"  # {doc.splitlines()[0][:160]}" if doc else ""))
+                visit(node.body, depth + 1)
+    visit(tree.body, 0)
+    return "\n".join(out)
+
+
+def unified_diff(old: str, new: str, context: int = 3) -> str:
+    """Unified diff without difflib's autojunk, which turns long files with
+    frequent lines (blank lines, padding) into whole-file replacements."""
+    import difflib
+    a, b = old.splitlines(True), new.splitlines(True)
+    out = ["--- parent/eeg_candidate.py\n", "+++ candidate/eeg_candidate.py\n"]
+    for group in difflib.SequenceMatcher(None, a, b, autojunk=False).get_grouped_opcodes(context):
+        i1, i2, j1, j2 = group[0][1], group[-1][2], group[0][3], group[-1][4]
+        out.append(f"@@ -{i1 + 1},{i2 - i1} +{j1 + 1},{j2 - j1} @@\n")
+        for tag, a1, a2, b1, b2 in group:
+            if tag == "equal":
+                out.extend(" " + line for line in a[a1:a2])
+                continue
+            out.extend("-" + line for line in a[a1:a2])
+            out.extend("+" + line for line in b[b1:b2])
+    return "".join(line if line.endswith("\n") else line + "\n" for line in out)
+
+
+def _source_view(record: dict[str, Any], parent: dict[str, Any] | None) -> dict[str, Any]:
+    source = record.get("source")
+    if not isinstance(source, str) or len(source) <= SOURCE_VERBATIM_CHARS:
+        return record
+    view = {key: value for key, value in record.items() if key != "source"}
+    outline = code_outline(source)
+    parent_source = (parent or {}).get("source")
+    if isinstance(parent_source, str) and parent_source != source:
+        diff = unified_diff(parent_source, source)
+        if len(diff) < len(source):
+            view["source_diff_vs_parent"] = diff
+    if outline is not None:
+        view["source_outline"] = outline
+    if "source_diff_vs_parent" not in view and outline is None:
+        return record  # Nothing faithful to replace it with.
+    view["source_view"] = {"full_chars": len(source), "full_source": "Read source_ref / the candidate artifact for full code.",
+                           "shown": [key for key in ("source_diff_vs_parent", "source_outline") if key in view]}
+    return view
+
+
+def _code_views(value: Any) -> Any:
+    """Changed code verbatim (diff vs parent), the rest as a signature outline."""
+    if not isinstance(value, dict):
+        return value
+    out = dict(value)
+    parent = value.get("parent_source") if isinstance(value.get("parent_source"), dict) else None
+    for key in SOURCE_KEYS:
+        if isinstance(value.get(key), dict):
+            out[key] = _source_view(value[key], parent if key == "implementation_source" else None)
+    return out
 
 
 def _is_provenance_key(key: str) -> bool:
@@ -273,7 +329,7 @@ BUDGET_STAGES = (
     ("hoist_fold_constants", _hoist_fold_constants),
     ("slim_fold_score_provenance", _slim_scores),
     ("summarize_numeric_series", _summarize_series),
-    ("cap_source_listings", _cap_sources),
+    ("code_diff_and_outline", _code_views),
     ("older_suites_headline_only", _older_suites_scalars),
 )
 

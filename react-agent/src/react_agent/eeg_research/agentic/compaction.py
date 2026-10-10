@@ -334,7 +334,8 @@ def _immutable_input(camp: Path, payload: dict) -> tuple[Path, dict]:
 
 
 def _recover_stage(camp: Path, request: dict, *, original: dict, refs: list[str],
-                   inputs: list[Path], system: str, model: str, identity: dict) -> tuple[dict, dict] | None:
+                   inputs: list[Path], system: str, model: str, identity: dict,
+                   check: Callable[[dict], dict] | None = None) -> tuple[dict, dict] | None:
     """Adopt a durable validated reply after a crash, without another API call."""
     from uuid import uuid4
     from react_agent.eeg_research.agentic.artifacts import (
@@ -391,7 +392,8 @@ def _recover_stage(camp: Path, request: dict, *, original: dict, refs: list[str]
                     or traced.get("system_sha256") != call.get("request_system_sha256")
                     or traced.get("user_sha256") != call.get("request_user_sha256")):
                 continue
-            summary = validate_summary(response["reply"], original, refs, max_chars=summary_budget(request["stage"]), stage=request["stage"])
+            summary = (check(response["reply"]) if check else
+                       validate_summary(response["reply"], original, refs, max_chars=summary_budget(request["stage"]), stage=request["stage"]))
         except (OSError, ValueError, KeyError, TypeError):
             continue
         # Crash after artifact registration but before the completed ledger row:
@@ -431,7 +433,8 @@ def _recover_stage(camp: Path, request: dict, *, original: dict, refs: list[str]
 
 def _stage(camp: Path, request: dict, *, original: dict, refs: list[str],
            inputs: list[Path], system: str, model: str,
-           invoke: Callable[..., dict]) -> tuple[dict, dict]:
+           invoke: Callable[..., dict], check: Callable[[dict], dict] | None = None,
+           recover_check: Callable[[dict], dict] | None = None) -> tuple[dict, dict]:
     from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
     from react_agent.eeg_research.agentic.llm import LlmUnavailable
@@ -445,16 +448,18 @@ def _stage(camp: Path, request: dict, *, original: dict, refs: list[str],
         "budget_feasibility": {"bounded_delivery_operation": True},
         "request_semantics": digest(request), "feedback": None,
     }
+    if check is None:
+        def check(reply):
+            return validate_summary(reply, original, refs, max_chars=summary_budget(request["stage"]), stage=request["stage"])
     recovered = _recover_stage(camp, request, original=original, refs=refs,
-        inputs=inputs, system=system, model=model, identity=identity)
+        inputs=inputs, system=system, model=model, identity=identity, check=recover_check or check)
     if recovered:
         return recovered
     task = begin_role_task(camp, role=ROLE, inputs=inputs, request=request,
                            recovery_identity=identity)
     if task.get("_cached_role_result"):
         cached = task["_cached_role_result"]
-        summary = validate_summary(cached["envelope"]["payload"]["compaction_summary"], original, refs,
-                                   max_chars=summary_budget(request["stage"]), stage=request["stage"])
+        summary = (recover_check or check)(cached["envelope"]["payload"]["compaction_summary"])
         envelope = finish_role_task(camp, task, {}, kind="handoff_compaction",
                                      path=Path(cached["artifact"]["path"]))
         return summary, resolve_verified_artifact(camp, envelope["artifact_refs"][-1])
@@ -462,7 +467,7 @@ def _stage(camp: Path, request: dict, *, original: dict, refs: list[str],
         summary = invoke(
             system=system, payload={**request, **{key: task[key] for key in
                 ("task_id", "attempt_id", "input_digest")}}, task=task,
-            validate=lambda reply: validate_summary(reply, original, refs, max_chars=summary_budget(request["stage"]), stage=request["stage"]),
+            validate=check,
             context_budget_chars=INPUT_CHARS,
         )
         envelope = finish_role_task(camp, task,
@@ -523,6 +528,9 @@ def project_for_curator(payload: dict) -> dict:
         if slim.get("scores") != run["aggregate"].get("scores"):
             run["aggregate"] = slim
             removed.append("/run/aggregate/scores/*: refs, hashes and inference identity (bound by suite_hash)")
+    population = protected_context(payload).get("benchmark_population")
+    if population is not None:
+        result["benchmark_population"] = population
     result["context_projection"] = {
         "revision": PROJECTION_REVISION, "original_chars": len(canonical(payload)),
         "projected_chars": len(canonical(result)), "removed": removed,
@@ -595,5 +603,136 @@ def compact_for_curator(camp: Path, payload: dict, *, inputs: list[Path], model:
         "source_ranges": [{key: part[key] for key in ("ref", "start", "end", "sha256")} for part in parts],
         "scope": "Derived model-written delivery summary; not scientific evidence or a memory lesson.",
         "limitations": "Structured numbers/references checked; natural-language fidelity requires source review.",
+    }
+    return result
+
+
+SEMANTIC_REVISION = "curator_semantic_summary.v1"
+SEMANTIC_TARGET_CHARS = 8000
+SEMANTIC_MAX_CHARS = 12000
+SEMANTIC_SECTIONS = ("## Setup", "## Key results", "## Cross-fold consistency and anomalies",
+                     "## Contradictions and uncertainties", "## Implications for next steps")
+_DECIMAL = re.compile(r"(?<![\w.~])(-?\d+\.\d+)(%?)")
+_FOLD_ID = re.compile(r"\bfold_\d+\b")
+
+
+def semantic_prompt() -> str:
+    return (Path(__file__).parent / "prompts" / "curator_semantic_summary.txt").read_text(encoding="utf-8")
+
+
+def _source_floats(value: Any) -> list[float]:
+    found: list[float] = []
+
+    def visit(item):
+        if isinstance(item, bool):
+            return
+        if isinstance(item, (int, float)):
+            found.append(float(item))
+        elif isinstance(item, dict):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+    visit(value)
+    return found
+
+
+def unverified_numbers(text: str, source: Any) -> list[str]:
+    """Unprefixed decimals in text that match no source value at their stated precision."""
+    floats = _source_floats(source)
+    bad = []
+    for match in _DECIMAL.finditer(text):
+        literal, percent = match.group(1), match.group(2)
+        x = float(literal)
+        tolerance = 0.5 * 10 ** -len(literal.split(".")[1]) + 1e-12
+        # A fraction may be written as a percentage, with or without the % sign.
+        as_percent = any(abs(x / 100 - v) <= tolerance / 100 for v in floats)
+        as_written = not percent and any(abs(x - v) <= tolerance for v in floats)
+        if not (as_percent or as_written):
+            bad.append(literal + percent)
+    return list(dict.fromkeys(bad))
+
+
+def fold_index(diagnostics: Any) -> list[dict]:
+    """Exact per-fold headline facts, independent of the model summary."""
+    rows = []
+    folds = diagnostics.get("folds") if isinstance(diagnostics, dict) else None
+    for fold in folds or []:
+        if not isinstance(fold, dict):
+            continue
+        metrics = fold.get("development_metrics") or {}
+        rows.append({"fold_id": fold.get("fold_id"), "held_out_subject": fold.get("held_out_subject"),
+                     "development_primary_metric": metrics.get("primary_metric"),
+                     "best_epoch": (fold.get("selected_checkpoint") or {}).get("best_epoch")})
+    return rows
+
+
+def semantic_compact(camp: Path, payload: dict, projected: dict, *, inputs: list[Path], model: str,
+                     invoke: Callable[..., dict]) -> dict:
+    """One-pass semantic summary of the per-fold records; everything else stays verbatim.
+
+    Follows the compaction pattern of summarizing in a single call with explicit
+    retain instructions: no character sharding, no per-note hard caps. Unprefixed
+    numbers and fold IDs are checked against the records; the model gets one
+    correction, after which remaining mismatches are delivered as flagged.
+    Over-long output is compacted again from the previous summary.
+    """
+    from react_agent.eeg_research.agentic.semantic_memory import unsafe_source
+    from react_agent.eeg_research.agentic.llm import LlmUnavailable
+    if unsafe_source(payload):
+        raise LlmUnavailable("handoff_compaction_forbidden_input")
+    diagnostics = projected.get("diagnostics")
+    run = projected.get("run") if isinstance(projected.get("run"), dict) else {}
+    source = {"diagnostics": diagnostics, "aggregate": run.get("aggregate")}
+    index = fold_index(diagnostics)
+    known_folds = {row["fold_id"] for row in index} | {row.get("fold_id") for row in
+                                                      (run.get("aggregate") or {}).get("scores") or []}
+    snapshot, input_artifact = _immutable_input(camp, payload)
+    request = {"operation": OPERATION, "revision": SEMANTIC_REVISION, "stage": "semantic",
+               "original_input_sha256": input_artifact["sha256"],
+               "target_output_chars": SEMANTIC_TARGET_CHARS, "max_output_chars": SEMANTIC_MAX_CHARS,
+               "method_suite_identity": projected.get("method_suite_identity"),
+               "records": source,
+               "repair_instruction": ("Fix only what validation_error reports. For unverified numbers: copy the exact "
+                                      "record value, or prefix a computed value with '~'. For length: compact again "
+                                      "from previous_compaction_summary, keeping every distinct finding and caveat.")}
+
+    def check(reply: dict, *, lenient: bool = False) -> dict:
+        text = reply.get("summary") if isinstance(reply, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("semantic_summary_missing")
+        missing = [heading for heading in SEMANTIC_SECTIONS if heading.lower() not in text.lower()]
+        if missing:
+            raise ValueError("semantic_summary_sections_missing:" + "|".join(missing))
+        if len(text) > SEMANTIC_MAX_CHARS:
+            raise ValueError(f"semantic_summary_too_long:{len(text)}>{SEMANTIC_MAX_CHARS}")
+        numbers = unverified_numbers(text, source)
+        folds = sorted(set(_FOLD_ID.findall(text)) - known_folds)
+        if (numbers or folds) and not lenient and not state["corrected"]:
+            state["corrected"] = True
+            raise ValueError("semantic_summary_unverified:" + json.dumps(
+                {"numbers": numbers[:30], "unknown_fold_ids": folds}, ensure_ascii=False))
+        return {"summary": text, "unverified_numbers": numbers, "unknown_fold_ids": folds}
+
+    state = {"corrected": False}
+    summary, artifact = _stage(camp, request, original=payload, refs=[], inputs=[*inputs, snapshot],
+                               system=semantic_prompt(), model=model, invoke=invoke, check=check,
+                               recover_check=lambda reply: check(reply, lenient=True))
+    result = copy.deepcopy(projected)
+    result["diagnostics"] = {
+        "semantic_summary": summary["summary"],
+        "fold_index": index,
+        "verification": {"unverified_numbers": summary["unverified_numbers"],
+                         "unknown_fold_ids": summary["unknown_fold_ids"],
+                         "basis": "Unprefixed decimals and fold IDs were checked against the per-fold records; "
+                                  "listed items did not match and must not be relied on."},
+        "full_records": "Per-fold records are immutable in the suite directory and the compaction input artifact.",
+    }
+    result["context_compaction"] = {
+        "revision": SEMANTIC_REVISION, "operation": OPERATION,
+        "artifact_id": artifact["artifact_id"], "sha256": artifact["sha256"],
+        "input_artifact_id": input_artifact["artifact_id"], "original_input_sha256": input_artifact["sha256"],
+        "scope": "Model-written summary of per-fold diagnostics only; every other field is verbatim or deterministically projected.",
     }
     return result

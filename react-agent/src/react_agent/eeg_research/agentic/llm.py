@@ -463,6 +463,16 @@ def _check_api_budget(camp: Path) -> None:
         raise LlmUnavailable("budget_exhausted")
 
 
+# Quality targets: share of the hard role budget a request should stay under.
+PLANNER_TARGET_RATIO = 0.7
+CURATOR_TARGET_RATIO = 0.5
+
+
+def _within_quality_target(projected: dict, ratio: float) -> bool:
+    report = projected["role_context_projection"]
+    return report["fits_budget"] and report["projected_total_chars"] <= ratio * report["budget_chars"]
+
+
 # Compaction failures are mechanical (length/quote-pointer limits) and usually
 # pass on a re-roll with the validation error attached.
 COMPACTION_ATTEMPTS = 4
@@ -525,8 +535,9 @@ def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_to
             schema_error = str(exc)[:3000]
             previous_summary = reply
             error = {"validation_error": schema_error, "previous_output_chars": len(canonical(reply)),
-                     "hard_output_chars": summary_budget(payload.get("stage", "map")), "target_output_chars": 6000,
-                     "instruction": "Fix the reported validation errors against the original input. For source_quotes copy an exact path from analysis_quote_catalog and a verbatim substring of its text, never an evidence ID or observation object path. Rewrite the full draft with shorter synthesized notes and fewer repeated facts; retain all distinct findings, contradictions, scope limits and expected source refs. Follow every OUTPUT_SCHEMA length/item limit. Do not truncate."}
+                     "hard_output_chars": payload.get("max_output_chars") or summary_budget(payload.get("stage", "map")),
+                     "target_output_chars": payload.get("target_output_chars", 6000),
+                     "instruction": payload.get("repair_instruction") or "Fix the reported validation errors against the original input. For source_quotes copy an exact path from analysis_quote_catalog and a verbatim substring of its text, never an evidence ID or observation object path. Rewrite the full draft with shorter synthesized notes and fewer repeated facts; retain all distinct findings, contradictions, scope limits and expected source refs. Follow every OUTPUT_SCHEMA length/item limit. Do not truncate."}
             _response_trace(camp, row, reply, validation="compaction_invalid", schema_errors=schema_error)
             continue
         _response_trace(camp, row, reply, validation="valid")
@@ -574,40 +585,55 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
         from react_agent.eeg_research.agentic.handoffs import compact_role_context
         from react_agent.eeg_research.agentic.role_examples import add_role_examples
 
-        def fits(value: dict) -> bool:
+        def measure(value: dict) -> dict:
             # Reserve exact-length task identity strings used by the native
             # ledger. Include system/schema/examples and the final JSON bytes.
             probe = {**value, "task_id": "task_" + "0" * 12,
                      "attempt_id": "0" * 12, "input_digest": "0" * 64}
-            probe = compact_role_context(add_role_examples(probe, role, memory),
-                                         role, system_chars=len(system))
-            return bool(probe["role_context_projection"]["fits_budget"])
+            return compact_role_context(add_role_examples(probe, role, memory),
+                                        role, system_chars=len(system))
 
-        if fits(payload):
+        def fits(value: dict) -> bool:
+            return bool(measure(value)["role_context_projection"]["fits_budget"])
+
+        def within_target(value: dict) -> bool:
+            return _within_quality_target(measure(value), CURATOR_TARGET_RATIO)
+
+        # Layered, like Claude Code: clear bulky records deterministically
+        # first; summarize semantically only if still above the quality target.
+        if within_target(payload):
             return payload
-        # Deterministic projection first: no model call, cannot fail validation.
-        from react_agent.eeg_research.agentic.compaction import (
-            compact_for_curator, project_for_curator, protected_context)
+        from react_agent.eeg_research.agentic.compaction import project_for_curator, semantic_compact
         projected = project_for_curator(payload)
-        if fits(projected):
+        if within_target(projected):
             return projected
         if os.environ.get("EEG_HANDOFF_COMPACTION", "0").lower() not in {"1", "true", "on"}:
             return projected
-        payload = projected
-        if not fits(protected_context(payload)):
-            raise LlmUnavailable("handoff_compaction_protected_budget_exceeded")
         if external_api_disabled():
             raise LlmUnavailable("external_api_disabled_by_operator")
+        from react_agent.eeg_research.agentic.compaction import SEMANTIC_MAX_CHARS
+        if not fits({**projected, "diagnostics": {"semantic_summary": "x" * SEMANTIC_MAX_CHARS}}):
+            # Even a maximal summary cannot fit beside the verbatim fields: do not pay for one.
+            raise LlmUnavailable("handoff_compaction_protected_budget_exceeded")
 
         def invoke(**kwargs):
             return _invoke_compaction(camp, client, loop, model=config.fast.model,
                                       max_tokens=int(config.fast.max_tokens), **kwargs)
 
-        prepared = compact_for_curator(camp, payload, inputs=inputs,
+        try:
+            prepared = semantic_compact(camp, payload, projected, inputs=inputs,
                                         model=config.fast.model, invoke=invoke)
-        if not fits(prepared):
-            raise LlmUnavailable("handoff_compaction_output_budget_exceeded")
-        return prepared
+        except LlmUnavailable as exc:
+            # The projection already carries every verbatim field; a failed
+            # summary only costs brevity, unless the projection is over budget.
+            if str(exc) in {"unsettled_api_intent_requires_recovery", "budget_exhausted"} or not fits(projected):
+                raise
+            return projected
+        if fits(prepared):
+            return prepared
+        if fits(projected):
+            return projected
+        raise LlmUnavailable("handoff_compaction_output_budget_exceeded")
 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
         task = None
@@ -667,11 +693,13 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             call_payload = add_role_examples(call_payload, role, memory)
             from react_agent.eeg_research.agentic.handoffs import compact_role_context
             projected = project_correction_context(call_payload, role, system_chars=len(system))
-            if not projected["role_context_projection"]["fits_budget"] and role == "research_planner":
+            if role == "research_planner" and not _within_quality_target(projected, PLANNER_TARGET_RATIO):
+                # Long inputs degrade judgment even when they fit: shrink the
+                # provider view toward the quality target, not just the hard budget.
                 from react_agent.eeg_research.agentic.planner_context import budget_reductions
                 for reduced in budget_reductions(call_payload):
                     projected = project_correction_context(reduced, role, system_chars=len(system))
-                    if projected["role_context_projection"]["fits_budget"]:
+                    if _within_quality_target(projected, PLANNER_TARGET_RATIO):
                         break
             call_payload = projected
             projection = call_payload["role_context_projection"]
