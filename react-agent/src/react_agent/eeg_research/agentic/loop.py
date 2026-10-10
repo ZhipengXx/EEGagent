@@ -656,7 +656,8 @@ def observation(camp: Path) -> dict[str, Any]:
     from react_agent.eeg_research.agentic.interface import candidate_interface
 
     protocol = load_protocol(camp)
-    from react_agent.eeg_research.agentic.measurement_context import evaluation_population_context, verified_parameter_count_comparisons
+    from react_agent.eeg_research.agentic.measurement_context import (
+        evaluation_population_context, measured_parameter_counts, verified_parameter_count_comparisons)
     trainable = ["baseline"]
     for row in state.get("candidates") or []:
         if row.get("status") == "ready" and row.get("candidate_id") and row["candidate_id"] not in trainable:
@@ -722,6 +723,7 @@ def observation(camp: Path) -> dict[str, Any]:
         "contract": contract,
         "evaluation_population": evaluation_population_context(protocol),
         "parameter_count_comparisons": verified_parameter_count_comparisons(camp, state, protocol=protocol),
+        "measured_parameter_counts": measured_parameter_counts(camp),
         "candidate_interface": candidate_interface(protocol),
         "evidence": [row for row in evidence if row.get("evidence_id") not in superseded_analysis_ids],
         "candidates": state.get("candidates") or [],
@@ -1396,6 +1398,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     from react_agent.eeg_research.agentic.budget import snapshot as budget_snapshot
     from react_agent.eeg_research.agentic.capabilities import capability_manifest
     from react_agent.eeg_research.agentic.confirmation_policy import load_confirmation_policy
+    from react_agent.eeg_research.agentic.measurement_context import measured_parameter_counts
 
     missing: list[str] = []
     from react_agent.eeg_research.agentic.handoffs import candidate_context, development_view, load_analysis_views, matched_diagnostics, verified_encoder_structural_facts
@@ -1465,6 +1468,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
         },
         "capabilities": capability_manifest(load_protocol(camp)),
         "budget": budget_snapshot(camp, state),
+        "measured_parameter_counts": measured_parameter_counts(camp),
         "missing_inputs": missing,
     })
     if method_parent is not None:

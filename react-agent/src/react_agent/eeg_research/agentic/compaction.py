@@ -486,6 +486,52 @@ def _stage(camp: Path, request: dict, *, original: dict, refs: list[str],
     return summary, resolve_verified_artifact(camp, envelope["artifact_refs"][-1])
 
 
+PROJECTION_REVISION = "curator_deterministic_projection.v1"
+# Fold-level identity/provenance already bound by suite_hash and method_suite_identity.
+_FOLD_PROVENANCE = {"dependencies", "job_dir", "protocol_path", "permission", "evaluation_key",
+                    "evaluator_hash", "protocol_hash", "checkpoint_hash", "method_revision",
+                    "suite_hash", "suite_id", "candidate_id", "fidelity", "seed"}
+
+
+def project_for_curator(payload: dict) -> dict:
+    """Shrink bulky measurement records without a model call.
+
+    Like API tool-result clearing: drop duplicates and hash/path provenance,
+    leave a placeholder saying what was removed and where it still lives.
+    Narrative (analyses, lessons, skills), permissions, source allowlists and
+    headline aggregate numbers are delivered verbatim.
+    """
+    from react_agent.eeg_research.agentic.planner_context import (
+        _hoist_fold_constants, _round_floats, _slim_scores, _strip_provenance)
+    result = copy.deepcopy(payload)
+    removed = []
+    run = result.get("run") if isinstance(result.get("run"), dict) else None
+    if run is not None and "diagnostics" in run:
+        if canonical(run["diagnostics"]) == canonical(result.get("diagnostics")):
+            run.pop("diagnostics")
+            removed.append("/run/diagnostics (identical copy of /diagnostics)")
+    diagnostics = result.get("diagnostics")
+    if isinstance(diagnostics, dict) and isinstance(diagnostics.get("folds"), list):
+        diagnostics["folds"] = [{key: value for key, value in fold.items() if key not in _FOLD_PROVENANCE}
+                                if isinstance(fold, dict) else fold for fold in diagnostics["folds"]]
+        diagnostics = _strip_provenance({"diagnostics": diagnostics})["diagnostics"]
+        result["diagnostics"] = _hoist_fold_constants(_round_floats(diagnostics))
+        removed.append("/diagnostics/folds/*: hash/path provenance and identities bound by suite_hash; "
+                       "floats to 4 significant digits; values shared by all folds listed once")
+    if run is not None and isinstance(run.get("aggregate"), dict):
+        slim = _slim_scores(run["aggregate"])
+        if slim.get("scores") != run["aggregate"].get("scores"):
+            run["aggregate"] = slim
+            removed.append("/run/aggregate/scores/*: refs, hashes and inference identity (bound by suite_hash)")
+    result["context_projection"] = {
+        "revision": PROJECTION_REVISION, "original_chars": len(canonical(payload)),
+        "projected_chars": len(canonical(result)), "removed": removed,
+        "verbatim": "analyses, episodes, lessons, skills, permissions, allowed_source_refs, aggregate headline metrics",
+        "full_records": "Immutable originals stay in the suite and job directories; cite them by suite_ref/artifact IDs.",
+    }
+    return result
+
+
 def compact_for_curator(camp: Path, payload: dict, *, inputs: list[Path], model: str,
                         invoke: Callable[..., dict]) -> dict:
     """Create/reuse model-written summaries while preserving native authority."""

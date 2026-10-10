@@ -122,3 +122,170 @@ def compact_planner_context(observation: dict[str, Any], *, target_chars: int = 
     result["planner_context_projection"]["projected_chars_before_size_field"] = _size(result)
     result["planner_context_projection"]["soft_target_exceeded"] = _size(result) > target_chars
     return result
+
+
+# Provider-view reductions applied only when a Planner request does not fit its
+# role budget. Each stage is cumulative and recorded in the delivered payload.
+SERIES_KEEP = 12
+SOURCE_KEYS = frozenset({"implementation_source", "parent_source", "control_source"})
+SOURCE_HEAD, SOURCE_TAIL = 6000, 1500
+
+
+def _slim_scores(value: Any) -> Any:
+    """Per-fold score provenance (refs/hashes) stays bound via suite_hash and score_dependencies."""
+    if isinstance(value, dict):
+        out = {key: _slim_scores(child) for key, child in value.items()}
+        scores = out.get("scores")
+        if isinstance(scores, list) and scores and all(isinstance(row, dict) and "fold_id" in row for row in scores):
+            out["scores"] = [{key: row[key] for key in ("fold_id", "held_out_subject", "status") if key in row}
+                             | {"metrics": {k: v for k, v in (row.get("metrics") or {}).items()
+                                            if not isinstance(v, (dict, list))}}
+                             for row in scores]
+            out["scores_provenance"] = "per-fold refs/hashes omitted from this view; bound by suite_hash"
+        return out
+    if isinstance(value, list):
+        return [_slim_scores(child) for child in value]
+    return value
+
+
+def _summarize_series(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: _summarize_series(child) for key, child in value.items()}
+    if isinstance(value, list):
+        if len(value) > SERIES_KEEP and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value):
+            step = max(1, len(value) // 10)
+            return {"series_summary": {
+                "len": len(value), "first": value[0], "last": value[-1],
+                "min": min(value), "max": max(value),
+                "argmin": value.index(min(value)), "argmax": value.index(max(value)),
+                "every_%d" % step: value[::step]}}
+        return [_summarize_series(child) for child in value]
+    return value
+
+
+def _cap_sources(value: Any) -> Any:
+    if isinstance(value, dict):
+        out = {}
+        for key, child in value.items():
+            if key in SOURCE_KEYS and isinstance(child, str) and len(child) > SOURCE_HEAD + SOURCE_TAIL:
+                omitted = len(child) - SOURCE_HEAD - SOURCE_TAIL
+                out[key] = (child[:SOURCE_HEAD] + f"\n# ... [{omitted} chars omitted in planner view; "
+                            "full source is in the candidate artifact] ...\n" + child[-SOURCE_TAIL:])
+            else:
+                out[key] = _cap_sources(child)
+        return out
+    if isinstance(value, list):
+        return [_cap_sources(child) for child in value]
+    return value
+
+
+def _is_provenance_key(key: str) -> bool:
+    return (key.endswith(("_sha256", "_fingerprint", "_ref", "_path")) or key in {"checkpoint_id", "source_sha256"})
+
+
+def _strip_provenance(value: Any, inside: bool = False) -> Any:
+    """Inside diagnostics subtrees, drop hash/path provenance; IDs elsewhere are untouched."""
+    if isinstance(value, dict):
+        return {key: _strip_provenance(child, inside or key == "diagnostics")
+                for key, child in value.items() if not (inside and _is_provenance_key(key))}
+    if isinstance(value, list):
+        return [_strip_provenance(child, inside) for child in value]
+    return value
+
+
+def _leaves(value: Any, prefix: tuple = ()) -> dict[tuple, Any]:
+    if isinstance(value, dict):
+        out = {}
+        for key, child in value.items():
+            out.update(_leaves(child, prefix + (key,)))
+        return out
+    return {prefix: value} if not isinstance(value, list) else {}
+
+
+def _drop_path(value: dict, path: tuple) -> None:
+    for key in path[:-1]:
+        value = value.get(key)
+        if not isinstance(value, dict):
+            return
+    value.pop(path[-1], None)
+
+
+def _hoist_fold_constants(value: Any) -> Any:
+    """Report a per-fold leaf once when all folds share the identical value."""
+    if isinstance(value, dict):
+        out = {key: _hoist_fold_constants(child) for key, child in value.items()}
+        folds = out.get("folds")
+        if isinstance(folds, list) and len(folds) > 2 and all(isinstance(f, dict) for f in folds):
+            leaves = [_leaves({k: v for k, v in f.items() if k != "fold_id"}) for f in folds]
+            shared = {path: val for path, val in leaves[0].items()
+                      if all(path in other and other[path] == val for other in leaves[1:])}
+            shared = {path: val for path, val in shared.items() if len(json.dumps(val, default=str)) > 8}
+            if shared:
+                folds = copy.deepcopy(folds)
+                for fold in folds:
+                    for path in shared:
+                        _drop_path(fold, path)
+                out["folds"] = folds
+                out["shared_fold_constants"] = {".".join(map(str, path)): val for path, val in shared.items()}
+        return out
+    if isinstance(value, list):
+        return [_hoist_fold_constants(child) for child in value]
+    return value
+
+
+def _round_floats(value: Any) -> Any:
+    """4 significant digits (0.01pp for top-1 fractions); gates use the full observation."""
+    if isinstance(value, float):
+        return float(f"{value:.4g}")
+    if isinstance(value, dict):
+        return {key: _round_floats(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [_round_floats(child) for child in value]
+    return value
+
+
+def _older_suites_scalars(value: Any) -> Any:
+    """All but the newest complete suite keep per-fold headline metrics only."""
+    if not isinstance(value, dict) or not isinstance(value.get("evidence"), list):
+        return value
+    rows = value["evidence"]
+    suites = [i for i, row in enumerate(rows) if isinstance(row, dict) and row.get("kind") == "method_suite"]
+    out = list(rows)
+    for i in suites[:-1]:
+        row = copy.deepcopy(rows[i])
+        diagnostics = row.get("diagnostics")
+        if isinstance(diagnostics, dict) and isinstance(diagnostics.get("folds"), list):
+            row["diagnostics"] = {
+                "scope": diagnostics.get("scope"),
+                "detail": "older_suite_headline_metrics_only",
+                "folds": [{"fold_id": fold.get("fold_id"),
+                           "development_metrics": {k: v for k, v in (fold.get("development_metrics") or {}).items()
+                                                   if k in {"primary_metric", "fixed_bank_top1", "fixed_bank_top5"}},
+                           "best_epoch": (fold.get("selected_checkpoint") or {}).get("best_epoch")}
+                          for fold in diagnostics["folds"] if isinstance(fold, dict)]}
+        out[i] = row
+    return {**value, "evidence": out}
+
+
+BUDGET_STAGES = (
+    ("round_floats_4_significant", _round_floats),
+    ("strip_diagnostic_provenance", _strip_provenance),
+    ("hoist_fold_constants", _hoist_fold_constants),
+    ("slim_fold_score_provenance", _slim_scores),
+    ("summarize_numeric_series", _summarize_series),
+    ("cap_source_listings", _cap_sources),
+    ("older_suites_headline_only", _older_suites_scalars),
+)
+
+
+def budget_reductions(payload: dict[str, Any]):
+    """Yield progressively smaller provider views of an over-budget Planner payload."""
+    current = payload
+    applied: list[dict[str, Any]] = []
+    for name, stage in BUDGET_STAGES:
+        before = _size(current)
+        current = stage(current)
+        applied.append({"stage": name, "before_chars": before, "after_chars": _size(current)})
+        yield {**current, "planner_budget_reductions": {
+            "stages": list(applied),
+            "scope": "Provider view only; on-disk evidence, sources and gates unchanged. Request an artifact read for full detail."}}

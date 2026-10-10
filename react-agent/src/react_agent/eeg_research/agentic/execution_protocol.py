@@ -62,29 +62,35 @@ def read_query_rows(
     subject_fallback: str,
 ) -> list[tuple[str, str]]:
     """Read (query_id, image_id) rows. Missing files are an error."""
+    from react_agent.eeg_research.agentic.verification_cache import file_memo
+
     found: list[tuple[str, str]] = []
     for path in paths:
         if not path.is_file():
             raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
-        raw = path.read_bytes()
-        if not raw.strip():
-            raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
-        subject = _subject_from_path(path, subject_fallback)
-        if raw.lstrip()[:1] in (b"[", b"{"):
-            data = json.loads(raw.decode("utf-8"))
-            rows = data.get("img") if isinstance(data, dict) else data
-            if not isinstance(rows, list) or not rows:
-                raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
-            found.extend((query_id(subject, str(item)), str(item)) for item in rows)
-            continue
-        from react_agent.eeg_training.data import load_trials
-
-        trials = load_trials(path, channels)
-        images = trials["img"]
-        if not isinstance(images, list) or not images:
-            raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
-        found.extend((query_id(subject, str(item)), str(item)) for item in images)
+        found.extend(file_memo("query_rows", (path,), (tuple(channels or ()), subject_fallback),
+                               lambda path=path: tuple(_file_query_rows(path, channels, subject_fallback))))
     return found
+
+
+def _file_query_rows(path: Path, channels: list[str] | None, subject_fallback: str) -> list[tuple[str, str]]:
+    with path.open("rb") as handle:
+        head = handle.read(4096).lstrip()
+    if not head:
+        raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
+    subject = _subject_from_path(path, subject_fallback)
+    if head[:1] in (b"[", b"{"):
+        data = json.loads(path.read_bytes().decode("utf-8"))
+        rows = data.get("img") if isinstance(data, dict) else data
+        if not isinstance(rows, list) or not rows:
+            raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
+        return [(query_id(subject, str(item)), str(item)) for item in rows]
+    from react_agent.eeg_training.data import load_trials
+
+    images = load_trials(path, channels)["img"]
+    if not isinstance(images, list) or not images:
+        raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
+    return [(query_id(subject, str(item)), str(item)) for item in images]
 
 
 def _channels(design: Design) -> list[str] | None:

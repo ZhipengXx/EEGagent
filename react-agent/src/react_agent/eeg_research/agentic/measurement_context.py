@@ -105,3 +105,29 @@ def verified_parameter_count_comparisons(camp: Path, state: dict[str, Any], *, l
     return {'comparisons': rows[:limit], 'verified_comparison_count': len(rows),
             'omitted_comparison_count': max(0, len(rows) - limit),
             'scope': 'Accepted paired development runs and current source/spec bindings; no new score, approval or capacity-match conclusion.'}
+
+
+def measured_parameter_counts(camp: Path) -> dict[str, Any]:
+    """Trainable scalar counts each candidate actually built, from its completed jobs.
+
+    A count is reported only when every completed job of that candidate agrees.
+    Specs that target a parameter count should be checked against these numbers.
+    """
+    seen: dict[str, set] = {}
+    for path in sorted((camp / 'jobs').glob('*/capabilities_used.json')):
+        try:
+            job = json.loads((path.parent / 'job.json').read_text(encoding='utf-8'))
+            counts = json.loads(path.read_text(encoding='utf-8')).get('parameter_counts')
+        except (OSError, ValueError):
+            continue
+        candidate = job.get('candidate_id') if isinstance(job, dict) else None
+        if not candidate or not isinstance(counts, dict):
+            continue
+        seen.setdefault(str(candidate), set()).add(json.dumps(counts, sort_keys=True))
+    result = {}
+    for candidate, values in seen.items():
+        if len(values) == 1:
+            counts = json.loads(next(iter(values)))
+            result[candidate] = {**counts, 'trainable_total': sum(v for v in counts.values() if isinstance(v, int))}
+    return {'status': 'measured' if result else 'unavailable', 'by_candidate': result,
+            'scope': 'Counted from built modules in completed jobs (capabilities_used.json); use these, not recalled architecture arithmetic.'}

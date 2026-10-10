@@ -88,6 +88,8 @@ Name required hooks in a nonempty required_capability_ids. For unchanged hooks,
 copy the parent's effective config; remove legacy descriptive metadata and
 state that removal is configuration cleanup, not a scientific intervention.
 Declare concrete parameter values and enabled/disabled switches for new hooks.
+Parameter-count targets (e.g. "equal to baseline") must use
+measured_parameter_counts.by_candidate; correct a draft whose number disagrees.
 For a controlled ablation use baseline as the supported runtime comparator,
 name the trained parent with parent_candidate_id and ablation_of_candidate_id,
 and change exactly one effective hook-config section. The paired parent result

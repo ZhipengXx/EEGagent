@@ -463,6 +463,11 @@ def _check_api_budget(camp: Path) -> None:
         raise LlmUnavailable("budget_exhausted")
 
 
+# Compaction failures are mechanical (length/quote-pointer limits) and usually
+# pass on a re-roll with the validation error attached.
+COMPACTION_ATTEMPTS = 4
+
+
 def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_tokens: int,
                        system: str, payload: dict, task: dict, validate: Callable,
                        context_budget_chars: int) -> dict:
@@ -471,7 +476,7 @@ def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_to
     from react_agent.eeg_research.agentic.roles import assert_role_task_dependencies
     error = None
     previous_summary = None
-    for attempt in range(2):
+    for attempt in range(COMPACTION_ATTEMPTS):
         assert_role_task_dependencies(camp, task)
         request = dict(payload)
         if error is not None:
@@ -564,8 +569,7 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
     def prepare_context(payload: dict[str, Any], *, inputs: list[Path]) -> dict:
         # Called before begin_role_task: the consumer digest binds the actual
         # semantic summary and its original dependencies, not an invisible view.
-        if (role != "memory_curator" or payload.get("evaluation_mode") != "loso_method_search"
-                or os.environ.get("EEG_HANDOFF_COMPACTION", "0").lower() not in {"1", "true", "on"}):
+        if role != "memory_curator" or payload.get("evaluation_mode") != "loso_method_search":
             return payload
         from react_agent.eeg_research.agentic.handoffs import compact_role_context
         from react_agent.eeg_research.agentic.role_examples import add_role_examples
@@ -581,7 +585,15 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
 
         if fits(payload):
             return payload
-        from react_agent.eeg_research.agentic.compaction import compact_for_curator, protected_context
+        # Deterministic projection first: no model call, cannot fail validation.
+        from react_agent.eeg_research.agentic.compaction import (
+            compact_for_curator, project_for_curator, protected_context)
+        projected = project_for_curator(payload)
+        if fits(projected):
+            return projected
+        if os.environ.get("EEG_HANDOFF_COMPACTION", "0").lower() not in {"1", "true", "on"}:
+            return projected
+        payload = projected
         if not fits(protected_context(payload)):
             raise LlmUnavailable("handoff_compaction_protected_budget_exceeded")
         if external_api_disabled():
@@ -654,7 +666,14 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             from react_agent.eeg_research.agentic.role_examples import add_role_examples
             call_payload = add_role_examples(call_payload, role, memory)
             from react_agent.eeg_research.agentic.handoffs import compact_role_context
-            call_payload = project_correction_context(call_payload, role, system_chars=len(system))
+            projected = project_correction_context(call_payload, role, system_chars=len(system))
+            if not projected["role_context_projection"]["fits_budget"] and role == "research_planner":
+                from react_agent.eeg_research.agentic.planner_context import budget_reductions
+                for reduced in budget_reductions(call_payload):
+                    projected = project_correction_context(reduced, role, system_chars=len(system))
+                    if projected["role_context_projection"]["fits_budget"]:
+                        break
+            call_payload = projected
             projection = call_payload["role_context_projection"]
             if not projection["fits_budget"]:
                 trace = context_budget_trace(camp, role, system=system,

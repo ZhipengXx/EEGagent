@@ -65,10 +65,9 @@ direct experiment_spec item), return one requirement_coverage item using its
 exact requirement_id and status="implemented", "contradicted" or "unverified".
 Record detail, source_hash, source_refs, check_ref and check_sha256 using the
 exact requirement_evidence_identity supplied by runtime. Source refs identify
-the actual extension/eeg_candidate.py execution path, optionally :line or #Lline.
-Do not copy ::Class.method from an approved requirement's code_locations into
-source_refs. Those are symbolic design locations; evidence references must be
-the injected current file path, optionally a valid numeric line or #L anchor.
+the actual extension/eeg_candidate.py execution path, optionally :line, #Lline
+or ::Class::method. A ::symbol reference is accepted only if that class/function
+exists in the current source; prefer a numeric line for the exact statement.
 For every core implementation requirement, implemented needs current matching
 source and check evidence. Old PASS, config declarations or a proposed mechanism
 alone cannot establish current implementation. Check implementation_semantics:

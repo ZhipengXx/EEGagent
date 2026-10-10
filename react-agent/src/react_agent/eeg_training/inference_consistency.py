@@ -23,6 +23,12 @@ EMBEDDING_TOLERANCES = {
 
 def file_digest(path: Path) -> str:
     """Hash file contents without materializing a trial/cache file in memory."""
+    from react_agent.eeg_research.agentic.verification_cache import file_hash
+
+    return file_hash(Path(path), _stream_digest)
+
+
+def _stream_digest(path: Path) -> str:
     digest = hashlib.sha256()
     with Path(path).open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):

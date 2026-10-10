@@ -43,6 +43,97 @@ _METHOD_ROLE_HARD_BLOCKS = {
 }
 
 
+# Recoverable blocks that resolve on their own (GPU contention, a re-rolled
+# compaction/schema reply, a smaller observation after state moves). The worker
+# resumes these itself with backoff instead of waiting for a human `resume`.
+_TRANSIENT_MARKERS = {
+    "gpu": ("gpu_unavailable", "gpu_existing_memory_exceeds_authorized_limit", "gpu_busy"),
+    "role": ("role_context_budget_requires_artifact_pages", "handoff_compaction_failed",
+             "compaction_validation_failed", "method_role_recovery_blocked"),
+}
+_TRANSIENT_LIMITS = {"gpu": 24, "role": 3}
+_TRANSIENT_BACKOFF = {"gpu": (120.0, 600.0), "role": (60.0, 300.0)}
+
+
+def transient_kind(state: dict[str, Any]) -> str | None:
+    if state.get("status") != "blocked":
+        return None
+    failure = state.get("failure") if isinstance(state.get("failure"), dict) else {}
+    if failure.get("recoverable") is not True:
+        return None
+    text = " ".join(str(value) for value in (failure.get("error_type"), state.get("detail")) if value)
+    for kind, markers in _TRANSIENT_MARKERS.items():
+        if any(marker in text for marker in markers):
+            return kind
+    return None
+
+
+def _sleep_unless_controlled(camp: Path, seconds: float) -> bool:
+    """Sleep in short steps; return False as soon as the user pauses or stops."""
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            action = json.loads((camp / "control.json").read_text(encoding="utf-8")).get("action")
+        except (OSError, ValueError):
+            action = None
+        if action in {"pause", "stop"}:
+            return False
+        time.sleep(min(5.0, max(0.0, deadline - time.time())))
+    return True
+
+
+def _auto_resume(camp: Path, state: dict[str, Any], retries: dict[str, int]) -> bool:
+    """Resume a transient block like the CLI would. False when the cap is spent or the user intervened."""
+    kind = transient_kind(state)
+    if kind is None or retries.get(kind, 0) >= _TRANSIENT_LIMITS[kind]:
+        return False
+    attempt = retries.get(kind, 0)
+    base, cap = _TRANSIENT_BACKOFF[kind]
+    delay = min(cap, base * (2 ** attempt))
+    event(camp, "auto_resume_scheduled", kind=kind, attempt=attempt + 1, limit=_TRANSIENT_LIMITS[kind],
+          delay_seconds=delay, error_type=(state.get("failure") or {}).get("error_type"), detail=state.get("detail"))
+    if not _sleep_unless_controlled(camp, delay):
+        return False
+    from react_agent.eeg_research.agentic.verification_cache import verification_scope
+    with verification_scope():
+        align_interrupt(camp)
+    current = load_state(camp)
+    if current.get("status") != "blocked" or transient_kind(current) != kind:
+        return False
+    retries[kind] = attempt + 1
+    current["status"] = "created"
+    current["pause_after_step"] = False
+    save_state(camp, current)
+    event(camp, "auto_resume", kind=kind, attempt=attempt + 1, worker_pid=os.getpid())
+    return True
+
+
+# Curation only proposes memory lessons. When compaction of its context keeps
+# failing validation, finish the curation task without lessons so the method
+# suite's scientific feedback is complete and the campaign can plan again.
+_DEGRADABLE_COMPACTION = {"handoff_compaction_failed", "compaction_validation_failed"}
+
+
+def _degraded_curation(camp_dir: Path, state: dict[str, Any], store: Any, inputs: list[Path],
+                       benchmark_origin: dict[str, Any], reason: str) -> dict[str, Any]:
+    from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
+    store.mark_pending_curation("curator_compaction_degraded")
+    task = begin_role_task(camp_dir, role="memory_curator", inputs=inputs, artifacts=[],
+                           request={"curation_degraded": {"reason": reason}})
+    finished = finish_role_task(
+        camp_dir, task,
+        {"status": "completed",
+         "summary_zh": f"经验整理已降级：上下文压缩多次校验失败（{reason}），本次未产出 lesson；不影响方法结果。",
+         "proposal": {}, "accepted": {"accepted": [], "rejected": []},
+         "curation_degraded": {"reason": reason, "lessons_pending": True}, **benchmark_origin},
+        kind="lessons", path=camp_dir / "memory" / f"lessons_{task['task_id']}.json",
+    )
+    event(camp_dir, "curation_degraded", reason=reason, task_id=task["task_id"])
+    _sync_ledger(camp_dir, state)
+    return {"status": "completed", "task_id": task["task_id"], "artifact_id": finished["artifact_refs"][-1],
+            "accepted_lessons": 0, "rejected_lessons": 0, "curator_called": False, "curation_degraded": reason}
+
+
 def _lesson_proposal(reply: Any) -> dict[str, Any]:
     """Read lessons from a RoleResult envelope or a bare curator object."""
     if not isinstance(reply, dict):
@@ -460,10 +551,18 @@ def build_services(camp: Path) -> dict[str, Any]:
             if (used < limit and outcome.get("detail") != "budget_exhausted"
                     and (check.get("error") or check.get("failures"))
                     and (workspace / "extension/eeg_candidate.py").is_file()):
+                # Reviewer findings that were being repaired stay open: fixing the
+                # check must not silently revert a requested scientific correction.
+                still_open = [dict(issue, status="still_open_from_previous_review")
+                              for issue in (repair or {}).get("issues") or []
+                              if issue.get("category") != "candidate_check_failure"]
                 state["repair_task"] = {"candidate_id": candidate_id, "remaining": 1, "used": used + 1,
                     "issues": [{"category": "candidate_check_failure", **row["check"],
-                                "correction_scope": "Repair the exact failing hook and approved config; preserve the scientific intervention."}],
-                    "intervention_coverage": None, "unverified_invariants": []}
+                                "correction_scope": "Repair the exact failing hook and approved config; preserve the scientific intervention"
+                                                    + (" and still resolve the open review issues." if still_open else ".")},
+                               *still_open],
+                    "intervention_coverage": (repair or {}).get("intervention_coverage") if still_open else None,
+                    "unverified_invariants": ((repair or {}).get("unverified_invariants") or []) if still_open else []}
                 state["experiment_failed"] = False
             else:
                 state["repair_task"] = None
@@ -914,7 +1013,12 @@ def build_services(camp: Path) -> dict[str, Any]:
             compaction_artifacts = []
             prepare = getattr(curator, "prepare_context", None)
             if method_mode and callable(prepare):
-                curation_context = prepare(curation_context, inputs=curation_inputs)
+                try:
+                    curation_context = prepare(curation_context, inputs=curation_inputs)
+                except LlmUnavailable as exc:
+                    if str(exc) not in _DEGRADABLE_COMPACTION or prepare_only:
+                        raise
+                    return _degraded_curation(camp_dir, state, store, curation_inputs, benchmark_origin, str(exc))
                 receipt = curation_context.get("context_compaction")
                 if receipt:
                     # Original files remain dependencies. Also pin the exact
@@ -1134,6 +1238,7 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
             state["detail"] = str(exc)
             save_state(camp, state)
         return state
+    retries: dict[str, int] = {}
     for tick_index in range(max_ticks):
         from react_agent.eeg_research.agentic.verification_cache import verification_scope
         with verification_scope():
@@ -1143,7 +1248,10 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
             encoding="utf-8",
         )
         if state.get("status") in _TERMINAL:
+            if _auto_resume(camp, state, retries):
+                continue
             break
+        retries.clear()
         if state.get("status") == "training":
             time.sleep(poll_seconds)
     else:

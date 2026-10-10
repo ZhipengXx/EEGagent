@@ -5,6 +5,40 @@ import re
 from typing import Any
 
 
+def _symbol_line(source: str, symbol: str) -> int | None:
+    """Line of `Class::method`, `Class.method` or `func` in the current source."""
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    parts = [part for part in re.split(r"::|\.", symbol) if part]
+    scope: list[ast.stmt] = list(tree.body)
+    line = None
+    for part in parts:
+        node = next((item for item in scope if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+                     and item.name == part), None)
+        if node is None:
+            return None
+        line, scope = node.lineno, list(node.body)
+    return line
+
+
+def valid_source_reference(reference: Any, allowed: set, source: str | None) -> bool:
+    """`path`, `path:N`, `path#LN`, or `path::Class::method` resolving in the current source."""
+    if not isinstance(reference, str):
+        return False
+    source_lines = len(source.splitlines()) if isinstance(source, str) else 0
+    path, sep, symbol = reference.partition("::")
+    if sep:
+        return path in allowed and isinstance(source, str) and _symbol_line(source, symbol) is not None
+    match = re.fullmatch(r"(.+?)(?::([0-9]+)|#L([0-9]+))?", reference)
+    if not match or match.group(1) not in allowed or source_lines == 0:
+        return False
+    line = match.group(2) or match.group(3)
+    return line is None or 1 <= int(line) <= source_lines
+
+
 def review_reference_errors(reply: dict[str, Any], request: dict[str, Any]) -> list[dict]:
     """Check only injected evidence metadata, without changing scientific claims."""
     identity = request.get("requirement_evidence_identity")
@@ -33,11 +67,8 @@ def review_reference_errors(reply: dict[str, Any], request: dict[str, Any]) -> l
         if not refs:
             error(base + ["source_refs"], "A current source reference is required for this claim.", identity.get("source_ref"))
         for position, reference in enumerate(refs):
-            match = re.fullmatch(r"(.+?)(?::([0-9]+)|#L([0-9]+))?", reference) if isinstance(reference, str) else None
-            line = (match.group(2) or match.group(3)) if match else None
-            if (not match or match.group(1) not in allowed_sources
-                    or source_lines == 0 or line is not None and not 1 <= int(line) <= source_lines):
+            if not valid_source_reference(reference, allowed_sources, source):
                 error(base + ["source_refs", position],
-                      "Use a current file path, optionally :line or #Lline within the injected source. ::Class.method is a code-location descriptor, not an evidence reference.",
+                      "Use a current file path, optionally :line, #Lline or ::Class::method that exists in the injected source.",
                       {"source_ref": identity.get("source_ref"), "line_count": source_lines})
     return errors

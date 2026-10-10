@@ -400,6 +400,10 @@ multi-seed claim is unfinished. Unmatched or stale off proofs remain gaps.
 
 
 MEASUREMENT POPULATION AND CAPACITY
+measured_parameter_counts.by_candidate gives the trainable scalar count each
+candidate actually built (e.g. baseline encoder). Any parameter-count target in a
+hypothesis or spec must be derived from these numbers, never from recalled
+architecture arithmetic.
 development_feedback.parent_comparison.parameter_count_comparison and
 parameter_count_comparisons
 deliver scalar encoder/objective counts from actual registered training receipts

@@ -679,14 +679,10 @@ def enforce_requirement_review(workspace: Path, spec: dict[str, Any], result: di
                            and semantic.get("requirements_hash") == requirements_hash(declarations))
     evidence_current = bool(receipt_current and checks.get("ok"))
     source_refs = {str(entry), "extension/eeg_candidate.py"}
-    source_lines = len(entry.read_text(encoding="utf-8").splitlines()) if entry.is_file() else 0
+    current_text = entry.read_text(encoding="utf-8") if entry.is_file() else None
     def valid_source_ref(reference: str) -> bool:
-        import re
-        match = re.fullmatch(r"(.+?)(?::([0-9]+)|#L([0-9]+))?", reference)
-        if not match or match.group(1) not in source_refs:
-            return False
-        line = match.group(2) or match.group(3)
-        return line is None or 1 <= int(line) <= source_lines
+        from react_agent.eeg_research.agentic.review_context import valid_source_reference
+        return valid_source_reference(reference, source_refs, current_text)
     requirements = []
     invalid_declaration = False
     try:
@@ -755,6 +751,25 @@ def enforce_requirement_review(workspace: Path, spec: dict[str, Any], result: di
     return updated
 
 
+def _reviewer_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Earlier check tracebacks are history, not evidence about the current source.
+
+    The reviewer judges the current source against the current checks.json; only
+    the error identity of a past check failure is kept so it can see what was repaired.
+    """
+    issues = spec.get("repair_issues")
+    if not isinstance(issues, list):
+        return spec
+    kept = []
+    for issue in issues:
+        if isinstance(issue, dict) and issue.get("category") == "candidate_check_failure":
+            kept.append({"category": "candidate_check_failure", "status": "superseded_by_current_checks",
+                         "previous_error": issue.get("error"), "previous_stage": issue.get("stage")})
+        else:
+            kept.append(issue)
+    return {**spec, "repair_issues": kept}
+
+
 def review(
     workspace: Path,
     spec: dict[str, Any],
@@ -771,7 +786,7 @@ def review(
     spec_path = workspace / "input_spec.json"
     interface = json.loads(spec_path.read_text(encoding="utf-8")) if spec_path.is_file() else candidate_interface(None)
     payload = {
-        "experiment_spec": spec,
+        "experiment_spec": _reviewer_spec(spec),
         "candidate_source": entry.read_text(encoding="utf-8") if entry.is_file() else None,
         "checks": checks,
         "evaluation_contract": contract_summary,
