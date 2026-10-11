@@ -50,7 +50,8 @@ _METHOD_ROLE_HARD_BLOCKS = {
 _TRANSIENT_MARKERS = {
     "gpu": ("gpu_unavailable", "gpu_existing_memory_exceeds_authorized_limit", "gpu_busy"),
     "role": ("role_context_budget_requires_artifact_pages", "handoff_compaction_failed",
-             "compaction_validation_failed", "method_role_recovery_blocked"),
+             "compaction_validation_failed", "method_role_recovery_blocked",
+             "method_suite_scientific_feedback_incomplete"),
     # A stale decision refused at execution is already marked rejected; resuming
     # asks the Planner again with current targets (loop._reject_plan_decision).
     "replan": ("action_unavailable:", "target_unavailable", "unknown_target"),

@@ -693,13 +693,17 @@ def role_backend(camp: Path, role: str) -> Callable[[dict[str, Any]], dict[str, 
             call_payload = add_role_examples(call_payload, role, memory)
             from react_agent.eeg_research.agentic.handoffs import compact_role_context
             projected = project_correction_context(call_payload, role, system_chars=len(system))
-            if role == "research_planner" and not _within_quality_target(projected, PLANNER_TARGET_RATIO):
-                # Long inputs degrade judgment even when they fit: shrink the
-                # provider view toward the quality target, not just the hard budget.
+            # Planner: shrink toward a quality target (long inputs degrade judgment
+            # even when they fit). Other roles: only when over the hard budget, and
+            # never round floats, since their numeric claims are checked against sources.
+            planner = role == "research_planner"
+            ratio = PLANNER_TARGET_RATIO if planner else 1.0
+            if not _within_quality_target(projected, ratio):
                 from react_agent.eeg_research.agentic.planner_context import budget_reductions
-                for reduced in budget_reductions(call_payload):
+                skip = () if planner else ("round_floats_4_significant",)
+                for reduced in budget_reductions(call_payload, skip=skip):
                     projected = project_correction_context(reduced, role, system_chars=len(system))
-                    if _within_quality_target(projected, PLANNER_TARGET_RATIO):
+                    if _within_quality_target(projected, ratio):
                         break
             call_payload = projected
             projection = call_payload["role_context_projection"]

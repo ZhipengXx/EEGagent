@@ -338,11 +338,13 @@ BUDGET_STAGES = (
 )
 
 
-def budget_reductions(payload: dict[str, Any]):
-    """Yield progressively smaller provider views of an over-budget Planner payload."""
+def budget_reductions(payload: dict[str, Any], *, skip: tuple[str, ...] = ()):
+    """Yield progressively smaller provider views of an over-budget role payload."""
     current = payload
     applied: list[dict[str, Any]] = []
     for name, stage in BUDGET_STAGES:
+        if name in skip:
+            continue
         before = _size(current)
         current = stage(current)
         applied.append({"stage": name, "before_chars": before, "after_chars": _size(current)})
