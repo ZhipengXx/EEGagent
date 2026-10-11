@@ -235,14 +235,15 @@ def _code_views(value: Any) -> Any:
     return out
 
 
-def _is_provenance_key(key: str) -> bool:
+def _is_provenance_key(key: Any) -> bool:
+    key = str(key)
     return (key.endswith(("_sha256", "_fingerprint", "_ref", "_path")) or key in {"checkpoint_id", "source_sha256"})
 
 
 def _strip_provenance(value: Any, inside: bool = False) -> Any:
     """Inside diagnostics subtrees, drop hash/path provenance; IDs elsewhere are untouched."""
     if isinstance(value, dict):
-        return {key: _strip_provenance(child, inside or key.endswith("diagnostics"))
+        return {key: _strip_provenance(child, inside or str(key).endswith("diagnostics"))
                 for key, child in value.items() if not (inside and _is_provenance_key(key))}
     if isinstance(value, list):
         return [_strip_provenance(child, inside) for child in value]
