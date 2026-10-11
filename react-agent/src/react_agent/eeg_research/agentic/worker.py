@@ -51,9 +51,12 @@ _TRANSIENT_MARKERS = {
     "gpu": ("gpu_unavailable", "gpu_existing_memory_exceeds_authorized_limit", "gpu_busy"),
     "role": ("role_context_budget_requires_artifact_pages", "handoff_compaction_failed",
              "compaction_validation_failed", "method_role_recovery_blocked"),
+    # A stale decision refused at execution is already marked rejected; resuming
+    # asks the Planner again with current targets (loop._reject_plan_decision).
+    "replan": ("action_unavailable:", "target_unavailable", "unknown_target"),
 }
-_TRANSIENT_LIMITS = {"gpu": 24, "role": 3}
-_TRANSIENT_BACKOFF = {"gpu": (120.0, 600.0), "role": (60.0, 300.0)}
+_TRANSIENT_LIMITS = {"gpu": 24, "role": 3, "replan": 3}
+_TRANSIENT_BACKOFF = {"gpu": (120.0, 600.0), "role": (60.0, 300.0), "replan": (5.0, 30.0)}
 
 
 def transient_kind(state: dict[str, Any]) -> str | None:

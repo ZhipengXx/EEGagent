@@ -1124,6 +1124,9 @@ def _apply_action(
                  "_has_development_artifacts": any(row.get("verification_status") == "verified" for row in live.get("artifact_index") or []),
                  "_read_remaining": live["artifact_read_budget"]["remaining_reads"],
                  "_has_open_report_issues": "revise_report" in live["available_actions"]}
+        # Same audit freshness rule the Planner's observation applied; without it a
+        # report that went stale looks freshly audited here and audit_result is refused.
+        refresh_audit_freshness(scope)
         live["available_actions"] = available_actions(scope)
         from react_agent.eeg_research.agentic.planner import eligible_targets
         live["eligible_targets"] = eligible_targets(scope)
