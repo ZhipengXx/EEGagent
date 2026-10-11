@@ -678,7 +678,11 @@ def build_services(camp: Path) -> dict[str, Any]:
         metadata = {"candidate_source": source.read_text(), "requirement_evidence_identity": {
             "source_ref": str(source), "source_hash": file_sha256(source),
             "check_ref": str(check_path), "check_sha256": file_sha256(check_path)}}
-        if not review_reference_errors(prior, metadata):
+        blocking = [issue for issue in prior.get("issues") or [] if issue.get("severity") == "blocking"]
+        # A review blocked only because core evidence was unavailable (not an
+        # observed defect) may be re-run once that evidence is supplied.
+        evidence_only = bool(blocking) and all(issue.get("kind") == "core_implementation_unverified" for issue in blocking)
+        if not review_reference_errors(prior, metadata) and not evidence_only:
             raise ValueError("review_revalidation_requires_recorded_reference_contract_failure")
         pinned_source = file_sha256(source)
         pinned_check = file_sha256(check_path)

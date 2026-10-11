@@ -751,6 +751,16 @@ def enforce_requirement_review(workspace: Path, spec: dict[str, Any], result: di
     return updated
 
 
+def _parameter_census(workspace: Path) -> dict[str, Any]:
+    """Trainable scalar counts for this candidate and the measured baseline."""
+    from react_agent.eeg_research.agentic.measurement_context import measured_parameter_counts
+    from react_agent.eeg_research.agentic.parameter_census import measure
+    camp = workspace.parent.parent
+    return {"candidate": measure(workspace),
+            "measured_by_candidate": measured_parameter_counts(camp).get("by_candidate", {}),
+            "scope": "Runtime measurement with the trainer's own hooks; this is the evidence for any parameter-count requirement."}
+
+
 def _reviewer_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Earlier check tracebacks are history, not evidence about the current source.
 
@@ -792,6 +802,7 @@ def review(
         "evaluation_contract": contract_summary,
         "candidate_interface": interface,
         "runtime_guarantees": interface.get("runtime_guarantees"),
+        "parameter_census": _parameter_census(workspace),
         "reviewer_model": model,
         "executor_model": model,
     }

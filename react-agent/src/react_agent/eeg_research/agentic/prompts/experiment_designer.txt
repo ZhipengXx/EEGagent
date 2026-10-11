@@ -90,6 +90,10 @@ state that removal is configuration cleanup, not a scientific intervention.
 Declare concrete parameter values and enabled/disabled switches for new hooks.
 Parameter-count targets (e.g. "equal to baseline") must use
 measured_parameter_counts.by_candidate; correct a draft whose number disagrees.
+The runtime measures and reports trainable scalar counts itself (parameter_census
+before training, capabilities_used.json after). Do not declare "reporting
+parameter counts" as a code requirement of the candidate; state a capacity
+constraint (e.g. "encoder trainable scalars <= baseline") if one matters.
 For a controlled ablation use baseline as the supported runtime comparator,
 name the trained parent with parent_candidate_id and ablation_of_candidate_id,
 and change exactly one effective hook-config section. The paired parent result

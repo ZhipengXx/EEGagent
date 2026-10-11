@@ -158,6 +158,13 @@ change solely to same-ID grouping. Preserve historical actual scores and code.
 
 MEASUREMENT POPULATION AND CAPACITY
 development_feedback.parent_comparison.parameter_count_comparison and
+parameter_census.candidate gives this candidate's trainable scalar counts,
+measured before training with the trainer's own hooks (the same numbers training
+will write to capabilities_used.json); parameter_census.measured_by_candidate
+gives completed candidates such as baseline. Use these to verify any parameter-
+count or capacity requirement; params_trainable/params_with_grad in checks count
+tensors, not scalars. If the census status is not "measured", the requirement
+is unverified, not contradicted.
 parameter_count_comparisons
 deliver scalar encoder/objective counts from actual registered training receipts
 for the named accepted source/spec pair. params_trainable and params_with_grad
