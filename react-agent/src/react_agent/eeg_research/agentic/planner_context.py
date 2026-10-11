@@ -289,12 +289,16 @@ def _hoist_fold_constants(value: Any) -> Any:
     return value
 
 
+# Values the Planner must copy back verbatim; its reply is checked against them exactly.
+EXACT_ECHO_KEYS = frozenset({"action_cost_estimates", "legal_choice_context", "budget", "eligible_targets"})
+
+
 def _round_floats(value: Any) -> Any:
     """4 significant digits (0.01pp for top-1 fractions); gates use the full observation."""
     if isinstance(value, float):
         return float(f"{value:.4g}")
     if isinstance(value, dict):
-        return {key: _round_floats(child) for key, child in value.items()}
+        return {key: child if key in EXACT_ECHO_KEYS else _round_floats(child) for key, child in value.items()}
     if isinstance(value, list):
         return [_round_floats(child) for child in value]
     return value
