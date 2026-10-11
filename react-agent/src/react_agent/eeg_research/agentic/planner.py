@@ -88,6 +88,19 @@ def action_target_error(
     return None
 
 
+# Estimates are advisory (never execution authority); a model restating
+# 88299.4599 as 88300 is the same estimate. Integer counts stay exact.
+COST_RELATIVE_TOLERANCE = 0.005
+
+
+def _matches_runtime_cost(value: float, expected: float | None) -> bool:
+    if expected is None:
+        return False
+    if float(expected).is_integer() and float(value).is_integer():
+        return value == expected
+    return abs(value - expected) <= max(1e-6, COST_RELATIVE_TOLERANCE * abs(expected))
+
+
 def resolve_cost_estimate(observation: dict[str, Any], action: str, target: str | None) -> tuple[str | None, dict[str, Any]]:
     """Prefer an exact cost row; allow only verified target-independent fallback."""
     rows: dict[str, dict[str, Any]] = observation.get("action_cost_estimates") or {}
@@ -822,7 +835,7 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
         _, estimate = resolve_cost_estimate(observation, option.action, option.target_id)
         expected_cost = estimate.get("estimated_cost") or {}
         for key, value in option.estimated_cost.model_dump().items():
-            if value is not None and (expected_cost.get(key) is None or abs(value - expected_cost[key]) > 1e-6):
+            if value is not None and not _matches_runtime_cost(value, expected_cost.get(key)):
                 return "option_cost_without_runtime_basis"
         if any(ref not in (estimate.get("cost_basis") or []) for ref in option.cost_basis):
             return "unknown_option_cost_basis"
