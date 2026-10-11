@@ -127,7 +127,7 @@ def compact_planner_context(observation: dict[str, Any], *, target_chars: int = 
 # Provider-view reductions applied only when a Planner request does not fit its
 # role budget. Each stage is cumulative and recorded in the delivered payload.
 SERIES_KEEP = 12
-SOURCE_KEYS = frozenset({"implementation_source", "parent_source", "control_source"})
+SOURCE_KEYS = frozenset({"implementation_source", "parent_source", "control_source", "candidate_context"})
 SOURCE_VERBATIM_CHARS = 6000
 
 
@@ -242,7 +242,7 @@ def _is_provenance_key(key: str) -> bool:
 def _strip_provenance(value: Any, inside: bool = False) -> Any:
     """Inside diagnostics subtrees, drop hash/path provenance; IDs elsewhere are untouched."""
     if isinstance(value, dict):
-        return {key: _strip_provenance(child, inside or key == "diagnostics")
+        return {key: _strip_provenance(child, inside or key.endswith("diagnostics"))
                 for key, child in value.items() if not (inside and _is_provenance_key(key))}
     if isinstance(value, list):
         return [_strip_provenance(child, inside) for child in value]

@@ -95,7 +95,7 @@ def _auto_resume(camp: Path, state: dict[str, Any], retries: dict[str, int]) -> 
     attempt = retries.get(kind, 0)
     base, cap = _TRANSIENT_BACKOFF[kind]
     delay = min(cap, base * (2 ** attempt))
-    event(camp, "auto_resume_scheduled", kind=kind, attempt=attempt + 1, limit=_TRANSIENT_LIMITS[kind],
+    event(camp, "auto_resume_scheduled", transient=kind, attempt=attempt + 1, limit=_TRANSIENT_LIMITS[kind],
           delay_seconds=delay, error_type=(state.get("failure") or {}).get("error_type"), detail=state.get("detail"))
     if not _sleep_unless_controlled(camp, delay):
         return False
@@ -109,7 +109,7 @@ def _auto_resume(camp: Path, state: dict[str, Any], retries: dict[str, int]) -> 
     current["status"] = "created"
     current["pause_after_step"] = False
     save_state(camp, current)
-    event(camp, "auto_resume", kind=kind, attempt=attempt + 1, worker_pid=os.getpid())
+    event(camp, "auto_resume", transient=kind, attempt=attempt + 1, worker_pid=os.getpid())
     return True
 
 
