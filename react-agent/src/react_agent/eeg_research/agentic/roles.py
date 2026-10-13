@@ -328,7 +328,7 @@ def role_recovery_identity(camp: Path, role: str, target: str | None, request: d
     memory = memory_config(camp)
     from react_agent.eeg_research.agentic.role_config import resolve_role_config
     resolved = resolve_role_config(camp, role)
-    system = system_prompt(role, memory=memory)
+    system = system_prompt(role, memory=memory,camp=camp)
     model = domain_model_for(role, memory)
     schema = model.model_json_schema() if model else {"envelope": ROLE_RESULT_VERSION}
     binding = load_approved_binding(camp, str(target)) if target else None

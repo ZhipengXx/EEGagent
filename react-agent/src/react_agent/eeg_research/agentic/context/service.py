@@ -383,6 +383,22 @@ class ContextService:
             # Always explicitly set both guards at the actual model boundary.
             request = {**request, "allow_semantic_compaction": False,
                        "allow_sync_memory_maintenance": False}
+        from ..research_execution import paid_maintenance_mode
+        mode = paid_maintenance_mode(self.camp)
+        if mode == "off":
+            # The native caller can adopt an exact already paid response; it
+            # must reject a cache miss before creating a transport intent.
+            kwargs = {**kwargs, "recovery_only": True, "maintenance_policy": "off"}
+        elif mode == "batch":
+            from ..owner_budget import auxiliary_owner
+            with auxiliary_owner(self.camp, purpose="memory_maintenance"):
+                return self.callback(request, **{**kwargs, "maintenance_policy": "batch"})
+        elif mode == "emergency":
+            from ..owner_budget import current_owner
+            owner = current_owner(self.camp)
+            if not owner or owner.get("kind") != "role_preparation":
+                raise RuntimeError("maintenance_deferred_no_role_preparation_owner")
+            kwargs = {**kwargs, "maintenance_policy": "emergency"}
         return self.callback(request, **kwargs)
 
     def _background_maintenance(self, base_turn_id: str):
@@ -425,6 +441,12 @@ class ContextService:
     def _upkeep(self, *, request, blocks, effective_payload, budget_report):
         if self.callback is None or _ACTIVE.get():
             return {"status": "unavailable"}
+        from ..research_execution import paid_maintenance_mode
+        mode = paid_maintenance_mode(self.camp)
+        if mode in {"off", "batch"}:
+            return {"status": "deferred", "reason": "paid_maintenance_" + mode, "calls": 0}
+        if mode == "emergency" and budget_report.get("chars", 0) <= request.budget.high_chars and budget_report.get("provider_budget_ok"):
+            return {"status": "deferred", "reason": "no_necessary_context_emergency", "calls": 0}
         token = _ACTIVE.set(True)
         try:
             coordinator = MaintenanceCoordinator(self.snapshot, generator=self._call_maintenance,
@@ -558,8 +580,19 @@ class ContextService:
             except (ValueError, KeyError, PermissionError, OSError) as exc:
                 return Blocked("context_source_unavailable", {"reason": str(exc)},
                                recoverable_when=("valid applicable source or native classification",))
+        from ..research_execution import single_plan_enabled, paid_maintenance_mode
+        if single_plan_enabled(self.camp) and request.role == "research_planner" and not maintenance:
+            from ..experiment_observations import compact_planner_view
+            payload = copy.deepcopy(request.payload)
+            if isinstance(payload.get("observation"), dict):
+                if payload["observation"].get("context_delivery_version") != "observation_card_first.v1":
+                    payload["observation"] = compact_planner_view(self.camp, payload["observation"])
+            elif payload.get("context_delivery_version") != "observation_card_first.v1":
+                payload = compact_planner_view(self.camp, payload)
+            request = replace(request, payload=payload)
         revision_before, calls_before = self.snapshot.revision, set(self.owned_calls)
-        current = self._current_kernel(request, callbacks=not maintenance)
+        callbacks = not maintenance and paid_maintenance_mode(self.camp) in {"legacy", "emergency"}
+        current = self._current_kernel(request, callbacks=callbacks)
         result = self.compiler.compile(current)
         if not maintenance and (self.snapshot.revision != revision_before or self.owned_calls != calls_before):
             # Own billed maintenance may change balances. Rebuild native values;
@@ -608,6 +641,11 @@ class ContextService:
         return result
 
     def run_long_memory(self, payload: dict, *, turn_id: str) -> dict:
+        from ..research_execution import paid_maintenance_mode
+        if paid_maintenance_mode(self.camp) in {"off", "emergency"}:
+            self.capture_closed(payload)
+            return {"status": "deferred", "reason": "paid_maintenance_" + paid_maintenance_mode(self.camp), "calls": 0,
+                    "recovery": self.recover_paid_publications()}
         if self.pipeline is None or self.callback is None or _ACTIVE.get():
             return {"status": "unavailable"}
         turn_id, callback = self._background_maintenance(turn_id)
@@ -618,8 +656,128 @@ class ContextService:
         finally:
             _ACTIVE.reset(token)
 
+    def recover_paid_publications(self) -> dict:
+        """Complete verified paid drafts with the original source/CAS proof.
+
+        No fresh maintenance claim, abstract cost reservation or model callback
+        is made. A changed authority/source remains deferred for native handling.
+        """
+        from ..task_ledger import task_snapshots, find_completed_task
+        from .snapshot import SnapshotProposal
+        with self.snapshot.persistence.db() as db:
+            drafts = db.execute("SELECT proposal_id,artifact_ref FROM context_proposals WHERE status='validated' ORDER BY created_at LIMIT 8").fetchall()
+        tasks = [task for task in reversed(task_snapshots(self.camp)) if task.get("role") == "memory_curator" and task.get("status") == "completed"]
+        ledger = self.camp / "llm_calls.jsonl"
+        calls = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines() if line.strip()] if ledger.is_file() else []
+        recovered, deferred = [], []
+        for row in drafts:
+            draft = self.snapshot.persistence.read(row["artifact_ref"])
+            operation_id = str((draft.get("generation") or {}).get("operation_id") or "")
+            with self.snapshot.persistence.db() as db:
+                no_benefit = db.execute("SELECT 1 FROM context_maintenance_jobs WHERE status='no_op' AND last_error='no_effective_request_benefit' AND ? LIKE input_digest || '%'", (operation_id,)).fetchone()
+            if no_benefit:
+                deferred.append({"proposal_id": row["proposal_id"], "reason": "original_no_effective_request_benefit"})
+                continue
+            proven = False
+            for task in tasks[:64]:
+                cache = find_completed_task(self.camp, role="memory_curator",
+                    recovery_identity=task.get("recovery_identity") or {}, input_digest=task.get("input_digest"))
+                if cache and cache["artifact"].get("kind") == "handoff_compaction":
+                    envelope = cache["envelope"]
+                    body = envelope.get("payload") or {}
+                    dependencies = (task.get("recovery_identity") or {}).get("input_dependencies") or []
+                    original_inputs = [_read(Path(dep["path"])) for dep in dependencies if isinstance(dep, dict) and dep.get("path")]
+                    source_match = any(item.get("closed_sections") == draft["batch"]["sections"]
+                        and item.get("base_revision") == draft["batch"]["base_revision"]
+                        and item.get("maintenance_operation_id") == operation_id for item in original_inputs)
+                    if (source_match and envelope.get("status") == "completed" and body.get("publication_status") == "proposal_only"
+                            and body.get("scientific_evidence") is False and body.get("execution_authority") is False
+                            and body.get("proposal") == draft["delta"]):
+                        proven = True
+                        self.owned_calls.update(call["call_id"] for call in calls if call.get("task_id") == task["task_id"]
+                            and call.get("success") is True and call.get("transport_outcome") == "confirmed_response")
+                        break
+            if not proven:
+                deferred.append({"proposal_id": row["proposal_id"], "reason": "original_paid_proposal_proof_unavailable"})
+                continue
+            proposal = SnapshotProposal(row["proposal_id"], row["artifact_ref"], draft["batch"]["base_revision"],
+                draft["batch"]["input_dependency_digest"])
+            try:
+                outcome = self.snapshot.publish(proposal)
+                destination = recovered if outcome.status in {"published", "no_signal", "already_published", "already_no_signal"} else deferred
+                destination.append({"proposal_id": row["proposal_id"], "status": outcome.status, "reason": outcome.reason})
+            except (ValueError, KeyError, OSError, PermissionError) as exc:
+                deferred.append({"proposal_id": row["proposal_id"], "reason": str(exc)[:500]})
+        pipeline = self._recover_paid_pipeline_publications(tasks)
+        return {"api_calls": 0, "recovered": recovered, "deferred": deferred, "long_memory": pipeline}
+
+    def _recover_paid_pipeline_publications(self, tasks) -> dict:
+        if self.pipeline is None:
+            return {"api_calls": 0, "recovered": [], "deferred": []}
+        from ..task_ledger import find_completed_task
+        import uuid
+        with self.pipeline.connect() as db:
+            rows = db.execute("SELECT request_digest,parent_digest,phase,response,metadata FROM memory_pipeline_proposals WHERE status='proposal_only' AND response IS NOT NULL ORDER BY created_at LIMIT 8").fetchall()
+        results, deferred = [], []
+        for row in rows:
+            metadata = json.loads(row["metadata"] or "{}")
+            claim = metadata.get("publication_claim")
+            if not isinstance(claim, dict) or claim.get("digest") != row["parent_digest"] or claim.get("phase") != row["phase"]:
+                deferred.append({"digest": row["parent_digest"], "reason": "original_publication_claim_missing"})
+                continue
+            response = json.loads(row["response"])
+            task = next((task for task in tasks if task.get("task_id") == metadata.get("task_ref")), None)
+            cache = find_completed_task(self.camp, role="memory_curator", recovery_identity=task.get("recovery_identity") or {},
+                input_digest=task.get("input_digest")) if task else None
+            if (not cache or cache["artifact"].get("kind") != "handoff_compaction"
+                    or (cache["envelope"].get("payload") or {}).get("proposal") != response):
+                deferred.append({"digest": row["parent_digest"], "reason": "original_paid_proposal_proof_unavailable"})
+                continue
+            dependencies = (task.get("recovery_identity") or {}).get("input_dependencies") or []
+            originals = [_read(Path(dep["path"])) for dep in dependencies if isinstance(dep, dict) and dep.get("path")]
+            original_request = claim.get("request") or {}
+            expected_input = original_request.get("payload", original_request)
+            if not any(item.get("maintenance_input_digest") == original_request.get("input_digest")
+                and all(item.get(key) == value for key, value in expected_input.items()
+                        if key not in {"turn_id", "mode", "maintenance_correction", "input_digest"}) for item in originals):
+                deferred.append({"digest": row["parent_digest"], "reason": "original_frozen_request_mismatch"})
+                continue
+            # Reacquire only this original publication lease, never an API or
+            # retry allocation. Live/inflight ownership is left untouched.
+            now, owner = self.pipeline.clock(), uuid.uuid4().hex
+            with self.pipeline.connect(write=True) as db:
+                table, where = ("memory_pipeline_jobs", "digest=?") if row["phase"] == "extraction" else ("memory_pipeline_writer", "singleton=1")
+                parameters = (claim["digest"],) if row["phase"] == "extraction" else ()
+                head = db.execute("SELECT * FROM " + table + " WHERE " + where, parameters).fetchone()
+                if (not head or (head["lease_until"] or 0) > now or head["in_flight"] and head["lease_deadline"] > now):
+                    deferred.append({"digest": claim["digest"], "reason": "publication_lease_active_or_missing"})
+                    continue
+                if row["phase"] == "extraction" and head["processed"]:
+                    results.append({"digest": claim["digest"], "status": "already_processed"})
+                    continue
+                if row["phase"] == "consolidation" and (head["revision"] != claim["base_revision"] or head["baseline"] != claim["baseline"] or head["input_digest"] != claim["digest"]):
+                    deferred.append({"digest": claim["digest"], "reason": "original_publication_cas_changed"})
+                    continue
+                db.execute("UPDATE " + table + " SET lease_owner=?,lease_until=? WHERE " + where,
+                    (owner, now + self.pipeline.config.lease_seconds, *parameters))
+            claim = {**claim, "owner": owner}
+            try:
+                publisher = self.pipeline.publish_extraction if row["phase"] == "extraction" else self.pipeline.publish
+                result = publisher(claim, response)
+                with self.pipeline.connect(write=True) as db:
+                    db.execute("UPDATE memory_pipeline_proposals SET status=? WHERE request_digest=?", (result["status"], row["request_digest"]))
+                results.append({"digest": claim["digest"], **result})
+            except (ValueError, KeyError, OSError) as exc:
+                deferred.append({"digest": claim["digest"], "reason": str(exc)[:500]})
+        return {"api_calls": 0, "recovered": results, "deferred": deferred}
+
     def after_task_background(self, payload: dict, *, turn_id: str, remaining_api_calls: int | None = None) -> dict:
         """Finite closed-source upkeep; no new training or execution permission."""
+        from ..research_execution import paid_maintenance_mode
+        if paid_maintenance_mode(self.camp) in {"off", "emergency"}:
+            self.capture_closed(payload)
+            return {"status": "deferred", "reason": "paid_maintenance_" + paid_maintenance_mode(self.camp), "calls": 0,
+                    "recovery": self.recover_paid_publications()}
         if self.callback is None or _ACTIVE.get():
             return {"status": "unavailable"}
         if remaining_api_calls is not None and remaining_api_calls <= 0:

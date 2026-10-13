@@ -1,0 +1,1 @@
+If the current method promises ordered temporal slots, identify the real pooling input and downstream representation boundary and use the native ordered_window_slots probe. Verify slots after every declared pooling stage. Ordered scale concatenation alone does not establish temporal slot preservation. Global pooling remains legal for tasks without this promise.

@@ -1,0 +1,1 @@
+Use native measured trainable scalar counts and the current declared parameter-budget tolerance. Verify the actual approved architecture; a target label does not establish capacity matching. Keep the evaluator and matched baseline identity fixed. Report a failed count/probe as an engineering observation until the implementation meets the approved task or returns bounded failure.

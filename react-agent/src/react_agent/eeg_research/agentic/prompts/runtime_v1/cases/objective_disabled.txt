@@ -1,0 +1,1 @@
+The disabled objective must execute the actual parent's frozen loss path when the approved task promises equivalence. Read that implementation and preserve temperature, logits, reduction and gradient semantics. Verify source behavior or the declared probe; a label or numerically similar scalar on one batch is not equivalence.

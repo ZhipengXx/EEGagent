@@ -1,0 +1,1 @@
+Use the current checkpoint round-trip error and actual constructor/state source. A saved buffer/parameter must have the same declared layout when reconstructing before strict load. Derive shapes and device behavior from the approved interface. Preserve strict native checkpoint verification and recheck the changed source.

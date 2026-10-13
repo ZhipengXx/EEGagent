@@ -126,6 +126,7 @@ class DeepSeekBackend:
         # EEG opts in at its application boundary. The existing fMRI callers
         # retain their transport and parsing behavior.
         self._requires_prepared_context = False
+        self._budget_campaign = None
         self._client = AsyncOpenAI(
             api_key=config.deepseek_api_key,
             base_url=config.deepseek_base_url,
@@ -139,7 +140,69 @@ class DeepSeekBackend:
     async def aclose(self) -> None:
         await self._client.close()
 
+    def enable_budget_protocol(self, camp) -> None:
+        """Bind EEG's opt-in campaign even for backend entrypoints called directly."""
+        from pathlib import Path
+        self._budget_campaign = Path(camp)
+
     async def _complete(self, *, messages: list[dict[str, str]], profile: str,
+                        request_fields: dict | None = None, role: str = "backend_direct",
+                        budget_report: dict | None = None) -> tuple[str, LMUsage]:
+        from react_agent.eeg_research.agentic import owner_budget as budget
+        camp = self._budget_campaign or budget.current_campaign()
+        if camp is None or not budget.enabled(camp):
+            return await self._complete_transport(messages=messages, profile=profile, request_fields=request_fields)
+        from uuid import uuid4
+        from react_agent.eeg_research.agentic.api_policy import reserve_operation_attempt
+        from react_agent.eeg_research.agentic.llm import _reserve_api_intent, _ledger, _price_usage
+        spec = self._profile(profile)
+        bounds = budget.input_token_bound(messages, request_fields, budget_report)
+        current = budget.current_transport(camp)
+        direct = current is None
+        call_id = current[1] if current else uuid4().hex[:12]
+        direct_row = None
+        if direct:
+            import hashlib
+            operation = "backend_" + hashlib.sha256(json.dumps({"messages": messages,
+                "model":spec.model,"max_tokens":spec.max_tokens,"fields":request_fields},sort_keys=True).encode()).hexdigest()
+            direct_row = {"call_id":call_id,"role":role,"requested_model":spec.model,
+                "owner_input_token_bound":bounds,"owner_output_token_bound":spec.max_tokens,
+                "operation_id":operation,"started_at":time.time()}
+            direct_row.update(reserve_operation_attempt(camp, operation=operation, call_id=call_id, metadata=direct_row))
+            _reserve_api_intent(camp, direct_row)
+        try:
+            budget.before_transport(camp, call_id=call_id, role=role, input_bound=bounds, output_bound=spec.max_tokens)
+        except budget.OwnerBudgetError as exc:
+            not_sent = {"transport_outcome":"definitely_not_sent","unconfirmed_charge_possible":False,"success":False,"error":str(exc)}
+            budget.settle_request(camp,call_id,not_sent)
+            if direct_row is not None:
+                _ledger(camp,{**direct_row,**not_sent})
+            raise DeepSeekConfigError(str(exc)) from exc
+        try:
+            with budget.transport_claim(camp,call_id):
+                text, usage = await self._complete_transport(messages=messages, profile=profile, request_fields=request_fields)
+        except (Exception, asyncio.CancelledError) as exc:
+            usage = getattr(exc,"usage",None)
+            if usage is not None:
+                row = usage.model_dump()
+            elif isinstance(exc,DeepSeekConfigError):
+                row = {"transport_outcome":"definitely_not_sent","unconfirmed_charge_possible":False}
+            else:
+                row = {"transport_outcome":"outcome_unknown","unconfirmed_charge_possible":True}
+            _price_usage(row,camp=camp)
+            budget.settle_request(camp, call_id, row)
+            if direct_row is not None:
+                _ledger(camp, {**direct_row,**row,"call_id":call_id})
+            raise
+        usage.call_id = call_id
+        row = usage.model_dump()
+        _price_usage(row,camp=camp)
+        budget.settle_request(camp, call_id, row)
+        if direct_row is not None:
+            _ledger(camp, {**direct_row,**row,"call_id":call_id})
+        return text,usage
+
+    async def _complete_transport(self, *, messages: list[dict[str,str]], profile: str,
                         request_fields: dict | None = None) -> tuple[str, LMUsage]:
         spec = self._profile(profile)
         kwargs: dict[str, Any] = {
@@ -176,6 +239,16 @@ class DeepSeekBackend:
             for name in ("tools", "tool_choice"):
                 if name in request_fields:
                     kwargs[name] = request_fields[name]
+        from react_agent.eeg_research.agentic import owner_budget as budget
+        camp=self._budget_campaign or budget.current_campaign()
+        if camp is not None and budget.enabled(camp):
+            permit=budget.current_transport(camp)
+            if permit is None:
+                raise DeepSeekConfigError("provider_transport_without_owner_claim")
+            try:
+                budget.mark_transport_dispatched(camp,permit[1])
+            except budget.OwnerBudgetError as exc:
+                raise DeepSeekConfigError(str(exc)) from exc
         started = time.perf_counter()
         try:
             request = self._client.chat.completions.create(**kwargs)
@@ -270,11 +343,12 @@ class DeepSeekBackend:
         else:
             messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         if prepared is None:
-            text, usage = await self._complete(messages=messages, profile=profile)
+            text, usage = await self._complete(messages=messages, profile=profile, role=role)
         else:
             text, usage = await self._complete(messages=messages, profile=profile,
-                                                request_fields=prepared.transport_fields)
-        usage.call_id = uuid4().hex[:12]
+                                                request_fields=prepared.transport_fields, role=role,
+                                                budget_report=prepared.budget_report)
+        usage.call_id = usage.call_id or uuid4().hex[:12]
         usage.role = role
         usage.status = "succeeded" if usage.success else "failed"
         try:

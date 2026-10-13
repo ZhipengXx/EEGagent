@@ -567,6 +567,8 @@ def add_role_examples(
     memory: Any = None,
     *,
     max_chars: int = EXAMPLE_CHARS,
+    execution_version: str | None = None,
+    max_count: int | None = None,
 ) -> dict[str, Any]:
     """Add complete deterministic examples within an independent field budget."""
     selectors: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]] = {
@@ -586,6 +588,13 @@ def add_role_examples(
     select = selectors.get(role)
     if select is None:
         return payload
+    max_count = min(1 if execution_version == "single_plan_v1" else EXAMPLE_COUNT,
+                    EXAMPLE_COUNT if max_count is None else max_count)
+    if max_count <= 0:
+        return payload
+    if execution_version == "single_plan_v1" and role == "research_planner":
+        # The concise provider protocol has no legacy action/top-level mirrors.
+        return payload
     field: dict[str, Any] = {"scope": _SCOPE, "examples": []}
     for example in select(payload):
         candidate = {"scope": _SCOPE, "examples": [*field["examples"], example]}
@@ -598,6 +607,6 @@ def add_role_examples(
         )
         if size <= min(max_chars, EXAMPLE_CHARS):
             field = candidate
-        if len(field["examples"]) == EXAMPLE_COUNT:
+        if len(field["examples"]) == max_count:
             break
     return {**payload, "illustrative_examples": field} if field["examples"] else payload

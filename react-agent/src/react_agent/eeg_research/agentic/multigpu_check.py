@@ -55,6 +55,8 @@ def _settle(directory: Path) -> dict:
         state, cost = _read(camp / "campaign_state.json"), _read(camp / "cost.json")
         accounting = {"gpu_seconds_left": float(state["max_gpu_seconds"]) - float(cost.get("gpu_seconds_used") or 0),
                       "gpu_seconds_reserved": 0, "training_jobs": int(state.get("training_jobs") or cost.get("training_jobs") or 0)}
+        from .owner_budget import settle_engineering_gpu
+        settle_engineering_gpu(camp,request["probe_identity"],max(0.0,actual),uncertain=record["status"]=="uncertain")
         charge_gpu(camp, accounting, max(0.0, actual), job_id="engineering_multigpu_" + request["probe_identity"])
     result = {**record, "gpu_seconds": max(0.0, actual), "probe_identity": request["probe_identity"],
               "cost_ledger": str(camp / "cost.json"), "data_scope": "synthetic_training_inputs_only",
@@ -214,6 +216,8 @@ def run_multigpu_check(camp: Path, protocol: dict, *, workspace: Path | None = N
     cap = float(timeout_s) * len(cards)
     if available < cap or timeout_s <= 1:
         return {"ok": False, "status": "blocked", "error": "multigpu_probe_budget_insufficient", "required_gpu_seconds": cap, "available_gpu_seconds": available}
+    from .owner_budget import claim_engineering_gpu
+    claim_engineering_gpu(camp,probe_id,cap)
     # Inventory is read in the actual process environment; mutable occupancy is
     # not confused with the immutable physical UUID/card binding.
     directory.mkdir(parents=True, exist_ok=False)

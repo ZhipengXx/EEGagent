@@ -174,6 +174,14 @@ def reserve_operation_attempt(camp: Path, *, operation: str, call_id: str,
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = camp / ATTEMPTS
         rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.is_file() else []
+        same_call = next((row for row in rows if row.get("call_id") == call_id), None)
+        if same_call:
+            if same_call.get("operation_id") != operation:
+                raise LlmUnavailable("api_call_operation_identity_conflict")
+            if any((metadata or {}).get(key) is not None and same_call.get(key) != (metadata or {}).get(key)
+                   for key in ("role","requested_model","role_config_hash","request_system_sha256","request_user_sha256","input_digest")):
+                raise LlmUnavailable("api_call_request_identity_conflict")
+            return same_call
         used = sum(row["operation_id"] == operation for row in rows)
         if used >= max_attempts:
             raise LlmUnavailable("api_operation_attempt_limit", diagnostics={"operation_id": operation, "actual_attempts": used})
@@ -190,6 +198,23 @@ def reserve_operation_attempt(camp: Path, *, operation: str, call_id: str,
         if authorization is not None:
             row.update(research_authorization_ref=authorization["authorization_hash"],
                        parent_planner_round_id=authorization["parent_planner_round_id"])
+        from .owner_budget import enabled, claim_request, OwnerBudgetError
+        if enabled(camp):
+            report = (metadata or {}).get("context_budget_report") or {}
+            fields = (metadata or {}).get("context_transport_fields") or {}
+            input_bound = (metadata or {}).get("owner_input_token_bound") or report.get("model_tokens_with_safety_margin") or report.get("safe_input_tokens")
+            if input_bound is None:
+                input_bound = max(int(report.get("model_tokens") or 0), int((metadata or {}).get("owner_input_token_bound") or 0))
+            output_bound = fields.get("max_tokens", (metadata or {}).get("owner_output_token_bound"))
+            if type(input_bound) is not int or input_bound < 1 or type(output_bound) is not int or output_bound < 1:
+                raise LlmUnavailable("owner_request_token_bounds_required")
+            try:
+                claim = claim_request(camp, call_id=call_id, operation=operation, role=(metadata or {}).get("role") or "backend_direct",
+                    input_bound=input_bound, output_bound=output_bound)
+            except OwnerBudgetError as exc:
+                raise LlmUnavailable(str(exc)) from exc
+            row.update(budget_owner=claim["owner_id"], resource_claim_id=call_id,
+                owner_input_token_bound=input_bound, owner_output_token_bound=output_bound)
         with path.open("a") as stream:
             stream.write(json.dumps(row) + "\n")
             stream.flush()

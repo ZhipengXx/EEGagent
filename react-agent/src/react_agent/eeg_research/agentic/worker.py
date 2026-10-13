@@ -906,7 +906,9 @@ def build_services(camp: Path) -> dict[str, Any]:
         method_mode = state.get("evaluation_mode") == "loso_method_search"
         screening_mode = method_mode and latest.get("kind") == "method_screening"
         feedback_goal = json.loads((camp_dir / "goal.json").read_text())
-        optional_curation = method_mode and feedback_goal.get("evaluation_schedule") == "screen_then_confirm"
+        from .research_execution import single_plan_enabled, paid_maintenance_mode
+        task_protocol = single_plan_enabled(feedback_goal)
+        optional_curation = task_protocol or (method_mode and feedback_goal.get("evaluation_schedule") == "screen_then_confirm")
         scientific_rows = state.get("evidence") or []
         if method_mode:
             from react_agent.eeg_research.agentic.method_suite import read_aggregate, verified_suite_records
@@ -953,6 +955,13 @@ def build_services(camp: Path) -> dict[str, Any]:
                      and row.get("execution_fingerprint") == latest.get("execution_fingerprint"))
             ],
         }
+        if task_protocol:
+            from .selected_plan import load_plan
+            selected = load_plan(camp_dir, state)
+            if selected:
+                payload["selected_research_task"] = {"plan_id": selected["plan_id"],
+                    **{key: selected["proposal"][key] for key in ("question", "scientific_intent", "evaluation_scope",
+                        "expected_observation", "completion_condition")}}
         from react_agent.eeg_research.agentic.artifacts import request_digest, resolve_verified_artifact
         from react_agent.eeg_research.agentic.handoffs import development_view, load_analysis_views
         from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
@@ -1182,6 +1191,12 @@ def build_services(camp: Path) -> dict[str, Any]:
             # Recovery retries that role with its actual feedback before curation.
             _sync_ledger(camp_dir, state)
             return
+        if task_protocol:
+            # Analysis is already an immutable role artifact. A selected task
+            # records it directly in its observation; optional paid extraction
+            # is scheduled separately by the maintenance policy.
+            _sync_ledger(camp_dir, state)
+            return
         from react_agent.eeg_research.agentic.memory import EpisodeStore
 
         store = EpisodeStore(camp_dir)
@@ -1358,6 +1373,20 @@ def build_services(camp: Path) -> dict[str, Any]:
         latest = next((row for row in reversed(scientific_rows)
                        if row.get("fidelity") and row.get("candidate_id") and "evaluation_valid" in row), None)
         if latest is None:
+            return
+        from .research_execution import single_plan_enabled
+        if single_plan_enabled(camp_dir):
+            from .selected_plan import load_plan
+            selected = load_plan(camp_dir, state)
+            if not selected:
+                return
+            latest = next((row for row in reversed(scientific_rows)
+                if row.get("candidate_id") == selected.get("candidate_id") and row.get("fidelity")
+                and row.get("evaluation_valid") is True), None)
+            if latest is None:
+                return
+            _analyze_run(camp_dir, state, latest, trigger={"kind": "selected_task_measurement",
+                "origin_plan_id": selected["plan_id"], "upstream_evidence_id": latest["evidence_id"]})
             return
         if latest.get("kind") == "method_screening":
             _analyze_run(camp_dir, state, latest, trigger={"kind": "completed_screening",

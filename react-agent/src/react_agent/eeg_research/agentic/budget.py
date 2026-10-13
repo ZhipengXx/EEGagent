@@ -33,7 +33,7 @@ def snapshot(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
     jobs_limit = int(state.get("max_training_jobs") or 0)
     jobs_used = int(state.get("training_jobs") or cost.get("training_jobs") or 0)
     gpu_left = float(state.get("gpu_seconds_left") if state.get("gpu_seconds_left") is not None else max(0.0, gpu_limit - gpu_used - gpu_reserved))
-    return {
+    result = {
         "gpu_seconds_used": gpu_used,
         "gpu_seconds_reserved": gpu_reserved,
         "gpu_seconds_left": gpu_left,
@@ -46,6 +46,13 @@ def snapshot(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
         "training_jobs_limit": jobs_limit,
         "baseline_jobs": int(state.get("baseline_jobs") or 0),
     }
+    from .owner_budget import enabled, snapshot as owner_snapshot, current_owner
+    if enabled(camp):
+        active = current_owner(camp)
+        pointer = state.get("selected_plan") or {}
+        owner_id = active.get("owner_id") if active else pointer.get("continuation_owner") or pointer.get("budget_owner")
+        result["owner_budget"] = owner_snapshot(camp,state,owner_id=owner_id)
+    return result
 
 
 def reserve_gpu(state: dict[str, Any], seconds: float) -> bool:
@@ -76,6 +83,9 @@ def charge_gpu(camp: Path, state: dict[str, Any], seconds: float, *, job_id: str
     if job_id:
         cost["settled_job_ids"] = settled + [job_id]
     cost.setdefault("api_usd", None)
+    if job_id:
+        from .owner_budget import settle_training
+        settle_training(camp, job_id, used)
     _write(camp / COST, cost)
     return True
 
@@ -132,17 +142,25 @@ def reserve_phase(camp: Path, state: dict[str, Any], request: dict[str, Any], *,
         job_reserved = sum(row["remaining_training_jobs"] for row in active)
         gpu_reserved = sum(row["remaining_gpu_seconds"] for row in active)
         call_reserved = sum(row["remaining_llm_calls"] for row in active)
-        if used_jobs + job_reserved + jobs > int(state["max_training_jobs"]):
+        from .owner_budget import enabled, reserve_phase_owner
+        owner_phase = None
+        if enabled(camp):
+            owner_phase = reserve_phase_owner(camp, receipt_id, {"training_jobs":jobs,"gpu_seconds":seconds},
+                replace_owner_id=(previous or {}).get("budget_owner"))
+        if not owner_phase and used_jobs + job_reserved + jobs > int(state["max_training_jobs"]):
             raise ValueError("phase_training_job_reservation_unavailable")
-        if used_gpu + gpu_reserved + seconds > float(state["max_gpu_seconds"]):
+        if not owner_phase and used_gpu + gpu_reserved + seconds > float(state["max_gpu_seconds"]):
             raise ValueError("phase_gpu_reservation_unavailable")
-        if used_calls + call_reserved + calls > int(state["max_llm_calls"]):
+        if not owner_phase and used_calls + call_reserved + calls > int(state["max_llm_calls"]):
             raise ValueError("phase_feedback_api_reservation_unavailable")
         receipt = {"receipt_id": receipt_id, "request": request, "request_hash": identity(request),
                    "status": "active", "remaining_training_jobs": jobs, "remaining_gpu_seconds": seconds,
                    "remaining_llm_calls": calls, "consumed_job_ids": [], "released_reason": None,
                    "job_gpu_estimates": {}, "settled_phase_job_ids": [],
                    "usage_at_admission": {"training_jobs": used_jobs, "llm_calls": used_calls, "gpu_seconds": used_gpu}}
+        if owner_phase:
+            receipt.update(budget_owner=owner_phase["owner_id"], allocation_kind="selected_plan_child",
+                feedback_api_authority="selected_plan_role_allocations")
         ledger["receipts"][receipt_id] = receipt
         if previous:
             previous.update(status="released", released_reason="superseded_by_explicit_failed_process_retry",
@@ -174,6 +192,9 @@ def consume_phase_job(camp: Path, receipt_id: str, job_id: str, gpu_estimate: fl
             return
         if row["status"] != "active" or row["remaining_training_jobs"] <= 0:
             raise ValueError("phase_launch_without_available_reservation")
+        from .owner_budget import enabled, claim_training
+        if enabled(camp):
+            claim_training(camp, job_id, gpu_estimate, phase_owner_id=row.get("budget_owner"))
         row["consumed_job_ids"].append(job_id)
         row["remaining_training_jobs"] -= 1
         # Keep a running/unknown process's GPU reservation until native settle.
@@ -227,6 +248,9 @@ def release_phase(camp: Path, state: dict[str, Any], receipt_id: str, reason: st
             unsettled = set(row["consumed_job_ids"]) - set(row.get("settled_phase_job_ids", []))
             if unsettled:
                 raise ValueError("phase_release_requires_process_cost_reconciliation")
+            if row.get("budget_owner"):
+                from .owner_budget import release_phase_owner
+                release_phase_owner(camp,row["budget_owner"])
             row.update(status="released", released_reason=reason, remaining_training_jobs=0,
                        remaining_gpu_seconds=0.0, remaining_llm_calls=0)
             ledger["receipts"][receipt_id] = row

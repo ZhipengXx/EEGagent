@@ -186,6 +186,95 @@ class PlannerProposal(PlannerActionPayload):
     ranking: list[str] = Field(default_factory=list, max_length=4)
 
 
+class ResearchExecutionConfig(DomainOutput):
+    """Explicit opt-in; frozen legacy campaigns keep their action protocol."""
+    version: Literal["single_plan_v1"]
+    target_k: int = Field(default=3, ge=2, le=4)
+    allow_degraded_singleton: bool = False
+    proposal_correction_calls: int = Field(default=1, ge=0, le=1)
+    max_planner_api_attempts: int = Field(default=2, ge=1, le=6)
+    max_engineering_repairs: int = Field(default=2, ge=0, le=2)
+    paid_maintenance: Literal["off", "emergency", "batch"] | None = None
+    budget: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResearchPlanProposal(DomainOutput):
+    proposal_id: str = Field(min_length=1, max_length=100)
+    task_kind: Literal["new_method", "confirmation", "diagnosis", "validation"]
+    question: str = Field(min_length=1, max_length=1200)
+    task_description: str = Field(min_length=1, max_length=2500)
+    target_candidate_ref: str | None = None
+    scientific_intent: str = Field(min_length=1, max_length=2000)
+    evaluation_scope: dict[str, Any]
+    expected_observation: str = Field(min_length=1, max_length=1200)
+    completion_condition: str = Field(min_length=1, max_length=1200)
+    required_context_refs: list[str] = Field(default_factory=list, max_length=8)
+    cost_assessment: dict[str, Any] = Field(default_factory=dict)
+    value_rationale: str = Field(min_length=1, max_length=1500)
+
+
+class ResearchPlanEvaluation(DomainOutput):
+    proposal_id: str = Field(min_length=1)
+    rank: int = Field(ge=1, le=4)
+    value_rationale: str = Field(min_length=1, max_length=1500)
+    implementation_risk: str = Field(min_length=1, max_length=1000)
+
+
+class ResearchRoundDraft(DomainOutput):
+    """Provider drafts have no duplicate selected action or execution metadata."""
+    protocol_version: Literal["research_plan_draft.v1"]
+    proposals: list[Any] = Field(max_length=4)
+    evaluations: list[Any] = Field(max_length=4)
+    selected_proposal_id: str | None = None
+    selection_rationale: str = Field(min_length=1, max_length=1800)
+
+
+class ResearchRound(DomainOutput):
+    round_id: str
+    input_observation_ids: list[str]
+    input_observation_digest: str
+    target_k: int = Field(ge=2, le=4)
+    proposals: list[dict[str, Any]]
+    evaluations: list[dict[str, Any]]
+    selected_proposal_id: str | None
+    pool_status: Literal["complete", "incomplete", "degraded_singleton", "no_feasible_plan"]
+    valid_count: int = Field(ge=0, le=4)
+    shortfall_reason: str | None = None
+    selection_rationale: str = ""
+    selection_source: str | None = None
+    validation_records: list[dict[str, Any]] = Field(default_factory=list)
+    raw_digest: str
+
+
+class SelectedPlan(DomainOutput):
+    plan_id: str
+    originating_round: str
+    originating_proposal: str
+    proposal: ResearchPlanProposal
+    scientific_intent_digest: str
+    candidate_id: str | None = None
+    source_hash: str | None = None
+    spec_hash: str | None = None
+    method_revision: str | None = None
+    approved_scientific_digest: str | None = None
+    budget_owner: str
+    recovery_limits: dict[str, Any]
+    status: Literal["selected", "preparing", "implementing", "checking", "repairing",
+                    "executing_measurement", "collecting_observation", "observation_ready",
+                    "paused", "blocked", "failed", "cancelled", "needs_replan"] = "selected"
+    current_step: str = "prepare"
+    repair_count: int = Field(default=0, ge=0)
+    attempt: int = Field(default=0, ge=0)
+    step_receipts: list[dict[str, Any]] = Field(default_factory=list)
+    input_evidence_ids: list[str] = Field(default_factory=list)
+    measurement_evidence_id: str | None = None
+    analysis_artifact_ref: str | None = None
+    terminal_observation_id: str | None = None
+    terminal_observation_digest: str | None = None
+    continuation_owner: str | None = None
+    engineering_failure: dict[str, Any] | None = None
+
+
 class MethodEvidencePacket(DomainOutput):
     question: Any = None
     search_scope: str = "local_method_cards"
@@ -455,10 +544,15 @@ class GoalSpec(BaseModel):
     max_gpu_seconds: float
     max_concurrent_training_jobs: int = 1
     max_api_usd: float | None = None
+    max_input_tokens: int | None = Field(default=None, ge=0)
+    max_output_tokens: int | None = Field(default=None, ge=0)
+    max_total_tokens: int | None = Field(default=None, ge=0)
     max_repairs_per_candidate: int = 2
     require_audit_before_completion: bool = False
     planner_mode: Literal["single_action", "compare_options"] = "compare_options"
     action_planning: ActionPlanningConfig | None = None
+    research_execution: ResearchExecutionConfig | None = None
+    paid_maintenance: Literal["off", "emergency", "batch"] | None = None
     api_request_policy: dict[str, Any] = Field(default_factory=dict)
     allowed_training_actions: list[Literal["run_pilot", "run_full", "replicate", "run_screening", "run_confirmation"]] = Field(
         default_factory=lambda: ["run_pilot", "run_full", "replicate"]
@@ -471,6 +565,8 @@ class GoalSpec(BaseModel):
 
     @model_validator(mode="after")
     def role_and_recovery_settings(self):
+        from .research_execution import paid_maintenance_mode
+        paid_maintenance_mode(self.model_dump())
         from react_agent.eeg_research.agentic.api_policy import validate_api_request_policy
         validate_api_request_policy(self.api_request_policy)
         from react_agent.eeg_research.agentic.role_config import ROLES, resolve_role_config

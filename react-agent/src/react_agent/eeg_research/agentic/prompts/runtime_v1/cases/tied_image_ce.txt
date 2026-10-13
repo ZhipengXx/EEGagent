@@ -1,0 +1,1 @@
+For an approved tied-image cross entropy task, use the current approved class/positive identity and specified classifier-sharing definition. Read the actual feature and training caller; tie parameters exactly where promised. Verify intended gradient flow and evaluation behavior. Keep the original loss/reductions when the approved switch disables this intervention.

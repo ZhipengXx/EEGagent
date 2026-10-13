@@ -86,6 +86,9 @@ def create_manifest(camp: Path, design, *, allow_shared_gpus: bool = False, esti
             "metric": METRIC, "metric_unit": "fraction", "aggregation": "macro_mean", "ddof": 0,
             "search_scope": "inter_subject_development_benchmark", "independent_final_test": False}
     goal = goal if goal is not None else (read(camp / "goal.json") if (camp / "goal.json").exists() else {})
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(goal):
+        body["research_execution_version"] = "single_plan_v1"
     if goal.get("evaluation_schedule") == "screen_then_confirm":
         from react_agent.eeg_research.agentic.screening import freeze_selection, SCIENCE_SCOPE
         selection = freeze_selection(goal)
@@ -658,12 +661,22 @@ def scientific_feedback_records(camp: Path, state: dict, row: dict) -> dict:
     return records
 
 
+def required_scientific_feedback(camp: Path, state: dict, row: dict) -> set[str]:
+    """A matched control is native evidence, not another paid research task."""
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(camp):
+        selected = state.get("selected_plan") or {}
+        if row.get("candidate_id") == "baseline" and selected.get("candidate_id") not in {None, "baseline"}:
+            return set()
+        return {"analysis"}
+    return {"analysis"} if manifest(camp).get("evaluation_schedule") == "screen_then_confirm" else {"analysis", "curation"}
+
+
 def complete_scientific_feedback(camp: Path, state: dict, row: dict, services: dict) -> None:
     """Recover the method's original role chain before the next Planner call."""
     from react_agent.eeg_research.agentic.loop import _write, save_state
     records = scientific_feedback_records(camp, state, row)
-    staged = manifest(camp).get("evaluation_schedule") == "screen_then_confirm"
-    required = {"analysis"} if staged else {"analysis", "curation"}
+    required = required_scientific_feedback(camp, state, row)
     if not required <= set(records):
         if not services.get("analyze"):
             raise ValueError("method_suite_scientific_feedback_service_missing")
@@ -678,6 +691,9 @@ def complete_scientific_feedback(camp: Path, state: dict, row: dict, services: d
     key = "screening_feedback" if row.get("kind") == "method_screening" else "scientific_feedback"
     progress[key] = {"status": "complete", "suite_hash": row["suite_hash"], **records,
                      "curation_status": "degraded" if (records.get("curation") or {}).get("degraded") else "complete" if "curation" in records else "curation_pending"}
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(camp):
+        progress[key].update(required_stages=sorted(required), native_control_only=not required)
     _write(path, progress)
 
 
@@ -743,9 +759,9 @@ def _audit_full(camp: Path, state: dict) -> dict:
             for bound in freeze["dependencies"]:
                 add(Path(bound["path"]), sha256=bound["sha256"])
         feedback = scientific_feedback_records(camp, state, row)
-        if set(feedback) != {"analysis", "curation"}:
+        if not required_scientific_feedback(camp, state, row) <= set(feedback):
             raise ValueError("method_audit_scientific_feedback_incomplete")
-        for stage in ("analysis", "curation"):
+        for stage in feedback:
             verified = development_artifact(camp, feedback[stage]["artifact_id"])
             artifact = resolve_verified_artifact(camp, verified["artifact_id"])
             add(Path(artifact["path"]), sha256=verified["sha256"], kind=stage)
@@ -857,6 +873,10 @@ def _advance_full(camp: Path, state: dict, services: dict) -> bool:
         if phased:
             intent.update(phase=progress["phase"], phase_receipt_id=state["phase_reservation_id"],
                           canonical_fold_hash=fold["canonical_fold_identity"]["canonical_hash"])
+        if not phased:
+            from .owner_budget import enabled as owner_enabled, claim_training
+            if owner_enabled(camp):
+                claim_training(camp,job_id,manifest(camp)["gpu_seconds_estimate_per_suite"] / 10)
         write_once(job / "launch_intent.json", intent)
         progress["jobs"][fold_id] = job_id
         progress["status"] = "running"

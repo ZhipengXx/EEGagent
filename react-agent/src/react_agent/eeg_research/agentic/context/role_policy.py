@@ -36,6 +36,7 @@ CONTROL_FIELDS = frozenset({
     "evaluation_mode", "evaluation_schedule", "scientific_unit", "science_scope", "screening_evidence_scope",
     "full_required_fold_count", "declared_full_primary_metric", "primary_metric", "state", "authoritative_state",
     "task", "intent", "permissions", "resources", "frontier", "active_tasks", "pending_tasks", "current_feedback",
+    "selected_research_task", "origin_plan_id", "selected_plan",
 })
 FACT_FIELDS = frozenset({"evidence", "method_screenings", "method_suites", "method_suite", "run", "metrics",
     "diagnostics", "verified_training_diagnostics", "latest_comparison", "latest_diagnostics", "checks",
@@ -59,7 +60,7 @@ MISSIONS = {
 SHARED_REQUIRED = frozenset({"goal", "contract", "budget", "permissions", "resources", "state",
     "authoritative_state", "task", "intent", "current_feedback", "candidate_id", "pending_tasks", "active_tasks",
     "execution_fingerprint", "contract_fingerprint", "evaluation_mode", "evaluation_schedule", "science_scope",
-    "screening_evidence_scope", "full_required_fold_count", "benchmark_permission"})
+    "screening_evidence_scope", "full_required_fold_count", "benchmark_permission", "selected_research_task", "origin_plan_id"})
 ROLE_REQUIRED = {
     "research_planner": CONTROL_FIELDS | frozenset({"evidence", "method_screenings", "method_suites", "latest_comparison", "checks", "research_progress", "controller_state"}),
     "candidate_coder": frozenset({"candidate_interface", "implementation_source", "source", "code", "approved_spec", "experiment", "repair_task", "checks", "candidate_checks", "implementation_lifecycle"}),
@@ -75,11 +76,21 @@ ROLE_REQUIRED = {
 }
 
 
-def role_policy(role: str) -> RolePolicy:
+def role_policy(role: str, *, execution_version: str | None = None) -> RolePolicy:
     if role not in MISSIONS:
         raise KeyError("policy_missing:" + role)
     full = frozenset({"implementation_source", "code", "source"}) if role == "candidate_coder" else frozenset()
-    return RolePolicy(role, MISSIONS[role], SHARED_REQUIRED | ROLE_REQUIRED[role], full)
+    required = SHARED_REQUIRED | ROLE_REQUIRED[role]
+    if execution_version == "single_plan_v1" and role == "research_planner":
+        from ..experiment_observations import HISTORY_FIELDS
+        # Present current facts via exact native cards; full historical trees
+        # remain registered/readable rather than compulsory literal payloads.
+        required = (required - HISTORY_FIELDS) | frozenset({"experiment_observations", "history_navigation", "context_delivery_version"})
+    mission = MISSIONS[role]
+    if execution_version == "single_plan_v1" and role == "research_planner":
+        mission = "Compare 2–4 bounded research tasks against current observation cards, costs and permissions; select one task to feedback."
+    return RolePolicy(role, mission, required, full,
+        version=POLICY_VERSION + (".single_plan_v1" if execution_version == "single_plan_v1" else ""))
 
 
 def prompt_rule_map() -> dict[str, str]:

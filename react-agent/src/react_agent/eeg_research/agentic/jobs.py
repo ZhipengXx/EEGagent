@@ -142,6 +142,8 @@ def start_job(
     )
     if frozen:
         persist_frozen_run_spec(job_dir, frozen)
+    from .owner_budget import training_launch_admission
+    owner_launch = training_launch_admission(camp,job_dir.name,max(1,len(run_design.gpu)),now=time.time())
     log = (job_dir / "train.log").open("wb")
     proc = subprocess.Popen(  # noqa: S603
         command,
@@ -153,6 +155,8 @@ def start_job(
     )
     n_gpu = max(1, len(run_design.gpu))
     deadline = wall_deadline(float(state.get("gpu_seconds_left") or 0.0), n_gpu, now=time.time())
+    if owner_launch:
+        deadline = owner_launch["deadline_at"] if deadline is None else min(deadline,owner_launch["deadline_at"])
     record = {
         "job_id": job_dir.name,
         "candidate_id": candidate_id,
@@ -167,6 +171,7 @@ def start_job(
         "nonce": uuid.uuid4().hex,
         "started_at": time.time(),
         "deadline_at": deadline,
+
         "status": "running",
         "manifest": manifest,
         "command": command,
@@ -176,6 +181,8 @@ def start_job(
         "protocol_path": None if protocol_path is None else str(protocol_path.resolve()),
         "source_hash": manifest.get("entry_sha256") if isinstance(manifest, dict) else None,
     }
+    if owner_launch:
+        record.update(budget_owner=owner_launch["budget_owner"],owner_gpu_seconds_bound=owner_launch["gpu_seconds_bound"])
     (job_dir / "job.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return record
 

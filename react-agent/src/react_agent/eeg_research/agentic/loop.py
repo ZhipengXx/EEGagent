@@ -193,6 +193,10 @@ def create_campaign(
         "decisions": [],
         "pause_after_step": False,
     }
+    if goal.get("research_execution") is not None:
+        from .schemas import ResearchExecutionConfig
+        goal["research_execution"] = ResearchExecutionConfig.model_validate(goal["research_execution"]).model_dump()
+        state["research_execution"] = goal["research_execution"]
     from react_agent.eeg_research.agentic.candidate_lifecycle import enabled
     if enabled(goal):
         from react_agent.eeg_research.agentic.schemas import ActionPlanningConfig
@@ -442,12 +446,19 @@ def _recover_decision_reads(camp: Path, state: dict[str, Any]) -> None:
             if any(previous[key] != record.get(key) for key in keys if key in previous):
                 raise ValueError("decision_state_identity_conflict:" + path.stem)
         if record.get("decision_schema_version"):
-            if (record.get("decision_schema_version") not in {"eeg_research.decision.v2", "eeg_research.decision.v3"}
+            if (record.get("decision_schema_version") not in {"eeg_research.decision.v2", "eeg_research.decision.v3", "eeg_research.decision.plan_step.v1"}
                     or record.get("campaign_id") != state.get("goal_id")
                     or record.get("raw_digest") != request_digest(request=raw)):
                 raise ValueError("decision_content_identity_conflict:" + path.stem)
         legacy_completion = None
         validation_raw = raw
+        if record.get("decision_schema_version") == "eeg_research.decision.plan_step.v1":
+            from .research_execution import single_plan_enabled
+            from .selected_plan import verify_step_history
+            if not single_plan_enabled(camp):
+                raise ValueError("selected_plan_protocol_not_enabled")
+            validation_raw = body.get("execution")
+            verify_step_history(camp, record, validation_raw)
         if record.get("decision_schema_version") == "eeg_research.decision.v3":
             validation_raw = body.get("execution")
             if not isinstance(validation_raw, dict) or record.get("execution_digest") != request_digest(request=validation_raw):
@@ -949,6 +960,10 @@ def observation(camp: Path) -> dict[str, Any]:
                 public["previous_planner_failure"] = {"decision_id": decision_id, "raw_digest": last["raw_digest"],
                     "detail": last.get("detail"), "raw": _correction_view(raw),
                     "scope": "historical failed input; revalidate all choices against current observation, not execution authority"}
+    if goal.get("research_execution") is not None:
+        public.update(research_execution=goal["research_execution"], selected_plan=state.get("selected_plan"),
+            terminal_observation_id=state.get("terminal_observation_id"),
+            terminal_observation_digest=state.get("terminal_observation_digest"))
     return public
 
 
@@ -969,11 +984,34 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     if state.get("pause_after_step") and not state.get("live_job") and state.get("status") not in _TERMINAL:
         state["status"] = "paused"
         save_state(camp, state)
+        from .research_execution import single_plan_enabled
+        if single_plan_enabled(camp):
+            from .selected_plan import reflect_control
+            reflect_control(camp, state)
         return state
     if state.get("status") in _TERMINAL:
+        from .research_execution import single_plan_enabled
+        if single_plan_enabled(camp):
+            from .selected_plan import reflect_control
+            reflect_control(camp, state)
         if (state.get("failure") or {}).get("phase") == "recovery":
             save_state(camp, state)
         return state
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(camp):
+        from .selected_plan import tick_selected_plan, reflect_control
+        try:
+            return tick_selected_plan(camp, state, backend, services, runner)
+        except (LlmUnavailable, OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            from .selected_plan import finish_bounded_engineering_failure
+            bounded = finish_bounded_engineering_failure(camp, state, exc)
+            if bounded is not None:
+                return bounded
+            persist_failure(camp, state, phase="selected_plan", error_type=str(exc), detail=str(exc),
+                            recoverable=True, diagnostics=getattr(exc, "diagnostics", None))
+            save_state(camp, state)
+            reflect_control(camp, state)
+            return state
     if state.get("evaluation_mode") == "loso_method_search":
         from react_agent.eeg_research.agentic.budget_inheritance import validate_inheritance
         from react_agent.eeg_research.agentic.method_suite import advance
@@ -1276,9 +1314,15 @@ def _apply_action(
     state["status"] = "planning"
     raw = (decision.get("execution") if isinstance(decision.get("execution"), dict) else
            decision.get("raw") if isinstance(decision.get("raw"), dict) else _decision_raw(camp, str(decision.get("decision_id") or "")))
+    from .selected_plan import verify_internal_decision
+    internal_plan = verify_internal_decision(camp, state, decision)
     if obs.get("planner_mode") == "compare_options" or any(raw.get(key) for key in ("options", "read_requests", "resolves_issue_ids", "report_revision")) or action == "revise_report":
         from react_agent.eeg_research.agentic.planner import _parse, validate_comparison_and_reads
         live = observation(camp)
+        if internal_plan is not None:
+            # A persisted selected-task intent replaces only outer comparison;
+            # native target/source/scope/read/budget gates below still apply.
+            live["planner_mode"] = "single_action"
         # Reconcile paid calls and persisted resource/target changes before
         # execution. A smaller remaining budget is never overwritten by a stale
         # in-memory planning snapshot.
@@ -1706,6 +1750,14 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
         delivery = standalone_delivery(bundle)
         if delivery is not None:
             context["retrieved_memory"] = delivery
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(camp):
+        from .selected_plan import load_plan
+        selected = load_plan(camp, state)
+        if selected:
+            context["selected_research_task"] = {"plan_id": selected["plan_id"],
+                **{key: selected["proposal"][key] for key in ("question", "task_description", "scientific_intent",
+                    "evaluation_scope", "expected_observation", "completion_condition")}}
     return context
 
 
@@ -2589,6 +2641,19 @@ def _launch(
         return
     if training_seed is not None:
         state["pending_training_seed"] = training_seed
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(camp):
+        from .owner_budget import claim_training, current_owner
+        owner = current_owner(camp)
+        allocation = (owner or {}).get("allocated") or {}
+        jobs_bound, gpu_bound = allocation.get("training_jobs"), allocation.get("gpu_seconds")
+        if not jobs_bound or not gpu_bound:
+            raise ValueError("selected_plan_training_bound_missing")
+        claim_training(camp, job_id, float(gpu_bound) / int(jobs_bound))
+        _write(job_dir / "controller_launch_intent.json", {
+            "job_id": job_id, "candidate_id": candidate_id, "fidelity": fidelity,
+            "training_seed": training_seed, "origin_plan_id": (state.get("selected_plan") or {}).get("plan_id"),
+            "budget_owner": (state.get("selected_plan") or {}).get("budget_owner")}, exclusive=True)
     record = services["launch"](camp, state, job_id, candidate_id, fidelity)
     state.pop("pending_training_seed", None)
     if (record.get("status") or "running") != "running":
@@ -2629,6 +2694,17 @@ def _train(
     raw: dict[str, Any] | None = None,
 ) -> None:
     from react_agent.eeg_research.agentic.planner import training_actions
+
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(camp):
+        from .selected_plan import load_plan
+        selected = load_plan(camp, state)
+        if (selected is None or selected.get("status") in {"failed", "cancelled", "needs_replan", "observation_ready"}
+                or selected.get("current_step") != "measure"
+                or (raw or {}).get("target_id") != selected.get("candidate_id")):
+            raise ValueError("measurement_requires_active_selected_plan")
+        if action == "run_confirmation" and selected["proposal"]["task_kind"] != "confirmation":
+            raise ValueError("confirmation_requires_explicit_selected_plan")
 
     if action not in training_actions(_read(camp / "goal.json")):
         persist_failure(camp, state, phase="train", error_type="training_action_outside_goal",

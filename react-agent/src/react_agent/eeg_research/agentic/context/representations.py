@@ -19,7 +19,7 @@ FAILURE_WORDS = ("error", "fail", "conflict", "unknown", "partial", "unverified"
 
 
 def source_kind(key: str, payload: Any) -> str:
-    if key in {"evidence", "metrics", "method_screenings", "method_suites", "method_suite", "run", "scores", "diagnostics", "facts", "results", "evaluation"}:
+    if key in {"experiment_observations", "evidence", "metrics", "method_screenings", "method_suites", "method_suite", "run", "scores", "diagnostics", "facts", "results", "evaluation"}:
         return "scientific"
     if "check" in key or "receipt" in key:
         return "checks"

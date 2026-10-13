@@ -15,7 +15,9 @@ DETACHMENTS = "candidate_detachments.jsonl"
 
 
 def enabled(goal: dict) -> bool:
-    return goal.get("evaluation_schedule") == "screen_then_confirm" or goal.get("action_planning") is not None
+    from .research_execution import single_plan_enabled
+    return (goal.get("evaluation_schedule") == "screen_then_confirm" or goal.get("action_planning") is not None
+            or single_plan_enabled(goal))
 
 
 def _read(path: Path) -> dict:
@@ -221,7 +223,17 @@ def detach_failed_candidate(camp: Path, state: dict, candidate_id: str, reason: 
         raise ValueError("candidate_detach_requires_local_failed_candidate")
     repair = state.get("repair_task") or {}
     if repair.get("candidate_id") == candidate_id and int(repair.get("remaining") or 0) > 0:
-        raise ValueError("candidate_detach_has_bounded_repair_remaining")
+        from .research_execution import single_plan_enabled
+        plan_exhausted = False
+        if single_plan_enabled(camp):
+            from .selected_plan import engineering_budget_failure, load_plan
+            selected = load_plan(camp, state)
+            plan_exhausted = bool(selected and selected.get("candidate_id") == candidate_id
+                and selected.get("status") == "failed" and selected.get("terminal_observation_id")
+                and (selected.get("repair_count", 0) >= selected["recovery_limits"]["max_engineering_repairs"]
+                     or engineering_budget_failure((selected.get("engineering_failure") or {}).get("error"))))
+        if not plan_exhausted:
+            raise ValueError("candidate_detach_has_bounded_repair_remaining")
     from .task_ledger import _append as append_task
     tasks = {}
     ledger = camp / "task_ledger.jsonl"

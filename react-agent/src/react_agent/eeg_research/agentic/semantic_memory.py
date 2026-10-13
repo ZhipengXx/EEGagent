@@ -338,6 +338,9 @@ def build_query(camp: Path, *, state: dict | None = None, experiment: dict | Non
 
 
 def _search_text(kind: str, body: dict) -> str:
+    if kind == "experiment_observation":
+        from .experiment_observations import observation_search_text
+        return observation_search_text(body)
     scope = body.get("conditions") if kind == "lesson" else body.get("preconditions")
     scope = scope or {}
     # The old goal_id is an applicability identity, not semantic text.
@@ -347,7 +350,7 @@ def _search_text(kind: str, body: dict) -> str:
     return description + ("\nApplicable scope: " + canonical(readable) if readable else "")
 
 
-def candidates(camp: Path, config: MemoryConfig, context: dict | None = None) -> list[dict]:
+def candidates(camp: Path, config: MemoryConfig, context: dict | None = None, *, query: str = "") -> list[dict]:
     from react_agent.eeg_research.agentic.memory import EpisodeStore, query_lessons
 
     require_eeg_campaign(camp)
@@ -421,6 +424,25 @@ def candidates(camp: Path, config: MemoryConfig, context: dict | None = None) ->
                          "content_hash": skill["content_hash"], "source_refs": skill["source_manifest"],
                          "applicability": "procedural_hint", "precondition_status": label,
                          "condition_differences": differences, "body": skill["payload"]})
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(camp):
+        from .experiment_observations import ExperimentObservationStore
+        # Current cards precede old lesson navigation; no paid extraction needed.
+        observation_store = ExperimentObservationStore(camp)
+        observations = observation_store.records(limit=MAX_CANDIDATES, query=query) if query.strip() else []
+        recent = observation_store.records(limit=16 if query.strip() else MAX_CANDIDATES)
+        known = {row["record_id"] for row in observations}
+        observations += [row for row in recent if row["record_id"] not in known]
+        for record in observations:
+            facts = record["body"].get("native_facts") or {}
+            identity = record["body"].get("identity") or {}
+            conditions = {key: facts.get(key, identity.get(key)) for key in ("scope", "seed", "modality", "dataset")}
+            differences = {key: {"record": value, "current": context[key]} for key, value in conditions.items()
+                if value is not None and context.get(key) is not None and canonical(value) != canonical(context[key])}
+            unknown = [key for key, value in conditions.items() if value is not None and context.get(key) is None]
+            record["applicability"] = "analogy_only" if differences else "applicability_unknown" if unknown else "compatible_evidence"
+            record["condition_differences"] = {"mismatch": differences, "unknown": unknown}
+        rows = observations + rows
     rows = rows[:MAX_CANDIDATES]
     for row in rows:
         row["search_text"] = _search_text(row["record_type"], row["body"])
@@ -523,7 +545,7 @@ def _fit_delivery(bundle: dict, *, standalone: bool = False) -> tuple[dict | Non
             # A long entry may still be useful through an explicitly partial
             # record card.  Preserve the original body in SQLite; this view
             # does not claim a full read or semantic coverage.
-            partial = copy.deepcopy(item.get("body") if item["record_type"] == "skill" else body)
+            partial = copy.deepcopy(item.get("body") if item["record_type"] != "lesson" else body)
             selected_ranges = {}
             for key in ("statement", "description_en", "trigger_en", "summary_zh"):
                 if isinstance(partial.get(key), str) and len(partial[key]) > 1200:
@@ -535,7 +557,7 @@ def _fit_delivery(bundle: dict, *, standalone: bool = False) -> tuple[dict | Non
                 trial["items"][-1]["representation"] = {"kind": "partial_record_card", "selected_ranges": selected_ranges,
                     "full_record_id": item["record_id"], "full_record_hash": item["content_hash"],
                     "complete": False, "actual_read": False}
-                if item["record_type"] == "skill":
+                if item["record_type"] != "lesson":
                     trial["items"][-1]["body"] = partial
                 else:
                     trial["lessons"][item["applicability"]][-1] = partial
@@ -572,7 +594,11 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
     try:
         require_eeg_campaign(camp)
         context = build_context(camp, state=state, experiment=experiment)
-        records = candidates(camp, config, context)
+        records = candidates(camp, config, context, query=query)
+        from .research_execution import single_plan_enabled
+        if single_plan_enabled(camp) and role == "research_planner":
+            # Engineering procedures belong to Coder/Reviewer, not every round.
+            records = [row for row in records if row["record_type"] != "skill"]
         bundle.update(candidate_count=len(records), indexing={"indexed": 0, "reused": 0, "pending": len(records), "failed": 0})
         backend = backend_for(config)
         store = SidecarStore(camp)
@@ -620,7 +646,7 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
         for _, _, _, row, score in ranked[:max(0, min(config.top_k, 32))]:
             item = {k: copy.deepcopy(v) for k, v in row.items() if k not in {"search_text", "text_hash", "body", "embedding_chunks"}}
             item["cosine_score"] = score
-            if row["record_type"] == "skill":
+            if row["record_type"] in {"skill", "experiment_observation"}:
                 item["body"] = copy.deepcopy(row["body"])
             bundle["items"].append(item)
             if row["record_type"] == "lesson":

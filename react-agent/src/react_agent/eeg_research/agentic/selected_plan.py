@@ -1,0 +1,620 @@
+"""Persistent selected-task executor inside the native campaign tick.
+
+The outer Planner runs once per observation. Existing native design, approval,
+implementation, repair, suite, job and Analyst services implement internal steps.
+"""
+from __future__ import annotations
+
+import contextlib
+import copy
+import json
+import time
+from pathlib import Path
+from typing import Any
+
+from .action_planning import digest
+from .plan_protocol import (config, decide_research_plan, measurement_action,
+                            proposal_cost, round_id, round_input, scientific_projection)
+from .research_execution import single_plan_enabled
+from .schemas import SelectedPlan
+
+TERMINAL = {"observation_ready", "failed", "cancelled", "needs_replan"}
+
+
+def _path(camp: Path, plan_id: str) -> Path:
+    if not plan_id.startswith("plan_") or any(c not in "0123456789abcdef" for c in plan_id[5:]):
+        raise ValueError("selected_plan_identity_invalid")
+    return camp / "selected_plans" / (plan_id + ".json")
+
+
+def load_plan(camp: Path, state: dict | None = None) -> dict | None:
+    from .loop import _read, load_state
+    state = state if state is not None else load_state(camp)
+    pointer = state.get("selected_plan") or {}
+    plan_id = pointer.get("plan_id") if isinstance(pointer, dict) else pointer
+    if not plan_id:
+        active = [_read(path) for path in (camp / "selected_plans").glob("plan_*.json")]
+        active = [row for row in active if row.get("status") not in TERMINAL]
+        if len(active) > 1:
+            raise ValueError("multiple_active_selected_plans")
+        if not active:
+            return None
+        plan_id = active[0]["plan_id"]
+    row = _read(_path(camp, str(plan_id)))
+    if not row:
+        raise ValueError("selected_plan_projection_missing")
+    projected = SelectedPlan.model_validate(row).model_dump()
+    journal = camp / "selected_plans" / (str(plan_id) + ".receipts.jsonl")
+    if journal.is_file():
+        for line in journal.read_text(encoding="utf-8").splitlines():
+            receipt = json.loads(line)
+            sequence = receipt.get("sequence")
+            if receipt.get("plan_id") != plan_id or type(sequence) is not int:
+                raise ValueError("selected_plan_receipt_identity_invalid")
+            if sequence < len(projected["step_receipts"]):
+                if projected["step_receipts"][sequence] != receipt:
+                    raise ValueError("selected_plan_receipt_projection_conflict")
+            elif sequence == len(projected["step_receipts"]):
+                projected["step_receipts"].append(receipt)
+            else:
+                raise ValueError("selected_plan_receipt_sequence_gap")
+    return projected
+
+
+def save_plan(camp: Path, state: dict, plan: dict) -> None:
+    from .loop import _write, save_state
+    plan = SelectedPlan.model_validate(plan).model_dump()
+    _write(_path(camp, plan["plan_id"]), plan)
+    state["selected_plan"] = {key: plan.get(key) for key in (
+        "plan_id", "budget_owner", "candidate_id", "status", "current_step", "repair_count",
+        "terminal_observation_id", "terminal_observation_digest", "continuation_owner")}
+    save_state(camp, state)
+
+
+def _receipt(camp: Path, plan: dict, kind: str, **fields: Any) -> None:
+    row = {"receipt_id": "plan_receipt_" + digest({"plan": plan["plan_id"], "sequence": len(plan["step_receipts"]),
+        "kind": kind, "fields": fields})[:24], "plan_id": plan["plan_id"], "kind": kind,
+        "sequence": len(plan["step_receipts"]), "time": time.time(), **fields}
+    path = camp / "selected_plans" / (plan["plan_id"] + ".receipts.jsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+    plan["step_receipts"].append(row)
+
+
+def reflect_control(camp: Path, state: dict) -> None:
+    plan = load_plan(camp, state)
+    if not plan or plan["status"] in TERMINAL:
+        return
+    status = state.get("status")
+    if status in {"paused", "cancelled", "blocked"} and plan["status"] != status:
+        _receipt(camp, plan, "control", status=status, current_step=plan["current_step"],
+                 detail=state.get("detail"))
+        plan["status"] = status
+        save_plan(camp, state, plan)
+        if status == "cancelled" and not state.get("live_job") and not state.get("active_suite"):
+            try:
+                _finish(camp, state, plan, "cancelled", detail="user_cancelled")
+            except ValueError as exc:
+                # Cancellation is final authority; unknown paid/process claims
+                # stay occupied until native reconciliation can release them.
+                _receipt(camp, plan, "cancellation_release_deferred", detail=str(exc))
+                save_plan(camp, state, plan)
+
+
+def _analysis_ref(state: dict, evidence_id: str | None) -> str | None:
+    return next((row.get("analysis_artifact_id") for row in reversed(state.get("evidence") or [])
+                 if row.get("kind") == "analysis" and row.get("status") == "completed"
+                 and row.get("run_evidence_id") == evidence_id), None)
+
+
+def _measurement(state: dict, plan: dict) -> dict | None:
+    proposal = plan["proposal"]
+    phase = proposal["evaluation_scope"].get("phase")
+    kind = "method_screening" if phase == "screening_2fold" else "method_suite" if (
+        state.get("evaluation_mode") == "loso_method_search") else None
+    for row in reversed(state.get("evidence") or []):
+        if row.get("candidate_id") != plan["candidate_id"] or row.get("evaluation_valid") is not True:
+            continue
+        if kind and row.get("kind") != kind:
+            continue
+        if not kind and row.get("fidelity") != ("pilot" if phase == "pilot" else "full"):
+            continue
+        if plan.get("source_hash") and row.get("source_hash") != plan["source_hash"]:
+            continue
+        if plan.get("spec_hash") and row.get("spec_hash") != plan["spec_hash"]:
+            continue
+        declared_seed = proposal["evaluation_scope"].get("seed")
+        if declared_seed is not None and row.get("seed") != declared_seed:
+            continue
+        return row
+    return None
+
+
+def _finish(camp: Path, state: dict, plan: dict, status: str, *, detail: str | None = None) -> dict:
+    from .experiment_observations import record_experiment_observation
+    from .owner_budget import finish_selected_plan
+    if not plan.get("terminal_observation_id"):
+        _receipt(camp, plan, "terminal", status=status, detail=detail,
+                 repair_count=plan["repair_count"], candidate_id=plan["candidate_id"])
+        plan["status"] = status
+        if status in {"failed", "needs_replan"}:
+            plan["engineering_failure"] = {"error": detail or "implementation_failed",
+                "error_fingerprint": digest({"detail": detail, "source_hash": plan.get("source_hash"), "spec_hash": plan.get("spec_hash")}),
+                "repairs_used": plan["repair_count"]}
+        card = record_experiment_observation(camp, state, plan, status,
+            analysis_ref=plan.get("analysis_artifact_ref") or _analysis_ref(state, plan.get("measurement_evidence_id")))
+        plan["terminal_observation_id"] = card["observation_id"]
+        plan["terminal_observation_digest"] = card["content_digest"]
+        # Publication precedes release/handoff. Restart reuses this exact card.
+        save_plan(camp, state, plan)
+    if not plan.get("continuation_owner"):
+        continuation = finish_selected_plan(camp, plan_id=plan["plan_id"],
+            observation_digest=plan["terminal_observation_digest"])
+        plan["continuation_owner"] = continuation.get("owner_id")
+    if status == "failed" and plan.get("candidate_id") and plan["candidate_id"] != "baseline":
+        from .candidate_lifecycle import detach_failed_candidate
+        try:
+            detach_failed_candidate(camp, state, plan["candidate_id"], reason=detail or "selected_task_engineering_failed")
+        except ValueError as exc:
+            # A pending check or unknown process is a recoverable environment
+            # state. It does not acquire detach/refund authority from a label.
+            _receipt(camp, plan, "failed_branch_retained", reason=str(exc))
+    from .decision_receipts import append_receipt, project_decisions
+    for record in state.get("decisions") or []:
+        if (record.get("origin_plan_id") == plan["plan_id"] and record.get("executed") is False
+                and not record.get("consumed") and status in {"failed", "needs_replan", "cancelled"}):
+            append_receipt(camp, record, status="executed", source="selected_task_terminal",
+                reason=detail or status, result={"origin_plan_id": plan["plan_id"], "task_status": status,
+                    "observation_id": plan["terminal_observation_id"], "scientific_success": False})
+    project_decisions(camp, state)
+    state["terminal_observation_digest"] = plan["terminal_observation_digest"]
+    state["terminal_observation_id"] = plan["terminal_observation_id"]
+    state.setdefault("completed_plan_ids", [])
+    if plan["plan_id"] not in state["completed_plan_ids"]:
+        state["completed_plan_ids"].append(plan["plan_id"])
+    if state.get("status") not in {"paused", "cancelled"}:
+        state.update(status="created")
+        state.pop("failure", None)
+        state.pop("detail", None)
+    save_plan(camp, state, plan)
+    return state
+
+
+def _blocked(camp: Path, state: dict, plan: dict, detail: str) -> dict:
+    from .loop import persist_failure
+    plan["status"] = "blocked"
+    persist_failure(camp, state, phase="selected_plan", error_type=detail, detail=detail, recoverable=True)
+    _receipt(camp, plan, "blocked", current_step=plan["current_step"], detail=detail)
+    save_plan(camp, state, plan)
+    return state
+
+
+def engineering_budget_failure(detail: Any) -> bool:
+    text = str(detail or "")
+    return any(marker in text for marker in ("owner_request_unavailable:", "coding_lineage_budget_exhausted",
+        "coding_no_progress_exhausted", "engineering_repair_limit", "coding_attempt_limit"))
+
+
+def finish_bounded_engineering_failure(camp: Path, state: dict, error: Any) -> dict | None:
+    plan = load_plan(camp, state)
+    if (not plan or plan["current_step"] not in {"design", "implement", "check", "repair"}
+            or not engineering_budget_failure(error)):
+        return None
+    return _finish(camp, state, plan, "failed", detail=str(error))
+
+
+def _native_step(camp: Path, state: dict, plan: dict, action: str, services: dict, runner=None, *, raw=None) -> bool:
+    """Persist an ordinary native decision, linked by an additional plan receipt."""
+    from .loop import (_apply_action, _finish_step, _next_decision_id, _read, _write,
+                       event, observation, save_state)
+    from .artifacts import request_digest
+    from .owner_budget import budget_owner
+    pending = next((r for r in reversed(plan["step_receipts"]) if r.get("kind") == "step_intent"
+                   and r.get("step") == plan["current_step"] and r.get("attempt") == plan["attempt"]), None)
+    complete = any(r.get("kind") == "step_completed" and pending and
+                   r.get("intent_receipt_id") == pending["receipt_id"] for r in plan["step_receipts"])
+    if complete:
+        return True
+    if pending:
+        body = _read(camp / "decisions" / (pending["decision_id"] + ".json"))
+        record = body.get("decision") or {}
+        payload = body.get("execution") or body.get("raw") or {}
+        if not record or request_digest(request=payload) != record.get("execution_digest"):
+            raise ValueError("selected_plan_internal_decision_identity_changed")
+        # Native decision receipts and service caches recover completed work.
+        projected = next((r for r in state.get("decisions") or [] if r.get("decision_id") == record["decision_id"]), None)
+        if projected is None:
+            state.setdefault("decisions", []).append(copy.deepcopy(record))
+    else:
+        payload = {"action": action, "target_id": plan.get("candidate_id"),
+            "decision_rationale": "Internal step of the selected research task.",
+            "required_artifact_refs": [ref for ref in plan["proposal"].get("required_context_refs") or []
+                if ref.startswith("art_")], **(raw or {})}
+        decision_id = _next_decision_id(camp, state)
+        record = {"decision_id": decision_id, "origin_plan_id": plan["plan_id"],
+            "campaign_id": state["goal_id"], "action": action, "ok": True, "executed": False,
+            "decision_schema_version": "eeg_research.decision.plan_step.v1",
+            "raw_digest": request_digest(request=payload), "execution_digest": request_digest(request=payload)}
+        _write(camp / "decisions" / (decision_id + ".json"), {"decision": record,
+            "raw": payload, "execution": payload}, exclusive=True)
+        state.setdefault("decisions", []).append(record)
+        _receipt(camp, plan, "step_intent", step=plan["current_step"], attempt=plan["attempt"],
+                 action=action, decision_id=decision_id, execution_digest=record["execution_digest"])
+        pending = plan["step_receipts"][-1]
+        save_plan(camp, state, plan)
+    decision = {"decision_id": record["decision_id"], "origin_plan_id": plan["plan_id"],
+                "action": action, "execution": payload, "raw": payload, "ok": True}
+    with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
+        _apply_action(camp, state, action, decision, runner, services, observation(camp))
+    _finish_step(camp, state)
+    if state.get("status") in {"blocked", "paused", "cancelled"}:
+        return False
+    workspace = camp / "candidates" / str(plan.get("candidate_id") or "")
+    from .identity import source_hash
+    attempt_identity = _read(workspace / "attempt.json") if plan.get("candidate_id") else {}
+    _receipt(camp, plan, "step_completed", step=plan["current_step"], attempt=plan["attempt"],
+             intent_receipt_id=pending["receipt_id"], action=action,
+             candidate_id=plan.get("candidate_id"), active_suite=state.get("active_suite"),
+             live_job=state.get("live_job"), source_hash=source_hash(workspace) if plan.get("candidate_id") else None,
+             attempt_id=attempt_identity.get("attempt_id"), spec_hash=(state.get("experiment") or {}).get("spec_hash"),
+             scientific_intent_digest=plan["scientific_intent_digest"])
+    save_plan(camp, state, plan)
+    return True
+
+
+def verify_internal_decision(camp: Path, state: dict, decision: dict) -> dict | None:
+    """Internal dispatch bypasses outer K comparison, never native science gates."""
+    plan_id = decision.get("origin_plan_id")
+    if not plan_id:
+        return None
+    plan = load_plan(camp, state)
+    if not plan or plan["plan_id"] != plan_id or plan["status"] in TERMINAL:
+        raise ValueError("selected_plan_internal_dispatch_not_active")
+    body = decision.get("execution") or decision.get("raw") or {}
+    matching = next((r for r in plan["step_receipts"] if r.get("kind") == "step_intent"
+                     and r.get("decision_id") == decision.get("decision_id")), None)
+    from .artifacts import request_digest
+    if not matching or matching.get("execution_digest") != request_digest(request=body):
+        raise ValueError("selected_plan_internal_dispatch_without_intent")
+    if body.get("target_id") != plan.get("candidate_id"):
+        raise ValueError("selected_plan_internal_target_changed")
+    if body.get("action") == "run_confirmation" and plan["proposal"]["task_kind"] != "confirmation":
+        raise ValueError("confirmation_requires_explicit_selected_plan")
+    return plan
+
+
+def verify_step_history(camp: Path, record: dict, payload: Any) -> None:
+    """Read-only historical intent proof, including closed selected tasks."""
+    from .loop import _read
+    from .artifacts import request_digest
+    from .schemas import PlannerActionPayload
+    if not isinstance(payload, dict):
+        raise ValueError("selected_plan_internal_execution_missing")
+    plan = load_plan(camp, {"selected_plan": {"plan_id": str(record.get("origin_plan_id") or "")}})
+    if plan is None:
+        raise ValueError("selected_plan_internal_history_missing")
+    expected = request_digest(request=payload)
+    if expected != record.get("execution_digest"):
+        raise ValueError("selected_plan_internal_execution_changed")
+    if not any(row.get("kind") == "step_intent" and row.get("decision_id") == record.get("decision_id")
+               and row.get("execution_digest") == expected for row in plan["step_receipts"]):
+        raise ValueError("selected_plan_internal_history_without_intent")
+    PlannerActionPayload.model_validate(payload)
+
+
+def _select(camp: Path, state: dict, backend) -> dict:
+    from .loop import _read, _sync_ledger, _write, event, observation, persist_failure, save_state
+    from .owner_budget import allocate_selected_plan, planner_owner, finish_planner_round
+    from .api_policy import planner_api_round
+    full = observation(camp)
+    cfg = config(full)
+    input_digest = state.get("terminal_observation_digest") or digest(round_input(full))
+    research_round_id = round_id(full)
+    from .experiment_observations import compact_planner_view
+    delivered = compact_planner_view(camp, full)
+    context_refs = {row.get("$context_source") for row in delivered.get("history_navigation") or []}
+    for card in (delivered.get("experiment_observations") or {}).get("cards") or []:
+        context_refs.update(row.get("source_ref") for row in card.get("source_refs") or [])
+    full["_delivered_context_refs"] = {ref for ref in context_refs if ref}
+    def request(payload):
+        bind = getattr(backend, "bind", None)
+        if callable(bind):
+            bind(operation_id=research_round_id + (":correction" if payload.get("plan_repair_request") else ":generation"))
+        return backend(payload)
+    round_path = camp / "research_rounds" / (research_round_id + ".json")
+    draft_path = camp / "research_round_drafts" / (research_round_id + ".json")
+    saved = _read(round_path)
+    limits = {"max_engineering_repairs": min(cfg.max_engineering_repairs,
+            int(state.get("max_repairs_per_candidate", cfg.max_engineering_repairs))), "coder_steps": 8}
+    limits["max_repairs"] = limits["max_engineering_repairs"]
+    if saved:
+        if saved.get("input_observation_digest") != digest(round_input(full)):
+            raise ValueError("research_round_input_identity_conflict")
+        chosen = next((p for p in saved.get("proposals") or [] if p["proposal_id"] == saved.get("selected_proposal_id")), None)
+        parsed = {"ok": chosen is not None and saved.get("pool_status") in {"complete", "degraded_singleton"},
+            "round": {k: v for k, v in saved.items() if k not in {"proposal_history", "planning_owner"}},
+            "selected_proposal": chosen, "proposal_history": saved.get("proposal_history") or [],
+            "detail": "research_pool_" + str(saved.get("pool_status"))}
+    else:
+        paid_draft = _read(draft_path)
+        if paid_draft:
+            if paid_draft["input_observation_digest"] != digest(round_input(full)):
+                raise ValueError("research_round_draft_identity_conflict")
+            parsed = paid_draft["parsed"]
+            planning_owner = paid_draft["planning_owner"]
+        else:
+            with planner_owner(camp, observation_digest=input_digest, round_id=research_round_id) as planning_owner:
+                with planner_api_round(camp, research_round_id, max_attempts=cfg.max_planner_api_attempts):
+                    parsed = decide_research_plan(full, lambda req: request({**delivered,
+                        **({"plan_repair_request": req["plan_repair_request"]} if req.get("plan_repair_request") else {})}))
+            # Persist paid drafts before releasing the continuation, so a crash
+            # after comparison never buys or reuses another planning allowance.
+            _write(draft_path, {"input_observation_digest": digest(round_input(full)),
+                "planning_owner": planning_owner, "parsed": parsed}, exclusive=True)
+        finish_planner_round(camp, planning_owner)
+        if parsed.get("round"):
+            from .owner_budget import preview_selected_plan
+            native_round = parsed["round"]
+            feasible = []
+            for item in native_round["proposals"]:
+                preview = preview_selected_plan(camp, task_kind=item["task_kind"],
+                    known_cost=proposal_cost(item, full)["known"], recovery_limits=limits)
+                if preview.get("ok"):
+                    feasible.append(item)
+                else:
+                    native_round["validation_records"].append({"proposal_id": item["proposal_id"],
+                        "status": "rejected", "error": preview.get("reason"), "stage": "complete_task_budget"})
+            by_id = {item["proposal_id"]: item for item in feasible}
+            ranking = sorted(native_round["evaluations"], key=lambda item: item["rank"])
+            selected_id = next((item["proposal_id"] for item in ranking if item["proposal_id"] in by_id), None)
+            prior_selected = native_round["selected_proposal_id"]
+            count = len(feasible)
+            native_round.update(proposals=feasible, valid_count=count,
+                pool_status="complete" if count >= 2 else "degraded_singleton" if count == 1 and cfg.allow_degraded_singleton else
+                    "incomplete" if count else "no_feasible_plan")
+            if count < cfg.target_k:
+                native_round["shortfall_reason"] = "independent_validation_or_complete_task_budget_rejections"
+            ok = bool(selected_id and native_round["pool_status"] in {"complete", "degraded_singleton"})
+            native_round["selected_proposal_id"] = selected_id if ok else None
+            if ok and selected_id != prior_selected:
+                native_round["selection_source"] = "valid_evaluation_rank_budget_fallback"
+                native_round["selection_rationale"] += " Native complete-task admission selected the highest-ranked feasible evaluation."
+            parsed.update(ok=ok, selected_proposal=by_id.get(selected_id) if ok else None,
+                detail=None if ok else "research_pool_" + native_round["pool_status"])
+            _write(round_path, {**native_round, "proposal_history": parsed["proposal_history"],
+                "planning_owner": planning_owner}, exclusive=True)
+        else:
+            _write(round_path, {"round_id": research_round_id, "pool_status": "no_feasible_plan", "valid_count": 0,
+                "input_observation_digest": digest(round_input(full)), "proposal_history": parsed["proposal_history"],
+                "planning_owner": planning_owner, "validation_records": parsed.get("validation_records")}, exclusive=True)
+    _sync_ledger(camp, state)
+    state["latest_research_round"] = parsed.get("round") or {"round_id": research_round_id}
+    if not parsed.get("ok"):
+        persist_failure(camp, state, phase="planner", error_type=parsed.get("detail") or "no_feasible_plan",
+                        detail=parsed.get("detail") or "no_feasible_plan", recoverable=True)
+        save_state(camp, state)
+        return state
+    proposal = parsed["selected_proposal"]
+    plan_id = "plan_" + digest({"round": research_round_id, "proposal": proposal})[:32]
+    owner = allocate_selected_plan(camp, plan_id=plan_id, task_kind=proposal["task_kind"],
+        known_cost=proposal_cost(proposal, full)["known"], recovery_limits=limits)
+    plan = SelectedPlan(plan_id=plan_id, originating_round=research_round_id,
+        originating_proposal=proposal["proposal_id"], proposal=proposal,
+        scientific_intent_digest=digest(proposal["scientific_intent"]), candidate_id=proposal.get("target_candidate_ref"),
+        budget_owner=owner["owner_id"], recovery_limits=limits,
+        input_evidence_ids=[row.get("evidence_id") for row in state.get("evidence") or [] if row.get("evidence_id")]).model_dump()
+    if plan.get("candidate_id"):
+        from .action_planning import target_binding
+        binding = target_binding(full, measurement_action(proposal, full), plan["candidate_id"])
+        plan.update(source_hash=binding.get("source_hash"), spec_hash=binding.get("spec_hash"))
+        plan["method_revision"] = next((row.get("method_revision") for row in reversed(full.get("evidence") or [])
+            if row.get("candidate_id") == plan["candidate_id"] and row.get("method_revision")
+            and (not plan.get("source_hash") or row.get("source_hash") == plan["source_hash"])), None)
+    _receipt(camp, plan, "selected", proposal_id=proposal["proposal_id"], budget_owner=owner["owner_id"],
+             pool_status=parsed["round"]["pool_status"])
+    save_plan(camp, state, plan)
+    event(camp, "research_plan_selected", plan_id=plan_id, proposal_id=proposal["proposal_id"],
+          round_id=research_round_id, task_kind=proposal["task_kind"])
+    return state
+
+
+def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=None) -> dict:
+    from .loop import (_launch, _record_job, _sync_ledger, candidate_implementation_target,
+                       load_state, observation, save_state)
+    from .owner_budget import budget_owner
+    plan = load_plan(camp, state)
+    if plan is None or plan["status"] in TERMINAL:
+        if plan and plan.get("terminal_observation_id") and not plan.get("continuation_owner"):
+            return _finish(camp, state, plan, plan["status"])
+        return _select(camp, state, backend)
+    # Resume continues the same identity and accumulated attempts.
+    if plan["status"] in {"paused", "blocked"}:
+        plan["status"] = "preparing"
+        save_plan(camp, state, plan)
+    if plan.get("approved_scientific_digest"):
+        if plan["proposal"]["task_kind"] == "new_method" and digest(scientific_projection(state.get("experiment"))) != plan["approved_scientific_digest"]:
+            return _finish(camp, state, plan, "needs_replan", detail="approved_scientific_intent_changed")
+    # The native suite owns fold restart/checkpoint/source verification and
+    # matched-control scheduling. Only its active selected task can advance.
+    if state.get("active_suite"):
+        from .method_suite import advance
+        from .resource_guard import advance_needs_gpus, require_idle_gpus
+        if advance_needs_gpus(camp, state):
+            require_idle_gpus(camp, state)
+        with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
+            advance(camp, state, services)
+        state = load_state(camp)
+        save_plan(camp, state, plan)
+        return state
+    if state.get("live_job"):
+        settle = services.get("settle")
+        if settle is None:
+            return _blocked(camp, state, plan, "selected_plan_settle_service_missing")
+        record = settle(camp, state["live_job"])
+        if record.get("status") == "running":
+            state.update(status="training", heartbeat=record.get("heartbeat"))
+            save_plan(camp, state, plan)
+            return state
+        _record_job(camp, state, record)
+        state.update(live_job=None, status="created")
+        save_plan(camp, state, plan)
+        return state
+    if state.get("queued"):
+        item = state["queued"].pop(0)
+        if item[0] != plan.get("candidate_id"):
+            raise ValueError("selected_plan_queue_target_mismatch")
+        with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
+            _launch(camp, state, services, item[0], item[1], training_seed=item[2] if len(item) > 2 else None)
+        save_plan(camp, state, plan)
+        return state
+    kind = plan["proposal"]["task_kind"]
+    if plan["current_step"] == "prepare":
+        if kind == "new_method":
+            plan.update(status="preparing", current_step="design")
+        elif kind == "diagnosis" or plan["proposal"]["evaluation_scope"].get("phase") == "diagnostic":
+            plan.update(status="collecting_observation", current_step="diagnose")
+        else:
+            plan.update(status="executing_measurement", current_step="measure")
+        save_plan(camp, state, plan)
+        return state
+    if plan["current_step"] == "design":
+        draft = {"intervention": plan["proposal"]["scientific_intent"], "parent_candidate_id": "baseline",
+                 "control_candidate_id": "baseline", "initial_fidelity": "pilot" if
+                    plan["proposal"]["evaluation_scope"].get("phase") == "pilot" else "full"}
+        if not _native_step(camp, state, plan, "design_experiment", services, runner, raw={
+            "hypothesis_draft": {"mechanism": plan["proposal"]["scientific_intent"], "question": plan["proposal"]["question"]},
+            "experiment_draft": draft}):
+            bounded = finish_bounded_engineering_failure(camp, state, state.get("detail"))
+            if bounded is not None:
+                return bounded
+            reflect_control(camp, state)
+            return state
+        if state.get("experiment_failed") or not (state.get("experiment") or {}).get("approval_record"):
+            return _finish(camp, state, plan, "failed", detail="design_not_approved")
+        plan["candidate_id"] = candidate_implementation_target(camp, state)
+        plan["spec_hash"] = state["experiment"].get("spec_hash")
+        plan["approved_scientific_digest"] = digest(scientific_projection(state["experiment"]))
+        plan.update(status="implementing", current_step="implement")
+        save_plan(camp, state, plan)
+        return state
+    if plan["current_step"] in {"implement", "repair"}:
+        repair = plan["current_step"] == "repair"
+        if repair and plan["repair_count"] >= plan["recovery_limits"]["max_engineering_repairs"]:
+            return _finish(camp, state, plan, "failed", detail="engineering_repair_limit")
+        if not _native_step(camp, state, plan, "repair_candidate" if repair else "implement_candidate", services, runner):
+            bounded = finish_bounded_engineering_failure(camp, state, state.get("detail"))
+            if bounded is not None:
+                return bounded
+            # Engineering failure with a native finite repair remains this plan;
+            # environmental/unknown blocks keep the same owner and current step.
+            if not state.get("repair_task"):
+                reflect_control(camp, state)
+                return state
+        if repair:
+            plan["repair_count"] += 1
+        plan["attempt"] += 1
+        if state.get("needs_replan"):
+            return _finish(camp, state, plan, "needs_replan", detail=str(state["needs_replan"]))
+        if state.get("pending_candidate_check"):
+            plan.update(status="checking", current_step="check")
+        elif state.get("candidate_ready") and state.get("candidate_id") == plan["candidate_id"]:
+            from .handoffs import candidate_context
+            source = candidate_context(camp, plan["candidate_id"])
+            plan.update(source_hash=source.get("source_hash"), status="executing_measurement", current_step="measure")
+        elif state.get("repair_task"):
+            if state["repair_task"].get("candidate_id") != plan["candidate_id"]:
+                raise ValueError("selected_plan_repair_candidate_changed")
+            plan.update(status="repairing", current_step="repair")
+            state.update(status="created")
+            state.pop("failure", None)
+        elif state.get("experiment_failed"):
+            return _finish(camp, state, plan, "failed", detail="engineering_implementation_failed")
+        else:
+            return _blocked(camp, state, plan, "implementation_has_no_verified_outcome")
+        save_plan(camp, state, plan)
+        return state
+    if plan["current_step"] == "check":
+        check = services.get("resume_pending_check")
+        if check is None:
+            return _blocked(camp, state, plan, "selected_plan_check_service_missing")
+        with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
+            check(camp, state)
+        if state.get("pending_candidate_check"):
+            reflect_control(camp, state)
+            return state
+        plan["current_step"] = "implement"
+        plan["status"] = "checking"
+        # The native implement service adopts the finished check and review.
+        save_plan(camp, state, plan)
+        return state
+    if plan["current_step"] == "measure":
+        if plan.get("source_hash") and plan["candidate_id"] != "baseline":
+            from .handoffs import candidate_context
+            source = candidate_context(camp, plan["candidate_id"])
+            if source.get("source_hash") != plan["source_hash"] or (plan.get("spec_hash")
+                    and source.get("spec_hash") != plan["spec_hash"]):
+                return _finish(camp, state, plan, "needs_replan", detail="selected_source_or_spec_changed")
+        row = _measurement(state, plan)
+        if row:
+            plan.update(measurement_evidence_id=row["evidence_id"], status="collecting_observation", current_step="analyze")
+            save_plan(camp, state, plan)
+            return state
+        failed_measurement = next((r for r in reversed(state.get("evidence") or [])
+            if r.get("candidate_id") == plan["candidate_id"] and r.get("fidelity")
+            and r.get("evidence_id") not in plan["input_evidence_ids"]
+            and (r.get("job_status") in {"failed", "cancelled", "invalid"} or r.get("evaluation_valid") is False)), None)
+        if failed_measurement:
+            return _finish(camp, state, plan, "failed", detail="measurement_engineering_failed:" +
+                str(failed_measurement.get("reason") or failed_measurement.get("job_status")))
+        action = measurement_action(plan["proposal"], observation(camp))
+        if state.get("evaluation_mode") == "loso_method_search" and action == "run_full" and plan["candidate_id"] != "baseline":
+            baseline = any(r.get("candidate_id") == "baseline" and r.get("kind") == "method_suite"
+                and r.get("evaluation_valid") for r in state.get("evidence") or [])
+            if not baseline:
+                from .method_suite import begin
+                with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
+                    begin(camp, state, "baseline")
+                save_plan(camp, state, plan)
+                return state
+        plan["status"] = "executing_measurement"
+        if not _native_step(camp, state, plan, action, services, runner):
+            reflect_control(camp, state)
+            return state
+        save_plan(camp, state, plan)
+        return state
+    if plan["current_step"] == "diagnose":
+        if not _native_step(camp, state, plan, "collect_diagnostics", services, runner):
+            reflect_control(camp, state)
+            return state
+        diagnostic = state.get("last_local_result") or {}
+        evidence_id = diagnostic.get("evidence_id") or diagnostic.get("same_as")
+        if not evidence_id:
+            evidence_id = next((row.get("evidence_id") for row in reversed(state.get("evidence") or [])
+                if row.get("kind") == "diagnostic_bundle"), None)
+        plan["measurement_evidence_id"] = evidence_id
+        plan["analysis_artifact_ref"] = next((row.get("analysis_artifact_id")
+            for row in reversed(state.get("evidence") or []) if row.get("kind") == "analysis"
+            and row.get("status") == "completed" and row.get("candidate_id") == plan["candidate_id"]), None)
+        plan.update(status="collecting_observation", current_step="observation")
+        save_plan(camp, state, plan)
+        return state
+    if plan["current_step"] == "analyze":
+        row = _measurement(state, plan)
+        if not row:
+            return _blocked(camp, state, plan, "selected_plan_verified_measurement_missing")
+        if not _analysis_ref(state, row["evidence_id"]):
+            analyst = services.get("analyze")
+            if analyst is None:
+                return _blocked(camp, state, plan, "selected_plan_analyst_missing")
+            with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
+                analyst(camp, state)
+            if not _analysis_ref(state, row["evidence_id"]):
+                return _blocked(camp, state, plan, "selected_plan_analysis_incomplete")
+        plan["current_step"] = "observation"
+        save_plan(camp, state, plan)
+        return state
+    if plan["current_step"] == "observation":
+        return _finish(camp, state, plan, "observation_ready")
+    raise ValueError("selected_plan_step_unknown:" + str(plan["current_step"]))

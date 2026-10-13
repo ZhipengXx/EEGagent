@@ -208,9 +208,23 @@ def domain_model_for(role: str, memory=None):
     return DOMAIN_OUTPUT_MODELS.get(role)
 
 
-def system_prompt(role: str, *, memory=None) -> str:
+def system_prompt(role: str, *, memory=None, camp=None) -> str:
     from react_agent.eeg_research.agentic.schemas import role_output_schema
 
+    if camp is not None:
+        from .research_execution import single_plan_enabled
+        if single_plan_enabled(camp):
+            from .runtime_prompts import runtime_mission
+            from .context.compiler import render_role_system
+            model = domain_model_for(role, memory)
+            if role == "research_planner":
+                from .schemas import ResearchRoundDraft
+                model = ResearchRoundDraft
+            schema = json.dumps(model.model_json_schema(),ensure_ascii=False) if model is not None else "{}"
+            if role == "research_planner":
+                from .schemas import ResearchPlanProposal
+                schema += "\nINDEPENDENT_PROPOSAL_SCHEMA\n" + json.dumps(ResearchPlanProposal.model_json_schema(),ensure_ascii=False)
+            return render_role_system(role, runtime_mission(role) + "\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object.\n",execution_version="single_plan_v1")
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
     mission = (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
     schema = role_output_schema(role)
@@ -238,7 +252,8 @@ def _method_api_accounting(camp: Path) -> bool:
     path = camp / "goal.json"
     if not path.is_file():
         return False
-    return json.loads(path.read_text(encoding="utf-8")).get("evaluation_mode") == "loso_method_search"
+    from .owner_budget import enabled
+    return enabled(camp) or json.loads(path.read_text(encoding="utf-8")).get("evaluation_mode") == "loso_method_search"
 
 
 def transport_options(profile, *, model=None, max_tokens=None) -> dict:
@@ -257,7 +272,10 @@ def transport_options(profile, *, model=None, max_tokens=None) -> dict:
     return value
 
 
-def _remaining_api_calls(camp: Path) -> int | None:
+def _remaining_api_calls(camp: Path, role: str | None = None) -> int | None:
+    from .owner_budget import enabled, admission_available
+    if role is not None and enabled(camp):
+        return admission_available(camp,role)["available"]["llm_calls"]
     goal_path = camp / "goal.json"
     if not goal_path.is_file():
         return None
@@ -269,8 +287,13 @@ def _remaining_api_calls(camp: Path) -> int | None:
     return max(0, int(maximum) - int(used))
 
 
-async def _send_compiled(client, prepared, *, role: str, profile: str):
+async def _send_compiled(client, prepared, *, role: str, profile: str, camp=None, call_id=None):
     from react_agent.eeg_research.agentic.context.service import send_prepared
+    if camp is not None and call_id is not None:
+        from .owner_budget import enabled, transport_claim
+        if enabled(camp):
+            with transport_claim(camp, call_id):
+                return await send_prepared(client, prepared, role=role, profile=profile)
     return await send_prepared(client, prepared, role=role, profile=profile)
 
 
@@ -354,6 +377,9 @@ def _ledgered_memory_maintenance(camp: Path, request: dict, **kwargs) -> dict:
             if (row.get("recovery_identity") or {}).get("source_dependency_digest") == source.source_hash), {})
         return {"output": recovered, "_maintenance_transport": {"api_calls": 0,
             "cache_adopted": True, "task_ref": recovered_task.get("task_id", "")}}
+    from .research_execution import paid_maintenance_mode
+    if kwargs.get("recovery_only") or paid_maintenance_mode(camp)=="off":
+        raise LlmUnavailable("paid_maintenance_recovery_cache_miss_deferred")
     if len(upkeep) >= 100 or sum(r.get("maintenance_turn_id") == turn for r in upkeep) >= 2:
         raise LlmUnavailable("memory_maintenance_budget_exhausted")
     task = begin_role_task(camp, role="memory_curator", inputs=[original_path],
@@ -381,6 +407,9 @@ def _ledgered_memory_maintenance(camp: Path, request: dict, **kwargs) -> dict:
                             deepseek_base_url=resolved.base_url)
     config.fast = resolved.profile()
     client, event_loop = DeepSeekBackend(config), asyncio.new_event_loop()
+    enable_budget = getattr(client,"enable_budget_protocol",None)
+    if enable_budget:
+        enable_budget(camp)
     try:
         response = _invoke_compaction(camp, client, event_loop, model=resolved.model,
             max_tokens=resolved.max_tokens, system=system, payload=payload, task=task,
@@ -478,6 +507,12 @@ def refresh_method_api_cost(camp: Path) -> dict[str, Any]:
     reserve_by_id = {row["call_id"]: row.get("unknown_usd_reserve") for row in operation_rows}
     cost["api_unknown_usd_reserved"] = sum(float(reserve_by_id[key]) for key in set(pending + abandoned)
                                          if isinstance(reserve_by_id.get(key), (int, float)))
+    from .owner_budget import native_cost_floor
+    floor = native_cost_floor(camp)
+    if floor:
+        for key in ("llm_calls", "input_tokens", "output_tokens"):
+            cost[key] = max(cost.get(key) or 0, floor[key])
+        cost["api_usd_known_subtotal"] = max(cost.get("api_usd_known_subtotal") or 0, floor["api_usd"])
     cost.setdefault("gpu_seconds_used", 0.0)
     _write_cost(camp, cost)
     return cost
@@ -495,7 +530,7 @@ def _reserve_api_intent(camp: Path, row: dict[str, Any]) -> None:
                "planner_round_id", "role_config_hash", "role_model_config", "requested_model",
                "maintenance_turn_id", "context_mode", "context_request_digest", "context_policy_version",
                "original_maintenance_turn_id", "maintenance_authorization_ref", "research_authorization_ref", "parent_planner_round_id",
-               "thinking", "reasoning_effort", "unknown_usd_reserve")}
+               "thinking", "reasoning_effort", "unknown_usd_reserve", "budget_owner", "resource_claim_id", "owner_input_token_bound", "owner_output_token_bound")}
     if row.get("operation"):
         intent["operation"] = row["operation"]
     intent.update(status="reserved_before_transport", recorded_at=time.time(),
@@ -515,7 +550,10 @@ def _ledger(camp: Path, row: dict[str, Any]) -> None:
         record_usage(camp, call_id=row["call_id"], role=row["role"],
             model=row["requested_model"], mode=row.get("context_mode", "normal"),
             estimated=report["model_tokens"], observed=row["input_tokens"])
-    _price_usage(row)
+    _price_usage(row,camp=camp)
+    from .owner_budget import enabled, settle_request
+    if enabled(camp) and row.get("resource_claim_id"):
+        settle_request(camp, row["resource_claim_id"], row)
     method_mode = _method_api_accounting(camp)
     ledger_path = camp / "llm_calls.jsonl"
     if method_mode and row.get("call_id") and ledger_path.is_file():
@@ -589,15 +627,22 @@ def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
             "request_user_sha256": user_sha}
 
 
-def _price_usage(row: dict) -> None:
+def _price_usage(row: dict, *, camp=None) -> None:
     """Deployment supplied pricing only; reasoning is part of completion tokens."""
     source = os.environ.get("DEEPSEEK_PRICE_SOURCE")
     date = os.environ.get("DEEPSEEK_PRICE_DATE")
     input_rate = os.environ.get("DEEPSEEK_USD_INPUT_PER_MILLION")
     output_rate = os.environ.get("DEEPSEEK_USD_OUTPUT_PER_MILLION")
+    if camp is not None and not all((source,date,input_rate,output_rate)):
+        from .owner_budget import enabled
+        if enabled(camp):
+            goal = json.loads((camp / "goal.json").read_text())
+            pricing = ((goal.get("research_execution") or {}).get("budget") or {}).get("pricing") or {}
+            source,date = pricing.get("source"),pricing.get("date")
+            input_rate,output_rate = pricing.get("input_per_million"),pricing.get("output_per_million")
     inp, out = row.get("input_tokens"), row.get("output_tokens")
     row.setdefault("api_usd", None)
-    if not all((source, date, input_rate, output_rate)) or not isinstance(inp, int) or not isinstance(out, int):
+    if not source or not date or input_rate is None or output_rate is None or not isinstance(inp, int) or not isinstance(out, int):
         return
     try:
         rates = [float(input_rate), float(output_rate)]
@@ -838,12 +883,15 @@ def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_to
         row.update({key: value for key, value in (operation_metadata or {}).items()
                     if key in {"original_maintenance_turn_id", "maintenance_authorization_ref"}})
         row.update(_request_trace(camp, row, system=prepared.system, user=user, max_tokens=max_tokens))
+        from .owner_budget import input_token_bound
+        row.update(owner_input_token_bound=input_token_bound(prepared.messages, prepared.transport_fields, prepared.budget_report),
+                   owner_output_token_bound=max_tokens)
         row.update(reserve_operation_attempt(camp, operation=logical_operation, call_id=row["call_id"],
                    reserve_usd=_unknown_reserve(camp), metadata=row))
         _reserve_api_intent(camp, row)
         try:
-            reply, usage = loop.run_until_complete(send_prepared(client, prepared,
-                profile="fast", role="memory_curator"))
+            reply, usage = loop.run_until_complete(_send_compiled(client, prepared,
+                profile="fast", role="memory_curator", camp=camp, call_id=row["call_id"]))
         except DeepSeekParseError as exc:
             _ledger(camp, _fail_row(row, exc, started))
             kind = getattr(exc.usage, "failure_kind", None)
@@ -905,10 +953,13 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
     config.fast = resolved.profile()
     from react_agent.eeg_research.agentic.embedding import memory_config
     memory = memory_config(camp)
-    system = system_prompt(role, memory=memory)
+    system = system_prompt(role, memory=memory, camp=camp)
     prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
     loop = asyncio.new_event_loop()
     client = DeepSeekBackend(config)
+    enable_budget = getattr(client, "enable_budget_protocol", None)
+    if enable_budget:
+        enable_budget(camp)
     enable_context = getattr(client, "enable_context_protocol", None)
     if enable_context:
         enable_context()
@@ -951,8 +1002,30 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         # another role's flat output schema.
         return payload
 
+    def compile_role_request(request):
+        from .owner_budget import role_preparation
+        with role_preparation(camp,role):
+            return context_service.compile(request)
+
+    def active_domain_model():
+        from .research_execution import single_plan_enabled
+        if role == "research_planner" and single_plan_enabled(camp):
+            from .schemas import ResearchRoundDraft
+            return ResearchRoundDraft
+        return domain_model_for(role,memory)
+
     def call(payload: dict[str, Any]) -> dict[str, Any]:
         nonlocal resolved
+        from .research_execution import single_plan_enabled
+        if single_plan_enabled(camp) and role in {"experiment_designer","candidate_coder","candidate_reviewer","result_analyst"}:
+            from .selected_plan import load_plan
+            selected = load_plan(camp)
+            if selected:
+                proposal = selected.get("proposal") or {}
+                payload = {**payload,"selected_research_task":{key:proposal[key] for key in (
+                    "question","task_description","scientific_intent","evaluation_scope","expected_observation","completion_condition") if key in proposal},
+                    "origin_plan_id":selected["plan_id"]}
+
         task = None
         if role in ENVELOPE_ROLES:
             from react_agent.eeg_research.agentic.roles import task_identity_from_payload
@@ -1034,7 +1107,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 if error:
                     raise RoleResultError("recovered_coder_tool_request_invalid")
             else:
-                model = domain_model_for(role, memory)
+                model = active_domain_model()
                 body = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else parsed
                 identities = {"schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "artifact_refs", "candidate_id"}
                 if model is not None:
@@ -1074,6 +1147,11 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                      and isinstance(item.get("draft"), dict) for item in failed_options))
             or (isinstance(payload.get("schema_error"), str) and bool(payload["schema_error"])
                 and isinstance(payload.get("previous"), dict) and bool(payload["previous"])))
+        plan_repair = payload.get("plan_repair_request")
+        if role=="research_planner" and single_plan_enabled(camp) and isinstance(plan_repair,dict):
+            rejected=plan_repair.get("rejected")
+            external_repair = external_repair or (plan_repair.get("kind")=="correct_research_proposals"
+                and isinstance(rejected,list) and any(isinstance(item,dict) and item.get("error") for item in rejected))
         transport_retry_prepared = None
         last: DeepSeekParseError | None = None
         schema_error = None
@@ -1109,12 +1187,20 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             from react_agent.eeg_research.agentic.context.types import CompileRequest, Ready
             from react_agent.eeg_research.agentic.context.service import budget_for_role
             from react_agent.eeg_research.agentic.context.calibration import tokenizer_for
-            call_payload = add_role_examples(call_payload, role, memory)
+            from .research_execution import single_plan_enabled
+            if single_plan_enabled(camp):
+                from .runtime_prompts import conditional_hints
+                hints = conditional_hints(role, call_payload)
+                if hints:
+                    call_payload = {**call_payload,"relevant_implementation_hints":hints}
+                call_payload = add_role_examples(call_payload, role, memory, max_count=1, execution_version="single_plan_v1")
+            else:
+                call_payload = add_role_examples(call_payload, role, memory)
             if transport_retry_prepared is not None:
                 prepared = transport_retry_prepared
                 transport_retry_prepared = None
             else:
-                outcome = context_service.compile(CompileRequest(
+                outcome = compile_role_request(CompileRequest(
                     camp.name, role, call_payload, system=system, model=config.fast.model,
                     max_output_tokens=int(config.fast.max_tokens), task_id=compile_task_id,
                     intent_id=logical_operation, purpose=bound.get("phase", role),
@@ -1128,7 +1214,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     # in the Planner/controller or an independent closed-group turn.
                     allow_semantic_compaction=not bool(compile_task_id),
                     allow_sync_memory_maintenance=not bool(compile_task_id),
-                    remaining_api_calls=_remaining_api_calls(camp)))
+                    remaining_api_calls=_remaining_api_calls(camp,role)))
                 if not isinstance(outcome, Ready):
                     raise LlmUnavailable("context_" + outcome.status,
                         diagnostics={"reason":getattr(outcome,"reason",None),
@@ -1184,12 +1270,15 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                        context_budget_report=prepared.budget_report)
             row.update(_request_trace(camp, row, system=prepared.system, user=user_text,
                                       max_tokens=int(config.fast.max_tokens)))
+            from .owner_budget import input_token_bound
+            row.update(owner_input_token_bound=input_token_bound(prepared.messages, prepared.transport_fields, prepared.budget_report),
+                       owner_output_token_bound=int(config.fast.max_tokens))
             row.update(reserve_operation_attempt(camp, operation=logical_operation, call_id=row["call_id"],
                        reserve_usd=_unknown_reserve(camp), metadata=row))
             _reserve_api_intent(camp, row)
             try:
                 reply, usage = loop.run_until_complete(
-                    _send_compiled(client, prepared, profile="fast", role=role)
+                    _send_compiled(client, prepared, profile="fast", role=role, camp=camp, call_id=row["call_id"])
                 )
             except DeepSeekParseError as exc:
                 last = exc
@@ -1291,7 +1380,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     raise LlmUnavailable(str(exc)) from exc
             if role != "candidate_coder":
                 from pydantic import ValidationError
-                domain_model = domain_model_for(role, memory)
+                domain_model = active_domain_model()
                 body = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else parsed
                 identity_keys = {"schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "artifact_refs", "candidate_id"}
                 if domain_model is not None:

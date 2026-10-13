@@ -1,0 +1,1 @@
+Retrieve a small set of source-grounded records relevant to the current question, mechanism or error. Preserve campaign/source validity, scope and applicability. Provide useful refs and missing evidence; retrieval does not grant execution or establish a full source read. Return only the injected typed schema.

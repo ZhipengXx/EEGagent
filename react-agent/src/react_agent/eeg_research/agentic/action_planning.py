@@ -93,6 +93,10 @@ def _payload(option: PlannerOption, raw: dict, observation: dict) -> tuple[dict,
     for key in ("action", "target_id", "question_id"):
         if payload.get(key) != getattr(option, key):
             raise ValueError("option_payload_identity_mismatch:" + key)
+    if raw.get("selected_option_id") == option.option_id:
+        for key in ("action", "target_id", "question_id", "evidence_refs", "required_artifact_refs", "required_read_digests"):
+            if key in raw and raw[key] != payload.get(key, [] if key.endswith("refs") or key.endswith("digests") else None):
+                raise ValueError("legacy_selected_mirror_conflict:" + key)
     for key in ("evidence_refs", "required_artifact_refs", "required_read_digests"):
         if payload.get(key, []) != getattr(option, key):
             raise ValueError("option_payload_reference_mismatch:" + key)
@@ -152,8 +156,15 @@ def validate_option(raw_option: Any, raw: dict, observation: dict, validator: Ca
         normalized = option.model_dump(exclude_none=True)
         # Cost is mechanical runtime information; stale model estimates are
         # recorded, then replaced without changing the proposed intervention.
-        from .planner import resolve_cost_estimate
+        from .planner import resolve_cost_estimate, _matches_runtime_cost
         _, cost = resolve_cost_estimate(observation, option.action, option.target_id)
+        explicit_cost = raw_option.get("estimated_cost") if isinstance(raw_option, dict) else None
+        if isinstance(explicit_cost, dict):
+            for key, submitted in explicit_cost.items():
+                if submitted is not None and not _matches_runtime_cost(submitted, (cost.get("estimated_cost") or {}).get(key)):
+                    raise ValueError("legacy_explicit_cost_conflict:" + key)
+        if isinstance(raw_option, dict) and "cost_basis" in raw_option and raw_option["cost_basis"] != (cost.get("cost_basis") or []):
+            raise ValueError("legacy_explicit_cost_basis_conflict")
         normalized.update(estimated_cost=cost.get("estimated_cost") or {},
                           cost_basis=cost.get("cost_basis") or [],
                           cost_confidence=cost.get("cost_confidence") or "unknown", payload=payload)

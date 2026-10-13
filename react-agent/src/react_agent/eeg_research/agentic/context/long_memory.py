@@ -667,7 +667,8 @@ class LongMemoryPipeline:
                 self._finish_call(call_id, "completed", raw_response)
                 with self.connect(write=True) as conn:
                     conn.execute("UPDATE memory_pipeline_proposals SET response=?,status='proposal_only',metadata=? WHERE request_digest=?",
-                                 (canonical(response), canonical(metadata), request_digest))
+                                 (canonical(response), canonical({**metadata, "publication_claim": {**copy.deepcopy(claim),
+                                     "request": copy.deepcopy(request)}}), request_digest))
                 if not self._renew_claim(claim, in_flight=False):
                     return self._fail(claim, "maintenance_source_or_lease_changed")
                 try:

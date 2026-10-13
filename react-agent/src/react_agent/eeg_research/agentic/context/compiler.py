@@ -47,7 +47,7 @@ def row_source_id(field: str, row: dict[str, Any]) -> str:
 
 def _compact_system_schema(system: str) -> str:
     # No generic line/string deletion: only JSON-schema annotation removal.
-    matches = list(re.finditer(r"(?m)^(?:OUTPUT_SCHEMA|OUTPUT SCHEMA|INDEPENDENT_OPTION_SCHEMA):?\s*\n", system))
+    matches = list(re.finditer(r"(?m)^(?:OUTPUT_SCHEMA|OUTPUT SCHEMA|INDEPENDENT_OPTION_SCHEMA|INDEPENDENT_PROPOSAL_SCHEMA):?\s*\n", system))
     for match in reversed(matches):
         start = match.end()
         tail = system[start:]
@@ -61,9 +61,9 @@ def _compact_system_schema(system: str) -> str:
     return system
 
 
-def render_role_system(role: str, system: str, *, instructions: Any = None, schema: Any = None) -> str:
+def render_role_system(role: str, system: str, *, instructions: Any = None, schema: Any = None, execution_version: str | None = None) -> str:
     """Freeze policy/schema text before native task and cache identity binding."""
-    policy = role_policy(role)
+    policy = role_policy(role, execution_version=execution_version)
     system = _compact_system_schema(system)
     if instructions is not None:
         system += "\nCURRENT_INSTRUCTIONS\n" + canonical(instructions)
@@ -244,7 +244,8 @@ class ContextCompiler:
         if not isinstance(request.payload, dict):
             return Blocked("invalid_payload", {"expected": "object"})
         try:
-            policy = role_policy(request.role)
+            from ..research_execution import single_plan_enabled
+            policy = role_policy(request.role, execution_version="single_plan_v1" if single_plan_enabled(self.camp) else None)
         except KeyError:
             return Blocked("policy_missing", {"role": request.role})
         # Compiler cannot enter its own paid maintenance from a maintenance call.

@@ -107,7 +107,8 @@ def phase_cost(common: dict, phase: str, candidate_completed: list[str], baselin
             "baseline_reuse_count": len(ids) - len(baseline_missing), "training_jobs": jobs,
             "gpu_seconds": jobs * per_fold if per_fold is not None else None,
             "gpu_estimate_basis": "frozen_suite_estimate_per_fold" if per_fold is not None else "unknown_requires_frozen_estimate",
-            "feedback_report_count": 1 + int(target != "baseline" and bool(baseline_missing)),
+            "feedback_report_count": 1 if common.get("research_execution_version") == "single_plan_v1" else
+                1 + int(target != "baseline" and bool(baseline_missing)),
             "conditional_api_review_repair_cost": "unknown_within_existing_authorized_caps",
             "confirmation_additional_jobs": (20 - len(set(candidate_completed) | set(candidate_missing))
                                               - len(set(baseline_completed) | set(baseline_missing))) if target != "baseline" else 10 - len(ids),
@@ -640,7 +641,7 @@ def audit_evidence(camp: Path, state: dict) -> dict:
             for bound in freeze["dependencies"]:
                 add(Path(bound["path"]), bound["sha256"])
         feedback = ms.scientific_feedback_records(camp, state, row)
-        if "analysis" not in feedback:
+        if not ms.required_scientific_feedback(camp, state, row) <= set(feedback):
             raise ValueError("phase_audit_required_analysis_incomplete")
         for stage, record in feedback.items():
             verified = development_artifact(camp, record["artifact_id"])

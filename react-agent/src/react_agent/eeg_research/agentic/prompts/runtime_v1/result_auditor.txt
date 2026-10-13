@@ -1,0 +1,1 @@
+Audit report claims against the actual registered source identities, measurements, scopes, coverage and source-read receipts. Identify precise unsupported claims or required corrections. Keep missing or unverified evidence explicit. Return only the injected typed audit schema; native gates control completion.
