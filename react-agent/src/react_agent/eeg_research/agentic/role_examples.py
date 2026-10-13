@@ -267,6 +267,8 @@ def _decision(
             },
             experiment_draft={"intervention": intervention},
         )
+    option["payload"] = {key: value for key, value in response.items()
+                         if key not in {"options", "selected_option_id", "selection_rationale"}}
     return response
 
 
@@ -406,6 +408,8 @@ def _scientific_choices(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if intervention is not None:
             decision["hypothesis_draft"] = {"statement": "Toy offset tests the observed input-centering gap."}
         option = decision["options"][0]
+        option["payload"] = {key: value for key, value in decision.items()
+                             if key not in {"options", "selected_option_id", "selection_rationale"}}
         option.update(option_id="example_option_" + str(i),
                       observed_gap="Toy pilot differs by only two hits; mechanism remains unresolved." if tiny else "Toy pilot is weak; optimization and concentrated retrieval remain competing explanations.",
                       expected_information="Measure prediction diversity, ties, margin and effective rank before spending a full job." if local else "Test whether the source-bound mechanism persists over the frozen full trajectory.",
@@ -420,6 +424,7 @@ def _scientific_choices(payload: dict[str, Any]) -> list[dict[str, Any]]:
     response["options"] = options
     if response["action"] == "stop":
         response["stop_reason"] = "budget_exhausted" if exhausted else "no_supported_next_experiment"
+        options[0]["payload"]["stop_reason"] = response["stop_reason"]
     if exhausted:
         response["scope_limits"] = ["No training jobs remain. Empty best-method confirmation does not mean every candidate was confirmed."]
     return [_example("budget_closeout" if exhausted else "pilot_information_choice", isolated,

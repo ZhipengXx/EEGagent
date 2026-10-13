@@ -28,6 +28,7 @@ from react_agent.eeg_research.agentic.research_plan import (
 )
 from react_agent.eeg_research.agentic.runner import accept_job, comparable
 from react_agent.eeg_research.agentic.schemas import SCHEMA_VERSION
+from react_agent.eeg_research.agentic.candidate_lifecycle import detach_failed_candidate
 
 _TERMINAL = {"paused", "finished", "blocked", "cancelled"}
 DEFAULT_MAX_GPU_SECONDS = 48 * 3600
@@ -159,6 +160,7 @@ def create_campaign(
     state = {
         "planner_mode": goal["planner_mode"],
         "evaluation_mode": goal.get("evaluation_mode", "single_target"),
+        "evaluation_schedule": goal.get("evaluation_schedule", "full_only"),
         "goal_id": goal["goal_id"],
         "request_id": request_id,
         "status": "created",
@@ -191,6 +193,11 @@ def create_campaign(
         "decisions": [],
         "pause_after_step": False,
     }
+    from react_agent.eeg_research.agentic.candidate_lifecycle import enabled
+    if enabled(goal):
+        from react_agent.eeg_research.agentic.schemas import ActionPlanningConfig
+        state.update(candidate_admission_protocol="approval_allocation.v2", candidate_admissions=[],
+                     detached_candidates={}, action_planning=ActionPlanningConfig.model_validate(goal.get("action_planning") or {}).model_dump())
     from react_agent.eeg_research.agentic.confirmation_policy import (
         ConfirmationPolicyError,
         freeze_confirmation_policy,
@@ -246,7 +253,8 @@ def incomplete_candidate_id(camp: Path, state: dict[str, Any]) -> str | None:
         name = path.name
         if not (name.startswith("c") and name[1:].isdigit()):
             continue
-        if name in recorded or name in evidenced:
+        from react_agent.eeg_research.agentic.candidate_lifecycle import is_detached
+        if name in recorded or name in evidenced or is_detached(state, name):
             continue
         if (path / "spec.json").is_file():
             names.append(name)
@@ -305,15 +313,20 @@ def _unexecuted_decision(state: dict[str, Any]) -> dict[str, Any] | None:
 
 def _decision_raw(camp: Path, decision_id: str) -> dict[str, Any]:
     payload = _read(camp / "decisions" / f"{decision_id}.json")
+    if (payload.get("decision") or {}).get("decision_schema_version") == "eeg_research.decision.v3":
+        execution = payload.get("execution")
+        return execution if isinstance(execution, dict) else {}
     raw = payload.get("raw")
     return raw if isinstance(raw, dict) else {}
 
 
 def _reject_plan_decision(camp: Path, record: dict[str, Any], detail: str) -> None:
     """Keep a rejected decision in the audit trail without replaying its action."""
-    raw = _decision_raw(camp, str(record["decision_id"]))
+    path = camp / "decisions" / f"{record['decision_id']}.json"
+    body = _read(path)
     record.update(ok=False, detail=detail, rejected_before_execution=True)
-    _write(camp / "decisions" / f"{record['decision_id']}.json", {"decision": record, "raw": raw})
+    body["decision"] = record
+    _write(path, body)
 
 
 def _mark_executed(state: dict[str, Any]) -> None:
@@ -333,6 +346,9 @@ def pending_repair(state: dict[str, Any]) -> dict[str, Any] | None:
         return None
     if not task.get("candidate_id"):
         return None
+    from react_agent.eeg_research.agentic.candidate_lifecycle import is_detached
+    if is_detached(state, task.get("candidate_id")):
+        return None
     return task
 
 
@@ -342,7 +358,7 @@ def pending_implement(camp: Path, state: dict[str, Any]) -> dict[str, Any] | Non
     if not decisions:
         return None
     last = decisions[-1]
-    if last.get("action") != "implement_candidate" or not last.get("ok"):
+    if last.get("action") != "implement_candidate" or not last.get("ok") or last.get("detached"):
         return None
     if incomplete_candidate_id(camp, state) is None:
         return None
@@ -401,16 +417,24 @@ def _recover_decision_reads(camp: Path, state: dict[str, Any]) -> None:
         previous = known.get(path.stem)
         if previous:
             keys = ("action", "ok", "read_requests", "required_artifact_refs", "required_read_digests",
-                    "selected_option_id", "resolves_issue_ids", "raw_digest", "campaign_id")
+                    "selected_option_id", "resolves_issue_ids", "raw_digest", "execution_digest", "campaign_id")
             if any(previous[key] != record.get(key) for key in keys if key in previous):
                 raise ValueError("decision_state_identity_conflict:" + path.stem)
         if record.get("decision_schema_version"):
-            if (record.get("decision_schema_version") != "eeg_research.decision.v2"
+            if (record.get("decision_schema_version") not in {"eeg_research.decision.v2", "eeg_research.decision.v3"}
                     or record.get("campaign_id") != state.get("goal_id")
                     or record.get("raw_digest") != request_digest(request=raw)):
                 raise ValueError("decision_content_identity_conflict:" + path.stem)
         legacy_completion = None
         validation_raw = raw
+        if record.get("decision_schema_version") == "eeg_research.decision.v3":
+            validation_raw = body.get("execution")
+            if not isinstance(validation_raw, dict) or record.get("execution_digest") != request_digest(request=validation_raw):
+                raise ValueError("decision_execution_identity_conflict:" + path.stem)
+            # Raw proposal/history is deliberately not a strict option pool.
+            # Only the independently validated execution envelope is recoverable.
+            if record.get("ok"):
+                PlannerDecision.model_validate(validation_raw)
         if not record.get("decision_schema_version"):
             # V1 non-read resumes already have independent local completion /
             # workspace markers. Reuse those two existing recovery paths; a
@@ -443,27 +467,28 @@ def _recover_decision_reads(camp: Path, state: dict[str, Any]) -> None:
                                                      if key in PlannerDecision.model_fields})
             if parsed.action != record.get("action") or record.get("read_requests", []) != validation_raw.get("read_requests", []):
                 raise ValueError("decision_action_identity_conflict:" + path.stem)
+        raw_for_reads = validation_raw
         if previous is None:
             row = dict(record)
             if legacy_completion is not None:
                 from react_agent.eeg_research.agentic.artifacts import file_digest
                 row["legacy_recovery_source"] = {"path": str(legacy_completion), "sha256": file_digest(legacy_completion)}
-            if row.get("ok") and row.get("executed") is False and not (row.get("action") == "retrieve_memory" and raw.get("read_requests")) and legacy_completion is None and not record.get("decision_schema_version"):
+            if row.get("ok") and row.get("executed") is False and not (row.get("action") == "retrieve_memory" and raw_for_reads.get("read_requests")) and legacy_completion is None and not record.get("decision_schema_version"):
                 if state.get("status") not in _TERMINAL:
                     raise ValueError("orphan_non_read_decision_requires_reconciliation:" + path.stem)
             state.setdefault("decisions", []).append(row)
             known[path.stem] = row
             previous = row
-            if row.get("executed") is True and row.get("action") == "retrieve_memory" and raw.get("read_requests"):
+            if row.get("executed") is True and row.get("action") == "retrieve_memory" and raw_for_reads.get("read_requests"):
                 state["_recovered_completed_read_id"] = path.stem
         elif record.get("executed") is True and previous.get("executed") is False:
             previous["executed"] = True
-            if previous.get("action") == "retrieve_memory" and raw and raw.get("read_requests"):
+            if previous.get("action") == "retrieve_memory" and raw_for_reads and raw_for_reads.get("read_requests"):
                 state["_recovered_completed_read_id"] = path.stem
-        if record.get("action") != "retrieve_memory" or not raw or not raw.get("read_requests"):
+        if record.get("action") != "retrieve_memory" or not raw_for_reads or not raw_for_reads.get("read_requests"):
             continue
         expected = {read_digest(request, (lookup(camp, str(request.get("artifact_id"))) or {}).get("sha256"))
-                    for request in raw["read_requests"]}
+                    for request in raw_for_reads["read_requests"]}
         receipts = [row for row in history if row.get("decision_id") == path.stem]
         seen = set()
         for receipt in receipts:
@@ -485,6 +510,9 @@ def _recover_decision_reads(camp: Path, state: dict[str, Any]) -> None:
 def rebuild_campaign_projection(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
     """Rebuild evidence/memory/counts from on-disk RunRecords when outer state lagged."""
     try:
+        from react_agent.eeg_research.agentic.candidate_lifecycle import sync, apply_detachments
+        sync(camp, state)
+        apply_detachments(camp, state)
         _recover_decision_reads(camp, state)
     except (OSError, ValueError, KeyError, TypeError) as exc:
         if state.get("status") in _TERMINAL:
@@ -608,6 +636,8 @@ def _dev_row(row: dict[str, Any]) -> dict[str, Any]:
         "evaluation_mode", "metric_scope", "primary_metric", "aggregate", "suite_id", "suite_ref", "suite_hash",
         "method_revision", "artifact_refs", "source_hash", "spec_hash", "result_hash",
         "config_hash", "contract_fingerprint", "execution_fingerprint", "scientific_view",
+        "screening", "scope", "phase", "coverage", "required_fold_count", "full_required_fold_count",
+        "science_scope", "independent_final_test",
     )
     return {key: row.get(key) for key in keep if key in row}
 
@@ -617,25 +647,45 @@ def candidate_implementation_target(camp: Path, state: dict[str, Any]) -> str:
     repair = pending_repair(state)
     if repair:
         return str(repair["candidate_id"])
+    from react_agent.eeg_research.agentic.candidate_lifecycle import is_detached
+    pending = (state.get("pending_candidate_check") or {}).get("candidate_id") or state.get("pending_candidate_id")
+    current_spec_hash = (state.get("experiment") or {}).get("spec_hash")
+    pending_matches_spec = any(row.get("candidate_id") == pending and row.get("spec_hash") == current_spec_hash
+                               for row in state.get("candidate_admissions") or [])
+    if pending and not is_detached(state, pending) and (pending_matches_spec or state.get("pending_candidate_check")
+            or state.get("candidate_admission_protocol") != "approval_allocation.v2"):
+        return str(pending)
+    spec_hash = current_spec_hash
+    admitted = next((row for row in state.get("candidate_admissions") or []
+                     if row.get("spec_hash") == spec_hash and not is_detached(state, row.get("candidate_id"))), None)
+    if admitted:
+        return str(admitted["candidate_id"])
     unfinished = incomplete_candidate_id(camp, state)
     if unfinished:
         return unfinished
     index = len(state.get("candidates") or []) + 1
-    while (camp / "candidates" / f"c{index}").exists():
+    allocated = {row.get("candidate_id") for row in state.get("candidate_admissions") or []}
+    while (camp / "candidates" / f"c{index}").exists() or f"c{index}" in allocated or is_detached(state, f"c{index}"):
         index += 1
     return f"c{index}"
 
 
 def observation(camp: Path) -> dict[str, Any]:
     state = load_state(camp)
+    from react_agent.eeg_research.agentic.candidate_lifecycle import sync
+    sync(camp, state)
     method_mode = state.get("evaluation_mode") == "loso_method_search"
     method_suites = []
+    method_screenings = []
     if method_mode:
         from react_agent.eeg_research.agentic.method_suite import manifest, verified_suite_records
         from react_agent.eeg_research.agentic.handoffs import method_suite_scalar_view
         verified = verified_suite_records(camp, state)
+        if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
+            from react_agent.eeg_research.agentic.screening import verified_screening_records
+            method_screenings = verified_screening_records(camp, state)
         method_permission = manifest(camp)["benchmark_permission"]
-        verified_ids = {row["evidence_id"] for row in verified}
+        verified_ids = {row["evidence_id"] for row in [*verified, *method_screenings]}
         ancillary_kinds = {"analysis", "audit", "data_audit", "method_hits", "report_revision",
                            "selected_development_read", "implementation"}
         # Keep engineering/role provenance, but no raw fold, partial suite or
@@ -650,7 +700,7 @@ def observation(camp: Path) -> dict[str, Any]:
     contract = public_contract(_read(camp / "evaluation_contract.json"))
     from react_agent.eeg_research.agentic.planner import blocked_actions, eligible_targets
 
-    method_by_id = {row["evidence_id"]: row for row in method_suites}
+    method_by_id = {row["evidence_id"]: row for row in [*method_suites, *method_screenings]}
     evidence = [_dev_row(method_by_id.get(row.get("evidence_id"), row))
                 for row in state.get("evidence") or []]
     from react_agent.eeg_research.agentic.interface import candidate_interface
@@ -664,7 +714,8 @@ def observation(camp: Path) -> dict[str, Any]:
             trainable.append(row["candidate_id"])
     if state.get("candidate_ready") and state.get("candidate_id") and state["candidate_id"] not in trainable:
         trainable.append(state["candidate_id"])
-    latest_job = next((row for row in reversed(state.get("evidence") or []) if row.get("job_dir") or row.get("fidelity")), None)
+    latest_job = next((row for row in reversed(state.get("evidence") or [])
+        if (row.get("kind") in {"method_suite", "method_screening"} if method_mode else row.get("job_dir") or row.get("fidelity"))), None)
     if method_mode and latest_job is not None:
         latest_job = method_by_id[latest_job["evidence_id"]]
     from react_agent.eeg_research.agentic.capabilities import capability_manifest
@@ -694,9 +745,13 @@ def observation(camp: Path) -> dict[str, Any]:
     state["_has_open_report_issues"] = bool((state.get("report_draft") or {}).get("claims") and any(
         row["status"] == "open" and row.get("claim_id") for row in feedback["issues"]))
     state["_implementation_target"] = candidate_implementation_target(camp, state)
+    if goal.get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import planner_phase_targets
+        state["_phase_eligible_targets"] = planner_phase_targets(camp, state)
     state = {**state, "budget": budget_snapshot(camp, state)}
     actions = available_actions(state)
     public = development_view({
+        "_campaign_path": str(camp.resolve()),
         "goal": _planner_goal(goal),
         "planner_mode": goal.get("planner_mode", "single_action"),
         "audit_feedback": feedback,
@@ -731,6 +786,15 @@ def observation(camp: Path) -> dict[str, Any]:
         "experiment": state.get("experiment"),
         "candidate_ready": state.get("candidate_ready"),
         "candidate_id": state.get("candidate_id"),
+        "action_planning": state.get("action_planning") or goal.get("action_planning"),
+        "candidate_admission_protocol": state.get("candidate_admission_protocol"),
+        "candidate_admissions": state.get("candidate_admissions") or [],
+        "inherited_candidate_admissions": state.get("inherited_candidate_admissions") or [],
+        "detached_candidates": state.get("detached_candidates") or {},
+        "pending_candidate_check": state.get("pending_candidate_check"),
+        "resource_wait": state.get("resource_wait"),
+        "execution_fingerprint": state.get("execution_fingerprint"),
+        "contract_fingerprint": state.get("contract_fingerprint"),
         "available_actions": actions,
         "eligible_targets": eligible_targets(state),
         "implementation_target_id": state["_implementation_target"],
@@ -765,9 +829,9 @@ def observation(camp: Path) -> dict[str, Any]:
     limits = {}
     for key in ("evidence", "memory", "lessons", "analyses"):
         if key == "evidence" and method_mode:
-            ordinary = [row for row in public[key] if row.get("kind") != "method_suite"]
+            ordinary = [row for row in public[key] if row.get("kind") not in {"method_suite", "method_screening"}]
             ordinary, limits[key] = bounded_history(ordinary)
-            scientific = [_dev_row(row) for row in method_suites]
+            scientific = [_dev_row(row) for row in [*method_suites, *method_screenings]]
             public[key] = ordinary + scientific
             limits[key]["complete_suite_scalars_preserved"] = len(scientific)
         else:
@@ -777,7 +841,14 @@ def observation(camp: Path) -> dict[str, Any]:
                       primary_metric=goal["primary_metric"],
                       benchmark_permission=method_permission,
                       scientific_unit="one_complete_method_suite_seed0")
-    public["evidence_index"] = [{key: row.get(key) for key in ("evidence_id", "candidate_id", "kind", "fidelity", "evaluation_valid")}
+        if goal.get("evaluation_schedule") == "screen_then_confirm":
+            from react_agent.eeg_research.agentic.screening import SCIENCE_SCOPE
+            public.update(evaluation_schedule="screen_then_confirm", method_screenings=method_screenings,
+                science_scope=SCIENCE_SCOPE, scientific_unit="frozen_method_revision_seed0_with_phase_scope",
+                screening_evidence_scope="two_fold_development", full_required_fold_count=10,
+                primary_metric=goal["primary_metric"] if method_suites else None,
+                declared_full_primary_metric=goal["primary_metric"])
+    public["evidence_index"] = [{key: row.get(key) for key in ("evidence_id", "candidate_id", "kind", "fidelity", "evaluation_valid", "scope", "phase", "coverage", "required_fold_count", "science_scope")}
                                 for row in evidence]
     public["memory_index"] = [{key: row.get(key) for key in ("episode_id", "candidate_id", "artifact", "retrieval")}
                               for row in retrieve(state.get("memory") or [], task_hash=str(state.get("goal_id")), fingerprint=str(state.get("contract_fingerprint")))]
@@ -871,9 +942,25 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         try:
             validate_inheritance(camp)
             from react_agent.eeg_research.agentic.resource_guard import advance_needs_gpus, require_idle_gpus
+            resource_wait = False
             if advance_needs_gpus(camp, state):
-                require_idle_gpus(camp, state)
-            if advance(camp, state, services):
+                try:
+                    require_idle_gpus(camp, state)
+                    state.pop("resource_wait", None)
+                except ValueError as exc:
+                    from react_agent.eeg_research.agentic.candidate_lifecycle import enabled
+                    busy = str(exc) in {"study_gpu_occupied_without_sharing_authorization", "gpu_existing_memory_exceeds_authorized_limit", "gpu_busy"}
+                    if not (busy and enabled(_read(camp / "goal.json")) and not state.get("active_suite") and not state.get("live_job")):
+                        raise
+                    # A resource wait cannot excuse a broken frozen framework.
+                    # CPU work reads no new EEG or scores; training still checks
+                    # data/cache dependencies at its native launch boundary.
+                    from react_agent.eeg_research.agentic.method_suite import manifest, verify_dependencies
+                    verify_dependencies(manifest(camp)["framework_dependencies"])
+                    state["resource_wait"] = {"kind": "gpu_busy", "detail": str(exc), "cpu_actions_may_continue": True}
+                    save_state(camp, state)
+                    resource_wait = True
+            if not resource_wait and advance(camp, state, services):
                 return load_state(camp)
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
             persist_failure(camp, state, phase="method_suite", error_type="method_suite_invalid_or_blocked",
@@ -938,6 +1025,11 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
             services["implement"](camp, state)
             _finish_step(camp, state)
             return state
+    resume_check = services.get("resume_pending_check")
+    if state.get("pending_candidate_check") and resume_check is not None:
+        if resume_check(camp, state):
+            _finish_step(camp, state)
+            return state
     if state.get("llm_calls_left", 1) <= 0:
         state["status"] = "blocked"
         state["detail"] = "budget_exhausted"
@@ -948,9 +1040,17 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         from react_agent.eeg_research.agentic.handoffs import record_read_delivery, prepare_read_delivery, _read_journal_records
         from react_agent.eeg_research.agentic.artifacts import request_digest
         reserved_id = _next_decision_id(camp, state)
+        from react_agent.eeg_research.agentic.action_planning import planner_round_identity
+        round_id = planner_round_identity(obs)
         from react_agent.eeg_research.agentic.semantic_memory import role_memory, apply_memory
         frozen_memory = role_memory(camp, state=state)
         def planner_request(request):
+            bind = getattr(backend, "bind", None)
+            if callable(bind):
+                stage = (request.get("option_repair_request") or {}).get("kind") or (
+                    "legacy_schema_correction" if request.get("schema_error") else "proposal_generation")
+                configuration_hash = getattr(getattr(backend, "role_config", None), "role_config_hash", "legacy")
+                bind(operation_id=round_id + ":" + stage + ":" + configuration_hash)
             if frozen_memory is not None:
                 request = apply_memory(request, frozen_memory)
             rows = request.get("artifact_reads") or []
@@ -962,7 +1062,10 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
             record_read_delivery(camp, rows, consumer="research_planner", request_id=prefix + str(attempt),
                                  input_digest=request_digest(request=request))
             return backend(request)
-        decision = decide(obs, planner_request)
+        from react_agent.eeg_research.agentic.api_policy import planner_api_round
+        from react_agent.eeg_research.agentic.action_planning import planning_config
+        with planner_api_round(camp, round_id, max_attempts=planning_config(obs).max_api_attempts_per_round):
+            decision = decide(obs, planner_request)
     except LlmUnavailable as exc:
         _sync_ledger(camp, state)
         persist_failure(camp, state, phase="planner", error_type=str(exc), detail=str(exc), recoverable=True)
@@ -980,11 +1083,27 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         save_state(camp, state)
         return state
     _sync_ledger(camp, state)
-    raw_decision = decision.get("raw") if isinstance(decision.get("raw"), dict) else {}
+    if decision.get("bounded_supplement_exhausted") and not decision.get("ok"):
+        from react_agent.eeg_research.agentic.planner_exhaustion import issue
+        from react_agent.eeg_research.agentic.planner import _validate_reply
+        save_state(camp, state)
+        latest = observation(camp)
+        validate = lambda reply: _validate_reply(reply, latest, latest["available_actions"],
+            set(latest.get("_known_evidence_ids") or []), set(latest.get("trainable_ids") or []), latest.get("eligible_targets"))
+        receipt = issue(camp, latest, decision.get("rejection_records") or [], validate)
+        if receipt:
+            execution = {"action": "stop", "stop_reason": "no_feasible_action", "exhaustion_receipt": receipt,
+                         "decision_rationale": "Runtime has exhausted bounded proposals and found no feasible operation."}
+            decision.update(ok=True, action="stop", execution=execution,
+                            reason_zh="当前合法研究路径已耗尽", selection_source="runtime_exhaustion_receipt")
+    original_reply = decision.get("raw") if isinstance(decision.get("raw"), dict) else {}
+    normalized_protocol = decision.get("proposal_history") is not None or decision.get("execution") is not None
+    raw_decision = (decision.get("execution") or {}) if normalized_protocol else original_reply
     cited = raw_decision.get("evidence_ids") or raw_decision.get("evidence_refs") or []
     record = {
         "decision_id": _next_decision_id(camp, state),
-        "decision_schema_version": "eeg_research.decision.v2",
+        "planner_round_id": round_id,
+        "decision_schema_version": "eeg_research.decision.v3" if normalized_protocol else "eeg_research.decision.v2",
         "campaign_id": state["goal_id"],
         "raw_digest": request_digest(request=decision.get("raw")),
         "action": decision.get("action"),
@@ -1005,8 +1124,16 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         "evidence_count": evidence_count(state),
         "executed": bool(decision.get("ok")) is False,
     }
+    if normalized_protocol:
+        record.update(execution_digest=request_digest(request=raw_decision),
+                      option_validation_records=decision.get("rejection_records") or [],
+                      pool_summary=decision.get("pool_summary"), selection_source=decision.get("selection_source"))
     state.setdefault("decisions", []).append(record)
-    _write(camp / "decisions" / f"{record['decision_id']}.json", {"decision": record, "raw": decision.get("raw")}, exclusive=True)
+    body = {"decision": record, "raw": decision.get("raw")}
+    if normalized_protocol:
+        body.update(execution=raw_decision, proposal_history=decision.get("proposal_history") or [],
+                    option_validation_records=decision.get("rejection_records") or [])
+    _write(camp / "decisions" / f"{record['decision_id']}.json", body, exclusive=True)
     event(camp, "decision", **record)
     if not decision.get("ok"):
         state["status"] = "blocked"
@@ -1058,6 +1185,7 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     if (state.get("failure") or {}).get("phase") in {"planner", "plan_update"}:
         state.pop("failure", None)
         state.pop("detail", None)
+    decision["decision_id"] = record["decision_id"]
     _apply_action(camp, state, str(decision.get("action") or ""), decision, runner, services, obs)
     _finish_step(camp, state)
     return state
@@ -1075,6 +1203,8 @@ def _finish_step(camp: Path, state: dict[str, Any]) -> None:
             if ((body.get("decision") or {}).get("decision_id") != record["decision_id"]
                     or (record.get("raw_digest") and request_digest(request=body.get("raw")) != record["raw_digest"])):
                 raise ValueError("decision_content_identity_conflict:" + record["decision_id"])
+            if record.get("execution_digest") and request_digest(request=body.get("execution")) != record["execution_digest"]:
+                raise ValueError("decision_execution_identity_conflict:" + record["decision_id"])
             body["decision"] = dict(record)
             _write(path, body)
     if state.get("pause_after_step") and state.get("status") not in _TERMINAL and not state.get("live_job"):
@@ -1099,7 +1229,8 @@ def _apply_action(
         save_state(camp, state)
         return
     state["status"] = "planning"
-    raw = decision.get("raw") if isinstance(decision.get("raw"), dict) else _decision_raw(camp, str(decision.get("decision_id") or ""))
+    raw = (decision.get("execution") if isinstance(decision.get("execution"), dict) else
+           decision.get("raw") if isinstance(decision.get("raw"), dict) else _decision_raw(camp, str(decision.get("decision_id") or "")))
     if obs.get("planner_mode") == "compare_options" or any(raw.get(key) for key in ("options", "read_requests", "resolves_issue_ids", "report_revision")) or action == "revise_report":
         from react_agent.eeg_research.agentic.planner import _parse, validate_comparison_and_reads
         live = observation(camp)
@@ -1124,6 +1255,9 @@ def _apply_action(
                  "_has_development_artifacts": any(row.get("verification_status") == "verified" for row in live.get("artifact_index") or []),
                  "_read_remaining": live["artifact_read_budget"]["remaining_reads"],
                  "_has_open_report_issues": "revise_report" in live["available_actions"]}
+        if current.get("evaluation_schedule") == "screen_then_confirm":
+            from react_agent.eeg_research.agentic.screening import planner_phase_targets
+            scope["_phase_eligible_targets"] = planner_phase_targets(camp, scope)
         # Same audit freshness rule the Planner's observation applied; without it a
         # report that went stale looks freshly audited here and audit_result is refused.
         refresh_audit_freshness(scope)
@@ -1131,6 +1265,19 @@ def _apply_action(
         from react_agent.eeg_research.agentic.planner import eligible_targets
         live["eligible_targets"] = eligible_targets(scope)
         candidate = {**raw, "action": action}
+        if candidate.get("target_binding"):
+            from react_agent.eeg_research.agentic.action_planning import target_binding
+            if candidate["target_binding"] != target_binding(live, action, candidate.get("target_id")):
+                persist_failure(camp, state, phase="planner", error_type="execution_source_spec_identity_changed",
+                                detail="execution_source_spec_identity_changed", recoverable=True)
+                record = (state.get("decisions") or [{}])[-1]
+                if record.get("decision_id") == decision.get("decision_id") and record.get("ok"):
+                    _reject_plan_decision(camp, record, "execution_source_spec_identity_changed")
+                return
+        if candidate.get("options"):
+            # Historical alternatives are not fresh grants. Recheck the chosen
+            # operation now; unrelated stale alternatives cannot veto it.
+            candidate["options"] = [row for row in candidate["options"] if row.get("option_id") == candidate.get("selected_option_id")]
         parsed = _parse(candidate, live["available_actions"], set(live.get("_known_evidence_ids") or []),
                         set(live.get("trainable_ids") or []), live.get("eligible_targets"))
         if action == "retrieve_memory" and raw.get("read_requests"):
@@ -1195,12 +1342,18 @@ def _apply_action(
         live = observation(camp)
         gate["research_progress"] = progress_context(camp, state, goal, budget_snapshot(camp, state), live["available_actions"])
         stop_error = completion_block_reason(gate, reason) or stopping_block_reason(gate, reason)
+        if reason == "no_feasible_action":
+            from react_agent.eeg_research.agentic.planner import _validate_reply
+            from react_agent.eeg_research.agentic.planner_exhaustion import verify
+            stop_error = verify(camp, raw.get("exhaustion_receipt"), live,
+                lambda reply: _validate_reply(reply, live, live["available_actions"],
+                    set(live.get("_known_evidence_ids") or []), set(live.get("trainable_ids") or []), live.get("eligible_targets")))
         if stop_error:
             persist_failure(camp, state, phase="stop", error_type="premature_research_stop",
                             detail=stop_error, recoverable=True)
             return
         state["status"] = "finished"
-        state["execution_status"] = "completed"
+        state["execution_status"] = "exhausted" if reason == "no_feasible_action" else "completed"
         state["research_outcome"] = state.get("research_outcome") or "not_evaluated"
         refresh_audit_freshness(state)
         state["audit_status"] = state.get("audit_status") or "pending"
@@ -1285,7 +1438,7 @@ def _apply_action(
             _implement_inline(camp, state, decision if decision.get("raw") else {"raw": raw, "reason_zh": decision.get("reason_zh")})
         else:
             implementer(camp, state)
-    elif action in {"run_pilot", "run_full", "replicate"}:
+    elif action in {"run_pilot", "run_full", "replicate", "run_screening", "run_confirmation"}:
         _train(camp, state, action, runner, services, raw)
 
 
@@ -1327,6 +1480,9 @@ def _propose_experiment(camp: Path, state: dict[str, Any], decision: dict[str, A
 
     state["candidate_ready"] = False
     state["experiment_failed"] = not experiment_is_approved(state.get("experiment") if isinstance(state.get("experiment"), dict) else None)
+    if not state["experiment_failed"]:
+        from react_agent.eeg_research.agentic.candidate_lifecycle import admit
+        admit(camp, state, candidate_implementation_target(camp, state), state["experiment"])
 
 
 def _retrieve_methods(camp: Path, state: dict[str, Any], raw: dict[str, Any], services: Services) -> None:
@@ -1410,6 +1566,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     control = str(spec.get("control_candidate_id") or "baseline")
     diagnostics = matched_diagnostics(state, parent)
     method_parent = None
+    screening_parent = None
     if state.get("evaluation_mode") == "loso_method_search":
         from react_agent.eeg_research.agentic.method_suite import verified_suite_records
         from react_agent.eeg_research.agentic.handoffs import method_suite_scalar_view
@@ -1424,6 +1581,13 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
             diagnostics = matched_diagnostics({"evidence": [method_parent]}, parent)
         else:
             diagnostics = None
+            if _read(camp / "goal.json").get("evaluation_schedule") == "screen_then_confirm":
+                from react_agent.eeg_research.agentic.screening import verified_screening_records
+                screening_parent = next((row for row in reversed(verified_screening_records(camp, state))
+                                         if row.get("candidate_id") == parent), None)
+                if screening_parent is not None:
+                    diagnostics = {"status": "verified_two_fold_screening", "scope": "two_fold_development",
+                        "screening": screening_parent["screening"], "independent_final_test": False}
     if diagnostics is None:
         missing.append("diagnostics")
     methods = state.get("method_hits") or []
@@ -1480,6 +1644,11 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
                 "evidence_id", "suite_id", "suite_ref", "suite_hash", "method_revision",
                 "source_hash", "result_hash", "contract_fingerprint")},
             scientific_unit="one_complete_method_suite_seed0")
+    elif screening_parent is not None:
+        context.update(method_screening=screening_parent["screening"], scope="two_fold_development",
+            science_scope=screening_parent.get("science_scope"), scientific_unit="fixed_two_fold_development_seed0",
+            method_screening_identity={key: screening_parent.get(key) for key in (
+                "evidence_id", "suite_id", "suite_ref", "suite_hash", "method_revision", "source_hash", "result_hash")})
     from react_agent.eeg_research.agentic.semantic_memory import role_memory, standalone_delivery
     bundle = role_memory(camp, state=state, experiment=spec)
     if bundle is not None:
@@ -1591,6 +1760,9 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     state["hypothesis"] = stored.get("hypothesis") if isinstance(stored, dict) else state.get("hypothesis")
     state["candidate_ready"] = False
     state["experiment_failed"] = blocked
+    if not blocked:
+        from react_agent.eeg_research.agentic.candidate_lifecycle import admit
+        admit(camp, state, candidate_implementation_target(camp, state), stored)
     if design_failure:
         scientific_epoch = [row.get("evidence_id") for row in state.get("evidence") or []
                             if row.get("evaluation_valid") is True and row.get("fidelity") in {"pilot", "full"}]
@@ -1682,18 +1854,31 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
         latest = next((row for row in reversed(state.get("evidence") or []) if row.get("comparison") or row.get("job_dir")), None)
     claims = []
     verdict = "PASS"
+    screening_latest = bool(method_mode and latest and latest.get("kind") == "method_screening")
     if latest is None:
         verdict = "REVISE"
         claims.append({"claim": "no_job_result", "status": "unsupported"})
     else:
-        if method_mode and latest.get("candidate_id") == "baseline":
+        if screening_latest:
+            result = latest.get("screening") or {}
+            valid = (result.get("status") == "complete" and result.get("coverage") == 2
+                     and result.get("required_fold_count") == 2 and len(set(result.get("screening_subjects") or [])) == 2)
+            name = "screening_baseline_reference" if latest.get("candidate_id") == "baseline" else "verified_two_fold_screening"
+            if latest.get("candidate_id") != "baseline":
+                valid = valid and len(result.get("paired_scores") or []) == 2 and result.get("screening_mean_delta_pp") is not None
+            claims.append({"claim": name, "status": "supported" if valid else "unsupported",
+                           "ref": latest.get("evidence_id"), "scope": "two_fold_development", "coverage": 2,
+                           "full_required_fold_count": 10, "independent_final_test": False})
+            if not valid:
+                verdict = "REVISE"
+        elif method_mode and latest.get("candidate_id") == "baseline":
             claims.append({"claim": "complete_baseline_reference", "status": "supported", "ref": latest.get("evidence_id")})
         elif latest.get("comparison") and latest["comparison"].get("comparable"):
             claims.append({"claim": "comparison_comparable", "status": "supported", "ref": latest.get("evidence_id")})
         else:
             claims.append({"claim": "comparison_comparable", "status": "unsupported", "ref": latest.get("evidence_id")})
             verdict = "REVISE"
-        if not latest.get("diagnostics"):
+        if not screening_latest and not latest.get("diagnostics"):
             claims.append({"claim": "diagnostics_present", "status": "unsupported"})
             verdict = "REVISE" if verdict != "BLOCK" else verdict
     import hashlib
@@ -1766,6 +1951,16 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
                           "no independent final test", "no replication or statistical significance",
                           "same-provider audit is not independent replication"],
         )
+        if method_report.get("scope") == "staged_method_development":
+            report_draft.update(scope="staged_method_development", evaluation_schedule="screen_then_confirm",
+                screenings=method_report.get("screenings") or [], science_scope=method_report.get("science_scope"),
+                primary_metric="benchmark.loso_mean_fixed_gallery_top1" if method_report["methods"] else None,
+                declared_full_primary_metric="benchmark.loso_mean_fixed_gallery_top1",
+                scope_limits=["fixed development gallery and source-side checkpoint selection",
+                    "two-fold screening feedback is not a ten-subject primary metric",
+                    "confirmed methods are conditional on fixed two-fold selection",
+                    "no independent final test", "no replication or established statistical significance",
+                    "same-provider audit is not independent replication"])
     report_draft["dependency_manifest_hash"] = hashlib.sha256(json.dumps(manifest, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     report_draft["report_hash"] = hashlib.sha256(json.dumps(report_draft, sort_keys=True, default=str).encode("utf-8")).hexdigest()
     report_draft["report_ref"] = "report:" + report_draft["report_hash"]
@@ -1797,6 +1992,7 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
         "claims": claims,
         "report_hash": report_hash,
         "summary_zh": "审计基于已落盘的 comparison/diagnostics，未训练模型",
+        "scope": report_draft["scope"],
     }
     from react_agent.eeg_research.agentic.audit_context import audit_feedback
     from react_agent.eeg_research.agentic.handoffs import bounded_control_view
@@ -1818,6 +2014,12 @@ def _audit_result(camp: Path, state: dict[str, Any], services: Services) -> None
                        independent_seed_count=method_report["independent_seed_count"], replicated=False,
                        independent_final_test=False, statistical_significance="not_established")
         request["deterministic_audit"]["scope"] = "method_development_benchmark"
+        if method_report.get("scope") == "staged_method_development":
+            request.update(evaluation_schedule="screen_then_confirm", scope="staged_method_development",
+                screenings=report_draft["screenings"], science_scope=report_draft.get("science_scope"),
+                scientific_unit="fixed_two_fold_development_seed0" if screening_latest else "complete_method_suite_seed0_with_selection_scope",
+                declared_full_primary_metric=report_draft["declared_full_primary_metric"])
+            request["deterministic_audit"]["scope"] = "two_fold_development" if screening_latest else "staged_method_development"
     audit_inputs = [camp / "goal.json", *(method_report["inputs"] if method_mode else [])]
     task = begin_role_task(camp, role="result_auditor", inputs=audit_inputs, request=request)
     request = {**request, "task_id": task["task_id"], "attempt_id": task["attempt_id"], "input_digest": task["input_digest"]}
@@ -2462,11 +2664,13 @@ def _train(
         from react_agent.eeg_research.agentic.method_suite import begin
         target = raw.get("target_id") or state.get("candidate_id")
         try:
-            if action != "run_full" or target not in _reviewed_ids(state):
+            if action not in {"run_full", "run_screening", "run_confirmation"} or target not in _reviewed_ids(state):
                 raise ValueError("method_suite_requires_reviewed_full_target")
             from react_agent.eeg_research.agentic.resource_guard import require_idle_gpus
             require_idle_gpus(camp, state)
-            begin(camp, state, target)
+            state.pop("resource_wait", None)
+            phase = {"run_screening": "screening_2fold", "run_confirmation": "confirmation_10fold"}.get(action)
+            begin(camp, state, target, **({"phase": phase} if phase else {}))
         except (OSError, ValueError, KeyError) as exc:
             persist_failure(camp, state, phase="method_suite", error_type="method_suite_admission_failed", detail=str(exc), recoverable=True)
         return

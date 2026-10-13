@@ -156,12 +156,24 @@ def request_deepseek(context: dict[str, Any]) -> dict[str, Any]:
     if model:
         config.fast.model = model
     system = _PROMPT.read_text(encoding="utf-8")
-    user = json.dumps(context, ensure_ascii=False)
+    from react_agent.eeg_research.agentic.context.service import ContextService, send_prepared
+    from react_agent.eeg_research.agentic.context.types import CompileRequest, Ready
+    import hashlib
+    campaign_id = str(context.get("campaign_id") or "legacy_eeg")
+    base = Path(context.get("_campaign_path") or Path(__file__).resolve().parents[3] / "runs" / "eeg_legacy_context")
+    camp = base / "context_campaigns" / hashlib.sha256(campaign_id.encode()).hexdigest()[:20]
+    outcome = ContextService(camp).compile(CompileRequest(camp.name, "research_planner", context,
+        system=system, purpose="legacy_research_controller", model=config.fast.model,
+        max_output_tokens=config.fast.max_tokens))
+    if not isinstance(outcome, Ready):
+        raise PlanningError("context_" + outcome.status + ":" + outcome.reason)
+    client = DeepSeekBackend(config)
+    enable = getattr(client, "enable_context_protocol", None)
+    if enable:
+        enable()
     try:
         payload, _usage = asyncio.run(
-            DeepSeekBackend(config).complete_json(
-                system=system,
-                user=user,
+            send_prepared(client, outcome.prepared,
                 profile="fast",
                 role="research_controller",
             )
@@ -303,7 +315,7 @@ class ResearchController:
             return backend(context)
         if not os.environ.get("DEEPSEEK_API_KEY"):
             raise PlanningError(open_adaptive())
-        return request_deepseek(context)
+        return request_deepseek({**context, "_campaign_path": str(self.out_dir.resolve())})
 
     def _blocked(
         self,

@@ -120,7 +120,7 @@ Copy [`.env.example`](../react-agent/.env.example) and keep real values local. E
 | Variable | Purpose |
 | --- | --- |
 | `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | DeepSeek-backed planning and research role calls |
-| `DEEPSEEK_FAST_MODEL` / `DEEPSEEK_REASONING_MODEL` | Model profiles; current EEG role calls use the fast profile |
+| `DEEPSEEK_FAST_MODEL` / `DEEPSEEK_REASONING_MODEL` | Logged compatibility defaults; explicit EEG role configuration takes priority |
 | `TRIBE_PYTHON` | Interpreter for external TRIBE generation |
 | `EEG_DATA_ROOT` | Preprocessed data and image-feature caches |
 | `EEG_TRAIN_PYTHON` | Torch interpreter for training and candidate checks |
@@ -157,3 +157,7 @@ uv run python -m react_agent.eeg_research.agentic.cli validate-goal \
 ```
 
 These commands inspect configuration and numeric screening behavior; they do not replace a full regression suite, live-role validation or a GPU retrieval study. Historical acceptance documents retain the commands and outcomes for their recorded revisions. See the [architecture map](architecture.md) for the current runtime and audit context.
+
+### Two-fold screening before ten-fold confirmation
+
+Use the explicit `screen_then_confirm` goal to enable fixed two-fold full-recipe screening, independent role routing and bounded option repair. See [the staged execution guide](screen-then-confirm.md) for the complete goal, configuration preview, dry-run, resource accounting and historical compatibility. Existing persisted full-only campaigns retain their earlier schedule.

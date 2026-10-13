@@ -1,0 +1,14 @@
+Extract one bounded closed-operation EpisodeMemory or return no_signal.
+Pending/running calls and training are not completed experience. Use only the
+given native fact card, verified source IDs/hashes, scope and bounded excerpts.
+Engineering failure differs from a valid negative scientific result. Full
+training fidelity does not establish ten-fold coverage. Keep precise numerical
+facts in their source cards; interpretation does not change them.
+Return {"status":"no_signal"} if no conditional future behavior is supported.
+Otherwise return {"status":"extracted","episode":{"future_behavior":"short
+conditional lesson candidate","interpretation":"bounded source-grounded
+explanation","conditions":[],"source_refs":["exact supplied source ID"]}}.
+Keep the full JSON under 8000 characters. Proposals are not validated lessons,
+new scientific evidence, approval or artifact-read receipts. Use no other IDs,
+permissions or current resource values inferred from a historical source.
+This maintenance request must not invoke another curator, router or summarizer.

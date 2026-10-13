@@ -240,6 +240,9 @@ def progress_context(camp: Path, state: dict[str, Any], goal: dict[str, Any],
                      budget: dict[str, Any], actions: list[str]) -> dict[str, Any]:
     """Count applied full-fidelity mechanisms from accepted, source-bound jobs."""
     if goal.get("evaluation_mode") == "loso_method_search":
+        if goal.get("evaluation_schedule") == "screen_then_confirm":
+            from react_agent.eeg_research.agentic.screening import progress_context as phase_progress
+            return phase_progress(camp, state, goal, budget, actions)
         from react_agent.eeg_research.agentic.method_suite import verified_suite_records
         from react_agent.eeg_research.agentic.planner import (
             IMPLEMENT_CALLS, _number, design_block_reason, training_block_reason,

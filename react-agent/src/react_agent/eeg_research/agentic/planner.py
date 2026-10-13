@@ -20,6 +20,8 @@ ACTIONS = (
     "run_pilot",
     "run_full",
     "replicate",
+    "run_screening",
+    "run_confirmation",
     "audit_result",
     "revise_report",
     "stop",
@@ -32,6 +34,7 @@ STOP_REASONS = (
     "budget_exhausted",
     "blocked",
     "user_cancelled",
+    "no_feasible_action",
 )
 
 Backend = Callable[[dict[str, Any]], dict[str, Any]]
@@ -40,7 +43,7 @@ Backend = Callable[[dict[str, Any]], dict[str, Any]]
 # candidate filter/annotation. These local actions consume no model/training
 # resources by target. All training/implementation costs need exact bindings.
 TARGET_INDEPENDENT_COST_ACTIONS = frozenset({"diagnose_results", "collect_diagnostics", "retrieve_memory"})
-TARGETED_ACTIONS = frozenset({"run_pilot", "run_full", "replicate", "implement_candidate", "repair_candidate"})
+TARGETED_ACTIONS = frozenset({"run_pilot", "run_full", "replicate", "run_screening", "run_confirmation", "implement_candidate", "repair_candidate"})
 
 
 def known_candidate_ids(observation: dict[str, Any]) -> set[str]:
@@ -176,9 +179,12 @@ def completion_block_reason(scope: dict[str, Any], reason: Any) -> str | None:
 def training_actions(scope: dict[str, Any]) -> set[str]:
     """Explicit execution scope. Empty permits no training; missing keeps defaults."""
     declared = scope.get("allowed_training_actions", ["run_pilot", "run_full", "replicate"])
-    if not isinstance(declared, list) or any(name not in {"run_pilot", "run_full", "replicate"} for name in declared):
+    if not isinstance(declared, list) or any(name not in {"run_pilot", "run_full", "replicate", "run_screening", "run_confirmation"} for name in declared):
         return set()
-    return set(declared)
+    permitted = set(declared)
+    if scope.get("evaluation_schedule") == "screen_then_confirm" and "run_full" in permitted:
+        permitted.update({"run_screening", "run_confirmation"})
+    return permitted
 
 
 def _number(value: Any) -> float | None:
@@ -213,12 +219,19 @@ def design_block_reason(state: dict[str, Any], budget: dict[str, Any] | None = N
     if state.get("evaluation_mode") == "loso_method_search":
         jobs_left = (budget or state.get("budget") or {}).get("training_jobs_left",
                     state.get("max_training_jobs", 0) - state.get("training_jobs", 0))
-        if jobs_left < 10:
+        minimum = 2 if state.get("evaluation_schedule") == "screen_then_confirm" else 10
+        if jobs_left < minimum:
+            if minimum == 2:
+                return "screening_requires_phase_job_slots"
             return "method_suite_requires_ten_job_slots"
     reason = training_block_reason(state, budget)
     if reason:
         return reason
-    if not training_actions(state).intersection({"run_pilot", "run_full"}):
+    initial_runs = {"run_pilot", "run_full"}
+    if (state.get("evaluation_mode") == "loso_method_search"
+            and state.get("evaluation_schedule") == "screen_then_confirm"):
+        initial_runs.add("run_screening")
+    if not training_actions(state).intersection(initial_runs):
         return "training_scope_no_initial_run"
     return None
 
@@ -228,7 +241,11 @@ def _new_implementation_block_reason(state: dict[str, Any]) -> str | None:
     # when no future training is possible. Preserve those pending tasks.
     if state.get("repair_task"):
         return None
+    if state.get("pending_candidate_check"):
+        return None
     target = state.get("_implementation_target") or state.get("candidate_id")
+    if any(row.get("candidate_id") == target for row in state.get("candidate_admissions") or []):
+        return None
     if any(row.get("candidate_id") == target and row.get("source_hash") for row in state.get("candidates") or []):
         return None
     if any(row.get("candidate_id") == target and row.get("evaluation_valid") for row in state.get("evidence") or []):
@@ -238,6 +255,10 @@ def _new_implementation_block_reason(state: dict[str, Any]) -> str | None:
 
 def submitted_candidates(state: dict[str, Any]) -> int:
     """Scientific candidates that produced a patch. Baseline is counted separately."""
+    if state.get("candidate_admission_protocol") == "approval_allocation.v2":
+        own = {row.get("admission_id") for row in state.get("candidate_admissions") or [] if row.get("admission_id")}
+        inherited = {row.get("quota_identity") for row in state.get("inherited_candidate_admissions") or [] if row.get("quota_identity")}
+        return len(own) + len(inherited)
     unwritten = {"implementation_failed", "requires_framework_extension"}
     return sum(
         1
@@ -285,19 +306,26 @@ def eligible_targets(state: dict[str, Any]) -> dict[str, list[str]]:
     if state.get("candidate_ready") and state.get("candidate_id"):
         names.append(str(state["candidate_id"]))
     for row in state.get("candidates") or []:
-        if row.get("status") == "ready" and row.get("candidate_id"):
+        if row.get("status") == "ready" and row.get("candidate_id") and row.get("candidate_id") not in (state.get("detached_candidates") or {}):
             names.append(str(row["candidate_id"]))
     if "baseline" not in names and any(row.get("candidate_id") == "baseline" for row in evidence):
         names.append("baseline")
     repair = state.get("repair_task") or {}
     implementation_target = state.get("_implementation_target") or repair.get("candidate_id") or state.get("candidate_id")
     targets: dict[str, list[str]] = {"run_pilot": [], "run_full": [], "replicate": [],
+        "run_screening": [], "run_confirmation": [],
         "implement_candidate": [str(implementation_target)] if implementation_target else [],
         "repair_candidate": [str(repair["candidate_id"])] if repair.get("candidate_id") else []}
     if _new_implementation_block_reason(state):
         targets["implement_candidate"] = []
     permitted = training_actions(state)
     if not room:
+        return targets
+    if state.get("evaluation_schedule") == "screen_then_confirm":
+        permitted = training_actions(state)
+        for name in ("run_screening", "run_confirmation"):
+            if name in permitted:
+                targets[name] = list((state.get("_phase_eligible_targets") or {}).get(name) or [])
         return targets
     from react_agent.eeg_research.agentic.confirmation_policy import policy_training_seeds
 
@@ -343,7 +371,8 @@ def blocked_actions(state: dict[str, Any]) -> list[dict[str, str]]:
     if state.get("experiment") and _new_implementation_block_reason(state):
         gaps.append({"action": "implement_candidate", "reason": _new_implementation_block_reason(state)})
     calls = _number(state.get("llm_calls_left"))
-    if calls is not None and calls < IMPLEMENT_CALLS and state.get("experiment"):
+    implementation_calls = 1 if state.get("pending_candidate_check") else IMPLEMENT_CALLS
+    if calls is not None and calls < implementation_calls and state.get("experiment"):
         gaps.append({"action": "implement_candidate", "reason": "llm_budget"})
     return gaps
 
@@ -354,7 +383,8 @@ def available_actions(state: dict[str, Any]) -> list[str]:
         return ["stop"]
     evidence = state.get("evidence") or []
     actions = ["inspect_data", "retrieve_memory", "retrieve_methods", "audit_result", "stop"]
-    pending_experiment = bool(state.get("experiment")) and not state.get("candidate_ready") and not state.get("experiment_failed")
+    pending_experiment = ((bool(state.get("experiment")) and not state.get("candidate_ready") and not state.get("experiment_failed"))
+                          or bool(state.get("repair_task")) or bool(state.get("pending_candidate_check")))
     if not pending_experiment and design_block_reason(state) is None:
         actions.append("propose_experiment")
         actions.append("design_experiment")
@@ -366,14 +396,19 @@ def available_actions(state: dict[str, Any]) -> list[str]:
     from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
 
     approved = experiment_is_approved(state.get("experiment") if isinstance(state.get("experiment"), dict) else None)
-    if state.get("repair_task") and int((state.get("repair_task") or {}).get("remaining") or 0) > 0:
+    if state.get("pending_candidate_check") and approved:
+        if calls_left >= 1:
+            actions.append("implement_candidate")
+    elif state.get("repair_task") and int((state.get("repair_task") or {}).get("remaining") or 0) > 0:
         if calls_left >= IMPLEMENT_CALLS:
             actions.append("implement_candidate")
             actions.append("repair_candidate")
     elif (
         pending_experiment
         and approved
-        and submitted_candidates(state) < int(state.get("max_candidates", 4))
+        and (submitted_candidates(state) < int(state.get("max_candidates", 4)) or
+             any(row.get("candidate_id") == (state.get("_implementation_target") or state.get("candidate_id"))
+                 for row in state.get("candidate_admissions") or []))
         and calls_left >= IMPLEMENT_CALLS
         and _new_implementation_block_reason(state) is None
     ):
@@ -386,7 +421,7 @@ def available_actions(state: dict[str, Any]) -> list[str]:
     if audit_completed(state):
         actions = [name for name in actions if name != "audit_result"]
     targets = eligible_targets(state)
-    for name in ("run_pilot", "run_full", "replicate"):
+    for name in ("run_pilot", "run_full", "replicate", "run_screening", "run_confirmation"):
         if targets.get(name):
             actions.append(name)
     return actions
@@ -501,6 +536,13 @@ def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -
     eligible = observation.get("eligible_targets") if isinstance(observation.get("eligible_targets"), dict) else None
     from react_agent.eeg_research.agentic.planner_context import compact_planner_context, normalize_input_echoes
     observation = {**observation, "legal_choice_context": legal_choice_context(observation)}
+    new_protocol = bool(observation.get("action_planning") or (observation.get("goal") or {}).get("action_planning")) or (
+        (observation.get("goal") or {}).get("evaluation_schedule") == "screen_then_confirm")
+    if new_protocol and observation.get("planner_mode", (observation.get("goal") or {}).get("planner_mode")) == "compare_options":
+        from react_agent.eeg_research.agentic.action_planning import decide_options
+        def validate_independent(reply):
+            return _validate_reply(reply, observation, allowed, known, trainable, eligible)
+        return decide_options(observation, lambda request: backend(compact_planner_context(request)), validate_independent)
     previous = observation.get("previous_planner_failure") or {}
     request = (_repair_request(observation, {"detail": previous["detail"]}, previous["raw"])
                if previous.get("raw") and previous.get("detail") else observation)
@@ -657,6 +699,15 @@ def _validate_reply(
     if detail:
         return {"ok": False, "detail": detail}
     if parsed["action"] == "stop":
+        if reply.get("stop_reason") == "no_feasible_action":
+            from pathlib import Path
+            from react_agent.eeg_research.agentic.planner_exhaustion import verify
+            if not observation.get("_campaign_path"):
+                return {"ok": False, "detail": "exhaustion_receipt_not_runtime_issued"}
+            error = verify(Path(observation["_campaign_path"]), reply.get("exhaustion_receipt"), observation,
+                lambda draft: _validate_reply(draft, observation, allowed, known, trainable, eligible))
+            if error:
+                return {"ok": False, "detail": error}
         from react_agent.eeg_research.agentic.research_progress import stopping_block_reason
         reason = (completion_block_reason(observation, reply.get("stop_reason"))
                   or stopping_block_reason(observation, reply.get("stop_reason")))
@@ -701,7 +752,7 @@ def _parse(
         reason = reply.get("stop_reason")
         if reason not in (None, "") and reason not in STOP_REASONS:
             return {"ok": False, "detail": f"stop_reason_invalid:{reason}"}
-    if action in {"run_pilot", "run_full", "replicate"}:
+    if action in {"run_pilot", "run_full", "replicate", "run_screening", "run_confirmation"}:
         target = reply.get("target_id")
         if eligible is not None:
             allowed_targets = set(eligible.get(action) or [])
@@ -770,7 +821,8 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
             if digest in digests or digest in (observation.get("_artifact_read_digests") or []):
                 return "artifact_read_replayed"
             digests.append(digest)
-    if compare and (not parsed.options or not parsed.selected_option_id or not parsed.selection_rationale.strip()):
+    runtime_exhaustion = parsed.action == "stop" and parsed.stop_reason == "no_feasible_action" and parsed.exhaustion_receipt is not None
+    if compare and not runtime_exhaustion and (not parsed.options or not parsed.selected_option_id or not parsed.selection_rationale.strip()):
         return "comparison_required"
     if not parsed.options:
         return None
@@ -799,7 +851,9 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
         return "option_intervention_requires_design"
     if selected.intervention and (parsed.experiment_draft or {}).get("intervention") != selected.intervention:
         return "selected_option_intervention_mismatch"
-    signatures = {(option.action, option.target_id, option.question_id, option.intervention) for option in parsed.options}
+    from react_agent.eeg_research.agentic.action_planning import operation_signature
+    signatures = {operation_signature(option.payload.model_dump()) if option.payload else
+                  json.dumps([option.action, option.target_id, option.intervention]) for option in parsed.options}
     if len(signatures) != len(parsed.options):
         return "duplicate_option_action"
     question_ids = {row.get("question_id") for row in ((observation.get("research_plan") or {}).get("plan") or {}).get("research_questions") or []}
@@ -828,7 +882,7 @@ def validate_comparison_and_reads(reply: dict[str, Any], observation: dict[str, 
         if option.executable:
             if option.action not in (observation.get("available_actions") or []):
                 return "option_action_unavailable:" + option.action
-            if option.action in {"run_pilot", "run_full", "replicate"} and option.target_id not in eligible.get(option.action, []):
+            if option.action in {"run_pilot", "run_full", "replicate", "run_screening", "run_confirmation"} and option.target_id not in eligible.get(option.action, []):
                 return "option_target_unavailable"
             if option.action in {"implement_candidate", "repair_candidate"} and option.target_id not in eligible.get(option.action, []):
                 return "option_target_unavailable"

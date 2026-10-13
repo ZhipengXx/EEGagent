@@ -71,6 +71,13 @@ def pack_candidate(job_dir: Path, dest: Path, *, workspace: Path | None = None) 
         "checkpoint": "last.ckpt" if (dest / "last.ckpt").is_file() else None,
         "context_root": ".",
     }
+    frozen = _read_json(dest / "frozen_run_spec.json")
+    derivation = frozen.get("fold_derivation") or {}
+    if derivation.get("evaluation_schedule") == "screen_then_confirm":
+        manifest.update(evaluation_schedule="screen_then_confirm", science_scope=derivation["science_scope"],
+                        canonical_fold_hash=derivation["canonical_fold_hash"],
+                        selection_manifest_hash=derivation["selection_manifest_hash"],
+                        score_scope="single_fold_only; no screening or ten_fold_mean_from_pack")
     (dest / "pack_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
 

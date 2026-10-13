@@ -386,6 +386,23 @@ def method_benchmark_origin(row: dict[str, Any]) -> dict[str, Any]:
             "independent_final_test": False}
 
 
+def method_screening_origin(row: dict[str, Any]) -> dict[str, Any]:
+    """Immutable two-fold source identity, distinct from a ten-fold aggregate."""
+    result = row.get("screening") or {}
+    if (row.get("kind") != "method_screening" or row.get("evaluation_valid") is not True
+            or result.get("status") != "complete" or result.get("coverage") != 2
+            or result.get("scope") != "two_fold_development"):
+        raise ValueError("screening_origin_requires_two_verified_folds")
+    return {"run_evidence_id": row["evidence_id"],
+            **{key: row[key] for key in ("candidate_id", "suite_id", "suite_ref", "suite_hash", "result_hash",
+                "method_revision", "source_hash", "spec_hash", "contract_fingerprint", "seed", "fidelity")},
+            "screening_artifact_id": row["artifact_refs"][0], "scope": "two_fold_development",
+            "coverage": 2, "required_fold_count": 2, "full_required_fold_count": 10,
+            "selection_manifest_hash": result["selection_manifest_hash"], "subjects": result["screening_subjects"],
+            "science_scope": result["science_scope"], "independent_seed_count": 1, "replicated": False,
+            "independent_final_test": False}
+
+
 def _audit_dependency_role_view(value: Any) -> Any:
     """Share only exactly equal manifest fields, preserving every missing field."""
     import copy
@@ -909,6 +926,33 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
     if path.stat().st_size > READ_FILE_BYTES:
         raise ValueError("artifact_exceeds_read_file_limit")
     body = json.loads(path.read_text(encoding="utf-8"))
+    def contains_screening_scope(value: Any) -> bool:
+        if isinstance(value, dict):
+            return (value.get("scope") == "two_fold_development"
+                    or value.get("phase") == "screening_2fold"
+                    or any(contains_screening_scope(child) for child in value.values()))
+        return isinstance(value, list) and any(contains_screening_scope(child) for child in value)
+    if row.get("kind") == "method_screening":
+        from react_agent.eeg_research.agentic.method_suite import manifest
+        from react_agent.eeg_research.agentic.screening import read_screening
+        common = manifest(camp)
+        suite_id = path.parent.name
+        expected = (camp / "suites" / suite_id / "screening.json").resolve()
+        if (common.get("evaluation_schedule") != "screen_then_confirm" or path != expected
+                or common["benchmark_permission"].get("partial_feedback") != "fixed_two_fold_only"):
+            raise ValueError("screening_artifact_requires_frozen_opt_in")
+        computed = read_screening(camp, suite_id)
+        if body.get("screening") != computed or computed.get("coverage") != 2:
+            raise ValueError("screening_artifact_requires_two_valid_folds")
+        return {**row, "development_scope": "two_fold_development", "native_completion_verified": True}
+    if row.get("kind") != "method_suite" and contains_screening_scope(body):
+        payload = body.get("payload")
+        origin = payload.get("method_screening_origin") if isinstance(payload, dict) else None
+        full_origin = payload.get("method_benchmark_origin") if isinstance(payload, dict) else None
+        if isinstance(origin, dict) and row.get("kind") in {"analysis", "lessons"}:
+            return _derived_method_artifact(camp, row, body, origin, screening=True)
+        if not isinstance(full_origin, dict):
+            raise ValueError("screening_artifact_requires_native_origin")
     def contains_benchmark_scope(value: Any) -> bool:
         if isinstance(value, dict):
             return (any(value.get(key) == "method_development_benchmark" for key in
@@ -932,7 +976,7 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
         permission = manifest(camp)["benchmark_permission"]
         suite_id = path.parent.name
         expected = (camp / "suites" / suite_id / "aggregate.json").resolve()
-        if path != expected or not permission.get("authorized") or permission.get("partial_feedback") is not False:
+        if path != expected or not permission.get("authorized") or permission.get("partial_feedback") not in {False, "fixed_two_fold_only"}:
             raise ValueError("method_benchmark_read_identity_or_permission_mismatch")
         computed = read_aggregate(camp, suite_id)
         if (body.get("aggregate") != computed or computed.get("status") != "complete"
@@ -948,7 +992,7 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
 
 
 def _derived_method_artifact(camp: Path, row: dict[str, Any], body: dict[str, Any],
-                             origin: dict[str, Any]) -> dict[str, Any]:
+                             origin: dict[str, Any], *, screening: bool = False) -> dict[str, Any]:
     """Allow only a completed native role receipt bound to a current full suite.
 
     Registered bytes, producer/task identity, aggregate input dependency, current
@@ -969,11 +1013,17 @@ def _derived_method_artifact(camp: Path, row: dict[str, Any], body: dict[str, An
         raise ValueError("method_derived_artifact_requires_completed_producer")
     envelope = validate_role_result(body, task)
     state = json.loads((camp / "campaign_state.json").read_text(encoding="utf-8"))
-    source = next((item for item in verified_suite_records(camp, state)
+    if screening:
+        from react_agent.eeg_research.agentic.screening import verified_screening_records
+        sources = verified_screening_records(camp, state)
+    else:
+        sources = verified_suite_records(camp, state)
+    source = next((item for item in sources
                    if item["evidence_id"] == origin.get("run_evidence_id")), None)
-    if source is None or origin != method_benchmark_origin(source):
+    origin_builder = method_screening_origin if screening else method_benchmark_origin
+    if source is None or origin != origin_builder(source):
         raise ValueError("method_derived_artifact_native_origin_mismatch")
-    native = development_artifact(camp, origin["aggregate_artifact_id"])
+    native = development_artifact(camp, origin["screening_artifact_id" if screening else "aggregate_artifact_id"])
     if (native["path"] != origin["suite_ref"] or native["sha256"] != origin["result_hash"]
             or not any(Path(ref).resolve() == Path(native["path"]).resolve()
                        for ref in task.get("input_artifact_refs") or [])):
@@ -988,8 +1038,8 @@ def _derived_method_artifact(camp: Path, row: dict[str, Any], body: dict[str, An
         raise ValueError("method_derived_artifact_analysis_pointer_mismatch")
     if envelope["input_digest"] != task["input_digest"]:
         raise ValueError("method_derived_artifact_task_input_mismatch")
-    return {**row, "development_scope": "method_development_benchmark",
-            "native_completion_verified": True, "method_benchmark_origin": origin}
+    return {**row, "development_scope": "two_fold_development" if screening else "method_development_benchmark",
+            "native_completion_verified": True, "method_screening_origin" if screening else "method_benchmark_origin": origin}
 
 
 def artifact_index(camp: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1408,7 +1458,7 @@ def analysis_experiment_binding(camp: Path, latest: dict[str, Any]) -> dict[str,
         if binding.get("target_id")!=target or binding.get("source_hash")!=latest.get("source_hash"):
             raise ValueError("run_source_binding_mismatch")
         method_identity = {}
-        if latest.get("kind") == "method_suite":
+        if latest.get("kind") in {"method_suite", "method_screening"}:
             # A complete method is ten native folds, not a legacy single job.
             # Its immutable suite and source/review dependencies carry the
             # exact approved intent; never fabricate a job_dir or hypothesis.
@@ -1419,9 +1469,14 @@ def analysis_experiment_binding(camp: Path, latest: dict[str, Any]) -> dict[str,
                 raise ValueError("method_suite_identity_missing")
             suite = validate_suite(camp, suite_id)
             suite_path = camp / "suites" / suite_id / "suite_manifest.json"
-            aggregate_path = suite_path.with_name("aggregate.json")
-            aggregate = read_aggregate(camp, suite_id)
-            if (latest.get("evaluation_valid") is not True or aggregate != latest.get("aggregate")
+            screening = latest.get("kind") == "method_screening"
+            aggregate_path = suite_path.with_name("screening.json" if screening else "aggregate.json")
+            if screening:
+                from react_agent.eeg_research.agentic.screening import read_screening
+                aggregate = read_screening(camp, suite_id)
+            else:
+                aggregate = read_aggregate(camp, suite_id)
+            if (latest.get("evaluation_valid") is not True or aggregate != latest.get("screening" if screening else "aggregate")
                     or latest.get("result_hash") != file_digest(aggregate_path)
                     or Path(str(latest.get("suite_ref") or "")).resolve() != aggregate_path.resolve()
                     or latest.get("suite_hash") != suite["suite_hash"]

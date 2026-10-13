@@ -10,7 +10,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-TEXT_BUILDER_VERSION = "eeg_campaign_memory.v1"
+TEXT_BUILDER_VERSION = "eeg_campaign_memory.v2.token_bounded"
 DIMENSION = 384
 _BACKENDS: dict[tuple, Any] = {}
 _FAILURES: dict[tuple, str] = {}
@@ -94,21 +94,35 @@ class MiniLMBackend:
         }
         self.fingerprint = content_hash(self.metadata)
 
+    def prepare_chunks(self, text: str, *, record_id: str):
+        from react_agent.eeg_research.agentic.context.retrieval import prepare_embedding_chunks
+        return prepare_embedding_chunks(text, tokenizer=self.model.tokenizer,
+            max_tokens=self.metadata["max_sequence_length"], record_id=record_id)
+
+    def prepare_query(self, text: str):
+        from react_agent.eeg_research.agentic.context.retrieval import prepare_query
+        # Keep the selected method/protocol/error cards ahead of potentially
+        # longer prose before applying the actual MiniLM token budget.
+        lines = text.splitlines()
+        priority = ("Action:", "Error:", "Method:", "Protocol:", "IDs:")
+        ordered = [line for line in lines if line.startswith(priority)]
+        ordered.extend(line for line in lines if not line.startswith(priority))
+        return prepare_query(question="\n".join(ordered), tokenizer=self.model.tokenizer,
+                             max_tokens=self.metadata["max_sequence_length"])
+
     def encode(self, texts: list[str]):
         import numpy as np
 
         metadata = []
         for text in texts:
             ids = self.model.tokenizer(text, truncation=False, add_special_tokens=True)["input_ids"]
-            actual = self.model.tokenizer(
-                text, truncation=True, add_special_tokens=True,
-                max_length=self.metadata["max_sequence_length"],
-            )["input_ids"]
+            if len(ids) > self.metadata["max_sequence_length"]:
+                raise ValueError("embedding_input_exceeds_tokenizer_limit_use_explicit_chunks")
             metadata.append({
-                "input_token_count": len(ids), "encoded_token_count": len(actual),
+                "input_token_count": len(ids), "encoded_token_count": len(ids),
                 "max_sequence_length": self.metadata["max_sequence_length"],
-                "truncated": len(ids) > len(actual),
-                "encoded_text": self.model.tokenizer.decode(actual, skip_special_tokens=True),
+                "truncated": False,
+                "encoded_text": text,
             })
         vectors = self.model.encode(
             texts, batch_size=self.config.batch_size, convert_to_numpy=True,

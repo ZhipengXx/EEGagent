@@ -1,0 +1,309 @@
+{
+  "date": "2026-10-12",
+  "source_request": "react-agent/docs/EEGagent_Codex_Modification_List_20261012 (1).md",
+  "base_commit": "b1e60233362d34798cb799a8e68033a6299fb6d3",
+  "final_verification": "passed_relevant_scope_with_separate_documented_legacy_baseline_failures",
+  "changed_files": {
+    "base_commit": "b1e60233362d34798cb799a8e68033a6299fb6d3",
+    "modified": [
+      "README.md",
+      "docs/architecture.md",
+      "docs/running.md",
+      "react-agent/.env.example",
+      "react-agent/src/react_agent/eeg_research/agentic/api_recovery.py",
+      "react-agent/src/react_agent/eeg_research/agentic/budget.py",
+      "react-agent/src/react_agent/eeg_research/agentic/budget_inheritance.py",
+      "react-agent/src/react_agent/eeg_research/agentic/cli.py",
+      "react-agent/src/react_agent/eeg_research/agentic/coder.py",
+      "react-agent/src/react_agent/eeg_research/agentic/compaction.py",
+      "react-agent/src/react_agent/eeg_research/agentic/export.py",
+      "react-agent/src/react_agent/eeg_research/agentic/handoffs.py",
+      "react-agent/src/react_agent/eeg_research/agentic/llm.py",
+      "react-agent/src/react_agent/eeg_research/agentic/loop.py",
+      "react-agent/src/react_agent/eeg_research/agentic/memory.py",
+      "react-agent/src/react_agent/eeg_research/agentic/method_evaluate.py",
+      "react-agent/src/react_agent/eeg_research/agentic/method_suite.py",
+      "react-agent/src/react_agent/eeg_research/agentic/native_patch.py",
+      "react-agent/src/react_agent/eeg_research/agentic/planner.py",
+      "react-agent/src/react_agent/eeg_research/agentic/planner_context.py",
+      "react-agent/src/react_agent/eeg_research/agentic/prompts/procedural_skill_extension.txt",
+      "react-agent/src/react_agent/eeg_research/agentic/prompts/research_planner.txt",
+      "react-agent/src/react_agent/eeg_research/agentic/prompts/result_analyst.txt",
+      "react-agent/src/react_agent/eeg_research/agentic/prompts/shared_contract.txt",
+      "react-agent/src/react_agent/eeg_research/agentic/research_progress.py",
+      "react-agent/src/react_agent/eeg_research/agentic/resource_guard.py",
+      "react-agent/src/react_agent/eeg_research/agentic/role_examples.py",
+      "react-agent/src/react_agent/eeg_research/agentic/roles.py",
+      "react-agent/src/react_agent/eeg_research/agentic/schemas.py",
+      "react-agent/src/react_agent/eeg_research/agentic/semantic_memory.py",
+      "react-agent/src/react_agent/eeg_research/agentic/skill_memory.py",
+      "react-agent/src/react_agent/eeg_research/agentic/view.py",
+      "react-agent/src/react_agent/eeg_research/agentic/worker.py",
+      "react-agent/src/react_agent/fmri/config.py",
+      "react-agent/src/react_agent/fmri/llm/deepseek.py",
+      "react-agent/src/react_agent/fmri/schemas.py",
+      "react-agent/src/react_agent/fmri/workbench_static/app.js"
+    ],
+    "added": [
+      "docs/modification-validation-20261012.json",
+      "docs/modification-validation-20261012.md",
+      "docs/screen-then-confirm.md",
+      "react-agent/configs/goals/eeg_screen_then_confirm.yaml",
+      "react-agent/src/react_agent/eeg_research/agentic/action_planning.py",
+      "react-agent/src/react_agent/eeg_research/agentic/api_policy.py",
+      "react-agent/src/react_agent/eeg_research/agentic/candidate_lifecycle.py",
+      "react-agent/src/react_agent/eeg_research/agentic/coding_recovery.py",
+      "react-agent/src/react_agent/eeg_research/agentic/engineering_memory.py",
+      "react-agent/src/react_agent/eeg_research/agentic/historical_runtime.py",
+      "react-agent/src/react_agent/eeg_research/agentic/model_replay.py",
+      "react-agent/src/react_agent/eeg_research/agentic/planner_exhaustion.py",
+      "react-agent/src/react_agent/eeg_research/agentic/role_config.py",
+      "react-agent/src/react_agent/eeg_research/agentic/screening.py"
+    ]
+  },
+  "implementation_groups": [
+    {
+      "requirements": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        22,
+        23,
+        24,
+        25,
+        30,
+        34
+      ],
+      "implementation": [
+        "action_planning.py",
+        "candidate_lifecycle.py",
+        "planner_exhaustion.py",
+        "planner.py",
+        "loop.py"
+      ],
+      "tests": [
+        "test_independent_action_planning.py",
+        "test_method_budget_handoff.py",
+        "test_screening_consumers.py"
+      ]
+    },
+    {
+      "requirements": [
+        8,
+        9,
+        10,
+        11,
+        26,
+        30
+      ],
+      "implementation": [
+        "coding_recovery.py",
+        "native_patch.py",
+        "worker.py",
+        "coder.py",
+        "engineering_memory.py"
+      ],
+      "tests": [
+        "test_coding_recovery_v2.py",
+        "test_coder_reliability.py",
+        "test_engineering_memory.py"
+      ]
+    },
+    {
+      "requirements": [
+        12,
+        13,
+        27,
+        28,
+        29
+      ],
+      "implementation": [
+        "role_config.py",
+        "api_policy.py",
+        "llm.py",
+        "roles.py",
+        "fmri/config.py",
+        "fmri/llm/deepseek.py"
+      ],
+      "tests": [
+        "test_role_api_config.py",
+        "test_role_context_recovery.py",
+        "test_api_intent_recovery.py",
+        "test_model_replay.py"
+      ]
+    },
+    {
+      "requirements": [
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        31,
+        32,
+        33
+      ],
+      "implementation": [
+        "screening.py",
+        "method_suite.py",
+        "budget.py",
+        "handoffs.py",
+        "memory.py",
+        "semantic_memory.py",
+        "research_progress.py",
+        "historical_runtime.py"
+      ],
+      "tests": [
+        "test_screen_then_confirm.py",
+        "test_screening_consumers.py",
+        "test_phase_launch_reconciliation.py",
+        "test_method_suite.py",
+        "test_method_memory_consumers.py"
+      ]
+    }
+  ],
+  "validation_scope": {
+    "real_api_calls": 0,
+    "actual_eeg_training_jobs": 0,
+    "gpu_training_started": false,
+    "unit_checks": "Real CPU torch checks plus native validators, SDK MockTransport request capture, synthetic training/scoring fixtures."
+  },
+  "baseline_comparison": {
+    "baseline_commit": "b1e60233362d34798cb799a8e68033a6299fb6d3",
+    "current_initial_failure_count": 55,
+    "reproduced_baseline_failure_count": 47,
+    "current_only_initial_failures": [
+      "tests.eeg_research.test_essential_live_path::test_stop_reason_is_injected_enum_not_a_freeform_sentence",
+      "tests.eeg_research.test_five_fixes::test_fix2_context_truncation_and_delivery_log_match_actual_input",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A02_latest_complete_audit_retained_after_many_legacy_rows",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A04_auditor_task_digest_binds_actual_feedback_and_request",
+      "tests.eeg_research.test_multigpu_check_lifecycle::test_native_tick_blocks_probe_recovery_before_paid_work[running-True]",
+      "tests.eeg_research.test_multigpu_check_lifecycle::test_native_tick_blocks_probe_recovery_before_paid_work[uncertain-False]",
+      "tests.eeg_research.test_multigpu_check_lifecycle::test_native_tick_blocks_probe_recovery_before_paid_work[uncertain_pending-True]",
+      "tests.eeg_research.test_role_context_recovery::test_role_backend_reuses_explicit_completed_task_before_transport"
+    ],
+    "baseline_failures": [
+      "tests.eeg_research.test_crash_recovery_followups::test_coder_log_mismatches_block_without_a_tool_rerun",
+      "tests.eeg_research.test_crash_recovery_followups::test_coder_log_resumes_the_same_candidate_from_the_next_step",
+      "tests.eeg_research.test_crash_recovery_followups::test_finished_coder_log_does_not_call_the_coder_again",
+      "tests.eeg_research.test_crash_recovery_followups::test_review_file_is_reused_and_a_real_rejection_is_recorded_once",
+      "tests.eeg_research.test_crash_recovery_followups::test_review_llm_failure_keeps_the_candidate_and_skips_the_coder",
+      "tests.eeg_research.test_crash_recovery_followups::test_review_program_error_is_not_a_parse_failure_and_resume_does_not_retry",
+      "tests.eeg_research.test_crash_recovery_followups::test_reviewer_rejection_uses_the_existing_status",
+      "tests.eeg_research.test_crash_recovery_followups::test_training_job_json_is_adopted_and_a_bare_directory_blocks",
+      "tests.eeg_research.test_e2a13a2_delta::test_d11_state_mutation_does_not_override_artifact",
+      "tests.eeg_research.test_essential_live_path::test_approved_candidate_keeps_design_binding_before_review_ready[blocked]",
+      "tests.eeg_research.test_essential_live_path::test_approved_candidate_keeps_design_binding_before_review_ready[needs_fix]",
+      "tests.eeg_research.test_essential_live_path::test_failed_preflight_queues_bounded_same_candidate_repairs",
+      "tests.eeg_research.test_essential_live_path::test_full_analysis_is_consumed_reused_and_hash_checked",
+      "tests.eeg_research.test_essential_live_path::test_stop_execution_rechecks_goal_and_actual_audit_dependencies",
+      "tests.eeg_research.test_five_fixes::test_fix2_planner_delivery_records_each_actual_retry_request",
+      "tests.eeg_research.test_method_suite::test_complete_native_suite_feedback_reaches_original_analyst_and_next_planner",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A02_malformed_legacy_issue_severity_is_blocking_and_does_not_crash_consumer[7]",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A02_malformed_legacy_issue_severity_is_blocking_and_does_not_crash_consumer[None]",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A02_malformed_legacy_issue_severity_is_blocking_and_does_not_crash_consumer[severity2]",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A02_malformed_legacy_issue_severity_is_blocking_and_does_not_crash_consumer[severity3]",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A04_registered_feedback_reaches_next_planner_backend",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A10_completed_audit_and_budget_stop_keep_support_separate[BLOCK-blocked]",
+      "tests.eeg_research.test_minimal_fix_consumers::test_A10_completed_audit_and_budget_stop_keep_support_separate[REVISE-needs_revision]",
+      "tests.eeg_research.test_minimal_fix_consumers::test_B03_new_implementation_option_targets_actual_worker_allocation",
+      "tests.eeg_research.test_minimal_fix_consumers::test_B04_budget_changed_during_planning_is_rechecked_from_disk",
+      "tests.eeg_research.test_minimal_fix_consumers::test_B04_latest_paid_ledger_budget_is_rechecked_before_implement",
+      "tests.eeg_research.test_minimal_fix_consumers::test_B06_api_failure_and_schema_retries_use_real_ledger_without_scheduler",
+      "tests.eeg_research.test_minimal_fix_consumers::test_C01_selected_design_reads_are_consumed_and_bound_in_task_ledger",
+      "tests.eeg_research.test_multigpu_check_lifecycle::test_native_tick_recovers_successful_settlement_without_new_probe",
+      "tests.eeg_research.test_systematic_revision::test_t01_blocked_banana_and_unknown_capability_are_not_approved",
+      "tests.eeg_research.test_systematic_revision::test_t02_approved_spec_hash_is_consumed_by_implement_gate",
+      "tests.eeg_research.test_v1_8::test_code_candidate_then_new_evidence_changes_the_next_action",
+      "tests.eeg_research.test_v1_8::test_coder_stops_before_the_budget_and_planner_reserves_calls",
+      "tests.eeg_research.test_v1_8::test_illegal_json_blocks_without_legacy_fallback",
+      "tests.eeg_research.test_v1_8::test_live_job_is_reconciled_without_a_planner_call",
+      "tests.eeg_research.test_v1_8::test_repeated_local_action_needs_new_evidence",
+      "tests.eeg_research.test_v1_9::test_baseline_does_not_consume_candidate_slots",
+      "tests.eeg_research.test_v1_9::test_blocked_launch_does_not_take_a_training_slot",
+      "tests.eeg_research.test_v1_9::test_incomparable_evidence_has_no_delta",
+      "tests.eeg_research.test_v1_9::test_inline_runner_respects_protocol_checkpoint",
+      "tests.eeg_research.test_v1_9::test_matched_control_writes_comparable_delta",
+      "tests.eeg_research.test_v1_9::test_unmatched_control_appends_to_existing_queue",
+      "tests.eeg_research.test_v1_9_3_audit::test_analysis_uses_the_candidate_hypothesis_and_api_failure_is_not_not_tested",
+      "tests.eeg_research.test_v1_9_3_audit::test_designer_sees_diagnostics_and_draft_without_intervention_stays_unapproved",
+      "tests.eeg_research.test_v1_9_3_audit::test_lessons_retrieve_compatible_and_analogy",
+      "tests.eeg_research.test_v1_9_3_audit::test_r03_registered_spec_matches_state",
+      "tests.eeg_research.test_v1_9_3_audit::test_stub_trajectory_consumes_the_pilot_evidence"
+    ],
+    "note": "Initial broad run preceded final fixes; rerun changed failures and new scope after all source edits finish."
+  },
+  "dry_run": {
+    "goal": "react-agent/configs/goals/eeg_screen_then_confirm.yaml",
+    "subjects": [
+      "sub-07",
+      "sub-10"
+    ],
+    "training_subject_count_per_fold": 9,
+    "screening_jobs_without_baseline_cache": 4,
+    "confirmation_jobs_when_both_methods_have_only_screening_folds": 16,
+    "confirmation_candidate_jobs_when_baseline_is_complete": 8,
+    "gpu_estimate_without_historical_basis": null
+  },
+  "compatibility": {
+    "existing_campaign_outputs_modified": false,
+    "existing_scientific_evidence_relabelled": false,
+    "old_source_requires_original_absolute_mount": true,
+    "old_score_cross_protocol_import_adopter_enabled": false,
+    "missing_import_proof": "rejected",
+    "standalone_old_source_checkout": "readonly SHA preview available; not an authorization to resume"
+  },
+  "limits": [
+    "Two-fold results are fixed-gallery development feedback and retain selection bias; tenfold completion is not independent final testing or ten seeds.",
+    "Flash/Pro performance or EEG gains were not measured.",
+    "Existing older fixture failures reproduced at the baseline commit are reported separately; full test suite is not claimed green.",
+    "Existing ignore rules retain test sources/validation outputs locally; no Git commit or push was requested for these modifications."
+  ],
+  "test_results": {
+    "unique_cases_passed": 577,
+    "final_batches": [
+      {
+        "xml": "/tmp/eegagent-modification-20261012-final-regressions.xml",
+        "passed": 568,
+        "failed": 1,
+        "skipped": 0
+      },
+      {
+        "xml": "/tmp/eegagent-modification-20261012-final-native-case.xml",
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      },
+      {
+        "xml": "/tmp/eegagent-modification-20261012-gradient-check.xml",
+        "passed": 1,
+        "failed": 0,
+        "skipped": 0
+      },
+      {
+        "xml": "/tmp/eegagent-modification-20261012-resolved-compatibility.xml",
+        "passed": 8,
+        "failed": 0,
+        "skipped": 0
+      }
+    ],
+    "initial_wide_suite": {
+      "passed": 1218,
+      "failed": 55,
+      "skipped": 17
+    },
+    "old_baseline_failures_reproduced": 47,
+    "resolved_current_only_failures": 8,
+    "entire_repository_suite_claimed_green": false,
+    "syntax": "Python AST and V8 JavaScript checks passed",
+    "ui_render_helpers": "passed with synthetic read-only data"
+  },
+  "test_command": "env -u DEEPSEEK_API_KEY PYTHONPATH=/tmp/eegagent-compaction-stage14-20261010-denskuz0/offline_hooks:src EEG_EXTERNAL_API_DISABLED=0 CUDA_VISIBLE_DEVICES= OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /tmp/eegagent-minilm-validation-venv/bin/python -m pytest -q [relevant test files listed in final XML]"
+}

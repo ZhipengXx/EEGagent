@@ -119,6 +119,13 @@ class LmProfile(BaseModel):
     supports_temperature: bool = False
     supports_thinking: bool = True
     supports_json_object: bool = True
+    # EEG opts in. Existing fMRI profiles keep their previous routing/output policy.
+    strict_final_output: bool = False
+    wall_clock_deadline: bool = False
+    connect_timeout_s: float = 10.0
+    read_timeout_s: float | None = None
+    write_timeout_s: float = 30.0
+    pool_timeout_s: float = 10.0
 
 
 class GenerationParams(BaseModel):

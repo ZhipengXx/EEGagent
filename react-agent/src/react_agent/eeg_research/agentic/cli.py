@@ -32,7 +32,7 @@ def _parser() -> argparse.ArgumentParser:
         "command",
         choices=["create", "start", "run", "status", "pause", "resume", "stop", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents", "validate-goal", "evaluate-export", "evaluate-pack",
                  "study-create", "study-status", "study-run", "study-freeze", "study-evaluate", "study-aggregate",
-                 "suite-retry-fold"],
+                 "suite-retry-fold", "role-config-preview", "screening-dry-run", "dispose-unknown-intent", "detach-candidate", "historical-runtime-preview"],
     )
     parser.add_argument("--campaign", default="eeg_retrieval_research_v1")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
@@ -56,6 +56,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-shared-gpus", action="store_true", help="Explicit authorization to use occupied GPUs without terminating their processes")
     parser.add_argument("--inherit-study", type=Path,
                         help="Native verified budget source: legacy study or quiescent method campaign")
+    parser.add_argument("--fresh-budget-authorization", action="store_true",
+                        help="Explicit new campaign allocation from goal limits; create only, requires --request-id")
+    parser.add_argument("--budget-history-source", type=Path,
+                        help="Read-only quiescent method campaign history/cost basis for a fresh allocation")
     parser.add_argument("--additional-llm-calls", type=int, default=0,
                         help="Explicit additional authorization for inherited method-campaign API attempts; create only")
     parser.add_argument("--additional-training-jobs", type=int, default=0,
@@ -65,6 +69,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", default=None, help="Frozen method suite ID for an engineering retry")
     parser.add_argument("--fold", default=None, help="Fold ID for an engineering retry")
     parser.add_argument("--candidate", default=None, help="Existing checked candidate for review revalidation")
+    parser.add_argument("--role-override", action="append", default=[], metavar="ROLE.FIELD=VALUE",
+                        help="Explicit new-campaign role settings; preview shows resolved request configuration")
+    parser.add_argument("--call-id", default=None, help="Unknown API intent for explicit response abandonment")
+    parser.add_argument("--runtime-checkout", type=Path, help="Pinned historical Git repository checkout; read-only compatibility preview")
+    parser.add_argument("--original-project-root", type=Path, default=Path(__file__).resolve().parents[5],
+                        help="Original absolute repository path recorded in historical framework dependencies")
+    parser.add_argument("--allow-new-request", action="store_true", help="Permit a new request after recorded unknown response abandonment; retains old charge")
     parser.add_argument("--retry-reason", default="", help="Observed engineering failure requiring a fresh fold or feedback validation")
     parser.add_argument("--max-existing-gpu-memory-mib", type=int, default=1024,
                         help="Explicit authorize-gpu-sharing only: maximum memory already used on each frozen card")
@@ -80,6 +91,25 @@ def load_goal_file(path: Path) -> dict:
         raise ValueError("goal_not_object")
     spec = GoalSpec.model_validate(raw)
     return spec.model_dump()
+
+
+def role_overrides(values: list[str]) -> dict:
+    from react_agent.eeg_research.agentic.role_config import ALIASES, FIELDS, ROLES
+    result = {}
+    for item in values:
+        key, separator, value = item.partition("=")
+        role, dot, field = key.partition(".")
+        role = ALIASES.get(role, role)
+        if not separator or not dot or role not in ROLES or field not in FIELDS:
+            raise ValueError("invalid_role_override: expected ROLE.FIELD=VALUE")
+        try:
+            value = json.loads(value)
+        except ValueError:
+            pass
+        if field in result.get(role, {}):
+            raise ValueError("duplicate_role_override")
+        result.setdefault(role, {})[field] = value
+    return result
 
 
 def goal(campaign: str, design=None) -> dict:
@@ -203,9 +233,80 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_ticks < 1:
         print(json.dumps({"error": "max_ticks_must_be_positive"}))
         return 2
+    try:
+        overrides = role_overrides(args.role_override)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}))
+        return 2
+    if overrides and args.command not in {"create", "role-config-preview", "screening-dry-run"}:
+        print(json.dumps({"error": "role_overrides_require_new_campaign_or_preview"}))
+        return 2
+    if args.command == "historical-runtime-preview":
+        from react_agent.eeg_research.agentic.historical_runtime import checkout_preview
+        try:
+            if args.runtime_checkout is None:
+                raise ValueError("historical_runtime_checkout_required")
+            result = checkout_preview(args.root.resolve() / args.campaign, args.runtime_checkout, args.original_project_root)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        except (ValueError, KeyError, OSError) as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
+    if args.command in {"role-config-preview", "screening-dry-run"}:
+        from react_agent.eeg_research.agentic.role_config import role_config_preview
+        try:
+            source = load_goal_file(args.goal) if args.goal else args.root.resolve() / args.campaign
+            if args.command == "role-config-preview":
+                result = role_config_preview(source, overrides)
+            else:
+                from react_agent.eeg_research.agentic.screening import dry_run, freeze_selection
+                SCHEDULE = "screen_then_confirm"
+                if isinstance(source, dict):
+                    if source.get("evaluation_schedule") != SCHEDULE:
+                        raise ValueError("screening_schedule_not_enabled")
+                    subjects = source["benchmark_subjects"]
+                    common = {"selection_manifest": freeze_selection(source), "screening_policy": source.get("screening") or {},
+                              "evaluation_schedule": SCHEDULE, "subjects": source["benchmark_subjects"],
+                              "folds": [{"fold_id": f"fold_{index:02d}", "held_out_subject": subject,
+                                         "train_subjects": [other for other in subjects if other != subject]}
+                                        for index, subject in enumerate(subjects, 1)],
+                              "gpu_seconds_estimate_per_suite": source.get("method_suite_gpu_seconds_estimate")}
+                else:
+                    from react_agent.eeg_research.agentic.method_suite import manifest
+                    common = manifest(source)
+                    if common.get("evaluation_schedule") != SCHEDULE:
+                        raise ValueError("screening_schedule_not_enabled")
+                baseline_completed, candidate_completed = [], []
+                if not isinstance(source, dict):
+                    from react_agent.eeg_research.agentic.screening import suites_for_target, valid_scores
+                    controls = suites_for_target(source, "baseline")
+                    if controls:
+                        baseline_completed = [row["fold_id"] for row in valid_scores(source, controls[-1])]
+                    if args.candidate:
+                        candidates = suites_for_target(source, args.candidate)
+                        if candidates:
+                            candidate_completed = [row["fold_id"] for row in valid_scores(source, candidates[-1])]
+                result = dry_run(common, baseline_completed=baseline_completed, candidate_completed=candidate_completed)
+                result["preview_only"] = True
+                result["verified_baseline_fold_ids"] = baseline_completed
+                result["verified_candidate_fold_ids"] = candidate_completed
+                result["cache_status"] = ("No completed fold is assumed in a goal preview." if isinstance(source, dict) else
+                                          "Completed folds verified from current native suite/source/checkpoint/evaluation dependencies.")
+                result["role_config"] = role_config_preview(source, overrides)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        except (ValueError, KeyError, OSError) as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
     additional = {"llm_calls": args.additional_llm_calls,
                   "training_jobs": args.additional_training_jobs,
                   "gpu_seconds": args.additional_gpu_seconds}
+    if args.fresh_budget_authorization or args.budget_history_source is not None:
+        if (args.command != "create" or not args.fresh_budget_authorization
+                or args.budget_history_source is None or args.inherit_study is not None
+                or any(additional.values()) or args.goal is None or not args.request_id.strip()):
+            print(json.dumps({"error": "fresh_authorization_requires_create_goal_history_request_id_without_inheritance"}))
+            return 2
     if any(additional.values()) and (args.command != "create" or args.inherit_study is None):
         print(json.dumps({"error": "additional_authorization_requires_new_inherited_method_campaign"}))
         return 2
@@ -338,23 +439,39 @@ def main(argv: list[str] | None = None) -> int:
         estimate_basis = []
         if submitted.get("evaluation_mode") == "loso_method_search":
             from dataclasses import replace
-            from react_agent.eeg_research.agentic.budget_inheritance import verified_history, derive_limits, estimate_suite
+            from react_agent.eeg_research.agentic.budget_inheritance import (
+                verified_history, fresh_authorization, derive_limits, estimate_suite,
+            )
             from react_agent.eeg_research.agentic.loso_study import SUBJECTS
-            if args.inherit_study is None:
+            if args.inherit_study is None and not args.fresh_budget_authorization:
                 print(json.dumps({"error": "method_search_requires_native_budget_inheritance"}))
                 return 2
             try:
-                inherited = verified_history(args.inherit_study, additional_authorization=additional)
+                if args.fresh_budget_authorization:
+                    if camp.exists():
+                        raise ValueError("fresh_authorization_requires_new_campaign")
+                    inherited = fresh_authorization(camp, submitted, args.budget_history_source,
+                                                    authorization_id=args.request_id)
+                    # Reject reuse of a named authorization before expensive
+                    # protocol construction or any new campaign files exist.
+                    from react_agent.eeg_research.agentic.loso_study import identity
+                    prior = root / "fresh_budget_authorizations" / (identity({
+                        "authorization_id": args.request_id}) + ".json")
+                    index = root / "request_index.json"
+                    if prior.exists() or (index.is_file() and args.request_id in json.loads(index.read_text())):
+                        raise ValueError("fresh_budget_authorization_already_bound")
+                else:
+                    inherited = verified_history(args.inherit_study, additional_authorization=additional)
+                submitted = derive_limits(submitted, inherited)
+                estimate, estimate_basis = estimate_suite(inherited, len(selected_gpus))
             except (OSError, ValueError, KeyError) as exc:
                 print(json.dumps({"error": str(exc)}, ensure_ascii=False))
                 return 2
-            submitted = derive_limits(submitted, inherited)
-            estimate, estimate_basis = estimate_suite(inherited, len(selected_gpus))
             submitted["method_suite_gpu_seconds_estimate"] = max(estimate, submitted.get("method_suite_gpu_seconds_estimate") or 0)
             design = replace(design, subject=",".join(SUBJECTS[:-1]), epochs=50, stop="single_full", seed=0,
                              data_root=str(base.resolve()), evaluation_mode="loso_method_search",
                              checkpoint_policy=submitted["checkpoint_policy"], selection_min_delta=submitted["selection_min_delta"])
-        elif args.inherit_study is not None:
+        elif args.inherit_study is not None or args.fresh_budget_authorization:
             print(json.dumps({"error": "budget_inheritance_requires_method_search"}))
             return 2
         try:
@@ -376,13 +493,18 @@ def main(argv: list[str] | None = None) -> int:
             protocol=protocol,
         )
         state["gpu"] = list(design.gpu)
+        if overrides:
+            from react_agent.eeg_research.agentic.role_config import role_config_preview
+            role_config_preview(camp, overrides)
+            from react_agent.eeg_research.agentic.loso_study import write_once
+            write_once(camp / "role_config_overrides.json", overrides)
         if inherited is not None:
             from react_agent.eeg_research.agentic.budget_inheritance import claim_successor
             from react_agent.eeg_research.agentic.method_suite import create_manifest, manifest
             claim_successor(camp, inherited)
             if not (camp / "method_search_manifest.json").exists():
                 create_manifest(camp, design, allow_shared_gpus=args.allow_shared_gpus,
-                                estimate=submitted["method_suite_gpu_seconds_estimate"])
+                                estimate=submitted["method_suite_gpu_seconds_estimate"], goal=submitted)
                 from react_agent.eeg_research.agentic.loso_study import write_once
                 write_once(camp / "suite_cost_basis.json", {"basis": estimate_basis, "estimate": submitted["method_suite_gpu_seconds_estimate"]})
             else:
@@ -429,6 +551,37 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(status_view(camp), ensure_ascii=False, indent=2))
         return 0
     state = load_state(camp)
+    if args.command == "detach-candidate":
+        from react_agent.eeg_research.agentic.candidate_lifecycle import detach_failed_candidate, enabled
+        import fcntl
+        try:
+            if not enabled(json.loads((camp / "goal.json").read_text())):
+                raise ValueError("candidate_detach_requires_explicit_new_protocol")
+            if not args.candidate or not args.retry_reason.strip():
+                raise ValueError("candidate_detach_requires_target_and_reason")
+            with (camp / "worker.lock").open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                receipt = detach_failed_candidate(camp, state, args.candidate, args.retry_reason)
+                save_state(camp, state)
+                event(camp, "candidate_detached", candidate_id=args.candidate, receipt_hash=receipt["receipt_hash"])
+            print(json.dumps(receipt, ensure_ascii=False))
+            return 0
+        except (ValueError, OSError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
+    if args.command == "dispose-unknown-intent":
+        from react_agent.eeg_research.agentic.api_policy import dispose_unknown_intent
+        import fcntl
+        try:
+            with (camp / "worker.lock").open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = dispose_unknown_intent(camp, args.call_id, reason=args.retry_reason,
+                                                allow_new_request=args.allow_new_request)
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+        except (ValueError, OSError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
     if args.command == "authorize-gpu-sharing":
         import fcntl
         from react_agent.eeg_research.agentic.resource_guard import authorize_low_memory_sharing

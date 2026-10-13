@@ -438,10 +438,14 @@ def _stage(camp: Path, request: dict, *, original: dict, refs: list[str],
     from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
     from react_agent.eeg_research.agentic.llm import LlmUnavailable
+    from react_agent.eeg_research.agentic.role_config import resolve_role_config
+    resolved = resolve_role_config(camp, ROLE)
+    request = {**request, "role_model_config": resolved.semantics()}
     identity = {
         "role": ROLE, "action": OPERATION + ":" + request["stage"], "target_id": None,
         "source": request["original_input_sha256"],
-        "config": {"revision": request["revision"], "model": model, "summary_chars": summary_budget(request["stage"])},
+        "config": {"revision": request["revision"], "model": model, "summary_chars": summary_budget(request["stage"]),
+                   "role_model_config": resolved.semantics(), "role_config_sources": resolved.sources},
         "approval": None, "prompt_hash": hashlib.sha256(system.encode()).hexdigest()[:16],
         "schema_hash": digest(summary_schema(request["stage"]).model_json_schema()), "evaluator": None,
         "evidence": refs, "memory_snapshot": None, "legal_actions": [],
@@ -507,7 +511,7 @@ def project_for_curator(payload: dict) -> dict:
     headline aggregate numbers are delivered verbatim.
     """
     from react_agent.eeg_research.agentic.planner_context import (
-        _hoist_fold_constants, _round_floats, _slim_scores, _strip_provenance)
+        _hoist_fold_constants, _slim_scores, _strip_provenance)
     result = copy.deepcopy(payload)
     removed = []
     run = result.get("run") if isinstance(result.get("run"), dict) else None
@@ -520,9 +524,9 @@ def project_for_curator(payload: dict) -> dict:
         diagnostics["folds"] = [{key: value for key, value in fold.items() if key not in _FOLD_PROVENANCE}
                                 if isinstance(fold, dict) else fold for fold in diagnostics["folds"]]
         diagnostics = _strip_provenance({"diagnostics": diagnostics})["diagnostics"]
-        result["diagnostics"] = _hoist_fold_constants(_round_floats(diagnostics))
+        result["diagnostics"] = _hoist_fold_constants(diagnostics)
         removed.append("/diagnostics/folds/*: hash/path provenance and identities bound by suite_hash; "
-                       "floats to 4 significant digits; values shared by all folds listed once")
+                       "exact values shared by all folds listed once")
     if run is not None and isinstance(run.get("aggregate"), dict):
         slim = _slim_scores(run["aggregate"])
         if slim.get("scores") != run["aggregate"].get("scores"):

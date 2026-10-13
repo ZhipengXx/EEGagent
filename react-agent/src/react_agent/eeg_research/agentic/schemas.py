@@ -39,7 +39,23 @@ class DomainOutput(BaseModel):
 PlannerAction = Literal["inspect_data", "retrieve_memory", "retrieve_methods", "diagnose_results",
                         "collect_diagnostics", "design_experiment", "propose_experiment",
                         "implement_candidate", "repair_candidate", "run_pilot", "run_full",
-                        "replicate", "audit_result", "revise_report", "stop"]
+                        "replicate", "run_screening", "run_confirmation", "audit_result", "revise_report", "stop"]
+
+
+class ActionPlanningConfig(DomainOutput):
+    protocol_version: Literal[2] = 2
+    target_options: int = Field(default=3, ge=2, le=4)
+    max_options: int = Field(default=4, ge=2, le=4)
+    option_repair_calls_per_round: int = Field(default=1, ge=0, le=1)
+    replacement_calls_per_round: int = Field(default=1, ge=0, le=1)
+    execute_when_valid_count_at_least: Literal[1] = 1
+    max_api_attempts_per_round: int = Field(default=6, ge=1, le=6)
+
+    @model_validator(mode="after")
+    def coherent_counts(self):
+        if self.target_options > self.max_options:
+            raise ValueError("target_options_exceeds_max_options")
+        return self
 
 
 class ArtifactReadRequest(DomainOutput):
@@ -91,6 +107,7 @@ class PlannerOption(DomainOutput):
     intervention: str | None = Field(default=None, description=(
         "Exact experiment_draft.intervention for an experiment design option. Use null for stop, "
         "retrieval, report revision and running an already approved candidate. Describe expected changes in value_rationale."))
+    payload: PlannerActionPayload | None = None
 
 
 class ReportClaimRevision(DomainOutput):
@@ -107,7 +124,7 @@ class ReportClaimRevision(DomainOutput):
         return self
 
 
-class PlannerDecision(DomainOutput):
+class PlannerActionPayload(DomainOutput):
     action: PlannerAction
     target_id: str | None = Field(default=None, description=(
         "Exact runtime candidate/action target ID or null. Artifact IDs belong in read_requests and "
@@ -133,15 +150,40 @@ class PlannerDecision(DomainOutput):
     plan_update: dict[str, Any] | None = None
     action_depends_on_plan_update: bool = False
     stop_reason: Literal["goal_addressed", "no_supported_next_experiment", "no_progress",
-                         "budget_exhausted", "blocked", "user_cancelled"] | None = None
+                         "budget_exhausted", "blocked", "user_cancelled", "no_feasible_action"] | None = None
     scope_limits: list[str] = Field(default_factory=list)
     observed_gap: str | None = None
-    options: list[PlannerOption] = Field(default_factory=list, max_length=4)
-    selected_option_id: str | None = None
-    selection_rationale: str = ""
     resolves_issue_ids: list[str] = Field(default_factory=list)
     read_requests: list[ArtifactReadRequest] = Field(default_factory=list)
     report_revision: list[ReportClaimRevision] = Field(default_factory=list)
+    query: str | None = None
+    target_binding: dict[str, Any] = Field(default_factory=dict)
+    exhaustion_receipt: dict[str, Any] | None = None
+
+
+PlannerOption.model_rebuild()
+
+
+class PlannerDecision(PlannerActionPayload):
+    """Only normalized valid options are persisted as execution authority."""
+    options: list[PlannerOption] = Field(default_factory=list, max_length=4)
+    selected_option_id: str | None = None
+    selection_rationale: str = ""
+
+
+class PlannerProposal(PlannerActionPayload):
+    """Strict outer protocol, raw independent option drafts validated by Planner."""
+    action: str | None = None
+    hypothesis_draft: Any = None
+    experiment_draft: Any = None
+    plan_update: Any = None
+    stop_reason: str | None = None
+    read_requests: list[Any] = Field(default_factory=list)
+    report_revision: list[Any] = Field(default_factory=list)
+    options: list[Any] = Field(default_factory=list, max_length=4)
+    selected_option_id: str | None = None
+    selection_rationale: str = ""
+    ranking: list[str] = Field(default_factory=list, max_length=4)
 
 
 class MethodEvidencePacket(DomainOutput):
@@ -338,7 +380,7 @@ class AuditReport(DomainOutput):
 
 
 DOMAIN_OUTPUT_MODELS = {
-    "research_planner": PlannerDecision,
+    "research_planner": PlannerProposal,
     "research_librarian": MethodEvidencePacket,
     "experiment_designer": ExperimentDesignResult,
     "candidate_reviewer": ImplementationReview,
@@ -351,6 +393,35 @@ DOMAIN_OUTPUT_MODELS = {
 PLAN_VERSION_NAME = "eeg_research.research_plan.v1"
 
 
+class ScreeningConfig(DomainOutput):
+    fold_count: Literal[2] = 2
+    selection: Literal["seeded_random_without_replacement", "explicit_subjects"] = "seeded_random_without_replacement"
+    selection_seed: int = 0
+    subjects: list[str] | None = None
+    training_recipe: Literal["same_as_confirmation"] = "same_as_confirmation"
+    min_mean_gain_pp: float = Field(default=0.5, allow_inf_nan=False)
+    reuse_compatible_full_fold_runs: bool = True
+
+    @model_validator(mode="after")
+    def selected_subjects(self):
+        if self.subjects is not None:
+            allowed = {f"sub-{index:02d}" for index in range(1, 11)}
+            if len(self.subjects) != 2 or len(set(self.subjects)) != 2 or not set(self.subjects) <= allowed:
+                raise ValueError("screening_requires_two_unique_known_subjects")
+        elif self.selection == "explicit_subjects":
+            raise ValueError("screening_explicit_subjects_missing")
+        return self
+
+
+class ScreeningConfirmationConfig(DomainOutput):
+    fold_count: Literal[10] = 10
+    subject_aggregation: Literal["macro_mean"] = "macro_mean"
+    freeze_method_before_screening: Literal[True] = True
+    # Exceptions require a runtime-issued, bounded receipt; default is no exception.
+    max_exploration_confirmations: int = Field(default=0, ge=0)
+    feedback_llm_calls_reserved: int = Field(default=2, ge=1, description="Per completed method-phase report; matched baseline feedback is counted separately.")
+
+
 class GoalSpec(BaseModel):
     """User-submitted research goal. Runtime validates; it does not invent budgets."""
 
@@ -361,6 +432,11 @@ class GoalSpec(BaseModel):
     task_type: Literal["eeg_image_retrieval"] = "eeg_image_retrieval"
     research_scope: str = "pooled_subject_retrieval"
     evaluation_mode: Literal["single_target", "loso_method_search"] = "single_target"
+    evaluation_schedule: Literal["full_only", "screen_then_confirm"] = "full_only"
+    screening: ScreeningConfig = Field(default_factory=ScreeningConfig)
+    confirmation: ScreeningConfirmationConfig = Field(default_factory=ScreeningConfirmationConfig)
+    coding_recovery: dict[str, Any] | None = None
+    role_models: dict[str, dict[str, Any]] = Field(default_factory=dict)
     benchmark_feedback_enabled: bool = False
     allow_shared_gpus: bool = False
     subject_aggregation: Literal["none", "macro_mean"] = "none"
@@ -382,7 +458,9 @@ class GoalSpec(BaseModel):
     max_repairs_per_candidate: int = 2
     require_audit_before_completion: bool = False
     planner_mode: Literal["single_action", "compare_options"] = "compare_options"
-    allowed_training_actions: list[Literal["run_pilot", "run_full", "replicate"]] = Field(
+    action_planning: ActionPlanningConfig | None = None
+    api_request_policy: dict[str, Any] = Field(default_factory=dict)
+    allowed_training_actions: list[Literal["run_pilot", "run_full", "replicate", "run_screening", "run_confirmation"]] = Field(
         default_factory=lambda: ["run_pilot", "run_full", "replicate"]
     )
     confirmation_target_pairs: int = 3
@@ -392,8 +470,22 @@ class GoalSpec(BaseModel):
     schema_version: str = SCHEMA_VERSION
 
     @model_validator(mode="after")
+    def role_and_recovery_settings(self):
+        from react_agent.eeg_research.agentic.api_policy import validate_api_request_policy
+        validate_api_request_policy(self.api_request_policy)
+        from react_agent.eeg_research.agentic.role_config import ROLES, resolve_role_config
+        for role in ROLES:
+            resolve_role_config(self.model_dump(), role, environ={})
+        if self.coding_recovery is not None:
+            from react_agent.eeg_research.agentic.coding_recovery import CodingRecoveryConfig
+            CodingRecoveryConfig.model_validate(self.coding_recovery)
+        return self
+
+    @model_validator(mode="after")
     def benchmark_mode_contract(self):
         if self.evaluation_mode == "single_target":
+            if self.evaluation_schedule != "full_only":
+                raise ValueError("screen_then_confirm_requires_loso_method_search")
             if self.benchmark_feedback_enabled or self.benchmark_subjects or self.required_fold_count != 1 or self.subject_aggregation != "none":
                 raise ValueError("benchmark_feedback_requires_loso_method_search")
             return self

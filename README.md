@@ -151,7 +151,7 @@ uv run python -m react_agent.eeg_research.agentic.cli start \
 | --- | --- |
 | Decoding task | EEG / MEG **image retrieval** from preprocessed signals; classification, image reconstruction, raw preprocessing and foundation-model adapters are unavailable |
 | Method evidence | Bundled local method cards; online literature retrieval is not implemented |
-| Role models | Eight role-specific calls currently use the same DeepSeek fast profile |
+| Role models | Eight independently configured EEG roles; thinking/effort, output budgets and wall-clock deadlines are applied to actual requests |
 | Planning and evidence reads | Default `compare_options`: usually **2–4 next-action alternatives**, one selected action and a saved rationale; bounded, verified artifact reads support selected role requests |
 | Result audit | Structured report and dependency context, identity / freshness checks and tracked corrections; same-provider review does not establish independent replication |
 | Demonstrated results | Platform DEMO values are synthetic. Historical acceptance records describe their own revisions and do not establish a new retrieval benchmark gain |

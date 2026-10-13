@@ -199,7 +199,8 @@ def _attach(backend: Any, **fields: Any) -> None:
         return
 
 
-def _stored_review(workspace: Path, *, candidate_id: str, attempt_id: str, input_hash: str) -> dict[str, Any] | None:
+def _stored_review(workspace: Path, *, candidate_id: str, attempt_id: str, input_hash: str,
+                   role_config_hash: str | None = None) -> dict[str, Any] | None:
     """Return a review only when it belongs to this attempt and this source hash."""
     path = workspace / "review.json"
     if not path.is_file():
@@ -218,6 +219,8 @@ def _stored_review(workspace: Path, *, candidate_id: str, attempt_id: str, input
         input_hash=input_hash,
     ):
         return None
+    if role_config_hash is not None and payload.get("role_config_hash") != role_config_hash:
+        return None
     from react_agent.eeg_research.agentic.native_patch import apply_review_filter, satisfied_invariants
     return apply_review_filter(payload, satisfied=satisfied_invariants(workspace))
 
@@ -235,12 +238,15 @@ def _review_or_reuse(
     """Use a stored review, or call the reviewer once. None means the campaign is already blocked."""
     attempt = ensure_attempt(workspace, str(workspace.name))
     digest = source_hash(workspace)
+    reviewer_config = getattr(reviewer, "role_config", None)
+    config_hash = getattr(reviewer_config, "role_config_hash", None)
     try:
         stored = _stored_review(
             workspace,
             candidate_id=str(workspace.name),
             attempt_id=str(attempt["attempt_id"]),
             input_hash=digest,
+            role_config_hash=config_hash,
         )
     except RecoveryBlocked as exc:
         _block_phase(
@@ -289,6 +295,7 @@ def _review_or_reuse(
         "phase": "review_candidate",
         "operation_id": operation_id(workspace, workspace.name, "review_candidate"),
         "input_hash": digest,
+        **({"role_config_hash": config_hash} if config_hash else {}),
     }
     _attach(reviewer, **identity)
     try:
@@ -350,7 +357,9 @@ def build_services(camp: Path) -> dict[str, Any]:
                      review_reason: str | None = None) -> None:
         if state.get("status") in {"paused", "cancelled"}:
             return
-        if state.get("evaluation_mode") == "loso_method_search":
+        from react_agent.eeg_research.agentic.coding_recovery import policy as coding_policy
+        modern_recovery = coding_policy(camp_dir / "candidates" / "_policy_probe") is not None
+        if state.get("evaluation_mode") == "loso_method_search" and not modern_recovery:
             from react_agent.eeg_research.agentic.resource_guard import require_idle_gpus
             try:
                 require_idle_gpus(camp_dir, state)
@@ -421,7 +430,8 @@ def build_services(camp: Path) -> dict[str, Any]:
             )
             return
         evidence_id = f"ev_impl_{candidate_id}"
-        if not repairing and review_reason is None and any(row.get("evidence_id") == evidence_id for row in state.get("evidence") or []):
+        awaiting_check = (state.get("pending_candidate_check") or {}).get("candidate_id") == candidate_id
+        if not repairing and not awaiting_check and review_reason is None and any(row.get("evidence_id") == evidence_id for row in state.get("evidence") or []):
             return
         max_calls = int(state.get("max_llm_calls", 100))
 
@@ -435,9 +445,23 @@ def build_services(camp: Path) -> dict[str, Any]:
             if repair.get("attempt_id"):
                 attempt = ensure_attempt(workspace, candidate_id)
                 if attempt["attempt_id"] != repair["attempt_id"]:
-                    _block_phase(camp_dir, state, phase="implement_candidate", error_type="RecoveryBlocked",
-                                 detail="repair_attempt_mismatch", recoverable=False)
-                    return
+                    from react_agent.eeg_research.agentic.coding_recovery import load as recovery_state
+                    recovery_projection = recovery_state(workspace)
+                    escalations = recovery_projection.get("escalations") or []
+                    latest_upgrade = escalations[-1] if escalations else {}
+                    if (latest_upgrade.get("parent_attempt_id") == repair["attempt_id"] and
+                            not latest_upgrade.get("attempt_id") and
+                            attempt.get("supersedes_attempt_id") == repair["attempt_id"]):
+                        from react_agent.eeg_research.agentic.coding_recovery import save as save_recovery
+                        latest_upgrade["attempt_id"] = attempt["attempt_id"]
+                        save_recovery(workspace, recovery_projection)
+                    if (latest_upgrade.get("parent_attempt_id") == repair["attempt_id"] and
+                            latest_upgrade.get("attempt_id") == attempt["attempt_id"]):
+                        repair["attempt_id"] = attempt["attempt_id"]
+                    else:
+                        _block_phase(camp_dir, state, phase="implement_candidate", error_type="RecoveryBlocked",
+                                     detail="repair_attempt_mismatch", recoverable=False)
+                        return
             else:
                 attempt = rotate_attempt(workspace, candidate_id)
                 repair["attempt_id"] = attempt["attempt_id"]
@@ -480,7 +504,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                 record_read_delivery(camp_dir, spec["artifact_reads"], consumer="candidate_coder",
                                      request_id=attempt["attempt_id"], input_digest=digest)
             last_llm: LlmUnavailable | None = None
-            for _attempt in range(IMPLEMENT_ATTEMPTS):
+            for _attempt in range(1 if modern_recovery else IMPLEMENT_ATTEMPTS):
                 try:
                     outcome = implement(
                         workspace,
@@ -537,6 +561,11 @@ def build_services(camp: Path) -> dict[str, Any]:
                     encoding="utf-8",
                 )
         row = {"candidate_id": candidate_id, "status": outcome["status"], "steps": outcome.get("steps"), "detail": outcome.get("detail")}
+        if modern_recovery:
+            from react_agent.eeg_research.agentic.coding_recovery import load as recovery_state
+            row["coding_recovery"] = recovery_state(workspace)
+            if repairing:
+                repair["attempt_id"] = ensure_attempt(workspace, candidate_id)["attempt_id"]
         check = outcome.get("check") if isinstance(outcome.get("check"), dict) else {}
         if not check and outcome.get("status") == "ready_for_review":
             check = read_json(workspace / "checks.json")
@@ -553,7 +582,7 @@ def build_services(camp: Path) -> dict[str, Any]:
             # A failed preflight is concrete engineering feedback, even before
             # the first review. Keep the same approved candidate and bounded
             # repair policy rather than making repair an unavailable action.
-            if (used < limit and outcome.get("detail") != "budget_exhausted"
+            if (used < limit and outcome.get("detail") not in {"budget_exhausted", "coding_lineage_budget_exhausted", "coding_no_progress_exhausted"}
                     and (check.get("error") or check.get("failures"))
                     and (workspace / "extension/eeg_candidate.py").is_file()):
                 # Reviewer findings that were being repaired stay open: fixing the
@@ -572,14 +601,24 @@ def build_services(camp: Path) -> dict[str, Any]:
             else:
                 state["repair_task"] = None
                 state["experiment_failed"] = True
-        elif repairing and outcome["status"] != "ready_for_review":
+        elif repairing and outcome["status"] not in {"ready_for_review", "check_pending"}:
             state["repair_task"] = None
             state["experiment_failed"] = True
         if outcome["status"] == "ready_for_review":
+            if (state.get("pending_candidate_check") or {}).get("candidate_id") == candidate_id:
+                state.pop("pending_candidate_check", None)
             verdict = (_review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state,
                         revalidation_reason=review_reason) if review_reason is not None
                        else _review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state))
             if verdict is None:
+                if modern_recovery:
+                    existing_row = next((index for index, value in enumerate(state.get("candidates") or [])
+                                         if value.get("candidate_id") == candidate_id), None)
+                    if existing_row is None:
+                        state.setdefault("candidates", []).append(row)
+                    else:
+                        state["candidates"][existing_row] = row
+                    save_state(camp_dir, state)
                 return
             row["review"] = verdict["status"]
             row["review_format_failed"] = verdict.get("format_failed")
@@ -623,7 +662,11 @@ def build_services(camp: Path) -> dict[str, Any]:
             else:
                 state["repair_task"] = None
                 row["status"] = f"review_{verdict['status']}"
-        if row["status"] != "ready":
+        if row["status"] == "check_pending":
+            state["pending_candidate_check"] = {"candidate_id": candidate_id, "source_hash": source_hash(workspace),
+                                                "check_fingerprint": check.get("check_fingerprint")}
+            state["experiment_failed"] = False
+        elif row["status"] != "ready":
             repairing_now = bool(
                 isinstance(state.get("repair_task"), dict)
                 and int((state.get("repair_task") or {}).get("remaining") or 0) > 0
@@ -653,6 +696,36 @@ def build_services(camp: Path) -> dict[str, Any]:
         if not replaced:
             state["evidence"].append(evidence_row)
         event(camp_dir, "implemented", **row)
+        if modern_recovery and state.get("experiment_failed") and not state.get("repair_task"):
+            from react_agent.eeg_research.agentic.loop import detach_failed_candidate
+            try:
+                detach_failed_candidate(camp_dir, state, candidate_id,
+                                        reason=str(row.get("detail") or row["status"]))
+            except ValueError as exc:
+                _block_phase(camp_dir, state, phase="candidate_detach", error_type=str(exc),
+                             detail=str(exc), recoverable=True)
+
+    def resume_pending_check(camp_dir: Path, state: dict[str, Any]) -> bool:
+        pending = state.get("pending_candidate_check") or {}
+        if not pending or state.get("status") in {"paused", "cancelled"}:
+            return False
+        workspace = camp_dir / "candidates" / str(pending["candidate_id"])
+        if source_hash(workspace) != pending.get("source_hash"):
+            _block_phase(camp_dir, state, phase="candidate_check", error_type="pending_check_source_changed",
+                         detail="pending_check_source_changed", recoverable=False)
+            return True
+        from react_agent.eeg_research.agentic.resource_guard import require_idle_gpus
+        try:
+            require_idle_gpus(camp_dir, state)
+        except (ValueError, OSError):
+            return False
+        state.pop("resource_wait", None)
+        do_implement(camp_dir, state)
+        current = next((row for row in state.get("candidates") or []
+                        if row.get("candidate_id") == pending["candidate_id"]), {})
+        if current.get("status") != "check_pending":
+            state.pop("pending_candidate_check", None)
+        return True
 
     def revalidate_review(camp_dir: Path, state: dict[str, Any], *, candidate_id: str, reason: str) -> dict:
         """Re-review current checked code after a recorded review metadata failure."""
@@ -717,18 +790,27 @@ def build_services(camp: Path) -> dict[str, Any]:
             return
         from react_agent.eeg_research.agentic.development_feedback import ensure_development_feedback
         method_mode = state.get("evaluation_mode") == "loso_method_search"
+        screening_mode = method_mode and latest.get("kind") == "method_screening"
+        feedback_goal = json.loads((camp_dir / "goal.json").read_text())
+        optional_curation = method_mode and feedback_goal.get("evaluation_schedule") == "screen_then_confirm"
         scientific_rows = state.get("evidence") or []
         if method_mode:
             from react_agent.eeg_research.agentic.method_suite import read_aggregate, verified_suite_records
             scientific_rows = verified_suite_records(camp_dir, state)
+            if screening_mode:
+                from react_agent.eeg_research.agentic.screening import read_screening, verified_screening_records
+                scientific_rows += verified_screening_records(camp_dir, state)
             # Raw fold/partial rows cannot grant benchmark interpretation or
             # become controls, even if they carry a truthy evaluation label.
             if latest not in scientific_rows:
                 return
-            suite_result = read_aggregate(camp_dir, latest["suite_id"])
-            feedback = {"status": "verified_complete_method_suite", "scope": "method_development_benchmark",
+            suite_result = (read_screening(camp_dir, latest["suite_id"]) if screening_mode else
+                            read_aggregate(camp_dir, latest["suite_id"]))
+            feedback = {"status": "verified_two_fold_screening" if screening_mode else "verified_complete_method_suite",
+                        "scope": "two_fold_development" if screening_mode else "method_development_benchmark",
                         "suite_ref": latest["suite_ref"], "suite_hash": latest["suite_hash"],
-                        "complete_fold_count": 10, "required_fold_count": 10, "independent_seed_count": 1}
+                        "complete_fold_count": 2 if screening_mode else 10,
+                        "required_fold_count": 2 if screening_mode else 10, "independent_seed_count": 1}
         else:
             feedback = ensure_development_feedback(camp_dir, state, latest)
         bound_hypothesis = latest.get("hypothesis")
@@ -895,6 +977,23 @@ def build_services(camp: Path) -> dict[str, Any]:
             }
             payload["latest"].update(metric_scope="method_development_benchmark", suite_id=latest["suite_id"],
                                      suite_hash=latest["suite_hash"], method_revision=latest["method_revision"])
+            if screening_mode:
+                from react_agent.eeg_research.agentic.screening import SCIENCE_SCOPE
+                payload.pop("primary_metric", None)
+                payload.update(method_screening=suite_result, scientific_unit="one_fixed_two_fold_screening_seed0",
+                    benchmark_permission={"authorized": True, "scope": "two_fold_development", "partial_feedback": True},
+                    evaluation_population={"unit": "two_prespecified_subjects_equal_weight", "required_fold_count": 2,
+                                           "full_required_fold_count": 10, "query_count_per_subject": 200,
+                                           "candidate_count_per_subject": 200}, science_scope=SCIENCE_SCOPE,
+                    limitations=["fixed_development_gallery", "two_subjects_not_ten_fold_conclusion",
+                                 "overlapping_training_sets_not_independent_replicates", "selection_bias",
+                                 "one_seed_no_independent_final_test"])
+                payload.pop("method_suite", None)
+                payload["verified_run_coverage"].update(authority="native_verified_two_fold_screening",
+                    scope="two_fold_development", required_fold_count=2, full_required_fold_count=10,
+                    matched_complete_baseline_pair=False, matched_two_fold_baseline_pair=latest["candidate_id"] != "baseline")
+                payload["latest"].update(metric_scope="two_fold_development", phase="screening_2fold",
+                                        screening_result=suite_result["screening_result"])
         payload = development_view(payload)
         digest = request_digest(request=payload)
         for row in state.get("evidence") or []:
@@ -923,7 +1022,7 @@ def build_services(camp: Path) -> dict[str, Any]:
             body = raw_reply.get("payload") if isinstance(raw_reply.get("payload"), dict) else raw_reply
             body = {key: value for key, value in body.items() if key not in {
                 "schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "status", "artifact_refs",
-                "method_benchmark_origin"}}
+                "method_benchmark_origin", "method_screening_origin"}}
             reply = ResultAnalysis.model_validate(body).model_dump()
             role_status = str(raw_reply.get("status") or "completed")
             if role_status not in {"completed", "partial", "failed", "blocked"}:
@@ -941,8 +1040,9 @@ def build_services(camp: Path) -> dict[str, Any]:
         target = camp_dir / "analyses" / f"{latest['evidence_id']}_{task['task_id']}.json"
         benchmark_origin = {}
         if method_mode:
-            from react_agent.eeg_research.agentic.handoffs import method_benchmark_origin
-            benchmark_origin = {"method_benchmark_origin": method_benchmark_origin(latest)}
+            from react_agent.eeg_research.agentic.handoffs import method_benchmark_origin, method_screening_origin
+            benchmark_origin = ({"method_screening_origin": method_screening_origin(latest)} if screening_mode else
+                                {"method_benchmark_origin": method_benchmark_origin(latest)})
         envelope = finish_role_task(camp_dir, task, {**reply, "status": role_status,
             "prompt_hash": raw_reply.get("prompt_hash", "") if "raw_reply" in locals() else "", **benchmark_origin},
             kind="analysis", path=target, candidate_id=latest.get("candidate_id"))
@@ -1003,6 +1103,22 @@ def build_services(camp: Path) -> dict[str, Any]:
                     missing_inputs=[],
                     limitations=["benchmark_used_for_method_development", "one_seed_not_replicated_or_statistically_significant"],
                 )
+                if screening_mode:
+                    from react_agent.eeg_research.agentic.method_suite import validate_suite
+                    screening_recipe = validate_suite(camp_dir, latest["suite_id"])["method"]["public_recipe"]
+                    curation_context.pop("primary_metric", None)
+                    curation_context.update(scientific_unit="one_fixed_two_fold_screening_seed0", scope="two_fold_development",
+                        method_screening=suite_result, science_scope=suite_result["science_scope"],
+                        benchmark_permission={"authorized": True, "scope": "two_fold_development", "partial_feedback": True},
+                        lesson_conditions_required={"fidelity": "full", "evaluation_identity": state["contract_fingerprint"],
+                            "scope": "two_fold_development", "screening_subjects": suite_result["screening_subjects"],
+                            "selection_manifest_hash": suite_result["selection_manifest_hash"], "seed": 0,
+                            "method_revision": latest["method_revision"], "training_recipe": screening_recipe,
+                            "independent_final_test": False},
+                        method_suite_identity={"suite_id": latest["suite_id"], "suite_hash": latest["suite_hash"],
+                            "method_revision": latest["method_revision"], "coverage": 2, "required_fold_count": 2,
+                            "full_required_fold_count": 10, "seed": 0},
+                        limitations=payload["limitations"], **benchmark_origin)
             from react_agent.eeg_research.agentic.embedding import memory_config
             memory = memory_config(camp_dir)
             if memory.enabled and memory.skills_enabled and role_status == "completed":
@@ -1011,6 +1127,8 @@ def build_services(camp: Path) -> dict[str, Any]:
                     curation_context = extend_curation_context(camp_dir, curation_context, envelope, state=state)
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     curation_context["skills_unavailable_reason"] = type(exc).__name__
+            from react_agent.eeg_research.agentic.engineering_memory import extend_curation_context as extend_engineering_context
+            curation_context = extend_engineering_context(camp_dir, curation_context, candidate_id=latest.get("candidate_id"))
             curation_inputs = [camp_dir / "goal.json"]
             if method_mode:
                 curation_inputs.extend([Path(latest["suite_ref"]), target])
@@ -1057,7 +1175,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                 store.mark_pending_curation("curator_unavailable")
                 finish_role_task(camp_dir, task, {"status": "failed", "summary_zh": f"经验提议未完成：{exc}"},
                                  kind="lessons", path=camp_dir / "memory" / f"lessons_{task['task_id']}.json")
-                if method_mode and str(exc) in _METHOD_ROLE_HARD_BLOCKS:
+                if method_mode and not optional_curation and str(exc) in _METHOD_ROLE_HARD_BLOCKS:
                     raise
             else:
                 proposal_status = str(proposal.get("status") or "completed")
@@ -1098,7 +1216,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                     "curator_called": True, "context_compaction": curation_context.get("context_compaction")}
         except LlmUnavailable as exc:
             store.mark_pending_curation("curator_unavailable")
-            if method_mode and str(exc) in _METHOD_ROLE_HARD_BLOCKS:
+            if method_mode and not optional_curation and str(exc) in _METHOD_ROLE_HARD_BLOCKS:
                 _sync_ledger(camp_dir, state)
                 raise
         except Exception:
@@ -1117,9 +1235,18 @@ def build_services(camp: Path) -> dict[str, Any]:
         if state.get("evaluation_mode") == "loso_method_search":
             from react_agent.eeg_research.agentic.method_suite import verified_suite_records
             scientific_rows = verified_suite_records(camp_dir, state)
+            from react_agent.eeg_research.agentic.screening import verified_screening_records
+            scientific_rows += verified_screening_records(camp_dir, state)
+            by_id = {row["evidence_id"]: row for row in scientific_rows}
+            scientific_rows = [by_id[row["evidence_id"]] for row in state.get("evidence") or []
+                               if row.get("evidence_id") in by_id]
         latest = next((row for row in reversed(scientific_rows)
                        if row.get("fidelity") and row.get("candidate_id") and "evaluation_valid" in row), None)
         if latest is None:
+            return
+        if latest.get("kind") == "method_screening":
+            _analyze_run(camp_dir, state, latest, trigger={"kind": "completed_screening",
+                                                        "upstream_evidence_id": latest["evidence_id"]})
             return
         from react_agent.eeg_research.agentic.analysis_dependencies import analysis_targets
         for row in analysis_targets(camp_dir, {**state, "evidence": scientific_rows}, latest):
@@ -1148,6 +1275,21 @@ def build_services(camp: Path) -> dict[str, Any]:
                      "upstream_job_id": latest.get("job_id")})
         if not result:
             raise ValueError("handoff_preparation_incomplete")
+        return result
+
+    def maintain_context(camp_dir: Path, state: dict[str, Any]) -> dict:
+        """Process closed sources at a quiescent native controller boundary."""
+        from react_agent.eeg_research.agentic.llm import external_api_disabled, _remaining_api_calls
+        if external_api_disabled() or state.get("live_job") or state.get("status") in {"paused", "cancelled", "blocked"}:
+            return {"status":"deferred", "reason":"not_a_quiescent_authorized_boundary"}
+        backend = role_backend(camp_dir, "memory_curator")
+        context_service = getattr(backend, "context_service", None)
+        if context_service is None:
+            return {"status":"unavailable", "reason":"injected_backend_without_context_service"}
+        result = context_service.after_task_background({"evidence":state.get("evidence") or []},
+            turn_id="native_closed:" + str(len(state.get("decisions") or [])),
+            remaining_api_calls=_remaining_api_calls(camp_dir))
+        _sync_ledger(camp_dir, state)
         return result
 
     def revalidate_feedback(camp_dir: Path, state: dict[str, Any], *, reason: str) -> dict:
@@ -1202,8 +1344,10 @@ def build_services(camp: Path) -> dict[str, Any]:
         "launch": launch,
         "settle": settle,
         "implement": do_implement,
+        "resume_pending_check": resume_pending_check,
         "analyze": analyze,
         "prepare_handoff": prepare_handoff,
+        "context_maintenance": maintain_context,
         "revalidate_feedback": revalidate_feedback,
         "retry_design": retry_design,
         "revalidate_review": revalidate_review,
@@ -1258,6 +1402,14 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
         from react_agent.eeg_research.agentic.verification_cache import verification_scope
         with verification_scope():
             state = tick(camp, planner, services=services)
+            upkeep = services.get("context_maintenance")
+            if upkeep and state.get("status") in {"created", "planning"}:
+                try:
+                    result = upkeep(camp, state)
+                    event(camp, "context_memory_maintenance", status=result.get("status", "completed"))
+                    save_state(camp, state)
+                except (LlmUnavailable, ValueError, OSError) as exc:
+                    event(camp, "context_memory_maintenance_deferred", reason=str(exc))
         (camp / "worker.json").write_text(
             json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "tick": tick_index,
                         "decision_ticks": decisions, "resumable": bool(state.get("live_job"))}),

@@ -16,6 +16,9 @@ from react_agent.eeg_research.agentic.embedding import (
     DIMENSION, TEXT_BUILDER_VERSION, EmbeddingUnavailable, MemoryConfig,
     backend_for, cached_vector, canonical, content_hash, memory_config, vector_blob,
 )
+from react_agent.eeg_research.agentic.context.retrieval import (
+    MAX_CANDIDATES, MAX_DELIVERY_CHARS, deduplicate_hits, prepare_query,
+)
 
 GROUPS = ("compatible_evidence", "analogy_only", "applicability_unknown")
 
@@ -113,9 +116,11 @@ class SidecarStore:
     def cached(self, record: dict, fingerprint: str, metadata: dict | None = None):
         with self.connect() as conn:
             row = conn.execute("""SELECT * FROM embedding_cache WHERE namespace=? AND record_type=?
-                AND record_id=? AND record_version=? AND text_hash=? AND embedding_fingerprint=?""",
-                (self.namespace, record["record_type"], record["record_id"], str(record["version"]), record["text_hash"], fingerprint)).fetchone()
-        if row is None or row["content_hash"] != record["content_hash"]:
+                AND record_id=? AND text_hash=? AND embedding_fingerprint=? ORDER BY created_at DESC LIMIT 1""",
+                (self.namespace, record["record_type"], record["record_id"], record["text_hash"], fingerprint)).fetchone()
+        # Vectors represent text, not the full source's scientific revision.
+        # Current source/filter validation happens before this lookup.
+        if row is None:
             return None
         row = dict(row)
         try:
@@ -144,6 +149,13 @@ class SidecarStore:
                 if record["record_type"] == "skill":
                     conn.execute("UPDATE skills SET index_status='indexed' WHERE namespace=? AND skill_id=? AND version=?",
                                  (self.namespace, record["record_id"], record["version"]))
+
+    def cached_encoding(self, record: dict, fingerprint: str) -> dict | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT encoding_metadata FROM embedding_cache WHERE namespace=? AND record_type=? "
+                "AND record_id=? AND text_hash=? AND embedding_fingerprint=? ORDER BY created_at DESC LIMIT 1",
+                (self.namespace, record["record_type"], record["record_id"], record["text_hash"], fingerprint)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def freeze(self, key: str, build):
         with self.connect() as conn:
@@ -175,9 +187,29 @@ class SidecarStore:
 def episode_source(camp: Path, episode: dict) -> dict:
     from react_agent.eeg_research.agentic.artifacts import file_digest, resolve_verified_artifact
 
+    if str(episode.get("schema_version", "")).startswith("eeg_research.memory_pipeline."):
+        from react_agent.eeg_research.agentic.context.long_memory import pipeline_record_sources
+        if unsafe_source(episode) or episode.get("origin_campaign_id") != camp.name:
+            raise ValueError("episode_not_campaign_development")
+        refs = pipeline_record_sources(camp, "episode", episode["episode_id"])
+        if not refs:
+            raise ValueError("pipeline_episode_sources_invalid")
+        return {"episode_id": episode["episode_id"], "content_hash": content_hash(episode),
+                "source_refs": refs, "scope": episode.get("scope"),
+                "scientific_scope": episode.get("scientific_scope"),
+                "interpretation_only": True, "replicated": False}
     method = episode.get("scope") == "method_development_benchmark"
-    if unsafe_source(episode) or (episode.get("scope") != "development" and not method):
+    screening = episode.get("scope") == "two_fold_development"
+    if unsafe_source(episode) or (episode.get("scope") != "development" and not method and not screening):
         raise ValueError("episode_not_development")
+    if screening:
+        from react_agent.eeg_research.agentic.memory import verified_screening_episode
+        native = verified_screening_episode(camp, episode)
+        return {"episode_id": episode["episode_id"], "content_hash": content_hash(episode),
+                "artifact_path": str(Path(native["path"]).resolve()), "artifact_sha256": native["sha256"],
+                "scope": "two_fold_development", "screening_subjects": episode["screening_subjects"],
+                "selection_manifest_hash": episode["selection_manifest_hash"], "method_revision": episode["method_revision"],
+                "science_scope": episode["science_scope"], "independent_seed_count": 1, "replicated": False}
     if method:
         from react_agent.eeg_research.agentic.memory import verified_method_episode
         native = verified_method_episode(camp, episode)
@@ -226,6 +258,20 @@ def build_context(camp: Path, *, state: dict | None = None, experiment: dict | N
         context["modality"] = "EEG"
     if protocol.get("exp_setting"):
         context["regime"] = protocol["exp_setting"]
+    if goal.get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.method_suite import manifest, validate_suite
+        common = manifest(camp)
+        selection = common["selection_manifest"]
+        context.update(scope="method_development_benchmark" if state.get("phase") == "confirmation_10fold" else "two_fold_development",
+                       screening_subjects=selection["subjects"], selection_manifest_hash=selection["selection_manifest_hash"], seed=0)
+        suite_id = state.get("phase_target_suite") or state.get("active_suite")
+        if not suite_id:
+            target = state.get("candidate_id")
+            row = next((item for item in reversed(state.get("evidence", [])) if item.get("candidate_id") == target and item.get("suite_id")), None)
+            suite_id = row.get("suite_id") if row else None
+        if suite_id:
+            suite = validate_suite(camp, suite_id)
+            context.update(method_revision=suite["method"]["method_revision"], training_recipe=suite["method"]["public_recipe"])
     return context
 
 
@@ -284,14 +330,19 @@ def build_query(camp: Path, *, state: dict | None = None, experiment: dict | Non
     scope = {key: context[key] for key in ("modality", "regime", "dataset") if key in context}
     if scope:
         sections.append(("Verified task scope: " + canonical(scope))[:200])
-    return "\n".join(dict.fromkeys(section for section in sections if section.strip()))[:4000]
+    action = state.get("last_action") or state.get("action") or ""
+    error = state.get("error") or state.get("block_reason") or ""
+    return prepare_query(question="\n".join(dict.fromkeys(section for section in sections if section.strip())),
+        action=action, error=error, method=experiment, protocol=context,
+        identities=[experiment.get("candidate_id"), state.get("active_question_id")])["text"]
 
 
 def _search_text(kind: str, body: dict) -> str:
     scope = body.get("conditions") if kind == "lesson" else body.get("preconditions")
     scope = scope or {}
     # The old goal_id is an applicability identity, not semantic text.
-    readable = {k: scope[k] for k in ("modality", "regime", "dataset", "input_geometry", "feature_target", "intervention", "fidelity") if scope.get(k) not in (None, "")}
+    readable = {k: scope[k] for k in ("modality", "regime", "dataset", "input_geometry", "feature_target", "intervention", "fidelity",
+                                    "scope", "screening_subjects", "selection_manifest_hash", "method_revision", "seed") if scope.get(k) not in (None, "")}
     description = str(body.get("statement") or "") if kind == "lesson" else str(body["description_en"]) + "\n" + str(body["trigger_en"])
     return description + ("\nApplicable scope: " + canonical(readable) if readable else "")
 
@@ -302,36 +353,75 @@ def candidates(camp: Path, config: MemoryConfig, context: dict | None = None) ->
     require_eeg_campaign(camp)
     context = context if context is not None else build_context(camp)
     store = EpisodeStore(camp)
-    episodes = {ep["episode_id"]: ep for ep in store.list_episodes()}
+    # Index navigation is bounded separately from the immutable full records.
+    lesson_rows = store.list_lessons(limit=MAX_CANDIDATES)
+    needed_ids = {ref for lesson in lesson_rows for ref in (lesson.get("supporting_episode_ids") or [])[:16]}
+    conn = sqlite3.connect(camp / "memory.sqlite")
+    try:
+        episodes = {}
+        for ref in sorted(needed_ids):
+            row = conn.execute("SELECT payload FROM episodes WHERE episode_id=?", (ref,)).fetchone()
+            if row:
+                episode = json.loads(row[0]); episodes[episode["episode_id"]] = episode
+        # Full-confirmation updates have a bounded navigation window as well.
+        for ep in store.list_episodes(limit=MAX_CANDIDATES):
+            episodes.setdefault(ep["episode_id"], ep)
+    finally:
+        conn.close()
     valid = []; sources = {}
-    for lesson in store.list_lessons():
-        if unsafe_source(lesson) or lesson.get("origin_campaign_id", camp.name) != camp.name or lesson.get("is_current") is False or lesson.get("status") in {"disabled", "superseded"}:
+    for lesson in lesson_rows:
+        if unsafe_source(lesson) or lesson.get("origin_campaign_id", camp.name) != camp.name or lesson.get("is_current") is False or lesson.get("status") in {"disabled", "superseded", "retired"}:
             continue
         try:
             refs = lesson.get("supporting_episode_ids") or []
-            if not refs:
+            if not refs or len(refs) > 16:
                 continue
-            manifest = [episode_source(camp, episodes[ref]) for ref in refs]
+            if lesson.get("pipeline_schema_version"):
+                from react_agent.eeg_research.agentic.context.long_memory import pipeline_record_sources
+                manifest = pipeline_record_sources(camp, "lesson", lesson["lesson_id"])
+                if not manifest:
+                    continue
+            else:
+                manifest = [episode_source(camp, episodes[ref]) for ref in refs]
         except (OSError, ValueError, KeyError, TypeError):
             continue
         valid.append(lesson); sources[lesson["lesson_id"]] = manifest
     rows = []
+    updates = {}
+    for ep in episodes.values():
+        if ep.get("scope") != "method_development_benchmark" or not ep.get("updates_episode_ids"):
+            continue
+        try:
+            source = episode_source(camp, ep)
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        for updated in ep["updates_episode_ids"]:
+            updates.setdefault(updated, []).append({"episode_id": ep["episode_id"], "source": source,
+                "scope": "method_development_benchmark", "verified_fold_coverage": 10,
+                "relation": ep.get("screening_update_relation", "additional_coverage"),
+                "scientific_strength": "greater_subject_coverage_same_frozen_method; development_selection_bias_remains"})
     for label, lessons in query_lessons(context, valid).items():
         for body in lessons:
             original = next(item for item in valid if item["lesson_id"] == body["lesson_id"])
             digest = content_hash(original)
+            evidence_updates = [update for ref in body.get("supporting_episode_ids", []) for update in updates.get(ref, [])]
+            if evidence_updates:
+                # Delivery-only relationship; retain the original lesson/episode
+                # bytes and expose the stronger native source beside them.
+                body = {**body, "evidence_updates": evidence_updates}
             rows.append({"record_type": "lesson", "record_id": body["lesson_id"], "version": digest,
-                         "content_hash": digest, "source_refs": sources[body["lesson_id"]],
+                         "content_hash": digest, "source_refs": sources[body["lesson_id"]] + [item["source"] for item in evidence_updates],
                          "applicability": label, "condition_differences": {k: body[k] for k in ("mismatch", "missing_conditions") if k in body},
                          "body": body})
     if config.skills_enabled:
         from react_agent.eeg_research.agentic.skill_memory import current_skills, skill_applicability
-        for skill in current_skills(camp):
+        for skill in current_skills(camp, limit=MAX_CANDIDATES):
             label, differences = skill_applicability(skill["payload"], context)
             rows.append({"record_type": "skill", "record_id": skill["skill_id"], "version": skill["version"],
                          "content_hash": skill["content_hash"], "source_refs": skill["source_manifest"],
                          "applicability": "procedural_hint", "precondition_status": label,
                          "condition_differences": differences, "body": skill["payload"]})
+    rows = rows[:MAX_CANDIDATES]
     for row in rows:
         row["search_text"] = _search_text(row["record_type"], row["body"])
         row["text_hash"] = hashlib.sha256(row["search_text"].encode()).hexdigest()
@@ -339,11 +429,28 @@ def candidates(camp: Path, config: MemoryConfig, context: dict | None = None) ->
 
 
 def index_records(store: SidecarStore, records: list[dict], backend, *, rebuild: bool = False) -> dict:
-    pending = [row for row in records if rebuild or store.cached(row, backend.fingerprint, backend.metadata) is None]
-    stats = {"indexed": 0, "reused": len(records) - len(pending), "pending": len(pending), "failed": 0}
+    chunks = []
+    for record in records[:MAX_CANDIDATES]:
+        base = {k: v for k, v in record.items() if k != "embedding_chunks"}
+        if hasattr(backend, "prepare_chunks"):
+            parts = backend.prepare_chunks(record["search_text"], record_id=record["record_id"])
+            record["embedding_chunks"] = [{**base, "search_text": part["text"], "text_hash": part["text_hash"],
+                "version": part["chunk_id"], "encoding_scope": {k: v for k, v in part.items() if k != "text"}}
+                for part in parts]
+        else:
+            # Legacy injected backends must still explicitly report encoding
+            # scope. Production MiniLM always implements the tokenizer path.
+            record["embedding_chunks"] = [base]
+        chunks.extend(record["embedding_chunks"])
+    pending = [row for row in chunks if rebuild or store.cached(row, backend.fingerprint, backend.metadata) is None]
+    stats = {"indexed": 0, "reused": len(chunks) - len(pending), "pending": len(pending), "failed": 0}
     if pending:
         try:
             vectors, metadata = backend.encode([row["search_text"] for row in pending])
+            metadata = [{**encoding, "representation_scope": row.get("encoding_scope", {"representation": "legacy_backend"})}
+                        for row, encoding in zip(pending, metadata)]
+            if any(encoding.get("truncated") for encoding in metadata):
+                raise ValueError("implicit_embedding_truncation_forbidden")
             store.save_vectors(pending, vectors, metadata, backend)
             stats.update(indexed=len(pending), pending=0)
         except Exception as exc:
@@ -385,7 +492,7 @@ def _delivery_fields(bundle: dict, *, standalone: bool) -> dict:
 
 def _fit_delivery(bundle: dict, *, standalone: bool = False) -> tuple[dict | None, dict]:
     """One whole-record budget rule for Planner and standalone role requests."""
-    budget = bundle["context_chars_budget"]
+    budget = min(bundle["context_chars_budget"], MAX_DELIVERY_CHARS)
     if budget <= 0 or bundle.get("delivery_available") is False or bundle.get("reason") == "disabled":
         return None, {}
     source_items = bundle["items"] if bundle["backend"] == "minilm" else []
@@ -412,6 +519,27 @@ def _fit_delivery(bundle: dict, *, standalone: bool = False) -> tuple[dict | Non
             trial["lessons"][item["applicability"]].append(copy.deepcopy(body))
         trial["hit_count"] = len(trial["items"])
         trial_fields = measure(trial)
+        if trial["context_chars_used"] > budget:
+            # A long entry may still be useful through an explicitly partial
+            # record card.  Preserve the original body in SQLite; this view
+            # does not claim a full read or semantic coverage.
+            partial = copy.deepcopy(item.get("body") if item["record_type"] == "skill" else body)
+            selected_ranges = {}
+            for key in ("statement", "description_en", "trigger_en", "summary_zh"):
+                if isinstance(partial.get(key), str) and len(partial[key]) > 1200:
+                    original = partial[key]
+                    partial[key] = original[:1200]
+                    selected_ranges[key] = {"char_range": [0, 1200], "full_chars": len(original),
+                                            "full_text_hash": hashlib.sha256(original.encode()).hexdigest()}
+            if selected_ranges:
+                trial["items"][-1]["representation"] = {"kind": "partial_record_card", "selected_ranges": selected_ranges,
+                    "full_record_id": item["record_id"], "full_record_hash": item["content_hash"],
+                    "complete": False, "actual_read": False}
+                if item["record_type"] == "skill":
+                    trial["items"][-1]["body"] = partial
+                else:
+                    trial["lessons"][item["applicability"]][-1] = partial
+                trial_fields = measure(trial)
         if trial["context_chars_used"] <= budget:
             selected, fields = trial, trial_fields
     fields = measure(selected)
@@ -430,12 +558,13 @@ def _finalize_bundle(bundle: dict) -> dict:
 
 def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
              experiment: dict | None = None, config: MemoryConfig | None = None,
-             require_embedding: bool = False, rebuild: bool = False) -> dict:
+             require_embedding: bool = False, rebuild: bool = False,
+             role: str = "research_planner") -> dict:
     config = config or memory_config(camp)
-    query = build_query(camp, state=state, experiment=experiment) if query is None else query
+    query = build_query(camp, state=state, experiment=experiment) if query is None else prepare_query(question=query)["text"]
     bundle = {"backend": "legacy", "degraded": False, "reason": "disabled", "query": query[:800],
               "items": [], "lessons": {k: [] for k in GROUPS}, "candidate_count": 0, "hit_count": 0,
-              "context_chars_budget": config.context_chars_budget, "truncated": False}
+              "context_chars_budget": min(config.context_chars_budget, MAX_DELIVERY_CHARS), "truncated": False}
     if not config.enabled:
         if require_embedding:
             raise EmbeddingUnavailable("memory_disabled")
@@ -457,31 +586,51 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
                       candidate_count=len(records), language_limit="Original lesson language; no translation. MiniLM is English-focused.")
         if not query.strip() or config.top_k <= 0 or not records:
             return _finalize_bundle(bundle)
-        query_vectors, query_metadata = backend.encode([query])
-        query_vector = query_vectors[0]
+        query_card = backend.prepare_query(query) if hasattr(backend, "prepare_query") else prepare_query(question=query)
+        query = query_card["text"]
+        bundle["query_representation"] = query_card["metadata"]
+        query_hash = hashlib.sha256(query.encode()).hexdigest()
+        query_record = {"record_type": "query", "record_id": "query_" + query_hash[:24], "version": TEXT_BUILDER_VERSION,
+                        "content_hash": query_hash, "text_hash": query_hash, "search_text": query}
+        query_vector = store.cached(query_record, backend.fingerprint, backend.metadata)
+        query_encoding = store.cached_encoding(query_record, backend.fingerprint) if query_vector is not None else None
+        if query_vector is None or query_encoding is None:
+            query_vectors, query_metadata = backend.encode([query])
+            query_vector = query_vectors[0]; query_encoding = query_metadata[0]
+            if query_encoding.get("truncated"):
+                raise EmbeddingUnavailable("implicit_query_truncation_forbidden")
+            store.save_vectors([query_record], query_vectors, query_metadata, backend)
         vector_blob(query_vector)
-        bundle["query_encoding"] = {k: v for k, v in query_metadata[0].items() if k != "encoded_text"}
+        bundle["query_encoding"] = {k: v for k, v in query_encoding.items() if k != "encoded_text"}
         ranked = []
         priorities = {"compatible_evidence": 0, "preconditions_met": 1, "analogy_only": 2,
                       "preconditions_mismatch": 2, "applicability_unknown": 3, "preconditions_unknown": 3}
         for row in records:
-            vector = store.cached(row, backend.fingerprint, backend.metadata)
-            if vector is None:
+            vectors = [store.cached(chunk, backend.fingerprint, backend.metadata)
+                       for chunk in row.get("embedding_chunks", [row])]
+            scores = [float(vector @ query_vector) for vector in vectors if vector is not None]
+            if not scores:
                 continue
-            score = float(vector @ query_vector)
+            score = max(scores)
             if score >= config.min_similarity:
                 ranked.append((priorities[row.get("precondition_status", row["applicability"])], -score,
                                (row["record_type"], row["record_id"], str(row["version"])), row, score))
         ranked.sort(key=lambda item: item[:3])
         bundle["matched_count"] = len(ranked)
-        for _, _, _, row, score in ranked[:max(0, config.top_k)]:
-            item = {k: copy.deepcopy(v) for k, v in row.items() if k not in {"search_text", "text_hash", "body"}}
+        for _, _, _, row, score in ranked[:max(0, min(config.top_k, 32))]:
+            item = {k: copy.deepcopy(v) for k, v in row.items() if k not in {"search_text", "text_hash", "body", "embedding_chunks"}}
             item["cosine_score"] = score
             if row["record_type"] == "skill":
                 item["body"] = copy.deepcopy(row["body"])
             bundle["items"].append(item)
             if row["record_type"] == "lesson":
                 bundle["lessons"][row["applicability"]].append(copy.deepcopy(row["body"]))
+        selected = deduplicate_hits(bundle["items"], role=role)
+        selected_ids = {item["record_id"] for item in selected}
+        bundle["omitted_count"] = len(bundle["items"]) - len(selected)
+        bundle["items"] = selected
+        for group in GROUPS:
+            bundle["lessons"][group] = [item for item in bundle["lessons"][group] if item["lesson_id"] in selected_ids]
         bundle["hit_count"] = len(bundle["items"])
         return _finalize_bundle(bundle)
     except Exception as exc:

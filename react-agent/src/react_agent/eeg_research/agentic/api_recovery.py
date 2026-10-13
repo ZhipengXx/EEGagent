@@ -24,6 +24,13 @@ def abandon_orphaned_intents(camp: Path, *, reason: str) -> dict:
     intents_path = camp / "llm_api_intents.jsonl"
     intents = [json.loads(line) for line in intents_path.read_text().splitlines()
                if line.strip()] if intents_path.exists() else []
+    # A crash can precede the primary intent append after the durable operation
+    # reservation. Those attempts remain charged and explicitly reconcilable.
+    from react_agent.eeg_research.agentic.api_policy import ATTEMPTS
+    path = camp / ATTEMPTS
+    operations = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.is_file() else []
+    known = {row["call_id"] for row in intents}
+    intents.extend(row for row in operations if row["call_id"] not in known)
     for intent in intents:
         if intent["call_id"] not in pending:
             continue

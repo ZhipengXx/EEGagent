@@ -36,7 +36,10 @@ def artifact_source(camp: Path, artifact_id: str) -> dict:
     from react_agent.eeg_research.agentic.semantic_memory import read_json, unsafe_source, unsafe_source_path
 
     row = resolve_verified_artifact(camp, artifact_id)
-    if row.get("kind") in {"method_suite", "analysis", "lessons"}:
+    if row.get("kind") == "engineering_repair":
+        from react_agent.eeg_research.agentic.engineering_memory import verify_engineering_artifact
+        verify_engineering_artifact(camp, artifact_id)
+    if row.get("kind") in {"method_suite", "method_screening", "analysis", "lessons"}:
         from react_agent.eeg_research.agentic.handoffs import development_artifact
         development_artifact(camp, artifact_id)
     path = Path(row["path"])
@@ -142,6 +145,17 @@ def validated_sources(camp: Path, proposal: SkillProposal, allowed: dict) -> dic
             if task != task_allow[task_id]:
                 raise ValueError("source_task_changed")
             tasks.append(task)
+    engineering = any(row.get("kind") == "engineering_repair" for row in artifacts) or any(
+        row.get("output_artifact", {}).get("kind") == "engineering_repair" for row in tasks)
+    if engineering:
+        import re
+        if proposal.preconditions.get("scope") != "engineering_repair" or proposal.supporting_episode_ids:
+            raise ValueError("engineering_skill_requires_separate_procedural_scope")
+        # This source proves code checks only. It cannot support a performance
+        # metric claim, even when written in the free-form procedure text.
+        text = " ".join([proposal.description_en, proposal.trigger_en, *proposal.procedure])
+        if re.search(r"(?i)top[_ -]?[15]|accuracy|\b\d+(?:\.\d+)?\s*(?:pp|percentage points)|准确率|检索(?:增益|提升|性能)", text):
+            raise ValueError("engineering_skill_cannot_claim_scientific_performance")
     if not tasks:
         raise ValueError("completed_subtask_source_required")
     stored_episodes = {row["episode_id"]: row for row in EpisodeStore(camp).list_episodes()}
@@ -187,14 +201,14 @@ def accept_skills(camp: Path, proposed: list, allowed: dict) -> dict:
     return {"accepted": accepted, "rejected": rejected}
 
 
-def current_skills(camp: Path) -> list[dict]:
+def current_skills(camp: Path, *, limit: int = 128) -> list[dict]:
     from react_agent.eeg_research.agentic.semantic_memory import SidecarStore, unsafe_source
 
     if not (camp / "semantic_memory.sqlite").is_file():
         return []
     store = SidecarStore(camp)
     with store.connect() as conn:
-        rows = conn.execute("SELECT * FROM skills WHERE namespace=? AND origin_campaign_id=? AND is_current=1 AND validation_status='source_validated_development_hint' ORDER BY skill_id,version", (camp.name, camp.name)).fetchall()
+        rows = conn.execute("SELECT * FROM skills WHERE namespace=? AND origin_campaign_id=? AND is_current=1 AND validation_status='source_validated_development_hint' ORDER BY created_at DESC,skill_id,version LIMIT ?", (camp.name, camp.name, max(0, min(limit, 128)))).fetchall()
     valid = []
     for row in rows:
         row = dict(row)
@@ -202,7 +216,13 @@ def current_skills(camp: Path) -> list[dict]:
             payload = json.loads(row["payload"]); source = json.loads(row["source_manifest"])
             if unsafe_source(payload) or content_hash({"payload": payload, "source_manifest": source}) != row["content_hash"]:
                 continue
-            if validated_sources(camp, SkillProposal.model_validate(payload), source) != source:
+            if source.get("pipeline_schema_version"):
+                from react_agent.eeg_research.agentic.context.long_memory import pipeline_record_sources
+                if (source.get("origin_campaign_id") != camp.name
+                        or payload.get("validation_status") not in {"proposal", "procedural_hint", "preconditions_unknown", "validated"}
+                        or not pipeline_record_sources(camp, "skill", row["skill_id"])):
+                    continue
+            elif validated_sources(camp, SkillProposal.model_validate(payload), source) != source:
                 continue
             row.update(payload=payload, source_manifest=source)
             valid.append(row)

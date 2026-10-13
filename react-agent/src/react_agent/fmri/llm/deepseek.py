@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import time
@@ -19,11 +20,19 @@ _PREFERRED_KEYS = ("tool", "action", "schema_version")
 
 
 def message_text(message: Any) -> str:
-    """Prefer content. Flash sometimes leaves the object in reasoning_content."""
+    """Only the final answer is executable; reasoning is never final JSON."""
     content = getattr(message, "content", None)
     if content is None and isinstance(message, dict):
         content = message.get("content")
     if isinstance(content, str) and content.strip():
+        return content
+    return content if isinstance(content, str) else ""
+
+
+def _legacy_message_text(message: Any) -> str:
+    """Preserve the existing non-strict fMRI entrypoint's output convention."""
+    content = message_text(message)
+    if content.strip():
         return content
     reasoning = getattr(message, "reasoning_content", None)
     if reasoning is None and isinstance(message, dict):
@@ -114,6 +123,9 @@ class DeepSeekBackend:
         from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 
         self.config = config
+        # EEG opts in at its application boundary. The existing fMRI callers
+        # retain their transport and parsing behavior.
+        self._requires_prepared_context = False
         self._client = AsyncOpenAI(
             api_key=config.deepseek_api_key,
             base_url=config.deepseek_base_url,
@@ -124,7 +136,11 @@ class DeepSeekBackend:
     def _profile(self, name: str) -> LmProfile:
         return self.config.reasoning if name == "reasoning" else self.config.fast
 
-    async def _complete(self, *, messages: list[dict[str, str]], profile: str) -> tuple[str, LMUsage]:
+    async def aclose(self) -> None:
+        await self._client.close()
+
+    async def _complete(self, *, messages: list[dict[str, str]], profile: str,
+                        request_fields: dict | None = None) -> tuple[str, LMUsage]:
         spec = self._profile(profile)
         kwargs: dict[str, Any] = {
             "model": spec.model,
@@ -133,6 +149,13 @@ class DeepSeekBackend:
             "timeout": spec.timeout_s,
             "max_tokens": spec.max_tokens,
         }
+        if spec.wall_clock_deadline:
+            # Use the SDK's HTTP module (some deployments vendor httpx2).
+            from openai import _base_client
+            http_module = getattr(_base_client, "httpx", None) or _base_client.httpx2
+            kwargs["timeout"] = http_module.Timeout(connect=spec.connect_timeout_s,
+                read=spec.read_timeout_s or spec.timeout_s, write=spec.write_timeout_s,
+                pool=spec.pool_timeout_s)
         if spec.supports_json_object:
             kwargs["response_format"] = {"type": "json_object"}
         if spec.supports_temperature and spec.temperature is not None:
@@ -143,20 +166,38 @@ class DeepSeekBackend:
             # not honor a fast profile that explicitly sets thinking=False.
             extra["thinking"] = {"type": "enabled" if spec.thinking else "disabled"}
             if spec.thinking and spec.reasoning_effort:
-                extra["reasoning_effort"] = spec.reasoning_effort
+                kwargs["reasoning_effort"] = spec.reasoning_effort
         if extra:
             kwargs["extra_body"] = extra
+        if request_fields is not None:
+            for name in ("model", "max_tokens", "stream", "response_format", "temperature", "reasoning_effort", "extra_body"):
+                if name in request_fields and kwargs.get(name) != request_fields[name]:
+                    raise DeepSeekConfigError("prepared_transport_field_changed:" + name)
+            for name in ("tools", "tool_choice"):
+                if name in request_fields:
+                    kwargs[name] = request_fields[name]
         started = time.perf_counter()
         try:
-            response = await self._client.chat.completions.create(**kwargs)
-        except Exception as exc:  # noqa: BLE001
-            status = getattr(getattr(exc, "response", None), "status_code", None)
-            unconfirmed = status not in {401, 403}
+            request = self._client.chat.completions.create(**kwargs)
+            response = await asyncio.wait_for(request, timeout=spec.timeout_s) if spec.wall_clock_deadline else await request
+        except (Exception, asyncio.CancelledError) as exc:  # cancellation still has possible cost
+            status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+            # An HTTP error is a confirmed response; absent a response, delivery
+            # outcome is unknown. Only known pre-send local errors are uncharged.
+            from openai import _base_client
+            http_module = getattr(_base_client, "httpx", None) or _base_client.httpx2
+            cause = exc.__cause__ or exc
+            not_sent = isinstance(cause, (http_module.ConnectError, http_module.ConnectTimeout, http_module.PoolTimeout))
+            unconfirmed = status is None and not not_sent
+            kind = "timeout" if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else "cancelled" if isinstance(exc, asyncio.CancelledError) else "authentication_error" if status in {401, 403} else "rate_limited" if status == 429 else "provider_error" if status and status >= 500 else "transport_error"
             usage = LMUsage(
                 provider="deepseek",
                 requested_model=spec.model,
                 profile=profile,
                 thinking=spec.thinking,
+                reasoning_effort=spec.reasoning_effort if spec.thinking else None,
+                http_status=status, failure_kind=kind,
+                transport_outcome="definitely_not_sent" if not_sent else "outcome_unknown" if unconfirmed else "confirmed_response",
                 success=False,
                 error=f"{type(exc).__name__}",
                 elapsed_seconds=time.perf_counter() - started,
@@ -164,8 +205,8 @@ class DeepSeekBackend:
             )
             raise DeepSeekCallError(usage) from exc
 
-        choice = response.choices[0]
-        content = message_text(choice.message)
+        choice = response.choices[0] if response.choices else None
+        content = (message_text if spec.strict_final_output else _legacy_message_text)(choice.message) if choice else ""
         raw_usage = getattr(response, "usage", None)
         usage = LMUsage(
             provider="deepseek",
@@ -173,15 +214,33 @@ class DeepSeekBackend:
             response_model=getattr(response, "model", None),
             profile=profile,
             thinking=spec.thinking,
+            reasoning_effort=spec.reasoning_effort if spec.thinking else None,
             input_tokens=_get(raw_usage, "prompt_tokens"),
             output_tokens=_get(raw_usage, "completion_tokens"),
-            reasoning_tokens=_nested(raw_usage, "completion_tokens_details", "reasoning_tokens"),
-            cache_hit_tokens=_nested(raw_usage, "prompt_tokens_details", "cached_tokens"),
+            reasoning_tokens=_first_int(_nested(raw_usage, "completion_tokens_details", "reasoning_tokens"), _get(raw_usage, "reasoning_tokens")),
+            cache_hit_tokens=_first_int(_get(raw_usage, "prompt_cache_hit_tokens"), _nested(raw_usage, "prompt_tokens_details", "cached_tokens")),
+            cache_miss_tokens=_get(raw_usage, "prompt_cache_miss_tokens"),
             elapsed_seconds=time.perf_counter() - started,
             success=True,
-            finish_reason=getattr(choice, "finish_reason", None),
+            finish_reason=getattr(choice, "finish_reason", None) if choice else None,
+            transport_outcome="confirmed_response", token_count_source="provider" if raw_usage else None,
         )
+        if spec.strict_final_output:
+            reason = usage.finish_reason
+            failure = "output_truncated" if reason == "length" else "non_stop_finish_reason" if reason != "stop" else "unexpected_tool_calls" if getattr(choice.message, "tool_calls", None) else "missing_final_content" if not content.strip() else None
+            if failure:
+                usage.success, usage.status, usage.failure_kind, usage.error = False, "failed", failure, failure
+                raise DeepSeekOutputError(raw_excerpt(content), usage)
         return content, usage
+
+    def enable_context_protocol(self) -> None:
+        """Require a frozen, measured request on EEG application calls."""
+        self._requires_prepared_context = True
+
+    async def complete_prepared_json(self, prepared, *, profile: str, role: str):
+        """Send the exact messages measured by the EEG context compiler."""
+        return await self.complete_json(system=prepared.system, user=prepared.user,
+                                        profile=profile, role=role, prepared=prepared)
 
     async def complete_json(
         self,
@@ -190,17 +249,31 @@ class DeepSeekBackend:
         user: str,
         profile: str,
         role: str,
+        prepared=None,
     ) -> tuple[dict[str, Any], LMUsage]:
         """Generic JSON object call used by planner/curator/probe."""
         from uuid import uuid4
 
-        text, usage = await self._complete(
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            profile=profile,
-        )
+        if self._requires_prepared_context and prepared is None:
+            raise DeepSeekConfigError("eeg_prepared_request_required")
+        if prepared is not None:
+            if (not prepared.verify() or prepared.system != system or prepared.user != user
+                    or not prepared.budget_report.get("ready_budget_ok")):
+                raise DeepSeekConfigError("invalid_prepared_context")
+            spec = self._profile(profile)
+            fields = prepared.transport_fields
+            if fields.get("model") != spec.model or fields.get("max_tokens") != spec.max_tokens:
+                raise DeepSeekConfigError("prepared_transport_profile_changed")
+            messages = list(prepared.messages)
+            if messages != [{"role": "system", "content": system}, {"role": "user", "content": user}]:
+                raise DeepSeekConfigError("prepared_messages_changed")
+        else:
+            messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        if prepared is None:
+            text, usage = await self._complete(messages=messages, profile=profile)
+        else:
+            text, usage = await self._complete(messages=messages, profile=profile,
+                                                request_fields=prepared.transport_fields)
         usage.call_id = uuid4().hex[:12]
         usage.role = role
         usage.status = "succeeded" if usage.success else "failed"
@@ -208,6 +281,7 @@ class DeepSeekBackend:
             payload = parse_json_object(text)
         except (json.JSONDecodeError, TypeError) as exc:
             usage.error = f"invalid_json:{type(exc).__name__}"
+            usage.failure_kind = "format_error"
             usage.success = False
             usage.status = "failed"
             raise DeepSeekParseError(raw_excerpt(text), usage) from exc
@@ -291,6 +365,10 @@ class DeepSeekParseError(RuntimeError):
         self.usage = usage
 
 
+class DeepSeekOutputError(DeepSeekParseError):
+    """A provider response exists but is not a complete final answer."""
+
+
 def _get(obj: Any, name: str) -> int | None:
     if obj is None:
         return None
@@ -298,6 +376,10 @@ def _get(obj: Any, name: str) -> int | None:
     if value is None and isinstance(obj, dict):
         value = obj.get(name)
     return int(value) if isinstance(value, int) else None
+
+
+def _first_int(*values) -> int | None:
+    return next((value for value in values if isinstance(value, int)), None)
 
 
 def _nested(obj: Any, a: str, b: str) -> int | None:

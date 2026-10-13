@@ -132,16 +132,19 @@ SOURCE_VERBATIM_CHARS = 6000
 
 
 def _slim_scores(value: Any) -> Any:
-    """Per-fold score provenance (refs/hashes) stays bound via suite_hash and score_dependencies."""
+    """Retain the complete fold identity; factor only exact shared columns.
+
+    A suite pointer cannot substitute for delivered training subjects, frozen
+    source/recipe/evaluator or checkpoint identity. Native scalar views already
+    omit raw inference detail; this budget stage must not further strip them.
+    """
     if isinstance(value, dict):
         out = {key: _slim_scores(child) for key, child in value.items()}
         scores = out.get("scores")
         if isinstance(scores, list) and scores and all(isinstance(row, dict) and "fold_id" in row for row in scores):
-            out["scores"] = [{key: row[key] for key in ("fold_id", "held_out_subject", "status") if key in row}
-                             | {"metrics": {k: v for k, v in (row.get("metrics") or {}).items()
-                                            if not isinstance(v, (dict, list))}}
-                             for row in scores]
-            out["scores_provenance"] = "per-fold refs/hashes omitted from this view; bound by suite_hash"
+            from react_agent.eeg_research.agentic.handoffs import _share_score_identity
+            _share_score_identity(out)
+            out["scores_provenance"] = "All original fold identities and metrics retained; merge exact shared_score_identity before literal per-fold fields."
         return out
     if isinstance(value, list):
         return [_slim_scores(child) for child in value]
@@ -277,6 +280,7 @@ def _hoist_fold_constants(value: Any) -> Any:
             shared = {path: val for path, val in leaves[0].items()
                       if all(path in other and other[path] == val for other in leaves[1:])}
             shared = {path: val for path, val in shared.items() if len(json.dumps(val, default=str)) > 8}
+            shared = {path: val for path, val in shared.items() if all("." not in str(key) for key in path)}
             if shared:
                 folds = copy.deepcopy(folds)
                 for fold in folds:
@@ -291,18 +295,10 @@ def _hoist_fold_constants(value: Any) -> Any:
 
 
 # Values the Planner must copy back verbatim; its reply is checked against them exactly.
-EXACT_ECHO_KEYS = frozenset({"action_cost_estimates", "legal_choice_context", "budget", "eligible_targets"})
+EXACT_ECHO_KEYS = frozenset({"action_cost_estimates", "legal_choice_context", "budget", "eligible_targets",
+    "method_suites", "method_screenings", "evidence", "latest_diagnostics", "verified_development_facts"})
 
 
-def _round_floats(value: Any) -> Any:
-    """4 significant digits (0.01pp for top-1 fractions); gates use the full observation."""
-    if isinstance(value, float):
-        return float(f"{value:.4g}")
-    if isinstance(value, dict):
-        return {key: child if key in EXACT_ECHO_KEYS else _round_floats(child) for key, child in value.items()}
-    if isinstance(value, list):
-        return [_round_floats(child) for child in value]
-    return value
 
 
 def _older_suites_scalars(value: Any) -> Any:
@@ -329,7 +325,6 @@ def _older_suites_scalars(value: Any) -> Any:
 
 
 BUDGET_STAGES = (
-    ("round_floats_4_significant", _round_floats),
     ("strip_diagnostic_provenance", _strip_provenance),
     ("hoist_fold_constants", _hoist_fold_constants),
     ("slim_fold_score_provenance", _slim_scores),

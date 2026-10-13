@@ -69,6 +69,18 @@ def validate_tool_request(reply: Any) -> tuple[str, dict[str, Any], dict[str, An
         start, end = args.get("start", 1), args.get("end", 200)
         if start < 1 or end < start:
             issues.append("read range must satisfy 1 <= start <= end")
+    if tool == "edit_candidate_code" and not issues:
+        edits = args["edits"]
+        if not 1 <= len(edits) <= 20:
+            issues.append("edits must contain 1 to 20 replacements")
+        for index, edit in enumerate(edits):
+            valid_text = (isinstance(edit, dict) and set(edit) == {"old", "new"} and
+                          isinstance(edit.get("old"), str) and bool(edit["old"]) and isinstance(edit.get("new"), str))
+            valid_lines = (isinstance(edit, dict) and set(edit) == {"start", "end", "new"} and
+                           type(edit.get("start")) is int and type(edit.get("end")) is int and
+                           1 <= edit["start"] <= edit["end"] and isinstance(edit.get("new"), str))
+            if not (valid_text or valid_lines):
+                issues.append(f"edits[{index}] must use nonempty old/new strings or integer 1 <= start <= end and new string")
     error = {"ok": False, "error": "invalid_tool_args", "detail": "; ".join(issues)} if issues else None
     return tool, args, error
 
@@ -266,6 +278,17 @@ def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: f
         from react_agent.eeg_research.agentic.execution_protocol import load_protocol
         from react_agent.eeg_research.agentic.multigpu_check import run_multigpu_check, validate_receipt
         camp = workspace.resolve().parent.parent
+        from react_agent.eeg_research.agentic.coding_recovery import policy
+        if policy(workspace) is not None:
+            from react_agent.eeg_research.agentic.loop import load_state
+            from react_agent.eeg_research.agentic.resource_guard import require_idle_gpus
+            try:
+                require_idle_gpus(camp, load_state(camp))
+            except (ValueError, OSError) as exc:
+                # The actual CPU check succeeded; GPU authorization remains absent.
+                return {**payload, "ok": False, "cpu_check_ok": True, "error": "gpu_check_pending",
+                        "stage": "multigpu_check", "detail": str(exc),
+                        "multigpu_check": {"ok": False, "status": "pending", "error": "gpu_unavailable"}}
         protocol = load_protocol(camp)
         if protocol is None or protocol.get("evaluation_mode") != "loso_method_search":
             receipt = {"ok": False, "error": "multigpu_probe_frozen_protocol_missing"}

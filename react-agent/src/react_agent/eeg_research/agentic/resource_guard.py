@@ -82,15 +82,22 @@ def advance_needs_gpus(camp: Path, state: dict) -> bool:
         return False
     suite_id = state.get("active_suite")
     if not suite_id:
-        return not any(row.get("kind") == "method_suite" and row.get("candidate_id") == "baseline"
-                       and row.get("evaluation_valid") is True for row in state.get("evidence", []))
+        goal_path = camp / "goal.json"
+        goal = json.loads(goal_path.read_text()) if goal_path.is_file() else {}
+        staged = goal.get("evaluation_schedule") == "screen_then_confirm"
+        # This selects a resource check only. Actual phase admission and scoring
+        # still validate the immutable suite and every result dependency.
+        return not any(row.get("candidate_id") == "baseline" and row.get("evaluation_valid") is True
+                       and (row.get("kind") == "method_suite" or staged and row.get("kind") == "method_screening"
+                            and row.get("scope") == "two_fold_development" and row.get("coverage") == 2)
+                       for row in state.get("evidence", []))
     from react_agent.eeg_research.agentic.loso_study import read
     directory = camp / "suites" / suite_id
     progress = read(directory / "suite_state.json")
     # Fixed ten-fold IDs are native execution slots; this check grants no
     # completion/score authority and does not change the frozen suite.
-    for index in range(1, 11):
-        fold = f"fold_{index:02d}"
+    folds = progress.get("phase_fold_ids") or [f"fold_{index:02d}" for index in range(1, 11)]
+    for fold in folds:
         if fold not in progress["completed_folds"]:
             return fold not in progress["jobs"]
     return False

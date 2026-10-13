@@ -41,10 +41,13 @@ def _framework_dependencies() -> list[dict]:
                  "baseline.py", "jobs.py", "runner.py", "execution_protocol.py", "run_context.py",
                  "method_suite.py", "method_evaluate.py", "check_entry.py", "implementation_semantics.py",
                  "multigpu_check.py", "multigpu_probe.py", "process_identity.py", "coder.py", "interface.py")]]
+    # New phase logic participates in newly created protocol provenance. Old
+    # manifests keep their original exact dependency rows and remain strict.
+    paths.extend(Path(__file__).parent / name for name in ("screening.py", "budget.py"))
     return [{"path": str(path), "sha256": digest(path)} for path in paths]
 
 
-def create_manifest(camp: Path, design, *, allow_shared_gpus: bool = False, estimate: float) -> dict:
+def create_manifest(camp: Path, design, *, allow_shared_gpus: bool = False, estimate: float, goal: dict | None = None) -> dict:
     from react_agent.eeg_research.agentic.execution_protocol import build_execution_protocol
     from react_agent.eeg_research.agentic.loso_study import gpu_inventory
     from react_agent.eeg_training.protocol import list_subjects, split_plan, feature_cache
@@ -82,6 +85,15 @@ def create_manifest(camp: Path, design, *, allow_shared_gpus: bool = False, esti
                                      "training_access": False, "checkpoint_selection": "source_subject_development_only"},
             "metric": METRIC, "metric_unit": "fraction", "aggregation": "macro_mean", "ddof": 0,
             "search_scope": "inter_subject_development_benchmark", "independent_final_test": False}
+    goal = goal if goal is not None else (read(camp / "goal.json") if (camp / "goal.json").exists() else {})
+    if goal.get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import freeze_selection, SCIENCE_SCOPE
+        selection = freeze_selection(goal)
+        body.update(schema_version="eeg_research.method_search_manifest.v2", evaluation_schedule="screen_then_confirm",
+                    selection_manifest=selection, science_scope=SCIENCE_SCOPE,
+                    screening_policy=goal.get("screening") or {}, confirmation_policy=goal.get("confirmation") or {})
+        body["benchmark_permission"] = {**body["benchmark_permission"], "purpose": "staged_method_suite_feedback",
+                                        "partial_feedback": "fixed_two_fold_only"}
     body["manifest_hash"] = identity(body)
     write_once(camp / MANIFEST, body)
     return body
@@ -92,9 +104,16 @@ def manifest(camp: Path) -> dict:
     if identity({k: v for k, v in body.items() if k != "manifest_hash"}) != body["manifest_hash"]:
         raise ValueError("method_search_manifest_changed")
     validate_manifest_rows(body["folds"])
-    if body["benchmark_permission"] != {"authorized": True, "data_role": "method_development_benchmark",
+    expected = {"authorized": True, "data_role": "method_development_benchmark",
                                        "purpose": "complete_method_suite_feedback", "partial_feedback": False,
-                                       "training_access": False, "checkpoint_selection": "source_subject_development_only"}:
+                                       "training_access": False, "checkpoint_selection": "source_subject_development_only"}
+    if body.get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import validate_selection
+        if body.get("schema_version") != "eeg_research.method_search_manifest.v2":
+            raise ValueError("screening_manifest_version_mismatch")
+        validate_selection(body["selection_manifest"])
+        expected.update(purpose="staged_method_suite_feedback", partial_feedback="fixed_two_fold_only")
+    if body["benchmark_permission"] != expected:
         raise ValueError("method_benchmark_permission_mismatch")
     return body
 
@@ -168,14 +187,27 @@ def validate_suite(camp: Path, suite_id: str, *, verify_data: bool = False) -> d
         protocol = read(Path(row["protocol_path"]))
         if protocol != row["protocol"] or protocol["method_revision"] != body["method"]["method_revision"]:
             raise ValueError("method_suite_fold_protocol_changed")
+        if body.get("evaluation_schedule") == "screen_then_confirm":
+            from react_agent.eeg_research.agentic.screening import canonical_fold_identity
+            if row.get("canonical_fold_identity") != canonical_fold_identity(parent, body["method"], row):
+                raise ValueError("method_suite_canonical_fold_identity_changed")
     return body
 
 
-def begin(camp: Path, state: dict, target: str) -> str:
+def begin(camp: Path, state: dict, target: str, *, phase: str | None = None) -> str:
+    if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import begin_phase
+        return begin_phase(camp, state, target, phase=phase)
+    if phase is not None:
+        raise ValueError("phase_requires_screen_then_confirm")
+    return _begin_full(camp, state, target)
+
+
+def _begin_full(camp: Path, state: dict, target: str, *, phase_preparation: bool = False) -> str:
     from react_agent.eeg_research.agentic.budget import reserve_gpu
     if state.get("active_suite"):
         raise ValueError("method_suite_already_active")
-    if target != "baseline" and not any(row.get("kind") == "method_suite" and row.get("candidate_id") == "baseline"
+    if not phase_preparation and target != "baseline" and not any(row.get("kind") == "method_suite" and row.get("candidate_id") == "baseline"
                                         and row.get("evaluation_valid") for row in state.get("evidence") or []):
         raise ValueError("complete_baseline_suite_required")
     common = manifest(camp)
@@ -184,7 +216,7 @@ def begin(camp: Path, state: dict, target: str) -> str:
     # from their immutable manifests without reserving ten fresh job slots.
     existing = any(read(path).get("method", {}).get("candidate_id") == target
                    for path in (camp / "suites").glob("*/suite_manifest.json"))
-    if not existing:
+    if not existing and not phase_preparation:
         if state["max_training_jobs"] - state["training_jobs"] < 10:
             raise ValueError("method_suite_requires_ten_job_slots")
         if common["gpu_seconds_estimate_per_suite"] > float(state.get("gpu_seconds_left", 0)) - float(state.get("gpu_seconds_reserved", 0)):
@@ -196,10 +228,10 @@ def begin(camp: Path, state: dict, target: str) -> str:
         validate_suite(camp, suite_id)
         state["active_suite"] = suite_id
         return suite_id
-    if state["max_training_jobs"] - state["training_jobs"] < 10:
+    if not phase_preparation and state["max_training_jobs"] - state["training_jobs"] < 10:
         raise ValueError("method_suite_requires_ten_job_slots")
     estimate = common["gpu_seconds_estimate_per_suite"]
-    if estimate > float(state.get("gpu_seconds_left", 0)) - float(state.get("gpu_seconds_reserved", 0)):
+    if not phase_preparation and estimate > float(state.get("gpu_seconds_left", 0)) - float(state.get("gpu_seconds_reserved", 0)):
         raise ValueError("method_suite_gpu_reservation_unavailable")
     verify_dependencies(method["dependencies"] + common["framework_dependencies"] +
                         common["data_dependencies"] + common["cache_dependencies"])
@@ -218,16 +250,23 @@ def begin(camp: Path, state: dict, target: str) -> str:
         rows.append({**fold, "protocol": protocol, "protocol_path": str(path.resolve())})
     body = {"schema_version": "eeg_research.method_suite.v1", "suite_id": suite_id, "method": method,
             "manifest_hash": common["manifest_hash"], "folds": rows, "seed": 0, "fidelity": "full"}
+    if phase_preparation:
+        from react_agent.eeg_research.agentic.screening import canonical_fold_identity
+        body.update(schema_version="eeg_research.method_suite.v2", evaluation_schedule="screen_then_confirm",
+                    selection_manifest_hash=common["selection_manifest"]["selection_manifest_hash"])
+        for fold in rows:
+            fold["canonical_fold_identity"] = canonical_fold_identity(common, method, fold)
     body["suite_hash"] = identity(body)
     write_once(suite_dir / "suite_manifest.json", body)
     if not (suite_dir / "suite_state.json").exists():
         write_once(suite_dir / "suite_state.json", {"status": "pending", "jobs": {}, "completed_folds": []})
-    if not reserve_gpu(state, estimate):
+    if not phase_preparation and not reserve_gpu(state, estimate):
         raise ValueError("method_suite_gpu_reservation_unavailable")
     state["active_suite"] = suite_id
     state["status"] = "training"
-    state["method_jobs_reserved"] = 10
-    state["method_gpu_reservation"] = estimate
+    if not phase_preparation:
+        state["method_jobs_reserved"] = 10
+        state["method_gpu_reservation"] = estimate
     return suite_id
 
 
@@ -236,12 +275,18 @@ def validate_fold_derivation(camp: Path, target: str, protocol: dict) -> dict:
     fold = next(row for row in suite["folds"] if row["fold_id"] == protocol["fold_id"])
     if suite["method"]["candidate_id"] != target or fold["protocol"] != protocol:
         raise ValueError("method_suite_fold_binding_mismatch")
-    return {"schema_version": "eeg_research.method_fold_derivation.v1",
+    result = {"schema_version": "eeg_research.method_fold_derivation.v1",
             "suite_hash": suite["suite_hash"], "method_revision": suite["method"]["method_revision"],
             "public_approval_ref": suite["method"]["approval_ref"], "fold_id": fold["fold_id"],
             "held_out_subject": fold["held_out_subject"], "train_subjects": fold["train_subjects"],
             "fold_protocol_hash": protocol["fingerprint"], "independent_initialization": True,
             "weight_or_optimizer_transfer": False, "seed_reset_per_process": 0}
+    if suite.get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import SCIENCE_SCOPE
+        result.update(evaluation_schedule="screen_then_confirm", science_scope=SCIENCE_SCOPE,
+                      canonical_fold_hash=fold["canonical_fold_identity"]["canonical_hash"],
+                      selection_manifest_hash=suite["selection_manifest_hash"])
+    return result
 
 
 def freeze_fold(camp: Path, suite: dict, fold: dict, job: Path) -> dict:
@@ -335,6 +380,11 @@ def aggregate_records(suite: dict, scores: list[dict]) -> dict:
             body["mean_" + key] = statistics.mean(values)
             body["std_" + key] = statistics.pstdev(values)
         body[METRIC] = body["mean_top1"]
+        if suite.get("evaluation_schedule") == "screen_then_confirm":
+            from react_agent.eeg_research.agentic.screening import SCIENCE_SCOPE
+            body.update(full_mean_top1=body["mean_top1"], full_mean_top5=body["mean_top5"],
+                        phase="confirmation_10fold", science_scope=SCIENCE_SCOPE,
+                        result_label="fixed_two_fold_selected_ten_fold_development_mean")
     return body
 
 
@@ -352,6 +402,10 @@ def read_aggregate(camp: Path, suite_id: str) -> dict:
 
 
 def verify_score(camp: Path, suite: dict, score: dict) -> None:
+    if suite.get("evaluation_schedule") == "screen_then_confirm":
+        fold = next(row for row in suite["folds"] if row["fold_id"] == score["fold_id"])
+        if score.get("canonical_fold_hash") != fold["canonical_fold_identity"]["canonical_hash"]:
+            raise ValueError("method_score_canonical_fold_identity_mismatch")
     freeze_path = camp / "suites" / suite["suite_id"] / score["fold_id"] / "benchmark_freeze.json"
     freeze = read(freeze_path)
     if digest(freeze_path) != score["freeze_sha256"] or str(freeze_path) != score["freeze_ref"]:
@@ -443,6 +497,21 @@ def suite_cost_estimates(camp: Path, state: dict, observation: dict) -> dict:
         targets, null_allowed = action_target_choices(observation, action,
             legacy_implicit=observation.get("planner_mode") == "single_action")
         for target in [*([None] if null_allowed else []), *targets]:
+            if common.get("evaluation_schedule") == "screen_then_confirm" and action in {"run_screening", "run_confirmation", "run_full"}:
+                from react_agent.eeg_research.agentic.screening import phase_cost, suites_for_target, valid_scores, SCREENING, CONFIRMATION
+                phase = CONFIRMATION if action == "run_confirmation" else SCREENING
+                c_suites = suites_for_target(camp, target or "baseline")
+                b_suites = suites_for_target(camp, "baseline")
+                c_done = [row["fold_id"] for row in valid_scores(camp, c_suites[-1])] if c_suites else []
+                b_done = [row["fold_id"] for row in valid_scores(camp, b_suites[-1])] if b_suites else []
+                cost = phase_cost(common, phase, c_done, b_done, target=target or "baseline")
+                estimates[f"{action}:{target or ''}"] = {**cost,
+                    "estimated_cost": {"llm_calls": None, "training_jobs": cost["training_jobs"], "gpu_seconds": cost["gpu_seconds"]},
+                    "cost_basis": ["runtime:phase_missing_candidate_and_baseline_folds", "manifest:" + common["manifest_hash"]],
+                    "cost_confidence": "rough", "cost_scope": phase,
+                    "unknown_components": ["role_retries", "repair_calls", "candidate_runtime_multiplier"],
+                    "api_usd": None, "usd_status": "unpriced", "planner_call_already_in_budget_ledger": True}
+                continue
             training = action == "run_full"
             design = action in {"design_experiment", "propose_experiment", "implement_candidate"}
             local = action in {"inspect_data", "retrieve_memory", "collect_diagnostics", "diagnose_results", "revise_report", "stop"}
@@ -519,11 +588,32 @@ def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
                                                                       for fold in suite["folds"]]}}
     if gain is not None:
         row.update(delta_vs_control_pp=gain, control_id=control["evidence_id"])
+    if suite.get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import SCIENCE_SCOPE
+        row.update(phase="confirmation_10fold", scope="method_development_benchmark", science_scope=SCIENCE_SCOPE)
+        screening_row = next((item for item in state.get("evidence", []) if item.get("kind") == "method_screening"
+                              and item.get("suite_id") == suite["suite_id"]), None)
+        if screening_row:
+            screened = screening_row["screening"]
+            row["updates_screening_evidence_id"] = screening_row["evidence_id"]
+            if gain is not None:
+                threshold = screened.get("min_mean_gain_pp", 0.5)
+                row["screening_update_relation"] = ("contradicts_screening_promotion" if screened["screening_result"] == "screening_passed" and gain < threshold
+                                                    else "overturns_screening_nonpromotion" if screened["screening_result"] != "screening_passed" and gain >= threshold
+                                                    else "consistent_at_current_threshold")
+        if comparison.get("comparable"):
+            comparison["paired_mean_delta_pp"] = comparison["delta_pp"]
     from react_agent.eeg_research.agentic.memory import EpisodeStore, episode
     ep = episode(task_hash=state["goal_id"], candidate_id=result["candidate_id"], kind="exploratory_result", fidelity="full",
                  seed=result["seed"], metric=result["mean_top1"], contract_fingerprint=state["contract_fingerprint"],
-                 artifact=str(path), episode_id="ep_" + suite["suite_hash"][:24], job_id=suite["suite_id"])
+                 artifact=str(path), episode_id="ep_" + suite["suite_hash"][:24],
+                 job_id=suite["suite_id"] + "::confirmation_10fold" if suite.get("evaluation_schedule") == "screen_then_confirm" else suite["suite_id"])
     ep["scope"] = "method_development_benchmark"
+    if suite.get("evaluation_schedule") == "screen_then_confirm":
+        ep.update(science_scope=SCIENCE_SCOPE, selection_manifest_hash=suite["selection_manifest_hash"],
+                  method_revision=suite["method"]["method_revision"],
+                  updates_episode_ids=["ep_screening_" + suite["suite_hash"][:24]],
+                  screening_update_relation=row.get("screening_update_relation", "additional_coverage"))
     stored = EpisodeStore(camp).persist_episode(ep)
     state["memory"] = [item for item in state.get("memory", []) if item.get("episode_id") != stored["episode_id"]] + [stored]
     state["evidence"].append(row)
@@ -537,8 +627,10 @@ def commit_aggregate(camp: Path, state: dict, suite: dict) -> dict:
 def scientific_feedback_records(camp: Path, state: dict, row: dict) -> dict:
     """Find completed, source-bound native analysis and curation artifacts."""
     from react_agent.eeg_research.agentic.artifacts import REGISTRY
-    from react_agent.eeg_research.agentic.handoffs import development_artifact, method_benchmark_origin
-    origin = method_benchmark_origin(row)
+    from react_agent.eeg_research.agentic.handoffs import development_artifact, method_benchmark_origin, method_screening_origin
+    screening = row.get("kind") == "method_screening"
+    origin = method_screening_origin(row) if screening else method_benchmark_origin(row)
+    origin_key = "method_screening_origin" if screening else "method_benchmark_origin"
     records = {}
     registry_path = camp / REGISTRY
     if not registry_path.is_file():
@@ -552,7 +644,7 @@ def scientific_feedback_records(camp: Path, state: dict, row: dict) -> dict:
             continue
         try:
             body = read(Path(artifact["path"]))
-            if body.get("status") != "completed" or (body.get("payload") or {}).get("method_benchmark_origin") != origin:
+            if body.get("status") != "completed" or (body.get("payload") or {}).get(origin_key) != origin:
                 continue
             verified = development_artifact(camp, artifact["artifact_id"])
         except (OSError, ValueError, KeyError, TypeError):
@@ -561,6 +653,8 @@ def scientific_feedback_records(camp: Path, state: dict, row: dict) -> dict:
             "artifact_id": verified["artifact_id"], "sha256": verified["sha256"],
             "task_id": body["task_id"], "input_digest": body["input_digest"], "prompt_hash": body.get("prompt_hash"),
         }
+        if kind == "lessons" and (body.get("payload") or {}).get("curation_degraded"):
+            records["curation"]["degraded"] = True
     return records
 
 
@@ -568,22 +662,33 @@ def complete_scientific_feedback(camp: Path, state: dict, row: dict, services: d
     """Recover the method's original role chain before the next Planner call."""
     from react_agent.eeg_research.agentic.loop import _write, save_state
     records = scientific_feedback_records(camp, state, row)
-    if set(records) != {"analysis", "curation"}:
+    staged = manifest(camp).get("evaluation_schedule") == "screen_then_confirm"
+    required = {"analysis"} if staged else {"analysis", "curation"}
+    if not required <= set(records):
         if not services.get("analyze"):
             raise ValueError("method_suite_scientific_feedback_service_missing")
         services["analyze"](camp, state)
         save_state(camp, state)
         records = scientific_feedback_records(camp, state, row)
-    if set(records) != {"analysis", "curation"}:
-        missing = sorted({"analysis", "curation"}.difference(records))
+    if not required <= set(records):
+        missing = sorted(required.difference(records))
         raise ValueError("method_suite_scientific_feedback_incomplete:" + ",".join(missing))
     path = camp / "suites" / row["suite_id"] / "suite_state.json"
     progress = read(path)
-    progress["scientific_feedback"] = {"status": "complete", "suite_hash": row["suite_hash"], **records}
+    key = "screening_feedback" if row.get("kind") == "method_screening" else "scientific_feedback"
+    progress[key] = {"status": "complete", "suite_hash": row["suite_hash"], **records,
+                     "curation_status": "degraded" if (records.get("curation") or {}).get("degraded") else "complete" if "curation" in records else "curation_pending"}
     _write(path, progress)
 
 
 def audit_evidence(camp: Path, state: dict) -> dict:
+    if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import audit_evidence as audit_phase
+        return audit_phase(camp, state)
+    return _audit_full(camp, state)
+
+
+def _audit_full(camp: Path, state: dict) -> dict:
     """Build the report's complete-suite view and current immutable dependencies.
 
     Raw EEG/cache/checkpoint bytes are hash dependencies, never role payloads.
@@ -658,6 +763,13 @@ def audit_evidence(camp: Path, state: dict) -> dict:
 
 
 def advance(camp: Path, state: dict, services: dict) -> bool:
+    if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import advance as advance_phase
+        return advance_phase(camp, state, services)
+    return _advance_full(camp, state, services)
+
+
+def _advance_full(camp: Path, state: dict, services: dict) -> bool:
     """One execution step, with no paid scientific calls until 10/10 complete."""
     from react_agent.eeg_research.agentic import jobs
     from react_agent.eeg_research.agentic.budget import charge_gpu, release_gpu
@@ -684,6 +796,8 @@ def advance(camp: Path, state: dict, services: dict) -> bool:
     progress = read(progress_path)
     for fold in suite["folds"]:
         fold_id = fold["fold_id"]
+        if suite.get("evaluation_schedule") == "screen_then_confirm" and fold_id not in progress["phase_fold_ids"]:
+            continue
         if fold_id in progress["completed_folds"]:
             continue
         job_id = progress["jobs"].get(fold_id)
@@ -697,7 +811,16 @@ def advance(camp: Path, state: dict, services: dict) -> bool:
                 save_state(camp, state)
                 return True
             charge_gpu(camp, state, record.get("gpu_seconds", 0), job_id=job_id)
+            if suite.get("evaluation_schedule") == "screen_then_confirm":
+                from react_agent.eeg_research.agentic.budget import settle_phase_job
+                settle_phase_job(camp, state, progress["phase_receipt_id"], job_id)
             state["live_job"] = None
+            if suite.get("evaluation_schedule") == "screen_then_confirm" and record.get("status") in {"failed", "cancelled"}:
+                progress.update(screening_result="engineering_failed", scheduling_status="engineering_failed",
+                                failure={"kind": "training_engineering_failure", "job_id": job_id,
+                                         "fold_id": fold_id, "job_status": record["status"],
+                                         "detail": record.get("detail"), "scientific_negative": False})
+                _write(progress_path, progress)
             freeze_fold(camp, suite, fold, job)
             # CPU scorer reuses the original implementation and carries no API
             # secrets. Its output is immutable and idempotent by evaluation key.
@@ -716,6 +839,10 @@ def advance(camp: Path, state: dict, services: dict) -> bool:
             return True
         if state["training_jobs"] >= state["max_training_jobs"] or state["gpu_seconds_left"] <= 0:
             raise ValueError("method_suite_budget_exhausted_partial")
+        phased = suite.get("evaluation_schedule") == "screen_then_confirm"
+        if phased:
+            from react_agent.eeg_research.agentic.screening import before_launch
+            before_launch(camp, state, suite, fold)
         from react_agent.eeg_research.agentic.loso_study import gpu_inventory
         physical = gpu_inventory(tuple(manifest(camp)["gpu"]), allow_shared=True)
         hardware_keys = ("index", "uuid", "name", "total_memory_mib")
@@ -726,10 +853,18 @@ def advance(camp: Path, state: dict, services: dict) -> bool:
         job = camp / "jobs" / job_id
         # Persist intent first. If an API/worker crash interrupts process
         # publication, uncertainty blocks a duplicate launch rather than guesses.
-        write_once(job / "launch_intent.json", {"suite_id": suite_id, "fold_id": fold_id, "protocol_hash": fold["protocol"]["fingerprint"]})
+        intent = {"suite_id": suite_id, "fold_id": fold_id, "protocol_hash": fold["protocol"]["fingerprint"]}
+        if phased:
+            intent.update(phase=progress["phase"], phase_receipt_id=state["phase_reservation_id"],
+                          canonical_fold_hash=fold["canonical_fold_identity"]["canonical_hash"])
+        write_once(job / "launch_intent.json", intent)
         progress["jobs"][fold_id] = job_id
         progress["status"] = "running"
         _write(progress_path, progress)
+        if phased:
+            from react_agent.eeg_research.agentic.budget import consume_phase_job
+            consume_phase_job(camp, state["phase_reservation_id"], job_id,
+                              manifest(camp)["gpu_seconds_estimate_per_suite"] / 10)
         state["training_jobs"] += 1
         state["method_jobs_reserved"] = max(0, int(state.get("method_jobs_reserved", 10)) - 1)
         state["live_job"] = job_id
@@ -746,6 +881,9 @@ def advance(camp: Path, state: dict, services: dict) -> bool:
         state["status"] = "training"
         save_state(camp, state)
         return True
+    if suite.get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import finish_phase
+        return finish_phase(camp, state, suite, progress, services)
     row = commit_aggregate(camp, state, suite)
     progress["status"] = "complete"
     _write(progress_path, progress)
@@ -763,6 +901,9 @@ def retry_fold(camp: Path, state: dict, suite_id: str, fold_id: str, *, reason: 
     All old jobs and cost receipts remain. Successful training only needs the
     idempotent scorer; it cannot be retrained to select another checkpoint.
     """
+    if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import retry_phase_fold
+        return retry_phase_fold(camp, state, suite_id, fold_id, reason=reason)
     from react_agent.eeg_research.agentic import jobs
     from react_agent.eeg_research.agentic.budget import charge_gpu
     from react_agent.eeg_research.agentic.loop import _write, event
@@ -822,11 +963,18 @@ def retry_fold(camp: Path, state: dict, suite_id: str, fold_id: str, *, reason: 
 
 def recover(camp: Path, state: dict) -> dict:
     """Rebuild only method evidence; never project individual fold scores."""
+    # Settling already-started probes precedes protocol admission. A missing or
+    # invalid manifest cannot erase paid work, nor authorize a new training job.
     from react_agent.eeg_research.agentic.multigpu_check import recover_probes
     recover_probes(camp, state)
+    if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
+        from react_agent.eeg_research.agentic.screening import recover as recover_phase
+        return recover_phase(camp, state)
     for path in sorted((camp / "suites").glob("*/suite_state.json")):
         progress = read(path)
         suite = validate_suite(camp, path.parent.name)
+        if suite["method"]["candidate_id"] in state.get("detached_candidates", []):
+            continue
         if (path.parent / "aggregate.json").exists():
             read_aggregate(camp, path.parent.name)
             commit_aggregate(camp, state, suite)

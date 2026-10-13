@@ -65,6 +65,8 @@ def evaluate(camp: Path, suite_id: str, fold_id: str) -> dict:
             "scope": "method_development_benchmark", "device": "cpu", "precision": "fp32",
             "gpu_seconds": 0.0, "started_at": started, "ended_at": time.time(),
             "freeze_ref": str(directory / "benchmark_freeze.json"), "freeze_sha256": digest(directory / "benchmark_freeze.json")}
+    if suite.get("evaluation_schedule") == "screen_then_confirm":
+        body["canonical_fold_hash"] = fold["canonical_fold_identity"]["canonical_hash"]
     aggregate_records(suite, [body])
     from react_agent.eeg_research.agentic.method_suite import verify_score
     verify_score(camp, suite, body)

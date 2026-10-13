@@ -1,0 +1,144 @@
+# User authorized 2026-10-12: fresh campaign; 300 API attempts, 40 actual training jobs,
+# 80 aggregate occupied GPU hours (288000 card-seconds); multi-GPU low-memory sharing.
+goal_id: eeg_screen_real_20261012
+objective: EEGagent设计一种通用EEG检索方法，以同一冻结实现进行九训一评十折训练，按十个留出被试等权均值与matched baseline比较，并依据完整方法结果分析与再规划。
+task_type: eeg_image_retrieval
+research_scope: subject_generalization
+evaluation_mode: loso_method_search
+primary_metric: benchmark.loso_mean_fixed_gallery_top1
+benchmark_feedback_enabled: true
+subject_aggregation: macro_mean
+benchmark_subjects:
+- sub-01
+- sub-02
+- sub-03
+- sub-04
+- sub-05
+- sub-06
+- sub-07
+- sub-08
+- sub-09
+- sub-10
+required_fold_count: 10
+checkpoint_policy: strict_best
+selection_min_delta: 0.001
+direction: maximize
+min_practical_gain_pp: 0.5
+final_test_enabled: false
+planner_mode: compare_options
+max_candidates: 2
+max_training_jobs: 40
+max_llm_calls: 300
+max_gpu_seconds: 288000
+max_concurrent_training_jobs: 1
+max_api_usd: null
+max_repairs_per_candidate: 2
+require_audit_before_completion: true
+allowed_training_actions:
+- run_screening
+- run_confirmation
+confirmation_target_pairs: 1
+training_seeds:
+- 0
+allowed_changes:
+- eeg_encoder
+- temporal_pooling
+- projection_head
+- training_loss
+- training_only_augmentation
+frozen_components:
+- split_manifest
+- query_gallery_manifest
+- evaluator
+- metric_definition
+- image_feature_target
+memory:
+  enabled: true
+  skills_enabled: true
+  model_id: sentence-transformers/all-MiniLM-L6-v2
+  model_revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+  device: cpu
+  batch_size: 32
+  top_k: 5
+  min_similarity: 0.3
+  context_chars_budget: 6000
+  allow_model_download: false
+  fallback: legacy
+evaluation_schedule: screen_then_confirm
+action_planning:
+  target_options: 3
+  max_options: 4
+  option_repair_calls_per_round: 1
+  replacement_calls_per_round: 1
+  execute_when_valid_count_at_least: 1
+screening:
+  fold_count: 2
+  selection: seeded_random_without_replacement
+  selection_seed: 0
+  subjects: null
+  training_recipe: same_as_confirmation
+  min_mean_gain_pp: 0.5
+  reuse_compatible_full_fold_runs: true
+confirmation:
+  fold_count: 10
+  subject_aggregation: macro_mean
+  freeze_method_before_screening: true
+coding_recovery:
+  repeated_error_limit: 2
+  max_model_escalations_per_candidate: 1
+  escalation_model: deepseek-v4-pro
+  escalation_thinking: true
+  escalation_reasoning_effort: high
+api_request_policy:
+  max_attempts_per_operation: 2
+  max_attempts_per_planner_round: 6
+role_models:
+  research_planner:
+    model: deepseek-flash
+    thinking: true
+    reasoning_effort: high
+    max_tokens: 16384
+    timeout_s: 180
+  experiment_designer:
+    model: deepseek-flash
+    thinking: true
+    reasoning_effort: high
+    max_tokens: 16384
+    timeout_s: 180
+  candidate_coder:
+    model: deepseek-flash
+    thinking: true
+    reasoning_effort: high
+    max_tokens: 32768
+    timeout_s: 240
+  candidate_reviewer:
+    model: deepseek-flash
+    thinking: true
+    reasoning_effort: high
+    max_tokens: 16384
+    timeout_s: 180
+  result_analyst:
+    model: deepseek-flash
+    thinking: true
+    reasoning_effort: high
+    max_tokens: 16384
+    timeout_s: 180
+  result_auditor:
+    model: deepseek-flash
+    thinking: true
+    reasoning_effort: high
+    max_tokens: 16384
+    timeout_s: 180
+  research_librarian:
+    model: deepseek-flash
+    thinking: false
+    reasoning_effort: null
+    max_tokens: 4096
+    timeout_s: 120
+  memory_curator:
+    model: deepseek-flash
+    thinking: true
+    reasoning_effort: low
+    max_tokens: 8192
+    timeout_s: 180
+allow_shared_gpus: true

@@ -1,0 +1,14 @@
+Consolidate only the supplied incremental new/changed/revoked operation episodes
+and their bounded relevant prior knowledge. Preserve source conditions, validity,
+counterexamples, scope and validation level; similarity/frequency never upgrades
+truth or permission. Withdrawal retires a claim only when no other valid support
+remains. Scientific two-fold development findings remain two-fold findings.
+Return {"status":"no_signal"} for no meaningful change. Otherwise return
+{"status":"consolidated","lessons":[{"statement":"conditional source-grounded
+claim","conditions":[],"supporting_episode_ids":["supplied episode ID"],
+"contradicting_episode_ids":[],"validation_status":"proposal"}],"skills":[]}.
+Skills, when justified, include description_en, procedure, preconditions and their
+supplied supporting episode IDs; preserve procedural_hint/preconditions_unknown.
+Keep the entire JSON under 8000 characters. Do not modify native controls,
+metrics, execution status, source IDs/hashes or existing unrelated records.
+This maintenance operation must not recursively invoke memory maintenance.

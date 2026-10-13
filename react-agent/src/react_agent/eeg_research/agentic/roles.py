@@ -215,6 +215,13 @@ def begin_role_task(
     recovery_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Open a ledger task whose digest covers the business request and input files."""
+    from react_agent.eeg_research.agentic.role_config import resolve_role_config
+    resolved = resolve_role_config(camp, role)
+    request = {**(request or {}), "role_model_config": resolved.semantics()}
+    if recovery_identity is not None:
+        recovery_identity = {**recovery_identity,
+            "config": {**(recovery_identity.get("config") or {}), "role_model_config": resolved.semantics(),
+                       "role_config_sources": resolved.sources}}
     if request is not None and request.get("artifact_reads"):
         from react_agent.eeg_research.agentic.handoffs import prepare_read_delivery
         prepare_read_delivery(request["artifact_reads"])
@@ -261,6 +268,8 @@ def role_recovery_identity(camp: Path, role: str, target: str | None, request: d
     from react_agent.eeg_research.agentic.run_context import load_approved_binding
     from react_agent.eeg_research.agentic.artifacts import request_digest
     memory = memory_config(camp)
+    from react_agent.eeg_research.agentic.role_config import resolve_role_config
+    resolved = resolve_role_config(camp, role)
     system = system_prompt(role, memory=memory)
     model = domain_model_for(role, memory)
     schema = model.model_json_schema() if model else {"envelope": ROLE_RESULT_VERSION}
@@ -268,6 +277,22 @@ def role_recovery_identity(camp: Path, role: str, target: str | None, request: d
     source = camp / "candidates" / str(target) / "extension" / "eeg_candidate.py"
     source_hash = hashlib.sha256(source.read_bytes()).hexdigest() if source.is_file() else None
     budget = request.get("budget") or {}
+    from dataclasses import asdict
+    from react_agent.eeg_research.agentic.context.types import POLICY_VERSION, RENDER_VERSION
+    from react_agent.eeg_research.agentic.context.budget import TOKENIZER_VERSION
+    from react_agent.eeg_research.agentic.context.service import budget_for_role, context_mode
+    snapshot_revision = 0
+    database = camp / "memory.sqlite"
+    if database.is_file():
+        import sqlite3
+        connection = sqlite3.connect("file:" + str(database.resolve()) + "?mode=ro", uri=True)
+        try:
+            row = connection.execute("SELECT revision FROM context_state WHERE singleton=1").fetchone()
+            snapshot_revision = int(row[0]) if row else 0
+        except sqlite3.OperationalError:
+            pass  # Legacy campaigns bootstrap on their first managed call.
+        finally:
+            connection.close()
     def semantic_view(value):
         if isinstance(value, dict):
             return {key: semantic_view(item) for key, item in value.items() if key not in {
@@ -284,6 +309,11 @@ def role_recovery_identity(camp: Path, role: str, target: str | None, request: d
     return {"input_dependencies": [], "role": role, "action": request.get("action") or request.get("analysis_trigger") or role,
             "target_id": target, "source": source_hash or request.get("source_hash") or request.get("run_identity"),
             "config": {"hooks": {key: (binding or {}).get(key) or {} for key in ("model", "objective", "transform")},
+                       "context_protocol": {"policy":POLICY_VERSION,"render":RENDER_VERSION,
+                           "tokenizer":TOKENIZER_VERSION,"mode":context_mode(),
+                           "snapshot_revision":snapshot_revision,"budget":asdict(budget_for_role(role))},
+                       "role_model_config": resolved.semantics(),
+                       "role_config_sources": resolved.sources,
                        "scientific_request": semantic_view(request.get("experiment") or request.get("contract") or request.get("effective_config"))},
             "approval": binding, "prompt_hash": hashlib.sha256(system.encode()).hexdigest()[:16],
             "schema_hash": request_digest(request=schema), "evaluator": request.get("evaluation_population") or request.get("contract"),

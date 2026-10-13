@@ -236,9 +236,13 @@ this reference. Never silently assume ln(256). All-query and bounded sample
 statistics have different coverage; cite query counts, sampling, checkpoint,
 source and definitions, preserving unavailable values as gaps.
 When runtime method_search opts in, incomplete fold execution is an engineering
-failure, not a complete negative method. Only a verified all-fold aggregate
-supports the method performance conclusion; per-fold scores cannot change the
-frozen method. Authorized inter-subject benchmark means are search feedback,
+failure, not a complete negative method. A ten-fold method performance conclusion
+requires a verified all-fold aggregate. Under screen_then_confirm, a native
+verified 2/2 method_screening supports only its prespecified two-subject
+development conclusion; analyze screening_mean_top1 and paired two-fold delta
+within that scope and keep confirmation/final-test claims unproved. Coverage=1/2
+supplies no formal screening mean. Per-fold scores cannot change the frozen
+method within its revision. Authorized inter-subject benchmark means are search feedback,
 not untouched independent final-test evidence. The runtime's explicit benchmark
 permission is required; do not relabel forbidden final data as development.
 An old candidate that reached 50 epochs yet remained worse limits an early-stop

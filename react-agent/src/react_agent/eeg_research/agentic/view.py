@@ -140,7 +140,7 @@ def worker_health(camp: Path, state: dict[str, Any]) -> dict[str, Any]:
 def _experiment_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
     rows = []
     for item in state.get("evidence") or []:
-        if item.get("fidelity") is None:
+        if item.get("fidelity") is None or item.get("kind") == "method_screening" or item.get("scope") == "two_fold_development":
             continue
         comparable = bool((item.get("comparison") or {}).get("comparable")) or item.get("comparison_status") == "comparable"
         rows.append(
@@ -186,6 +186,7 @@ def _candidate_rows(camp: Path, state: dict[str, Any], *, include_source: bool) 
             "parent_candidate_id": parent_id,
             "lineage": lineage if isinstance(lineage, dict) else None,
             "attempt_id": attempt.get("attempt_id") if isinstance(attempt, dict) else None,
+            "coding_recovery": _read(workspace / "coding_recovery.json") or None,
             "source": None,
             "source_loaded": include_source,
             "source_available": entry.is_file(),
@@ -248,6 +249,30 @@ def campaign_view(camp: Path, *, include_source: bool = True) -> dict[str, Any]:
     contract = _read(camp / "evaluation_contract.json") or {}
     cost = _read(camp / "cost.json") or {}
     state = _read(camp / "campaign_state.json") or {}
+    role_calls = {}
+    calls_path = camp / "llm_calls.jsonl"
+    if calls_path.is_file():
+        for line in calls_path.read_text().splitlines():
+            try:
+                call = json.loads(line)
+            except ValueError:
+                continue
+            if call.get("role"):
+                role_calls[call["role"]] = {key: call.get(key) for key in (
+                    "requested_model", "response_model", "thinking", "reasoning_effort", "role_config_hash",
+                    "max_tokens", "timeout_s", "input_tokens", "output_tokens", "reasoning_tokens",
+                    "finish_reason", "elapsed_seconds", "success", "error")}
+                model_config = call.get("role_model_config") or {}
+                role_calls[call["role"]].update({key: model_config.get(key) for key in
+                    ("thinking", "reasoning_effort", "max_tokens", "timeout_s")})
+    screening_rows = [row for row in state.get("evidence") or [] if row.get("kind") == "method_screening"]
+    phase_rows = []
+    for path in sorted((camp / "suites").glob("*/suite_state.json")):
+        record = _read(path) or {}
+        if record.get("phase"):
+            phase_rows.append({"suite_id": path.parent.name, **{key: record.get(key) for key in (
+                "phase", "status", "completed_folds", "pending_fold_ids", "screening_result",
+                "confirmation_admission", "reused_fold_ids", "phase_cost")}})
     candidates = _candidate_rows(camp, state, include_source=include_source)
     rows = _experiment_rows(state)
     by_candidate = {item.get("candidate_id"): item for item in candidates}
@@ -310,6 +335,8 @@ def campaign_view(camp: Path, *, include_source: bool = True) -> dict[str, Any]:
         "jobs": _job_index(camp),
         "health": health,
         "decisions": decisions,
+        "plan_pool": (state.get("decisions") or [{}])[-1].get("pool_summary"),
+        "option_validation_records": (state.get("decisions") or [{}])[-1].get("option_validation_records") or [],
         "decision_count": len(state.get("decisions") or []),
         "candidates": candidates,
         "experiments": rows,
@@ -317,6 +344,11 @@ def campaign_view(camp: Path, *, include_source: bool = True) -> dict[str, Any]:
         "full_rows": full_rows,
         "best_full": best_full,
         "analyses": analyses,
+        "evaluation_schedule": goal.get("evaluation_schedule", "full_only"),
+        "screening_rows": screening_rows,
+        "experiment_phases": phase_rows,
+        "last_role_calls": role_calls,
+        "pending_candidate_check": state.get("pending_candidate_check"),
         "budget": {
             "training_jobs": budget.get("training_jobs_used"),
             "max_training_jobs": budget.get("training_jobs_limit"),

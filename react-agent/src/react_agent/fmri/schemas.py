@@ -280,6 +280,10 @@ class LMUsage(BaseModel):
     response_model: str | None = None
     profile: str | None = None
     thinking: bool | None = None
+    reasoning_effort: str | None = None
+    http_status: int | None = None
+    failure_kind: str | None = None
+    transport_outcome: str | None = None
     input_tokens: int | None = None
     output_tokens: int | None = None
     reasoning_tokens: int | None = None

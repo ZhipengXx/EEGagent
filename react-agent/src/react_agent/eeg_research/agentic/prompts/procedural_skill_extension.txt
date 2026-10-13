@@ -33,6 +33,15 @@ support a failure mode; an untested recovery suggestion is not a verified fix.
 A reusable procedure does not establish scientific performance improvement.
 Keep quantitative findings in proposed_lessons under the original evidence rules.
 
+If supplied engineering_repairs has scope=engineering_repair, its source refs
+prove a historical failed-code check followed by a passing check of the same
+approved method. Use those refs only for a procedural skill with
+preconditions.scope="engineering_repair" and supporting_episode_ids=[].
+Do not turn a shape/import/gradient repair into a lesson about EEG accuracy,
+top1/top5, or scientific gain. Checked source/spec hashes and applicability
+conditions describe the historical repair; the current candidate still needs
+its own current code check and review before any training authorization.
+
 Source references must come only from allowed_source_refs:
 source_task_refs copies allowed_source_refs.tasks[].task_id;
 supporting_episode_ids copies allowed_source_refs.episodes[].episode_id;

@@ -230,10 +230,24 @@ def implement(
     seen_reads: set[tuple[Any, ...]] = set(restored.get("seen_reads") or [])
     read_cache = dict(restored.get("read_cache") or {})
     next_step = int(restored["next_step"])
+    from react_agent.eeg_research.agentic import coding_recovery
+    recovery_policy = coding_recovery.policy(workspace)
+    recovery = (coding_recovery.initialize(workspace, recovery_policy, max_steps=max_steps,
+                max_repairs=max_repairs, restored=restored) if recovery_policy else None)
+    if recovery is not None:
+        recovery.setdefault("operation_binding", dict(getattr(backend, "identity", {}) or {}))
+        coding_recovery.save(workspace, recovery)
+        coding_recovery.reconcile_escalation(workspace, recovery, backend)
     step_limit = max_steps
     first_step = 1
     failed_at_start = 0
-    if resume_repair:
+    if recovery is not None:
+        step_limit = int(recovery["tool_step_limit"])
+        if ((recovery["steps_used"] >= step_limit or recovery["failed_checks_used"] >= recovery["failed_check_limit"])
+                and (last_check or {}).get("error") != "gpu_check_pending"):
+            return {"status": "implementation_failed", "detail": "coding_lineage_budget_exhausted", "check": last_check,
+                    "steps": recovery["steps_used"], "coding_recovery": recovery}
+    elif resume_repair:
         from react_agent.eeg_research.agentic.identity import ensure_attempt
         attempt = ensure_attempt(workspace, workspace.name)
         budget_path = workspace / "coder_attempt_budget.json"
@@ -262,7 +276,36 @@ def implement(
     references = {name: page["text"] for name, page in pages.items()}
     reference_ranges = {name: {key: value for key, value in page.items() if key != "text"} for name, page in pages.items()}
     entry = workspace / "extension" / "eeg_candidate.py"
+    if recovery is not None and (last_check or {}).get("error") == "gpu_check_pending":
+        last_check = {**run_candidate_check(workspace, python=python),
+                      "source_sha256": file_sha256(entry), "check_fingerprint": _check_fingerprint(workspace, python)}
+        last_check_fingerprint = last_check["check_fingerprint"]
+        (workspace / "checks.json").write_text(json.dumps(last_check, ensure_ascii=False, indent=2), encoding="utf-8")
+        if last_check.get("error") == "gpu_check_pending":
+            return {"status": "check_pending", "detail": "gpu_check_pending", "check": last_check,
+                    "steps": recovery["steps_used"]}
+        if last_check.get("ok"):
+            # Complete the previously requested automatic check, then finalize
+            # existing source through the same native tool and current identity.
+            # This is a controller action, not a generated model response.
+            result = _execute(workspace, "finish_patch", {"summary": "Native completion after deferred GPU preflight."},
+                              last_check, python)
+            with log_path.open("a") as stream:
+                stream.write(json.dumps({"call_id": uuid.uuid4().hex[:12], "step": next_step - 1,
+                    "tool": "finish_patch", "args": {"summary": "Native completion after deferred GPU preflight."},
+                    "result": result, "model_invoked": False, "trigger": "deferred_gpu_check_completed"}) + "\n")
+            coding_recovery.observe_check(recovery, last_check)
+            from react_agent.eeg_research.agentic.engineering_memory import record_engineering_repair
+            try:
+                record_engineering_repair(workspace, last_check, spec, python=python)
+            except (ValueError, OSError) as exc:
+                recovery["engineering_memory_pending"] = {"reason": str(exc), "check_fingerprint": last_check.get("check_fingerprint")}
+            coding_recovery.save(workspace, recovery)
+            return {"status": "ready_for_review", "manifest": result["manifest"], "check": last_check, "steps": next_step - 1}
     extension_answered = bool(restored["extension_answered"])
+    if recovery is not None and (recovery["steps_used"] >= step_limit or recovery["failed_checks_used"] >= recovery["failed_check_limit"]):
+        return {"status": "implementation_failed", "detail": "coding_lineage_budget_exhausted", "check": last_check,
+                "steps": recovery["steps_used"], "coding_recovery": recovery}
     for step in range(next_step, step_limit + 1):
         if calls_left is not None and calls_left() <= reserve:
             return {"status": "implementation_failed", "detail": "budget_exhausted", "check": last_check, "steps": step - 1}
@@ -288,6 +331,21 @@ def implement(
             "last_check": last_check,
             "history": history[-8:],
         }
+        if recovery is not None:
+            request["coding_recovery"] = {k: recovery[k] for k in ("tool_step_limit", "failed_check_limit", "steps_used",
+                                        "failed_checks_used", "model_escalations_used", "consecutive_error_count")}
+            if last_check and not last_check.get("ok"):
+                request["repair_context"] = coding_recovery.repair_context(workspace, spec, last_check, recovery)
+                attempt_path = workspace / "attempt.json"
+                if attempt_path.is_file():
+                    request["repair_context"]["attempt_id"] = json.loads(attempt_path.read_text()).get("attempt_id")
+            from react_agent.eeg_research.agentic.engineering_memory import coder_hints
+            request["verified_engineering_repairs"] = coder_hints(workspace.parent.parent, candidate_id=workspace.name)
+            no_progress = coding_recovery.maybe_escalate(workspace, spec, last_check or {}, recovery,
+                            recovery_policy, backend, calls_left=calls_left)
+            if no_progress and no_progress != "escalated":
+                return {"status": "implementation_failed", "detail": no_progress, "check": last_check,
+                        "steps": recovery["steps_used"], "coding_recovery": recovery}
         if last_check and not last_check.get("ok") and "config" in json.dumps(last_check, default=str).lower():
             from react_agent.eeg_research.agentic.handoffs import training_semantics
             request["hook_config_runtime_source"] = training_semantics(config_only=True)
@@ -437,12 +495,31 @@ def implement(
             row["read_key"] = list(key)
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        if recovery is not None:
+            recovery["steps_used"] = max(int(recovery["steps_used"]), step)
+            observed = tool_for_check or (result if tool == "run_candidate_check" and _is_check_receipt(result) else None)
+            if isinstance(observed, dict):
+                row["engineering_progress"] = coding_recovery.observe_check(recovery, observed)
+                from react_agent.eeg_research.agentic.engineering_memory import capture_failed_check, record_engineering_repair
+                try:
+                    if observed.get("ok"):
+                        record_engineering_repair(workspace, observed, spec, python=python)
+                    else:
+                        capture_failed_check(workspace, observed, spec, python=python)
+                except (ValueError, OSError) as exc:
+                    recovery["engineering_memory_pending"] = {"reason": str(exc), "check_fingerprint": observed.get("check_fingerprint")}
+            coding_recovery.save(workspace, recovery)
+            if (last_check or {}).get("error") == "gpu_check_pending":
+                return {"status": "check_pending", "detail": "gpu_check_pending", "check": last_check, "steps": step}
         history.append({"tool": tool, "result": result if tool in _READ_TOOLS else _short(result)})
         if tool == "requires_framework_extension":
             return {"status": "requires_framework_extension", "detail": args, "steps": step}
         if tool == "finish_patch" and result.get("ok"):
             return {"status": "ready_for_review", "manifest": result["manifest"], "check": last_check, "steps": step}
-        if failed_checks - failed_at_start >= max_repairs + 1:
+        if (recovery is not None and recovery["failed_checks_used"] >= recovery["failed_check_limit"]):
+            return {"status": "implementation_failed", "detail": "coding_lineage_budget_exhausted", "check": last_check,
+                    "steps": step, "coding_recovery": recovery}
+        if recovery is None and failed_checks - failed_at_start >= max_repairs + 1:
             return {"status": "implementation_failed", "detail": "repair_limit", "check": last_check, "steps": step}
     return {"status": "implementation_failed", "detail": "step_limit", "check": last_check, "steps": step_limit}
 
@@ -823,7 +900,7 @@ def review(
                                     "source": text[:16000], "source_truncated": len(text) > 16000}
     reply = backend(payload)
     repaired = False
-    if not _review_valid(reply):
+    if not _review_valid(reply) and getattr(backend, "role_config", None) is None:
         repaired = True
         reply = backend(
             {
@@ -856,6 +933,10 @@ def review(
         for key in ("candidate_id", "attempt_id", "phase", "operation_id"):
             if identity.get(key):
                 result[key] = identity[key]
+    configuration = getattr(backend, "role_config", None)
+    if configuration is not None:
+        result["role_config_hash"] = configuration.role_config_hash
+        result["role_configuration"] = configuration.semantics()
     experiment = spec.get("experiment") or {}
     if (experiment.get("principal_intervention") or experiment.get("intervention")) and not result.get("intervention_coverage"):
         result["status"] = "needs_fix"

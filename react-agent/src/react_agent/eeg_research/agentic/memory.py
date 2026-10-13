@@ -18,6 +18,36 @@ LEVEL_ORDER = (
 )
 
 
+def verified_screening_episode(camp: Path, payload: dict[str, Any]) -> dict[str, Any]:
+    from react_agent.eeg_research.agentic.artifacts import REGISTRY, resolve_verified_artifact
+    from react_agent.eeg_research.agentic.handoffs import development_artifact
+    from react_agent.eeg_research.agentic.screening import read_screening
+    ref = str(payload.get("artifact") or "")
+    if ref.startswith("art_"):
+        row = resolve_verified_artifact(camp, ref)
+    else:
+        path = Path(ref)
+        path = path if path.is_absolute() else camp / path
+        rows = [json.loads(line) for line in (camp / REGISTRY).read_text().splitlines() if line.strip()]
+        row = next((item for item in rows if item.get("kind") == "method_screening"
+                    and Path(item["path"]).resolve() == path.resolve()), None)
+    if not row or row.get("kind") != "method_screening":
+        raise ValueError("screening_episode_requires_registered_screening")
+    validated = development_artifact(camp, row["artifact_id"])
+    result = read_screening(camp, Path(validated["path"]).parent.name)
+    if (payload.get("scope") != "two_fold_development" or payload.get("primary_metric") is not None
+            or payload.get("candidate_id") != result["candidate_id"] or payload.get("seed") != result["seed"]
+            or payload.get("fidelity") != "full" or payload.get("evidence_level") != "exploratory_result"
+            or payload.get("screening_mean_top1") != result["screening_mean_top1"]
+            or payload.get("screening_subjects") != result["screening_subjects"]
+            or payload.get("selection_manifest_hash") != result["selection_manifest_hash"]
+            or payload.get("method_revision") != result["method_revision"]
+            or payload.get("science_scope") != result["science_scope"]):
+        raise ValueError("screening_episode_identity_or_scope_mismatch")
+    return {"artifact_id": validated["artifact_id"], "path": validated["path"], "sha256": validated["sha256"],
+            "screening": result, "scope": "two_fold_development", "independent_seed_count": 1, "replicated": False}
+
+
 def verified_method_episode(camp: Path, payload: dict[str, Any]) -> dict[str, Any]:
     """Validate an opt-in complete method benchmark episode at its native source.
 
@@ -279,18 +309,21 @@ def query_lessons(context: dict[str, Any], lessons: list[dict[str, Any]]) -> dic
         if not isinstance(conditions, dict) or not conditions:
             continue
         copied = dict(lesson)
+        checked_keys = (*keys, "scope", "screening_subjects", "selection_manifest_hash", "method_revision", "seed", "training_recipe") if conditions.get("scope") == "two_fold_development" else keys
         mismatches = [
             key
-            for key in keys
+            for key in checked_keys
             if context.get(key) not in (None, "")
             and conditions.get(key) not in (None, "")
             and context.get(key) != conditions.get(key)
         ]
         required_missing = [
             key
-            for key in keys
+            for key in checked_keys
             if context.get(key) not in (None, "") and conditions.get(key) in (None, "")
         ]
+        if conditions.get("scope") == "two_fold_development":
+            required_missing.extend(key for key in checked_keys[len(keys):] if context.get(key) in (None, ""))
         if required_missing:
             copied["retrieval"] = "applicability_unknown"
             copied["missing_conditions"] = required_missing
@@ -357,6 +390,8 @@ class EpisodeStore:
         payload.setdefault("episode_id", f"ep_{uuid.uuid4().hex[:12]}")
         if payload.get("scope") == "method_development_benchmark":
             verified_method_episode(self.camp, payload)
+        if payload.get("scope") == "two_fold_development":
+            verified_screening_episode(self.camp, payload)
         conn = open_store(self.camp)
         try:
             existing = conn.execute("SELECT payload FROM episodes WHERE episode_id = ?", (payload["episode_id"],)).fetchone()
@@ -397,18 +432,22 @@ class EpisodeStore:
         """Episodes are immutable. Curator and callers must not rewrite them."""
         raise PermissionError("episode_immutable")
 
-    def list_episodes(self) -> list[dict[str, Any]]:
+    def list_episodes(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         conn = open_store(self.camp)
         try:
-            rows = conn.execute("SELECT payload FROM episodes ORDER BY created_at").fetchall()
+            rows = conn.execute("SELECT payload FROM episodes ORDER BY created_at" if limit is None else
+                                "SELECT payload FROM episodes ORDER BY created_at DESC,episode_id LIMIT ?",
+                                () if limit is None else (max(0, int(limit)),)).fetchall()
         finally:
             conn.close()
         return [json.loads(item[0]) for item in rows]
 
-    def list_lessons(self) -> list[dict[str, Any]]:
+    def list_lessons(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         conn = open_store(self.camp)
         try:
-            rows = conn.execute("SELECT payload FROM lessons ORDER BY created_at").fetchall()
+            rows = conn.execute("SELECT payload FROM lessons ORDER BY created_at" if limit is None else
+                                "SELECT payload FROM lessons ORDER BY created_at DESC,lesson_id LIMIT ?",
+                                () if limit is None else (max(0, int(limit)),)).fetchall()
         finally:
             conn.close()
         return [json.loads(item[0]) for item in rows]
@@ -466,12 +505,20 @@ class EpisodeStore:
                     reasons.append("episode_missing")
                 cited = [episodes[item] for item in supporting if item in episodes]
                 method_cited = [item for item in cited if item.get("scope") == "method_development_benchmark"]
+                screening_cited = [item for item in cited if item.get("scope") == "two_fold_development"]
+                for item in screening_cited:
+                    try:
+                        verified_screening_episode(self.camp, item)
+                    except (OSError, ValueError, KeyError, TypeError):
+                        reasons.append("screening_support_invalid")
                 for item in method_cited:
                     try:
                         verified_method_episode(self.camp, item)
                     except (OSError, ValueError, KeyError, TypeError):
                         reasons.append("method_suite_support_invalid")
-                if any("test" in json_keys(item) for item in cited):
+                from react_agent.eeg_research.agentic.semantic_memory import unsafe_source
+                if any(unsafe_source(item) if item.get("scope") in {"two_fold_development", "method_development_benchmark"} else "test" in json_keys(item)
+                       for item in cited):
                     reasons.append("final_test_derived")
                 group_level = min((_rank(item.get("evidence_level")) for item in cited), default=0)
                 requested = str(
@@ -486,6 +533,15 @@ class EpisodeStore:
                 conditions = lesson.get("conditions") if "conditions" in lesson else proposal.get("conditions")
                 if not isinstance(conditions, dict) or not conditions:
                     reasons.append("conditions_missing")
+                if screening_cited:
+                    required_scope = ("screening_subjects", "selection_manifest_hash", "method_revision", "training_recipe")
+                    if (not isinstance(conditions, dict) or conditions.get("scope") != "two_fold_development"
+                            or conditions.get("fidelity") != "full" or conditions.get("seed") != 0
+                            or any(any(conditions.get(key) != item.get(key) for key in required_scope) for item in screening_cited)
+                            or conditions.get("independent_final_test") is not False):
+                        reasons.append("screening_conditions_mismatch")
+                    if requested != "exploratory_result":
+                        reasons.append("screening_cannot_upgrade_evidence_level")
                 if method_cited and (not isinstance(conditions, dict) or conditions.get("fidelity") != "full"
                         or any(conditions.get("evaluation_identity") != item.get("contract_fingerprint") for item in method_cited)):
                     reasons.append("method_suite_conditions_mismatch")
