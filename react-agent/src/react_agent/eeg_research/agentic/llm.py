@@ -221,9 +221,6 @@ def system_prompt(role: str, *, memory=None, camp=None) -> str:
                 from .schemas import ResearchRoundDraft
                 model = ResearchRoundDraft
             schema = json.dumps(model.model_json_schema(),ensure_ascii=False) if model is not None else "{}"
-            if role == "research_planner":
-                from .schemas import ResearchPlanProposal
-                schema += "\nINDEPENDENT_PROPOSAL_SCHEMA\n" + json.dumps(ResearchPlanProposal.model_json_schema(),ensure_ascii=False)
             return render_role_system(role, runtime_mission(role) + "\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object.\n",execution_version="single_plan_v1")
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
     mission = (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
@@ -632,8 +629,23 @@ def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
             "request_user_sha256": user_sha}
 
 
-def _price_usage(row: dict, *, camp=None) -> None:
+def _price_usage(row: dict, *, camp=None, call_id=None) -> None:
     """Deployment supplied pricing only; reasoning is part of completion tokens."""
+    if camp is not None:
+        from .owner_budget import enabled, request_pricing
+        if enabled(camp):
+            from .pricing import resolve_pricing, estimate_usd
+            identifier = call_id or row.get("call_id")
+            frozen = request_pricing(camp, identifier) if identifier else None
+            frozen = frozen or resolve_pricing(camp, provider=row.get("provider") or "deepseek", model=row.get("requested_model"))
+            row.setdefault("api_usd", None)
+            amount = estimate_usd(frozen, input_tokens=row.get("input_tokens"), output_tokens=row.get("output_tokens"), cache_hit_tokens=row.get("cache_hit_tokens"))
+            if amount is not None:
+                price = frozen["pricing"]
+                row.update(api_usd=amount, pricing_source=price["source"], pricing_date=price["date"],
+                    pricing_fingerprint=frozen["fingerprint"], frozen_pricing=frozen,
+                    cost_status="uncertain" if row.get("unconfirmed_charge_possible") else "priced")
+            return
     source = os.environ.get("DEEPSEEK_PRICE_SOURCE")
     date = os.environ.get("DEEPSEEK_PRICE_DATE")
     input_rate = os.environ.get("DEEPSEEK_USD_INPUT_PER_MILLION")

@@ -26,8 +26,11 @@ react-agent/src/react_agent/version/
 .agents/
 skills-lock.json
 
-# Local validation files; publish runtime files only
-react-agent/tests/
+# Local validation files; publish the focused synthetic audit regressions
+react-agent/tests/*
+!react-agent/tests/eeg_research/
+react-agent/tests/eeg_research/*
+!react-agent/tests/eeg_research/version_audit/
 **/.pytest_cache/
 
 # Local plan, acceptance, API, and validation notes

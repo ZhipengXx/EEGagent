@@ -198,6 +198,33 @@ class ResearchExecutionConfig(DomainOutput):
     budget: dict[str, Any] = Field(default_factory=dict)
 
 
+RESEARCH_TASK_PHASES = {
+    "new_method": frozenset({"screening_2fold", "full", "pilot"}),
+    "confirmation": frozenset({"confirmation_10fold", "full"}),
+    "diagnosis": frozenset({"diagnostic"}),
+    "validation": frozenset({"screening_2fold", "full", "pilot", "diagnostic"}),
+}
+
+
+def validate_research_task(task_kind: str, phase: str, target: str | None,
+                           evaluation_schedule: str | None = None) -> None:
+    """Use the same task contract for drafts, persisted plans and dispatch."""
+    if phase not in RESEARCH_TASK_PHASES.get(task_kind, ()):
+        raise ValueError("task_kind_phase_mismatch:" + str(task_kind) + ":" + str(phase))
+    if task_kind == "new_method":
+        if target is not None:
+            raise ValueError("new_method_cannot_overwrite_existing_candidate")
+    elif not target:
+        raise ValueError("task_requires_existing_candidate")
+    if evaluation_schedule is not None and phase != "diagnostic":
+        if evaluation_schedule == "screen_then_confirm":
+            expected = "confirmation_10fold" if task_kind == "confirmation" else "screening_2fold"
+            if phase != expected:
+                raise ValueError("task_phase_does_not_match_frozen_schedule")
+        elif phase in {"screening_2fold", "confirmation_10fold"} or (task_kind == "confirmation" and phase != "full"):
+            raise ValueError("task_phase_does_not_match_frozen_schedule")
+
+
 class ResearchPlanProposal(DomainOutput):
     proposal_id: str = Field(min_length=1, max_length=100)
     task_kind: Literal["new_method", "confirmation", "diagnosis", "validation"]
@@ -219,6 +246,11 @@ class ResearchPlanProposal(DomainOutput):
         " JSON pointers, hashes, paths and prospective sources are not references."))
     cost_assessment: dict[str, Any] = Field(default_factory=dict)
     value_rationale: str = Field(min_length=1, max_length=1500)
+
+    @model_validator(mode="after")
+    def valid_task_phase(self):
+        validate_research_task(self.task_kind, self.evaluation_scope.get("phase"), self.target_candidate_ref)
+        return self
 
 
 class ResearchPlanEvaluation(DomainOutput):
@@ -247,6 +279,8 @@ class ResearchRound(DomainOutput):
     selected_proposal_id: str | None
     pool_status: Literal["complete", "incomplete", "degraded_singleton", "no_feasible_plan"]
     valid_count: int = Field(ge=0, le=4)
+    evaluation_count: int = Field(default=0, ge=0, le=4)
+    unevaluated_proposal_ids: list[str] = Field(default_factory=list)
     shortfall_reason: str | None = None
     selection_rationale: str = ""
     selection_source: str | None = None

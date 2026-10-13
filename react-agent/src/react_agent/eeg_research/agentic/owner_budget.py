@@ -250,14 +250,15 @@ def allocate_child(camp, parent_owner_id, child_id, amount, *, kind="role", purp
         return _allocate(conn, Path(camp), child_id, amount, kind=kind, parent_id=parent_owner_id, purpose=purpose)
 
 
-def _request_resources(camp, input_bound, output_bound):
+def _request_resources(camp, input_bound, output_bound, *, frozen_pricing=None):
     amount = resources({"llm_calls": 1, "input_tokens": input_bound, "output_tokens": output_bound, "total_tokens": input_bound + output_bound})
     goal = _read(camp / "goal.json")
     config = ((goal.get("research_execution") or {}).get("budget") or {})
-    pricing = config.get("pricing") or {}
-    if pricing.get("source") and pricing.get("date") and isinstance(pricing.get("input_per_million"), (int,float)) and isinstance(pricing.get("output_per_million"), (int,float)):
-        rates=resources({"api_usd":pricing["input_per_million"]}),resources({"api_usd":pricing["output_per_million"]})
-        amount["api_usd"] = (input_bound * rates[0]["api_usd"] + output_bound * rates[1]["api_usd"]) / 1e6
+    from .pricing import resolve_pricing, estimate_usd
+    frozen_pricing = frozen_pricing or resolve_pricing(camp)
+    known_price = estimate_usd(frozen_pricing, input_tokens=input_bound, output_tokens=output_bound, upper_bound=True)
+    if known_price is not None:
+        amount["api_usd"] = known_price
     else:
         reserve = config.get("conservative_usd_per_request", (goal.get("api_request_policy") or {}).get("unknown_usd_reserve"))
         if reserve is not None:
@@ -306,15 +307,21 @@ def _role_owner(conn, camp, role):
     return None
 
 
-def claim_request(camp, *, call_id, operation, role, input_bound, output_bound):
+def claim_request(camp, *, call_id, operation, role, input_bound, output_bound, provider="deepseek", model=None):
     camp = Path(camp)
     if not enabled(camp):
         return None
-    amount = _request_resources(camp, input_bound, output_bound)
+    from .pricing import resolve_pricing
+    if model is None:
+        from .role_config import ROLES, resolve_role_config
+        if role in ROLES:
+            model = resolve_role_config(camp, role).model
+    frozen_pricing = resolve_pricing(camp, provider=provider, model=model)
+    amount = _request_resources(camp, input_bound, output_bound, frozen_pricing=frozen_pricing)
     with _transaction(camp) as conn:
         existing = _get(conn, "claims", call_id)
         if existing:
-            if existing["operation_id"] != operation or existing["requested"] != amount or existing["role"] != role:
+            if existing["operation_id"] != operation or existing["requested"] != amount or existing["role"] != role or (existing.get("frozen_pricing") and existing["frozen_pricing"] != frozen_pricing):
                 raise OwnerBudgetError("claim_identity_conflict")
             return existing
         _control(camp,provider=True)
@@ -352,10 +359,9 @@ def claim_request(camp, *, call_id, operation, role, input_bound, output_bound):
                 cursor = _get(conn, "owners", cursor["parent_id"]) if cursor.get("parent_id") else None
         else:
             _fit(amount, snap["unreserved_available"], "auxiliary_request_deferred")
-        configuration=((_read(camp/"goal.json").get("research_execution") or {}).get("budget") or {})
-        pricing=configuration.get("pricing") or {}
-        priced=pricing.get("source") and pricing.get("date") and isinstance(pricing.get("input_per_million"),(int,float)) and isinstance(pricing.get("output_per_million"),(int,float))
+        priced=frozen_pricing["pricing"] is not None
         row = {"usd_bound_kind":"configured_price" if priced else "conservative" if amount["api_usd"]>0 else "unpriced",
+               "frozen_pricing": frozen_pricing,
                "call_id": call_id, "operation_id": operation, "owner_id": owner_id, "role": role, "requested": amount,
                "committed": amount, "actual": resources({"llm_calls": 1}), "status": "claimed", "created_at": time.time()}
         _put(conn, "claims", call_id, row)
@@ -380,6 +386,14 @@ def settle_request(camp, call_id, usage):
         row = _get(conn, "claims", call_id)
         if not row:
             raise OwnerBudgetError("settlement_without_claim")
+        if row.get("frozen_pricing", {}).get("pricing") is not None:
+            from .pricing import estimate_usd
+            computed = estimate_usd(row["frozen_pricing"], input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"), cache_hit_tokens=usage.get("cache_hit_tokens"))
+            if computed is not None:
+                if usage.get("api_usd") is not None and abs(float(usage["api_usd"]) - computed) > 1e-9:
+                    raise OwnerBudgetError("settlement_pricing_identity_conflict")
+                usage = {**usage, "api_usd": computed}
         identity = {key: usage.get(key) for key in ("input_tokens", "output_tokens", "api_usd", "transport_outcome", "unconfirmed_charge_possible")}
         identity["unconfirmed_charge_possible"] = bool(identity.get("unconfirmed_charge_possible"))
         signature = _hash(identity)
@@ -461,7 +475,7 @@ def transport_claim(camp, call_id):
         TRANSPORT.reset(token)
 
 
-def before_transport(camp, *, call_id, role, input_bound, output_bound):
+def before_transport(camp, *, call_id, role, input_bound, output_bound, provider="deepseek", model=None):
     camp = Path(camp)
     with _transaction(camp) as conn:
         _control(camp,provider=True)
@@ -473,6 +487,14 @@ def before_transport(camp, *, call_id, role, input_bound, output_bound):
             raise OwnerBudgetError("provider_transport_claim_not_sendable")
         if row["role"]!=role:
             raise OwnerBudgetError("provider_transport_claim_role_mismatch")
+        if row.get("frozen_pricing"):
+            from .pricing import resolve_pricing, PricingConflict
+            try:
+                current = resolve_pricing(camp, provider=provider, model=model or row["frozen_pricing"].get("model"))
+            except PricingConflict as exc:
+                raise OwnerBudgetError(str(exc)) from exc
+            if current != row["frozen_pricing"]:
+                raise OwnerBudgetError("provider_pricing_identity_changed")
         if input_bound > row["requested"]["input_tokens"] or output_bound > row["requested"]["output_tokens"]:
             raise OwnerBudgetError("provider_bounds_exceed_claim")
         row.update(status="inflight", transport_started_at=time.time())
@@ -484,6 +506,13 @@ def current_transport(camp=None):
     if value and (camp is None or value[0] == str(Path(camp).resolve())):
         return value
     return None
+
+
+def request_pricing(camp, call_id):
+    """The original claim's price proof also governs late ledger recovery."""
+    with _transaction(Path(camp)) as conn:
+        row = _get(conn, "claims", call_id)
+        return row.get("frozen_pricing") if row else None
 
 
 def current_campaign():

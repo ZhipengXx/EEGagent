@@ -210,7 +210,8 @@ def reserve_operation_attempt(camp: Path, *, operation: str, call_id: str,
                 raise LlmUnavailable("owner_request_token_bounds_required")
             try:
                 claim = claim_request(camp, call_id=call_id, operation=operation, role=(metadata or {}).get("role") or "backend_direct",
-                    input_bound=input_bound, output_bound=output_bound)
+                    input_bound=input_bound, output_bound=output_bound,
+                    provider=(metadata or {}).get("provider") or "deepseek", model=(metadata or {}).get("requested_model") or fields.get("model"))
             except OwnerBudgetError as exc:
                 raise LlmUnavailable(str(exc)) from exc
             row.update(budget_owner=claim["owner_id"], resource_claim_id=call_id,

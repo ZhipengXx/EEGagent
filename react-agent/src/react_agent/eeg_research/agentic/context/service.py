@@ -619,13 +619,19 @@ class ContextService:
                                recoverable_when=("valid applicable source or native classification",))
         from ..research_execution import single_plan_enabled, paid_maintenance_mode
         if single_plan_enabled(self.camp) and request.role == "research_planner" and not maintenance:
-            from ..experiment_observations import compact_planner_view
+            from ..experiment_observations import compact_planner_view, planner_applicability_context, ObservationDeliveryRequired
             payload = copy.deepcopy(request.payload)
-            if isinstance(payload.get("observation"), dict):
-                if payload["observation"].get("context_delivery_version") != "observation_card_first.v1":
-                    payload["observation"] = compact_planner_view(self.camp, payload["observation"])
-            elif payload.get("context_delivery_version") != "observation_card_first.v1":
-                payload = compact_planner_view(self.camp, payload)
+            try:
+                # Terminal feedback is required current material. The separate
+                # optional retrieval cap must not silently exclude its facts.
+                delivery_cap = min(16000, request.budget.hard_chars)
+                if isinstance(payload.get("observation"), dict):
+                    payload["observation"] = compact_planner_view(self.camp, payload["observation"], char_cap=delivery_cap,
+                        context=planner_applicability_context(self.camp, payload))
+                else:
+                    payload = compact_planner_view(self.camp, payload, char_cap=delivery_cap)
+            except ObservationDeliveryRequired as exc:
+                return exc.result
             request = replace(request, payload=payload)
         revision_before, calls_before = self.snapshot.revision, set(self.owned_calls)
         callbacks = not maintenance and paid_maintenance_mode(self.camp) in {"legacy", "emergency"}

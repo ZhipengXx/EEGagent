@@ -171,7 +171,8 @@ class DeepSeekBackend:
             direct_row.update(reserve_operation_attempt(camp, operation=operation, call_id=call_id, metadata=direct_row))
             _reserve_api_intent(camp, direct_row)
         try:
-            budget.before_transport(camp, call_id=call_id, role=role, input_bound=bounds, output_bound=spec.max_tokens)
+            budget.before_transport(camp, call_id=call_id, role=role, input_bound=bounds, output_bound=spec.max_tokens,
+                provider="deepseek", model=spec.model)
         except budget.OwnerBudgetError as exc:
             not_sent = {"transport_outcome":"definitely_not_sent","unconfirmed_charge_possible":False,"success":False,"error":str(exc)}
             budget.settle_request(camp,call_id,not_sent)
@@ -189,14 +190,14 @@ class DeepSeekBackend:
                 row = {"transport_outcome":"definitely_not_sent","unconfirmed_charge_possible":False}
             else:
                 row = {"transport_outcome":"outcome_unknown","unconfirmed_charge_possible":True}
-            _price_usage(row,camp=camp)
+            _price_usage(row,camp=camp,call_id=call_id)
             budget.settle_request(camp, call_id, row)
             if direct_row is not None:
                 _ledger(camp, {**direct_row,**row,"call_id":call_id})
             raise
         usage.call_id = call_id
         row = usage.model_dump()
-        _price_usage(row,camp=camp)
+        _price_usage(row,camp=camp,call_id=call_id)
         budget.settle_request(camp, call_id, row)
         if direct_row is not None:
             _ledger(camp, {**direct_row,**row,"call_id":call_id})

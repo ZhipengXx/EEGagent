@@ -419,6 +419,8 @@ def _recover_decision_reads(camp: Path, state: dict[str, Any]) -> None:
     from react_agent.eeg_research.agentic.artifacts import lookup, request_digest
     from react_agent.eeg_research.agentic.handoffs import read_history, read_digest, verify_read_receipt, rebuild_read_projection, _receipt_id
     from react_agent.eeg_research.agentic.schemas import PlannerDecision
+    from .selected_plan import recover_step_publications
+    recover_step_publications(camp, state)
     history = read_history(camp)
     known = {row.get("decision_id"): row for row in state.get("decisions") or []}
     if len(known) != len(state.get("decisions") or []) or None in known:
@@ -990,12 +992,15 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
             reflect_control(camp, state)
         return state
     if state.get("status") in _TERMINAL:
+        if (state.get("failure") or {}).get("phase") == "recovery":
+            # Invalid publication/intent cannot authorize a control receipt or
+            # a rewrite of the selected-plan projection during recovery.
+            save_state(camp, state)
+            return state
         from .research_execution import single_plan_enabled
         if single_plan_enabled(camp):
             from .selected_plan import reflect_control
             reflect_control(camp, state)
-        if (state.get("failure") or {}).get("phase") == "recovery":
-            save_state(camp, state)
         return state
     from .research_execution import single_plan_enabled
     if single_plan_enabled(camp):
@@ -1270,7 +1275,7 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
     return state
 
 
-def _finish_step(camp: Path, state: dict[str, Any]) -> None:
+def _finish_step(camp: Path, state: dict[str, Any], *, selected_step_outcome: dict | None = None) -> None:
     _sync_ledger(camp, state)
     _mark_executed(state)
     if state.get("decisions"):
@@ -1289,7 +1294,9 @@ def _finish_step(camp: Path, state: dict[str, Any]) -> None:
                 append_receipt(camp, record, status="executed", source="native_step",
                     result={"status": state.get("status"), "local_result": state.get("last_local_result"),
                             "live_job": state.get("live_job"), "active_suite": state.get("active_suite"),
-                            "experiment_ref": state.get("experiment_ref"), "report_ref": state.get("report_ref")})
+                            "experiment_ref": state.get("experiment_ref"), "report_ref": state.get("report_ref"),
+                            **({"selected_step_state_delta": selected_step_outcome}
+                               if selected_step_outcome is not None else {})})
     if state.get("pause_after_step") and state.get("status") not in _TERMINAL and not state.get("live_job"):
         state["status"] = "paused"
     save_state(camp, state)

@@ -429,19 +429,10 @@ def candidates(camp: Path, config: MemoryConfig, context: dict | None = None, *,
         from .experiment_observations import ExperimentObservationStore
         # Current cards precede old lesson navigation; no paid extraction needed.
         observation_store = ExperimentObservationStore(camp)
-        observations = observation_store.records(limit=MAX_CANDIDATES, query=query) if query.strip() else []
-        recent = observation_store.records(limit=16 if query.strip() else MAX_CANDIDATES)
+        observations = observation_store.records(limit=MAX_CANDIDATES, query=query, context=context) if query.strip() else []
+        recent = observation_store.records(limit=16 if query.strip() else MAX_CANDIDATES, context=context)
         known = {row["record_id"] for row in observations}
         observations += [row for row in recent if row["record_id"] not in known]
-        for record in observations:
-            facts = record["body"].get("native_facts") or {}
-            identity = record["body"].get("identity") or {}
-            conditions = {key: facts.get(key, identity.get(key)) for key in ("scope", "seed", "modality", "dataset")}
-            differences = {key: {"record": value, "current": context[key]} for key, value in conditions.items()
-                if value is not None and context.get(key) is not None and canonical(value) != canonical(context[key])}
-            unknown = [key for key, value in conditions.items() if value is not None and context.get(key) is None]
-            record["applicability"] = "analogy_only" if differences else "applicability_unknown" if unknown else "compatible_evidence"
-            record["condition_differences"] = {"mismatch": differences, "unknown": unknown}
         rows = observations + rows
     rows = rows[:MAX_CANDIDATES]
     for row in rows:
@@ -542,10 +533,19 @@ def _fit_delivery(bundle: dict, *, standalone: bool = False) -> tuple[dict | Non
         trial["hit_count"] = len(trial["items"])
         trial_fields = measure(trial)
         if trial["context_chars_used"] > budget:
+            if item["record_type"] == "experiment_observation":
+                from .experiment_observations import minimum_observation_card
+                minimum = minimum_observation_card(item)
+                # Native classification was computed against the retrieval's
+                # complete current context; projection cannot upgrade it.
+                minimum["applicability"] = item["applicability"]
+                minimum["condition_differences"] = copy.deepcopy(item["condition_differences"])
+                trial["items"][-1].update(minimum)
+                trial_fields = measure(trial)
             # A long entry may still be useful through an explicitly partial
             # record card.  Preserve the original body in SQLite; this view
             # does not claim a full read or semantic coverage.
-            partial = copy.deepcopy(item.get("body") if item["record_type"] != "lesson" else body)
+            partial = copy.deepcopy(trial["items"][-1].get("body") if item["record_type"] != "lesson" else body)
             selected_ranges = {}
             for key in ("statement", "description_en", "trigger_en", "summary_zh"):
                 if isinstance(partial.get(key), str) and len(partial[key]) > 1200:
@@ -581,7 +581,7 @@ def _finalize_bundle(bundle: dict) -> dict:
 def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
              experiment: dict | None = None, config: MemoryConfig | None = None,
              require_embedding: bool = False, rebuild: bool = False,
-             role: str = "research_planner") -> dict:
+             role: str = "research_planner", context: dict | None = None) -> dict:
     config = config or memory_config(camp)
     query = build_query(camp, state=state, experiment=experiment) if query is None else prepare_query(question=query)["text"]
     bundle = {"backend": "legacy", "degraded": False, "reason": "disabled", "query": query[:800],
@@ -593,7 +593,7 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
         return bundle
     try:
         require_eeg_campaign(camp)
-        context = build_context(camp, state=state, experiment=experiment)
+        context = {**build_context(camp, state=state, experiment=experiment), **(context or {})}
         records = candidates(camp, config, context, query=query)
         from .research_execution import single_plan_enabled
         if single_plan_enabled(camp) and role == "research_planner":

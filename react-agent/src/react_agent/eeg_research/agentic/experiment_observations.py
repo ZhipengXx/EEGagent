@@ -16,9 +16,64 @@ from typing import Any
 from .embedding import canonical, content_hash, memory_config
 from .research_execution import single_plan_enabled
 from .context.sources import ContextSourceRegistry, atomic_immutable
+from .context.types import NeedsContext, ReadRequest
 
 VERSION = "eeg_research.experiment_observation.v1"
 TERMINAL = frozenset({"observation_ready", "failed", "needs_replan", "cancelled"})
+
+
+class ObservationDeliveryRequired(RuntimeError):
+    """A saved current feedback cannot fit the authorized delivery budget."""
+    def __init__(self, result: NeedsContext):
+        super().__init__(result.reason)
+        self.result = result
+
+
+def observation_conditions(value: dict) -> dict:
+    """Normalize the same exact comparison conditions for recent and semantic hits."""
+    owners = [value[key] for key in ("native_facts", "identity", "evaluation_scope", "applicability", "science_scope")
+              if isinstance(value.get(key), dict)] + [value]
+    aliases = {
+        "scope": ("scope", "science_scope"), "dataset": ("dataset",), "modality": ("modality",),
+        "seed": ("seed", "training_seed"),
+        "fold_count": ("required_fold_count", "fold_count", "folds", "coverage"),
+        "fold_ids": ("screening_fold_ids", "fold_ids"),
+        "subjects": ("subjects", "screening_subjects", "held_out_subjects", "held_out_subject"),
+        "source_hash": ("source_hash",), "spec_hash": ("spec_hash",),
+        "method_revision": ("method_revision",), "selection_manifest_hash": ("selection_manifest_hash",),
+        "evaluation_identity": ("evaluation_identity", "evaluation_key", "contract_fingerprint"),
+    }
+    result = {}
+    for key, names in aliases.items():
+        found = next((owner[name] for owner in owners for name in names
+                      if owner.get(name) is not None and not isinstance(owner[name], dict)), None)
+        if found is None:
+            continue
+        if key == "fold_count" and isinstance(found, list):
+            found = len(found)
+        if key in {"subjects", "fold_ids"}:
+            found = sorted(found if isinstance(found, (list, tuple)) else [found], key=canonical)
+        if key == "modality" and isinstance(found, str):
+            found = found.upper()
+        result[key] = copy.deepcopy(found)
+    folds = (value.get("native_facts") or {}).get("folds")
+    if isinstance(folds, list) and folds and all(isinstance(row, dict) for row in folds):
+        result.setdefault("fold_ids", sorted([row["fold_id"] for row in folds if "fold_id" in row], key=canonical))
+        result.setdefault("subjects", sorted([row["held_out_subject"] for row in folds if "held_out_subject" in row], key=canonical))
+    return result
+
+
+def observation_applicability(body: dict, context: dict | None) -> tuple[str, dict]:
+    recorded, current = observation_conditions(body), observation_conditions(context or {})
+    keys = set(recorded) | set(current) | {"scope", "dataset", "seed", "fold_count", "subjects", "source_hash"}
+    mismatch = {key: {"record": recorded[key], "current": current[key]} for key in sorted(keys)
+                if key in recorded and key in current and canonical(recorded[key]) != canonical(current[key])}
+    unknown = {key: {"record": recorded.get(key), "current": current.get(key)} for key in sorted(keys)
+               if key not in recorded or key not in current}
+    label = "analogy_only" if mismatch else "applicability_unknown" if unknown else "compatible_evidence"
+    return label, {"mismatch": [{"field": key, **detail} for key, detail in mismatch.items()],
+                   "unknown": [{"field": key, **detail} for key, detail in unknown.items()],
+                   "matched_comparison": label == "compatible_evidence"}
 
 
 def _read(path: Path) -> dict:
@@ -106,10 +161,14 @@ class ExperimentObservationStore:
         except (OSError, KeyError, ValueError, PermissionError):
             return False
 
-    def records(self, *, limit=256, query: str = "", before: tuple[float, str] | None = None) -> list[dict]:
+    def records(self, *, limit=256, query: str = "", before: tuple[float, str] | None = None,
+                observation_id: str | None = None, context: dict | None = None) -> list[dict]:
         """Bounded navigation and a query window into arbitrarily old cards."""
         parameters: list[Any] = [self.camp.name]
         where = "namespace=?"
+        if observation_id is not None:
+            where += " AND observation_id=?"
+            parameters.append(observation_id)
         if before is not None:
             where += " AND (created_at<? OR (created_at=? AND observation_id<?))"
             parameters.extend((before[0], before[0], before[1]))
@@ -126,10 +185,12 @@ class ExperimentObservationStore:
         for row in rows:
             body = json.loads(row["payload"])
             if content_hash(body) == row["content_hash"] and self.valid(body, row["source_ref"]):
+                label, differences = observation_applicability(body, context)
                 results.append({"record_type": "experiment_observation", "record_id": body["observation_id"],
                     "version": body["content_digest"], "content_hash": row["content_hash"], "body": body,
                     "source_refs": [{"source_ref": row["source_ref"], "source_hash": row["content_hash"]}],
-                    "applicability": "compatible_evidence", "navigation": {"created_at": row["created_at"], "observation_id": body["observation_id"]}})
+                    "applicability": label, "condition_differences": differences,
+                    "navigation": {"created_at": row["created_at"], "observation_id": body["observation_id"]}})
         return results
 
 
@@ -284,20 +345,29 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
         interpretation = {"artifact_id": analysis_ref, "sha256": row["sha256"], "candidate_id": row.get("candidate_id"), "interpretation_only": True,
             "read_ref": analysis_ref, "points": {key: copy.deepcopy(explanation[key]) for key in (
                 "hypothesis_assessment", "summary_zh", "evidence_gaps", "suggested_next_actions")
-                if key in explanation and len(canonical(explanation[key])) <= 1200}}
+                if key in explanation and len(canonical(explanation[key])) <= 1200},
+            "omitted_point_fields": [key for key in ("hypothesis_assessment", "summary_zh", "evidence_gaps", "suggested_next_actions")
+                if key in explanation and len(canonical(explanation[key])) > 1200]}
         sources.append({"artifact_id": analysis_ref, "sha256": row["sha256"], "kind": row["kind"]})
     if engineering:
         failure.setdefault("error", plan.get("error") or plan.get("block_reason") or "implementation_failed")
         failure.setdefault("error_fingerprint", content_hash({"error": failure["error"], "source_hash": plan.get("source_hash"), "spec_hash": plan.get("spec_hash")}))
         failure.setdefault("repairs_used", plan.get("repair_count", 0))
+        failure.setdefault("error_category", "engineering_failure")
+    conditions = planner_applicability_context(camp, {**state, "experiment": plan,
+        "evaluation_scope": proposal.get("evaluation_scope") or {}})
     body = {"origin_campaign_id": camp.name, "plan_id": plan["plan_id"], "observation_kind": "engineering_failure" if engineering else "experiment",
         "execution_status": execution_status, "question": proposal.get("question"),
         "intervention": proposal.get("scientific_intent") or proposal.get("task_description"),
-        "identity": {key: plan[key] for key in ("candidate_id", "method_revision", "source_hash", "spec_hash", "scientific_intent_digest") if key in plan},
+        "identity": {key: plan[key] for key in ("candidate_id", "method_revision", "source_hash", "spec_hash", "scientific_intent_digest") if key in plan} |
+            {key: conditions[key] for key in ("dataset", "modality") if key in conditions},
+        "evaluation_scope": copy.deepcopy(proposal.get("evaluation_scope") or {}),
         "native_facts": facts, "analyst_interpretation": interpretation,
         "engineering_failure": failure if engineering else None,
         "unresolved_questions": copy.deepcopy(plan.get("unresolved_questions") or []),
-        "source_refs": sources, "applicability": {"campaign_id": camp.name, "scope": facts.get("scope"), "seed": facts.get("seed"), "scientific_intent_digest": plan.get("scientific_intent_digest")}}
+        "source_refs": sources, "applicability": {**conditions, "campaign_id": camp.name,
+            "scope": facts.get("scope", conditions.get("scope")), "seed": facts.get("seed", conditions.get("seed")),
+            "scientific_intent_digest": plan.get("scientific_intent_digest")}}
     if facts.get("measurement_kind") == "existing_development_diagnostic":
         body["identity"]["binding_level"] = "plan_target_with_per_source_diagnostic_identity"
         body["identity"]["unknown_top_level_fields"] = [key for key in ("source_hash", "spec_hash", "method_revision")
@@ -306,44 +376,187 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
     return ExperimentObservationStore(camp).record(body)
 
 
+def planner_applicability_context(camp: Path, fullobs: dict) -> dict:
+    """Pass task conditions, not only the query's candidate ID, to both paths."""
+    from .semantic_memory import build_context
+    experiment = fullobs.get("experiment") or {}
+    context = build_context(camp, state=fullobs, experiment=experiment)
+    for owner in (fullobs.get("contract"), fullobs.get("protocol"), experiment,
+                  fullobs.get("selected_research_task"), fullobs.get("current_task_context"), fullobs):
+        if isinstance(owner, dict):
+            context.update(observation_conditions(owner))
+    for key in ("candidate_id", "terminal_observation_id"):
+        if fullobs.get(key) is not None:
+            context[key] = fullobs[key]
+    selected = fullobs.get("selected_plan") or {}
+    context.setdefault("terminal_observation_id", selected.get("terminal_observation_id"))
+    return context
+
+
+def _feedback_handle(record: dict, pointer: str = "", *, unit: str = "json", size: int | None = None) -> dict:
+    source = record["source_refs"][0]
+    request = {"source_ref": source["source_ref"], "source_hash": source["source_hash"],
+               "json_pointer": pointer, "unit": unit, "max_chars": 2000}
+    if size is not None:
+        request.update(start=0, end=min(size, 512 if unit == "chars" else 1))
+    return {"$context_source": source["source_ref"], "source_hash": source["source_hash"],
+            "json_pointer": pointer, "fidelity": "REF_ONLY", "read_unit": unit,
+            "read_capability": "registered_bounded_delivery_read", "satisfies_development_read_receipt": False,
+            "next_read": request}
+
+
+def minimum_observation_card(record: dict, *, current: bool = False, context: dict | None = None) -> dict:
+    """Deterministic feedback: exact identities/results, prose behind real reads.
+
+    Large exact measurements or identities remain exact. If this minimum is too
+    large the caller must report NeedsContext; it never clips native facts.
+    """
+    body = record["body"]
+    from .context.representations import NARRATIVE_FIELDS, LOG_FIELDS
+    prose_fields = NARRATIVE_FIELDS | LOG_FIELDS | {"reason", "error", "warning", "summary_zh"}
+    omissions = []
+    next_reads = []
+    identity_fields = {"candidate_id", "plan_id", "method_revision", "source_hash", "spec_hash", "scope",
+        "seed", "fold_id", "held_out_subject", "suite_id", "job_id", "dataset", "modality",
+        "evaluation_identity", "source_ref", "source_identity_missing", "error_category", "error_fingerprint"}
+    def first_text(value, path):
+        if isinstance(value, str) and len(value) > 512:
+            return path, value
+        if isinstance(value, dict):
+            children = ((path + "/" + str(key).replace("~", "~0").replace("/", "~1"), child) for key, child in value.items())
+        elif isinstance(value, list):
+            children = ((path + "/" + str(i), child) for i, child in enumerate(value))
+        else:
+            return None
+        return next((found for child_path, child in children if (found := first_text(child, child_path))), None)
+    def omit(path, value):
+        unit = "chars" if isinstance(value, str) else "items" if isinstance(value, list) else "json"
+        omissions.append({"path": path, "reason": "bounded_current_feedback_view",
+            "read_unit": unit, "original_size": len(value) if isinstance(value, (str, list, dict)) else None})
+        if len(next_reads) < 3:
+            text = first_text(value, path)
+            read_path, read_value = text if text else (path, value)
+            read_unit = "chars" if isinstance(read_value, str) else "items" if isinstance(read_value, list) else "json"
+            next_reads.append(_feedback_handle(record, read_path, unit=read_unit,
+                size=len(read_value) if isinstance(read_value, (str, list)) else None)["next_read"])
+    def exact_diagnostics(value, path):
+        if isinstance(value, dict):
+            result = {}
+            for key, child in value.items():
+                child_path = path + "/" + key.replace("~", "~0").replace("/", "~1")
+                narrative = key in prose_fields or any(word in key.lower() for word in ("error", "traceback"))
+                if isinstance(child, str) and len(child) > 512 and narrative and key not in identity_fields:
+                    omit(child_path, child)
+                else:
+                    result[key] = exact_diagnostics(child, child_path)
+            return result
+        if isinstance(value, list):
+            return [exact_diagnostics(child, path + "/" + str(i)) for i, child in enumerate(value)]
+        return copy.deepcopy(value)
+    # Producer fields not classified by this adapter remain literal obligations.
+    # New scientific/control fields must not disappear behind a claimed minimum.
+    projected = {"native_facts", "engineering_failure", "question", "intervention", "unresolved_questions", "analyst_interpretation"}
+    selected = {key: copy.deepcopy(value) for key, value in body.items() if key not in projected}
+    facts = copy.deepcopy(body.get("native_facts") or {})
+    for key in ("summary", "native_diagnostics", "diagnostic_selection"):
+        if key in facts:
+            facts[key] = exact_diagnostics(facts[key], "/native_facts/" + key)
+    selected["native_facts"] = facts
+    failure = body.get("engineering_failure")
+    if isinstance(failure, dict):
+        selected["engineering_failure"] = exact_diagnostics(
+            {key: value for key, value in failure.items() if key != "error"}, "/engineering_failure")
+        selected["engineering_failure"].setdefault("error_category", "engineering_failure")
+        selected["engineering_failure"].setdefault("error_fingerprint", content_hash({"error": failure.get("error"),
+            "source_hash": (body.get("identity") or {}).get("source_hash"), "spec_hash": (body.get("identity") or {}).get("spec_hash")}))
+        if "error" in failure:
+            omit("/engineering_failure/error", failure["error"])
+    for key in ("question", "intervention", "unresolved_questions", "analyst_interpretation"):
+        value = body.get(key)
+        if value is not None:
+            if key in {"question", "intervention"} and len(canonical(value)) <= 512:
+                selected[key] = copy.deepcopy(value)
+            else:
+                omit("/" + key, value)
+    if not next_reads:
+        # A minimum blocked by an unfamiliar long obligation still gives a
+        # usable page of that exact source, without classifying it as omitted.
+        text = first_text(body, "")
+        if text:
+            next_reads.append(_feedback_handle(record, text[0], unit="chars", size=len(text[1]))["next_read"])
+    label, differences = observation_applicability(body, context)
+    return {"record_type": "experiment_observation", "record_id": record["record_id"], "body": selected,
+        "source_refs": copy.deepcopy(record["source_refs"]), "applicability": label,
+        "condition_differences": differences, "current_feedback": current, "fidelity": "FACT_CARD",
+        "omissions": omissions, "full_record": _feedback_handle(record), "next_reads": next_reads,
+        "minimum_feedback_version": "eeg.observation.minimum.v1"}
+
+
 def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
                         context: dict | None = None) -> dict:
-    """Recent cards first; semantic hits are optional local work with a dual cap."""
+    """Current terminal feedback is mandatory; optional history uses remaining space."""
     from .semantic_memory import retrieve
     from .context.retrieval import prepare_query
     store = ExperimentObservationStore(camp)
-    records = store.records()
-    choices = records[:min(recent, 2)]
+    records = store.records(context=context)
+    current_id = (context or {}).get("terminal_observation_id")
+    current = (store.records(limit=1, observation_id=current_id, context=context) if current_id else records[:1])
+    if current_id and not current:
+        raise ObservationDeliveryRequired(NeedsContext(({"observation_id": current_id,
+            "status": "current_observation_unreadable"},), (), "current_observation_unreadable"))
+    choices = current + records[:min(max(recent, 0), 2)]
     config = memory_config(camp)
     backend = "recent_only"
     if config.enabled and relevant > 0:
         query = prepare_query(question=question, identities=[(context or {}).get("candidate_id")])["text"]
-        bundle = retrieve(camp, query, config=config, role="research_planner")
+        bundle = retrieve(camp, query, config=config, role="research_planner", context=context)
         backend = bundle.get("backend", backend)
         choices += [item for item in bundle.get("items", []) if item["record_type"] == "experiment_observation"][:min(relevant, 5)]
-    delivered, seen, seen_sources = [], set(), set()
+    result = {"status": "ready", "cards": [], "budget_chars": char_cap, "budget_tokens": token_cap,
+        "backend": backend, "max_recent": min(max(recent, 0), 2), "max_relevant": min(max(relevant, 0), 5),
+        "full_records_readable": True, "current_observation_id": current[0]["record_id"] if current else None,
+        "omitted_history_count": 0, "delivered_chars": 0}
+    def fits(candidate):
+        candidate["delivered_chars"] = len(canonical(candidate["cards"]))
+        text = canonical(candidate)
+        return len(text) <= char_cap and len(text.encode("utf-8")) <= token_cap
+    seen, seen_sources = set(), set()
     for record in choices:
         if record["record_id"] in seen:
             continue
+        seen.add(record["record_id"])
         body = record.get("body") or next((row["body"] for row in records if row["record_id"] == record["record_id"]), None)
+        if record.get("minimum_feedback_version"):
+            original = store.records(limit=1, observation_id=record["record_id"], context=context)
+            body = original[0]["body"] if original else None
         if body is None:
             continue
+        record = {**record, "body": body}
+        mandatory = bool(current and record["record_id"] == current[0]["record_id"])
         native_sources = tuple(sorted(ref.get("artifact_id") or ref.get("source_ref") or ref.get("path") or ""
             for ref in body.get("source_refs", []) if ref.get("kind") not in {"analysis", "result_analysis", "role_result", "analysis_output"}))
-        if native_sources and native_sources in seen_sources:
+        if native_sources and native_sources in seen_sources and not mandatory:
             continue
-        seen.add(record["record_id"])
-        card = {"record_type": "experiment_observation", "record_id": record["record_id"], "body": body,
-            "source_refs": record["source_refs"], "applicability": record.get("applicability", "compatible_evidence")}
-        trial = {"cards": delivered + [card], "budget_chars": char_cap, "budget_tokens": token_cap, "backend": backend}
-        # Each UTF-8 byte is a conservative tokenizer-independent token upper
-        # bound. Provider's actual request tokenizer is still checked later.
-        if len(canonical(trial)) <= char_cap and len(canonical(trial).encode("utf-8")) <= token_cap:
-            delivered.append(card)
+        card = minimum_observation_card(record, current=mandatory, context=context)
+        trial = {**result, "cards": result["cards"] + [card]}
+        if fits(trial):
+            result = trial
             if native_sources:
                 seen_sources.add(native_sources)
-    return {"cards": delivered, "budget_chars": char_cap, "budget_tokens": token_cap, "backend": backend, "delivered_chars": len(canonical(delivered)),
-        "max_recent": min(recent, 2), "max_relevant": min(relevant, 5), "full_records_readable": True}
+        elif mandatory:
+            handles = card["next_reads"]
+            if not handles:
+                handles = [card["full_record"]["next_read"]]
+            raise ObservationDeliveryRequired(NeedsContext(({"observation_id": record["record_id"],
+                "plan_id": body["plan_id"], "status": "minimum_current_feedback_exceeds_budget",
+                "minimum_chars": len(canonical(trial)), "minimum_utf8_token_upper_bound": len(canonical(trial).encode("utf-8")),
+                "full_record": card["full_record"]},), tuple(ReadRequest(**handle) for handle in handles[:3]),
+                "current_observation_minimum_exceeds_budget", {"budget_chars": char_cap, "budget_tokens": token_cap},
+                {"paid_maintenance_calls": 0}))
+        else:
+            result["omitted_history_count"] += 1
+    fits(result)
+    return result
 
 
 # Fields explicitly moved behind readable references in the versioned adapter.
@@ -391,9 +604,20 @@ def _cost_view(costs) -> tuple[Any, dict]:
         "full_details_readable": True}
 
 
-def compact_planner_view(camp: Path, fullobs: dict) -> dict:
+def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap=16000,
+                         context: dict | None = None) -> dict:
     if not single_plan_enabled(camp):
         return copy.deepcopy(fullobs)
+    if fullobs.get("context_delivery_version") == "observation_card_first.v1":
+        # Recheck the actual request's budget without recapturing projections
+        # as new authoritative heads for their original history sources.
+        result = copy.deepcopy(fullobs)
+        goal = fullobs.get("goal") or _read(Path(camp) / "goal.json")
+        question = str(fullobs.get("current_question") or goal.get("objective") or "")
+        result["experiment_observations"] = recall_observations(camp, question,
+            context={**planner_applicability_context(camp, fullobs), **(context or {})},
+            char_cap=char_cap, token_cap=token_cap)
+        return result
     registry = ContextSourceRegistry(camp)
     result, navigation = {}, []
     def register(key, value):
@@ -426,7 +650,9 @@ def compact_planner_view(camp: Path, fullobs: dict) -> dict:
             result[key] = copy.deepcopy(value)
     goal = fullobs.get("goal") or _read(Path(camp) / "goal.json")
     question = str(fullobs.get("current_question") or goal.get("objective") or "")
-    result["experiment_observations"] = recall_observations(camp, question)
+    result["experiment_observations"] = recall_observations(camp, question,
+        context={**planner_applicability_context(camp, fullobs), **(context or {})},
+        char_cap=char_cap, token_cap=token_cap)
     result["history_navigation"] = navigation
     result["context_delivery_version"] = "observation_card_first.v1"
     return result

@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from .action_planning import digest
 from .schemas import (ResearchExecutionConfig, ResearchPlanEvaluation,
-                      ResearchPlanProposal, ResearchRoundDraft)
+                      ResearchPlanProposal, ResearchRoundDraft, validate_research_task)
 from .research_execution import single_plan_enabled
 
 VERSION = "single_plan_v1"
@@ -53,11 +53,19 @@ def _phase(proposal: dict) -> str:
     return str((proposal.get("evaluation_scope") or {}).get("phase") or "")
 
 
+def validate_task(proposal: dict, observation: dict) -> tuple[str, str]:
+    kind, phase = proposal["task_kind"], _phase(proposal)
+    schedule = observation.get("evaluation_schedule") or (observation.get("goal") or {}).get("evaluation_schedule") or "full_only"
+    validate_research_task(kind, phase, proposal.get("target_candidate_ref"), schedule)
+    return kind, phase
+
+
 def measurement_action(proposal: dict, observation: dict) -> str:
-    phase = _phase(proposal)
-    if proposal["task_kind"] == "confirmation":
-        return "run_confirmation" if (observation.get("evaluation_schedule") or
-            (observation.get("goal") or {}).get("evaluation_schedule")) == "screen_then_confirm" else "run_full"
+    kind, phase = validate_task(proposal, observation)
+    if phase == "diagnostic":
+        return "collect_diagnostics"
+    if kind == "confirmation":
+        return "run_confirmation" if phase == "confirmation_10fold" else "run_full"
     if phase == "screening_2fold":
         return "run_screening"
     return "run_pilot" if phase == "pilot" else "run_full"
@@ -72,11 +80,12 @@ def scientific_projection(spec: dict | None) -> dict:
 
 
 def proposal_cost(proposal: dict, observation: dict) -> dict:
-    kind, target = proposal["task_kind"], proposal.get("target_candidate_ref")
+    kind, phase = validate_task(proposal, observation)
+    target = proposal.get("target_candidate_ref")
     result = {"known": {"training_jobs": None, "gpu_seconds": None}, "predicted": {
         "llm_calls": None, "input_tokens": None, "output_tokens": None, "wall_seconds": None},
         "basis": [], "confidence": "unknown"}
-    if kind == "diagnosis" or _phase(proposal) == "diagnostic":
+    if phase == "diagnostic":
         result.update(known={"training_jobs": 0, "gpu_seconds": 0.0, "feedback_report_count": 1},
                       basis=["Diagnostic task reuses recorded results and needs no training."], confidence="runtime_bound")
         return result
@@ -122,10 +131,8 @@ def proposal_cost(proposal: dict, observation: dict) -> dict:
 def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
     try:
         item = ResearchPlanProposal.model_validate(raw).model_dump()
-        kind, target = item["task_kind"], item.get("target_candidate_ref")
-        phase = _phase(item)
-        if phase not in {"screening_2fold", "confirmation_10fold", "full", "pilot", "diagnostic"}:
-            raise ValueError("evaluation_phase_missing_or_unsupported")
+        kind, phase = validate_task(item, observation)
+        target = item.get("target_candidate_ref")
         if kind == "new_method":
             if target is not None:
                 raise ValueError("new_method_cannot_overwrite_existing_candidate")
@@ -135,14 +142,6 @@ def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
             from .planner import known_candidate_ids
             if not target or target not in known_candidate_ids(observation):
                 raise ValueError("target_candidate_missing_or_unknown")
-        if kind == "diagnosis" and phase != "diagnostic":
-            raise ValueError("diagnosis_must_not_train")
-        if kind == "confirmation" and phase not in {"confirmation_10fold", "full"}:
-            raise ValueError("confirmation_phase_mismatch")
-        schedule = observation.get("evaluation_schedule") or (observation.get("goal") or {}).get("evaluation_schedule")
-        if schedule == "screen_then_confirm" and phase != "diagnostic":
-            if phase != ("confirmation_10fold" if kind == "confirmation" else "screening_2fold"):
-                raise ValueError("task_phase_does_not_match_frozen_schedule")
         if kind in {"confirmation", "validation"} and phase != "diagnostic":
             action = measurement_action(item, observation)
             if target not in (observation.get("eligible_targets") or {}).get(action, []):
@@ -181,6 +180,20 @@ def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
     except (ValidationError, ValueError, TypeError, KeyError) as exc:
         return None, {"proposal_id": raw.get("proposal_id") if isinstance(raw, dict) else None,
             "status": "rejected", "error": str(exc), "raw_digest": digest(raw), "draft": copy.deepcopy(raw)}
+
+
+def pool_summary(proposals: list[dict], evaluations: list[dict], cfg: ResearchExecutionConfig) -> dict:
+    """A feasible proposal counts as compared only with one accepted evaluation."""
+    ids = {row["proposal_id"] for row in proposals}
+    coverage = {pid: sum(row["proposal_id"] == pid for row in evaluations) for pid in ids}
+    missing = sorted(pid for pid, count in coverage.items() if count != 1)
+    count = len(proposals)
+    status = ("no_feasible_plan" if not count else "incomplete" if missing else
+              "complete" if 2 <= count <= 4 else
+              "degraded_singleton" if count == 1 and cfg.allow_degraded_singleton else "incomplete")
+    return {"pool_status": status, "valid_count": count,
+            "evaluation_count": sum(count == 1 for count in coverage.values()),
+            "unevaluated_proposal_ids": missing}
 
 
 def normalize_research_round(raw: Any, observation: dict, *, existing: list[dict] | None = None) -> dict:
@@ -227,8 +240,8 @@ def normalize_research_round(raw: Any, observation: dict, *, existing: list[dict
     preferred = draft.selected_proposal_id
     selected = preferred if preferred in by_id and preferred in evaluation_ids else (ranked[0]["proposal_id"] if ranked else None)
     # Explicit rankings, never container order, provide fallback evidence.
-    count = len(proposals)
-    status = "complete" if 2 <= count <= 4 else "degraded_singleton" if count == 1 and cfg.allow_degraded_singleton else "incomplete" if count else "no_feasible_plan"
+    summary = pool_summary(proposals, evaluations, cfg)
+    count, status = summary["valid_count"], summary["pool_status"]
     ok = bool(selected and status in {"complete", "degraded_singleton"})
     cards = observation.get("experiment_observations") or []
     if isinstance(cards, dict):
@@ -237,8 +250,8 @@ def normalize_research_round(raw: Any, observation: dict, *, existing: list[dict
         cards if r.get("observation_id")],
         "input_observation_digest": digest(round_input(observation)), "target_k": cfg.target_k,
         "proposals": proposals, "evaluations": evaluations, "selected_proposal_id": selected if ok else None,
-        "pool_status": status, "valid_count": count, "shortfall_reason": None if count >= cfg.target_k else
-        "independent_rejections_or_insufficient_distinct_tasks", "selection_rationale": draft.selection_rationale,
+        **summary, "shortfall_reason": "missing_or_nonunique_proposal_evaluations" if summary["unevaluated_proposal_ids"] else
+        None if count >= cfg.target_k else "independent_rejections_or_insufficient_distinct_tasks", "selection_rationale": draft.selection_rationale,
         "selection_source": "provider_selection_with_valid_evaluation" if selected == preferred else
             "valid_evaluation_rank_fallback" if selected else None,
         "validation_records": records, "raw_digest": digest(raw)}
@@ -258,6 +271,8 @@ def decide_research_plan(observation: dict, backend) -> dict:
         first_records = parsed.get("validation_records") or []
         request = {**observation, "plan_repair_request": {"kind": "correct_research_proposals",
             "valid_proposals": parsed.get("valid_proposals") or [],
+            "valid_evaluations": (parsed.get("round") or {}).get("evaluations") or [],
+            "missing_evaluation_ids": (parsed.get("round") or {}).get("unevaluated_proposal_ids") or [],
             "rejected": parsed.get("validation_records") or [],
             "instruction": "Keep valid proposals. Correct failed tasks once and provide explicit evaluations and selection."}}
         corrected = backend(request)

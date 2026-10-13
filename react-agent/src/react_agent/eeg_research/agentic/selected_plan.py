@@ -8,13 +8,15 @@ from __future__ import annotations
 import contextlib
 import copy
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any
 
 from .action_planning import digest
 from .plan_protocol import (config, decide_research_plan, measurement_action,
-                            proposal_cost, round_id, round_input, scientific_projection)
+                            pool_summary, proposal_cost, round_id, round_input,
+                            scientific_projection, validate_task)
 from .research_execution import single_plan_enabled
 from .schemas import SelectedPlan
 
@@ -44,6 +46,7 @@ def load_plan(camp: Path, state: dict | None = None) -> dict | None:
     if not row:
         raise ValueError("selected_plan_projection_missing")
     projected = SelectedPlan.model_validate(row).model_dump()
+    validate_task(projected["proposal"], {"goal": _read(camp / "goal.json")})
     journal = camp / "selected_plans" / (str(plan_id) + ".receipts.jsonl")
     if journal.is_file():
         for line in journal.read_text(encoding="utf-8").splitlines():
@@ -71,16 +74,167 @@ def save_plan(camp: Path, state: dict, plan: dict) -> None:
     save_state(camp, state)
 
 
-def _receipt(camp: Path, plan: dict, kind: str, **fields: Any) -> None:
-    row = {"receipt_id": "plan_receipt_" + digest({"plan": plan["plan_id"], "sequence": len(plan["step_receipts"]),
+def _receipt_row(plan: dict, kind: str, **fields: Any) -> dict:
+    return {"receipt_id": "plan_receipt_" + digest({"plan": plan["plan_id"], "sequence": len(plan["step_receipts"]),
         "kind": kind, "fields": fields})[:24], "plan_id": plan["plan_id"], "kind": kind,
         "sequence": len(plan["step_receipts"]), "time": time.time(), **fields}
+
+
+def _append_plan_receipt(camp: Path, plan: dict, row: dict) -> None:
+    sequence = row["sequence"]
+    if sequence < len(plan["step_receipts"]):
+        if plan["step_receipts"][sequence] != row:
+            raise ValueError("selected_plan_receipt_projection_conflict")
+        return
+    if sequence != len(plan["step_receipts"]):
+        raise ValueError("selected_plan_receipt_sequence_gap")
     path = camp / "selected_plans" / (plan["plan_id"] + ".receipts.jsonl")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         stream.flush()
+        os.fsync(stream.fileno())
     plan["step_receipts"].append(row)
+
+
+def _receipt(camp: Path, plan: dict, kind: str, **fields: Any) -> None:
+    _append_plan_receipt(camp, plan, _receipt_row(plan, kind, **fields))
+
+
+def _publication_path(camp: Path, plan_id: str, decision_id: str, phase: str) -> Path:
+    _path(camp, plan_id)
+    if not decision_id.startswith("d") or not decision_id[1:].isdigit() or int(decision_id[1:]) < 1:
+        raise ValueError("selected_plan_publication_identity_invalid")
+    return camp / "selected_plans" / "publications" / plan_id / (decision_id + "." + phase + ".json")
+
+
+def _step_binding(plan: dict) -> dict:
+    return {**{key: plan.get(key) for key in ("plan_id", "originating_round", "originating_proposal",
+        "scientific_intent_digest", "budget_owner", "current_step", "attempt", "repair_count",
+        "candidate_id", "source_hash", "spec_hash", "approved_scientific_digest")},
+        "proposal_digest": digest(plan["proposal"])}
+
+
+def _validate_publication(camp: Path, plan: dict, prepared: dict) -> tuple[dict, dict]:
+    from .artifacts import request_digest
+    from .schemas import PlannerActionPayload
+    unsigned = {key: value for key, value in prepared.items() if key != "prepare_digest"}
+    if (prepared.get("schema_version") != "eeg_research.plan_step_publication.v1"
+            or prepared.get("prepare_digest") != digest(unsigned)):
+        raise ValueError("selected_plan_publication_prepare_changed")
+    binding, body, intent = prepared["binding"], prepared["body"], prepared["intent"]
+    record, payload = body["decision"], body["execution"]
+    expected = request_digest(request=payload)
+    publication_id = "plan_step_" + digest({"binding": binding, "decision_id": record["decision_id"],
+        "execution_digest": expected})[:32]
+    if (prepared["publication_id"] != publication_id or record.get("step_publication_id") != publication_id
+            or record.get("origin_plan_id") != plan["plan_id"] or record.get("action") != payload.get("action")
+            or record.get("raw_digest") != expected or record.get("execution_digest") != expected
+            or body.get("raw") != payload or intent.get("decision_id") != record["decision_id"]
+            or intent.get("execution_digest") != expected or intent.get("publication_id") != publication_id
+            or intent.get("kind") != "step_intent" or intent.get("plan_id") != plan["plan_id"]
+            or intent.get("step") != binding.get("current_step") or intent.get("attempt") != binding.get("attempt")
+            or intent.get("action") != record.get("action") or payload.get("target_id") != binding.get("candidate_id")):
+        raise ValueError("selected_plan_publication_identity_changed")
+    frozen = _step_binding(plan)
+    if any(binding.get(key) != frozen[key] for key in ("plan_id", "originating_round", "originating_proposal",
+            "scientific_intent_digest", "budget_owner", "proposal_digest")):
+        raise ValueError("selected_plan_publication_plan_changed")
+    PlannerActionPayload.model_validate(payload)
+    return record, intent
+
+
+def _verify_publication_commit(camp: Path, plan: dict, prepared: dict) -> None:
+    from .loop import _read
+    from .artifacts import file_digest
+    record, intent = _validate_publication(camp, plan, prepared)
+    decision_path = camp / "decisions" / (record["decision_id"] + ".json")
+    committed = _read(_publication_path(camp, plan["plan_id"], record["decision_id"], "commit"))
+    if (not committed or committed != {"schema_version": "eeg_research.plan_step_commit.v1",
+            "publication_id": prepared["publication_id"], "prepare_digest": prepared["prepare_digest"],
+            "decision_sha256": file_digest(decision_path), "intent_receipt_id": intent["receipt_id"]}
+            or _read(decision_path) != prepared["body"] or intent not in plan["step_receipts"]):
+        raise ValueError("selected_plan_internal_publication_not_committed")
+
+
+def _publish_step(camp: Path, state: dict, plan: dict, prepared: dict) -> None:
+    """Finish the same frozen publication; no service or budget allocation here."""
+    from .loop import _read, _write
+    from .artifacts import file_digest
+    record, intent = _validate_publication(camp, plan, prepared)
+    decision_path = camp / "decisions" / (record["decision_id"] + ".json")
+    commit_path = _publication_path(camp, plan["plan_id"], record["decision_id"], "commit")
+    if commit_path.is_file():
+        _verify_publication_commit(camp, plan, prepared)
+    else:
+        if prepared["binding"] != _step_binding(plan):
+            raise ValueError("selected_plan_publication_step_changed")
+        if decision_path.is_file():
+            if _read(decision_path) != prepared["body"]:
+                raise ValueError("selected_plan_publication_decision_changed")
+        else:
+            _write(decision_path, prepared["body"], exclusive=True)
+        _append_plan_receipt(camp, plan, intent)
+        _write(commit_path, {"schema_version": "eeg_research.plan_step_commit.v1",
+            "publication_id": prepared["publication_id"], "prepare_digest": prepared["prepare_digest"],
+            "decision_sha256": file_digest(decision_path), "intent_receipt_id": intent["receipt_id"]}, exclusive=True)
+    # A committed journal is authoritative when either mutable projection lags.
+    pointer = state.get("selected_plan") or {}
+    if isinstance(pointer, dict) and pointer.get("plan_id") == plan["plan_id"]:
+        missing = not any(row.get("decision_id") == record["decision_id"] for row in state.get("decisions") or [])
+        if missing:
+            state.setdefault("decisions", []).append(copy.deepcopy(record))
+        if missing or _read(_path(camp, plan["plan_id"])).get("step_receipts") != plan["step_receipts"]:
+            save_plan(camp, state, plan)
+
+
+def recover_step_publications(camp: Path, state: dict) -> None:
+    """Called before ordinary decision validation, including prepare-only exits."""
+    from .loop import _read
+    for path in sorted((camp / "selected_plans" / "publications").glob("plan_*/*.prepare.json")):
+        prepared = _read(path)
+        plan_id = prepared.get("binding", {}).get("plan_id")
+        decision_id = prepared.get("body", {}).get("decision", {}).get("decision_id")
+        if path != _publication_path(camp, str(plan_id or ""), str(decision_id or ""), "prepare"):
+            raise ValueError("selected_plan_publication_path_changed")
+        plan = load_plan(camp, {"selected_plan": {"plan_id": plan_id}})
+        _publish_step(camp, state, plan, prepared)
+
+
+def _native_outcome(before: dict, after: dict) -> dict:
+    # The append-only owner/cost journals remain the authority for resources;
+    # an execution receipt only repairs the action's mutable output projection.
+    from .owner_budget import CAPS, DIMENSIONS
+    protected = set(CAPS.values()) | set(DIMENSIONS) | {key + "_left" for key in DIMENSIONS}
+    protected.update(key for key in before.keys() | after.keys() if key.endswith("_reserved"))
+    protected.update({"goal_id", "decisions", "selected_plan", "latest_research_round", "budget",
+        "budget_owner", "pause_after_step", "last_control_id", "stop_reason", "report_support_status"})
+    return {key: {"before_present": key in before, "before": copy.deepcopy(before.get(key)),
+                  "after_present": key in after, "after": copy.deepcopy(after.get(key))}
+            for key in before.keys() | after.keys() if key not in protected
+            and ((key in before) != (key in after) or before.get(key) != after.get(key))}
+
+
+def _restore_native_outcome(camp: Path, state: dict, record: dict) -> None:
+    from .decision_receipts import LEDGER, _rows
+    receipt = next((row for row in _rows(camp / LEDGER)
+                    if row["receipt_hash"] == record.get("decision_receipt")), None)
+    if not receipt or receipt.get("source") != "native_step":
+        return
+    changes = (receipt.get("result") or {}).get("selected_step_state_delta") or {}
+    pending = []
+    for key, value in changes.items():
+        present, current = key in state, state.get(key)
+        if present == value["after_present"] and current == value["after"]:
+            continue
+        if present != value["before_present"] or current != value["before"]:
+            raise ValueError("selected_plan_native_outcome_projection_conflict:" + key)
+        pending.append((key, value))
+    for key, value in pending:
+        if value["after_present"]:
+            state[key] = copy.deepcopy(value["after"])
+        else:
+            state.pop(key, None)
 
 
 def reflect_control(camp: Path, state: dict) -> None:
@@ -206,9 +360,8 @@ def finish_bounded_engineering_failure(camp: Path, state: dict, error: Any) -> d
 
 
 def _native_step(camp: Path, state: dict, plan: dict, action: str, services: dict, runner=None, *, raw=None) -> bool:
-    """Persist an ordinary native decision, linked by an additional plan receipt."""
-    from .loop import (_apply_action, _finish_step, _next_decision_id, _read, _write,
-                       event, observation, save_state)
+    """Commit an ordinary native decision and its frozen selected-task intent."""
+    from .loop import (_apply_action, _finish_step, _next_decision_id, _read, _write, observation)
     from .artifacts import request_digest
     from .owner_budget import budget_owner
     pending = next((r for r in reversed(plan["step_receipts"]) if r.get("kind") == "step_intent"
@@ -218,7 +371,8 @@ def _native_step(camp: Path, state: dict, plan: dict, action: str, services: dic
     if complete:
         return True
     if pending:
-        body = _read(camp / "decisions" / (pending["decision_id"] + ".json"))
+        from .decision_receipts import read_projected_decision
+        body = read_projected_decision(camp, pending["decision_id"])
         record = body.get("decision") or {}
         payload = body.get("execution") or body.get("raw") or {}
         if not record or request_digest(request=payload) != record.get("execution_digest"):
@@ -237,18 +391,27 @@ def _native_step(camp: Path, state: dict, plan: dict, action: str, services: dic
             "campaign_id": state["goal_id"], "action": action, "ok": True, "executed": False,
             "decision_schema_version": "eeg_research.decision.plan_step.v1",
             "raw_digest": request_digest(request=payload), "execution_digest": request_digest(request=payload)}
-        _write(camp / "decisions" / (decision_id + ".json"), {"decision": record,
-            "raw": payload, "execution": payload}, exclusive=True)
-        state.setdefault("decisions", []).append(record)
-        _receipt(camp, plan, "step_intent", step=plan["current_step"], attempt=plan["attempt"],
-                 action=action, decision_id=decision_id, execution_digest=record["execution_digest"])
-        pending = plan["step_receipts"][-1]
-        save_plan(camp, state, plan)
+        binding = _step_binding(plan)
+        publication_id = "plan_step_" + digest({"binding": binding, "decision_id": decision_id,
+            "execution_digest": record["execution_digest"]})[:32]
+        record["step_publication_id"] = publication_id
+        pending = _receipt_row(plan, "step_intent", step=plan["current_step"], attempt=plan["attempt"],
+            action=action, decision_id=decision_id, execution_digest=record["execution_digest"],
+            publication_id=publication_id)
+        prepared = {"schema_version": "eeg_research.plan_step_publication.v1", "publication_id": publication_id,
+            "binding": binding, "body": {"decision": record, "raw": payload, "execution": payload}, "intent": pending}
+        prepared["prepare_digest"] = digest(prepared)
+        _write(_publication_path(camp, plan["plan_id"], decision_id, "prepare"), prepared, exclusive=True)
+        _publish_step(camp, state, plan, prepared)
     decision = {"decision_id": record["decision_id"], "origin_plan_id": plan["plan_id"],
                 "action": action, "execution": payload, "raw": payload, "ok": True}
-    with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
-        _apply_action(camp, state, action, decision, runner, services, observation(camp))
-    _finish_step(camp, state)
+    if not record.get("executed") and not record.get("consumed"):
+        before = copy.deepcopy(state)
+        with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
+            _apply_action(camp, state, action, decision, runner, services, observation(camp))
+        _finish_step(camp, state, selected_step_outcome=_native_outcome(before, state))
+    elif record.get("executed"):
+        _restore_native_outcome(camp, state, record)
     if state.get("status") in {"blocked", "paused", "cancelled"}:
         return False
     workspace = camp / "candidates" / str(plan.get("candidate_id") or "")
@@ -278,6 +441,9 @@ def verify_internal_decision(camp: Path, state: dict, decision: dict) -> dict | 
     from .artifacts import request_digest
     if not matching or matching.get("execution_digest") != request_digest(request=body):
         raise ValueError("selected_plan_internal_dispatch_without_intent")
+    original = _read_internal_publication(camp, plan, str(decision.get("decision_id") or ""))
+    if original is not None:
+        _verify_publication_commit(camp, plan, original)
     if body.get("target_id") != plan.get("candidate_id"):
         raise ValueError("selected_plan_internal_target_changed")
     if body.get("action") == "run_confirmation" and plan["proposal"]["task_kind"] != "confirmation":
@@ -301,7 +467,23 @@ def verify_step_history(camp: Path, record: dict, payload: Any) -> None:
     if not any(row.get("kind") == "step_intent" and row.get("decision_id") == record.get("decision_id")
                and row.get("execution_digest") == expected for row in plan["step_receipts"]):
         raise ValueError("selected_plan_internal_history_without_intent")
+    if record.get("step_publication_id"):
+        prepared = _read_internal_publication(camp, plan, str(record.get("decision_id") or ""))
+        if prepared is None or prepared.get("publication_id") != record["step_publication_id"]:
+            raise ValueError("selected_plan_internal_publication_prepare_missing")
+        _verify_publication_commit(camp, plan, prepared)
     PlannerActionPayload.model_validate(payload)
+
+
+def _read_internal_publication(camp: Path, plan: dict, decision_id: str) -> dict | None:
+    from .loop import _read
+    record = _read(camp / "decisions" / (decision_id + ".json")).get("decision") or {}
+    if not record.get("step_publication_id"):
+        return None  # Previously published v1 intents keep their original authority.
+    prepared = _read(_publication_path(camp, plan["plan_id"], decision_id, "prepare"))
+    if not prepared:
+        raise ValueError("selected_plan_internal_publication_prepare_missing")
+    return prepared
 
 
 def _select(camp: Path, state: dict, backend) -> dict:
@@ -332,6 +514,11 @@ def _select(camp: Path, state: dict, backend) -> dict:
     if saved:
         if saved.get("input_observation_digest") != digest(round_input(full)):
             raise ValueError("research_round_input_identity_conflict")
+        for item in saved.get("proposals") or []:
+            validate_task(item, full)
+        saved.update(pool_summary(saved.get("proposals") or [], saved.get("evaluations") or [], cfg))
+        if saved["unevaluated_proposal_ids"]:
+            saved.update(selected_proposal_id=None, shortfall_reason="missing_or_nonunique_proposal_evaluations")
         chosen = next((p for p in saved.get("proposals") or [] if p["proposal_id"] == saved.get("selected_proposal_id")), None)
         parsed = {"ok": chosen is not None and saved.get("pool_status") in {"complete", "degraded_singleton"},
             "round": {k: v for k, v in saved.items() if k not in {"proposal_history", "planning_owner"}},
@@ -367,16 +554,17 @@ def _select(camp: Path, state: dict, backend) -> dict:
                     native_round["validation_records"].append({"proposal_id": item["proposal_id"],
                         "status": "rejected", "error": preview.get("reason"), "stage": "complete_task_budget"})
             by_id = {item["proposal_id"]: item for item in feasible}
-            ranking = sorted(native_round["evaluations"], key=lambda item: item["rank"])
+            evaluations = [item for item in native_round["evaluations"] if item["proposal_id"] in by_id]
+            ranking = sorted(evaluations, key=lambda item: item["rank"])
             prior_selected = native_round["selected_proposal_id"]
             selected_id = prior_selected if prior_selected in by_id else next((item["proposal_id"]
                 for item in ranking if item["proposal_id"] in by_id), None)
-            count = len(feasible)
-            native_round.update(proposals=feasible, valid_count=count,
-                pool_status="complete" if count >= 2 else "degraded_singleton" if count == 1 and cfg.allow_degraded_singleton else
-                    "incomplete" if count else "no_feasible_plan")
-            if count < cfg.target_k:
-                native_round["shortfall_reason"] = "independent_validation_or_complete_task_budget_rejections"
+            native_round.update(proposals=feasible, evaluations=evaluations,
+                                **pool_summary(feasible, evaluations, cfg))
+            native_round["shortfall_reason"] = ("missing_or_nonunique_proposal_evaluations"
+                if native_round["unevaluated_proposal_ids"] else
+                "independent_validation_or_complete_task_budget_rejections"
+                if native_round["valid_count"] < cfg.target_k else None)
             ok = bool(selected_id and native_round["pool_status"] in {"complete", "degraded_singleton"})
             native_round["selected_proposal_id"] = selected_id if ok else None
             if ok and selected_id != prior_selected:
