@@ -368,8 +368,9 @@ def _select(camp: Path, state: dict, backend) -> dict:
                         "status": "rejected", "error": preview.get("reason"), "stage": "complete_task_budget"})
             by_id = {item["proposal_id"]: item for item in feasible}
             ranking = sorted(native_round["evaluations"], key=lambda item: item["rank"])
-            selected_id = next((item["proposal_id"] for item in ranking if item["proposal_id"] in by_id), None)
             prior_selected = native_round["selected_proposal_id"]
+            selected_id = prior_selected if prior_selected in by_id else next((item["proposal_id"]
+                for item in ranking if item["proposal_id"] in by_id), None)
             count = len(feasible)
             native_round.update(proposals=feasible, valid_count=count,
                 pool_status="complete" if count >= 2 else "degraded_singleton" if count == 1 and cfg.allow_degraded_singleton else

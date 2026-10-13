@@ -250,6 +250,8 @@ def supervise(directory: Path) -> None:
     request, intent = _read(directory / "request.json"), _read(directory / "intent.json")
     if file_digest(directory / "request.json") != intent["request_sha256"]:
         raise RuntimeError("multigpu_probe_request_changed")
+    from .owner_budget import engineering_launch_admission
+    engineering_launch_admission(Path(request["camp"]),request["probe_identity"])
     process = {"status": "running", "pid": os.getpid(), "proc_start": _proc_start(os.getpid()), "started_at": time.time()}
     _write(directory / "process.json", process)
     with (directory / "probe.stdout").open("w") as stdout, (directory / "probe.stderr").open("w") as stderr:

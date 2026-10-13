@@ -86,10 +86,11 @@ def _transaction(camp):
         if not conn.execute("SELECT 1 FROM meta WHERE id='baseline'").fetchone():
             initial=_native_used(camp)
             prior=_read(camp/"cost.json")
-            native_rows={row.get("call_id",str(index)):row for index,row in enumerate(_journal(camp,"llm_calls.jsonl"))}
+            native_rows={str(row.get("call_id") or ("legacy_row_"+str(index))):row for index,row in enumerate(_journal(camp,"llm_calls.jsonl"))}
             coverage={key:max(int(prior.get(key+"_known_call_count") or 0),sum(type(row.get(key)) is int for row in native_rows.values())) for key in ("input_tokens","output_tokens")}
             _put(conn, "meta", "baseline", {"used": initial, "call_ids": sorted(_native_ids(camp)),
-                "token_known_counts":coverage,"usd_priced":isinstance(prior.get("api_usd"),(int,float)),"at":time.time()})
+                "token_known_counts":coverage,"initial_usage":{key:{field:row.get(field) for field in ("input_tokens","output_tokens","api_usd")} for key,row in native_rows.items()},
+                "usd_priced":isinstance(prior.get("api_usd"),(int,float)),"at":time.time()})
         yield conn
         conn.execute("COMMIT")
     except BaseException:
@@ -113,8 +114,8 @@ def _all(conn, table):
     return [json.loads(row[0]) for row in conn.execute("SELECT payload FROM " + table)]
 
 
-def _control(camp):
-    if os.environ.get("EEG_EXTERNAL_API_DISABLED", "0").lower() in {"1", "true", "on"}:
+def _control(camp, *, provider=False):
+    if provider and os.environ.get("EEG_EXTERNAL_API_DISABLED", "0").lower() in {"1", "true", "on"}:
         raise OwnerBudgetError("external_api_disabled_by_operator")
     state, control = _read(camp / "campaign_state.json"), _read(camp / "control.json")
     if state.get("status") in {"paused", "cancelled", "completed", "stopped"} or state.get("pause_after_step") or control.get("action") in {"pause", "stop", "cancel"}:
@@ -152,8 +153,10 @@ def _snapshot(conn, camp, owner_id=None):
                 "engineering_multigpu_"+claim["operation_id"] in (_read(camp/"cost.json").get("settled_job_ids") or []))
             if not native_probe_accounted:
                 reserved_unknown[key] += max(0, claim["committed"][key] - actual[key])
+    known = {key:max(used[key],owner_actual[key]) for key in DIMENSIONS}
+    conservative = dict(reserved_unknown)
     for key in DIMENSIONS:
-        used[key] = max(used[key], owner_actual[key]) + reserved_unknown[key]
+        used[key] = known[key] + reserved_unknown[key]
     owners = _all(conn, "owners")
     reserved = resources()
     for row in owners:
@@ -171,33 +174,37 @@ def _snapshot(conn, camp, owner_id=None):
     cap = {key: goal.get(name) if goal.get(name) is not None else config.get(name) for key, name in CAPS.items()}
     for key in ("input_tokens","output_tokens"):
         if cap[key] is not None or cap["total_tokens"] is not None:
-            missing=max(0,baseline["used"]["llm_calls"]-baseline.get("token_known_counts",{}).get(key,0))
+            missing=_historical_unknown_count(camp,baseline,key)
             if missing:
                 bound=config.get("conservative_"+key+"_per_call")
                 if type(bound) is not int or bound<=0:
                     raise OwnerBudgetError("explicit_token_cap_historical_unknown_usage_deferred:"+key)
                 used[key]+=missing*bound
                 used["total_tokens"]+=missing*bound
+                conservative[key]+=missing*bound
+                conservative["total_tokens"]+=missing*bound
     if cap["api_usd"] is not None:
-        legacy_unpriced = 0 if baseline.get("usd_priced") else baseline["used"]["llm_calls"]
-        priced_legacy = {row.get("call_id") for row in _journal(camp,"llm_calls.jsonl")
-            if row.get("call_id") in baseline_ids and isinstance(row.get("api_usd"),(int,float))}
-        legacy_unpriced=max(0,legacy_unpriced-len(priced_legacy))
+        legacy_unpriced = 0 if baseline.get("usd_priced") else _historical_unknown_count(camp,baseline,"api_usd")
         changed_unpriced=[claim for claim in claims if claim["call_id"] not in baseline_ids and claim["requested"]["llm_calls"]>0
             and claim["committed"]["api_usd"]==0 and claim["actual"]["api_usd"]==0
-            and claim.get("settlement_usage",{}).get("api_usd") is None and claim.get("usd_bound_kind")!="configured_price"]
+            and claim.get("settlement_usage",{}).get("api_usd") is None and claim.get("usd_bound_kind")!="configured_price"
+            and claim.get("settlement_usage",{}).get("transport_outcome")!="definitely_not_sent"]
         unpriced_count=legacy_unpriced+len(changed_unpriced)
         if unpriced_count:
             reserve=config.get("conservative_usd_per_request",(goal.get("api_request_policy") or {}).get("unknown_usd_reserve"))
             if not isinstance(reserve,(int,float)) or not math.isfinite(reserve) or reserve<=0:
                 raise OwnerBudgetError("explicit_usd_cap_historical_unpriced_usage_deferred")
             used["api_usd"] += unpriced_count * reserve
+            conservative["api_usd"] += unpriced_count * reserve
 
     unreserved = {key: None if cap[key] is None else max(0, cap[key] - used[key] - reserved[key]) for key in DIMENSIONS}
+    request_view=_native_request_observations(camp,claims)
     result = {"global_caps": cap, "global_spent_and_occupied": used, "top_level_unused_allocations": reserved,
+        "actual_known_subtotals":known,"conservative_resource_remainders":conservative,
+        "unpriced_call_ids":request_view["unpriced"],
         "global_remaining": {key: None if cap[key] is None else max(0, cap[key] - used[key]) for key in DIMENSIONS},
-        "unreserved_available": unreserved, "inflight": [c["call_id"] for c in claims if c["status"] in {"claimed", "inflight"}],
-        "unknown": [c["call_id"] for c in claims if c["status"] == "unknown"], "dimension_units": {"api_usd": "USD", "gpu_seconds": "GPU seconds"}}
+        "unreserved_available": unreserved, "inflight": request_view["inflight"],
+        "unknown":request_view["unknown"],"native_pending_call_ids":request_view["native_pending"], "dimension_units": {"api_usd": "USD", "gpu_seconds": "GPU seconds"}}
     if owner_id:
         row = _get(conn, "owners", owner_id)
         result["owner_remaining"] = _remaining(row) if row else resources()
@@ -220,6 +227,8 @@ def _allocate(conn, camp, owner_id, amount, *, kind, parent_id=None, purpose=Non
     identity = {"owner_id": owner_id, "allocated": resources(amount), "kind": kind, "parent_id": parent_id, "purpose": purpose, "binding": binding or {}}
     old = _get(conn, "owners", owner_id)
     if old:
+        if old["status"]=="released":
+            raise OwnerBudgetError("owner_allocation_already_released")
         if any(old[key] != value for key, value in identity.items()):
             raise OwnerBudgetError("owner_allocation_identity_conflict")
         return old
@@ -308,7 +317,7 @@ def claim_request(camp, *, call_id, operation, role, input_bound, output_bound):
             if existing["operation_id"] != operation or existing["requested"] != amount or existing["role"] != role:
                 raise OwnerBudgetError("claim_identity_conflict")
             return existing
-        _control(camp)
+        _control(camp,provider=True)
         snap = _snapshot(conn, camp)
         dispositions={row.get("call_id") for row in _journal(camp,"api_unknown_dispositions.jsonl")
             if row.get("action")=="abandon_response" and row.get("allow_new_request") is True}
@@ -382,6 +391,13 @@ def settle_request(camp, call_id, usage):
                 elif row["status"]=="unknown" and identity["unconfirmed_charge_possible"] and identity["input_tokens"] is None and identity["output_tokens"] is None:
                     # Explicit native abandonment changes disposition, not usage.
                     return
+                elif (row["status"]=="settled" and usage.get("charge_usage_source")=="durable_owner_provider_settlement"
+                      and row.get("settlement_usage",{}).get("input_tokens")==identity["input_tokens"]
+                      and row.get("settlement_usage",{}).get("output_tokens")==identity["output_tokens"]
+                      and row.get("settlement_usage",{}).get("api_usd")==identity["api_usd"]):
+                    # A lost outer reply may be explicitly abandoned; exact
+                    # persisted provider usage remains a known charge fact.
+                    return
                 else:
                     raise OwnerBudgetError("settlement_identity_conflict")
             else:
@@ -397,11 +413,10 @@ def settle_request(camp, call_id, usage):
                 committed[key] = observed
             elif not_sent:
                 committed[key] = 0
-        if type(usage.get("input_tokens")) is int and type(usage.get("output_tokens")) is int:
-            actual["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
-            committed["total_tokens"] = actual["total_tokens"]
-        elif not_sent:
-            committed["total_tokens"] = 0
+        # Each known component discharges its own remainder. Total tokens
+        # always sum input + completion, including partial provider usage.
+        actual["total_tokens"] = actual["input_tokens"] + actual["output_tokens"]
+        committed["total_tokens"] = committed["input_tokens"] + committed["output_tokens"]
         price = usage.get("api_usd")
         if isinstance(price, (int,float)) and price >= 0 and math.isfinite(price):
             actual["api_usd"] = price
@@ -409,7 +424,8 @@ def settle_request(camp, call_id, usage):
         elif not_sent:
             committed["api_usd"] = 0
         _adjust_consumed(conn, row, {key: committed[key] - row["committed"][key] for key in DIMENSIONS})
-        row.update(actual=actual, committed=committed, settlement_usage=identity, settlement_digest=signature,
+        row.update(actual=actual, committed=committed, settlement_usage=identity,
+                   pricing_proof={key:usage[key] for key in ("pricing_source","pricing_date") if usage.get(key) is not None},settlement_digest=signature,
                    status="unknown" if unknown else "settled", settled_at=time.time())
         _put(conn, "claims", call_id, row)
         # Provider overrun is a recorded fact, never clamped to manufacture compliance.
@@ -448,13 +464,15 @@ def transport_claim(camp, call_id):
 def before_transport(camp, *, call_id, role, input_bound, output_bound):
     camp = Path(camp)
     with _transaction(camp) as conn:
-        _control(camp)
+        _control(camp,provider=True)
         if _get(conn, "meta", "overrun"):
             raise OwnerBudgetError("provider_budget_overrun_requires_reconciliation")
         _check_global_equation(_snapshot(conn,camp))
         row = _get(conn, "claims", call_id)
         if not row or row["status"] != "claimed":
             raise OwnerBudgetError("provider_transport_claim_not_sendable")
+        if row["role"]!=role:
+            raise OwnerBudgetError("provider_transport_claim_role_mismatch")
         if input_bound > row["requested"]["input_tokens"] or output_bound > row["requested"]["output_tokens"]:
             raise OwnerBudgetError("provider_bounds_exceed_claim")
         row.update(status="inflight", transport_started_at=time.time())
@@ -564,11 +582,6 @@ def finish_selected_plan(camp, *, plan_id, observation_digest):
             if row["terminal_observation_digest"] != observation_digest:
                 raise OwnerBudgetError("terminal_observation_conflict")
             return continuation
-        pending = [claim for claim in _all(conn, "claims") if str(claim.get("owner_id") or "").startswith(owner_id) and claim["status"] in {"claimed", "inflight", "unknown"}]
-        if pending:
-            raise OwnerBudgetError("owner_release_requires_reconciliation")
-        # Move the unspent continuation into a top-level owner in one transaction.
-        remaining = _remaining(continuation)
         descendants={owner_id}
         children=_all(conn,"owners")
         changed=True
@@ -577,6 +590,11 @@ def finish_selected_plan(camp, *, plan_id, observation_digest):
             for child in children:
                 if child.get("parent_id") in descendants and child["owner_id"] not in descendants:
                     descendants.add(child["owner_id"]);changed=True
+        pending = [claim for claim in _all(conn, "claims") if claim.get("owner_id") in descendants and claim["status"] in {"claimed", "inflight", "unknown"}]
+        if pending:
+            raise OwnerBudgetError("owner_release_requires_reconciliation")
+        # Move the unspent continuation into a top-level owner in one transaction.
+        remaining = _remaining(continuation)
         for child in children:
             if child["owner_id"] in descendants and child["owner_id"] not in {owner_id,continuation["owner_id"]}:
                 child["status"] = "released"
@@ -644,11 +662,13 @@ def native_cost_floor(camp):
         result = dict(baseline["used"])
         ids = set(baseline["call_ids"])
         result["llm_calls"] += len(_native_ids(Path(camp)) - ids)
-        rows = {row["call_id"]: row for row in _journal(Path(camp), "llm_calls.jsonl") if row.get("call_id") and row["call_id"] not in ids}
-        for row in rows.values():
+        rows = {row["call_id"]: row for row in _journal(Path(camp), "llm_calls.jsonl") if row.get("call_id")}
+        initial=baseline.get("initial_usage") or {}
+        for call_id,row in rows.items():
             for key in ("input_tokens", "output_tokens", "api_usd"):
                 if isinstance(row.get(key), (int,float)):
-                    result[key] += row[key]
+                    before=(initial.get(call_id) or {}).get(key) if call_id in ids else 0
+                    result[key] += max(0,row[key]-(before if isinstance(before,(int,float)) else 0))
         return result
 
 
@@ -798,7 +818,7 @@ def _check_global_equation(snap):
 def mark_transport_dispatched(camp, call_id):
     """The sole HTTP boundary consumes the claim's one transport permit once."""
     with _transaction(Path(camp)) as conn:
-        _control(Path(camp))
+        _control(Path(camp),provider=True)
         claim=_get(conn,"claims",call_id)
         if not claim or claim["status"]!="inflight" or claim.get("dispatched_at"):
             raise OwnerBudgetError("provider_transport_permit_already_used_or_missing")
@@ -876,3 +896,88 @@ def settle_engineering_gpu(camp,probe_id,gpu_seconds,*,uncertain=False):
         _adjust_consumed(conn,row,{key:final[key]-row["committed"][key] for key in DIMENSIONS})
         row.update(committed=final,actual=resources() if uncertain else final,status="unknown" if uncertain else "settled",settled_at=time.time())
         _put(conn,"claims",row["call_id"],row)
+
+
+
+def _historical_unknown_count(camp,baseline,dimension):
+    """Late confirmed usage discharges only its original conservative remainder."""
+    ids=set(baseline["call_ids"])
+    initial=baseline.get("initial_usage") or {}
+    current={row["call_id"]:row for row in _journal(camp,"llm_calls.jsonl") if row.get("call_id")}
+    tracked_unknown=sum(not isinstance((current.get(identity) or {}).get(dimension),(int,float))
+        and (current.get(identity) or {}).get("transport_outcome")!="definitely_not_sent" for identity in ids)
+    opaque=max(0,baseline["used"]["llm_calls"]-len(ids))
+    initial_tracked_known=sum(isinstance((initial.get(identity) or {}).get(dimension),(int,float)) for identity in ids)
+    initial_coverage=baseline.get("token_known_counts",{}).get(dimension,0) if dimension!="api_usd" else sum(isinstance(row.get(dimension),(int,float)) for row in initial.values())
+    opaque_known=max(0,initial_coverage-initial_tracked_known)
+    tracked_initial_sum=sum((initial.get(identity) or {}).get(dimension) or 0 for identity in ids)
+    # A positive persisted known subtotal proves at least one known anonymous
+    # historical call, even when older journals omitted its stable id.
+    if not opaque_known and baseline["used"][dimension]>tracked_initial_sum:
+        opaque_known=1
+    return tracked_unknown+max(0,opaque-opaque_known)
+
+
+def engineering_launch_admission(camp,probe_id):
+    """One claimed engineering check grants one GPU-child launch permit."""
+    if not enabled(camp):
+        return None
+    with _transaction(Path(camp)) as conn:
+        _control(Path(camp))
+        _check_global_equation(_snapshot(conn,Path(camp)))
+        claim=_get(conn,"claims","engineering:"+probe_id)
+        if not claim or claim["status"]!="inflight" or claim.get("gpu_child_dispatched_at"):
+            raise OwnerBudgetError("engineering_gpu_launch_permit_already_used_or_missing")
+        owner=_get(conn,"owners",claim["owner_id"])
+        if not owner or owner["status"]!="active":
+            raise OwnerBudgetError("engineering_gpu_owner_not_active")
+        claim["gpu_child_dispatched_at"]=time.time()
+        _put(conn,"claims",claim["call_id"],claim)
+        return claim
+
+
+
+def settled_provider_usage(camp,call_id):
+    """Known charge proof survives an outer receipt crash; it is not a reply."""
+    if not enabled(camp):
+        return None
+    with _transaction(Path(camp)) as conn:
+        claim=_get(conn,"claims",call_id)
+        usage=(claim or {}).get("settlement_usage") or {}
+        if claim and claim["status"]=="settled" and usage.get("transport_outcome")=="confirmed_response":
+            return {**usage,**(claim.get("pricing_proof") or {})}
+    return None
+
+
+
+def _native_request_observations(camp,claims):
+    """Expose existing native occupancy without creating a second charge."""
+    intents={str(row["call_id"]) for name in ("llm_api_intents.jsonl","api_operation_attempts.jsonl")
+        for row in _journal(camp,name) if row.get("call_id")}
+    settled={str(row["call_id"]):row for row in _journal(camp,"llm_calls.jsonl") if row.get("call_id")}
+    owned={row["call_id"]:row for row in claims}
+    native_ids=intents|set(settled)
+    disposition_ids={str(row["call_id"]) for row in _journal(camp,"api_unknown_dispositions.jsonl")
+        if row.get("call_id") and row.get("action")=="abandon_response"}
+    # A disposition retains its unknown charge; it ends waiting for that reply.
+    known_dispositions=disposition_ids.intersection(native_ids|set(owned))
+    native_unknown={identity for identity,row in settled.items() if row.get("unconfirmed_charge_possible")
+        or row.get("transport_outcome") in {"outcome_unknown","unknown_after_process_exit"}}
+    pending=intents.difference(settled).difference(known_dispositions)
+    inflight={identity for identity in pending if (owned.get(identity) or {}).get("status")!="settled"}|{row["call_id"] for row in claims if row["status"] in {"claimed","inflight"}}
+    unknown=native_unknown|known_dispositions|{row["call_id"] for row in claims if row["status"]=="unknown"}
+    unpriced=set()
+    for identity in native_ids|set(owned):
+        claim=owned.get(identity)
+        if claim and claim["requested"]["llm_calls"]==0:
+            continue
+        source=settled.get(identity) or ((claim or {}).get("settlement_usage") or {})
+        if source.get("transport_outcome")=="definitely_not_sent" or ((claim or {}).get("settlement_usage") or {}).get("transport_outcome")=="definitely_not_sent":
+            continue
+        # SDK usage can be durable before its outer native receipt is written.
+        price=source.get("api_usd")
+        if not isinstance(price,(int,float)):
+            price=((claim or {}).get("settlement_usage") or {}).get("api_usd")
+        if not isinstance(price,(int,float)):
+            unpriced.add(identity)
+    return {"inflight":sorted(inflight),"unknown":sorted(unknown),"unpriced":sorted(unpriced),"native_pending":sorted(pending)}

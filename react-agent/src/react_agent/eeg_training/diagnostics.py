@@ -27,9 +27,11 @@ def training_dynamics(job_dir: Path) -> dict[str, Any]:
     history = job_dir / "history.jsonl"
     if not history.is_file():
         return _item(UNAVAILABLE, reason="history_missing")
-    rows = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines() if line.strip()]
+    from react_agent.eeg_research.agentic.jsonl_read import read_jsonl
+    read = read_jsonl(history, allow_complete_tail=True)
+    rows = read["rows"]
     if not rows:
-        return _item(UNAVAILABLE, reason="history_empty")
+        return _item(UNAVAILABLE, {"history_read": {k: read[k] for k in ("diagnostics", "truncated", "source")}}, reason="history_empty")
     last = rows[-1]
     best = max(rows, key=lambda item: float(item.get("fixed_bank_top1") or 0.0))
     return _item(
@@ -44,6 +46,8 @@ def training_dynamics(job_dir: Path) -> dict[str, Any]:
             "fixed_bank_top1": [row.get("fixed_bank_top1") for row in rows],
             "sample_count": len(rows),
             "definition": "epoch_series_from_history",
+            "coverage": "partial_history" if read["diagnostics"] or read["truncated"] else "complete_history_rows",
+            "history_read": {k: read[k] for k in ("diagnostics", "truncated", "source")},
             "checkpoint_selection": _read_object(job_dir / "selected_checkpoint.json"),
             "training_execution": training_execution(job_dir),
         },

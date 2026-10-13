@@ -15,6 +15,7 @@ def read_jsonl(
     *,
     max_bytes: int = MAX_JSONL_BYTES,
     max_lines: int = MAX_JSONL_LINES,
+    allow_complete_tail: bool = False,
 ) -> dict[str, Any]:
     """Return dict rows plus diagnostics. Missing files are empty, not errors."""
     if not path.is_file():
@@ -32,7 +33,17 @@ def read_jsonl(
     elif size and not text.endswith("\n") and lines:
         incomplete = lines.pop()
         if incomplete.strip():
-            diagnostics.append({"kind": "incomplete_tail", "excerpt": incomplete[:200]})
+            complete = False
+            if allow_complete_tail:
+                try:
+                    complete = isinstance(json.loads(incomplete), dict)
+                except json.JSONDecodeError:
+                    pass
+            if complete:
+                lines.append(incomplete)
+                diagnostics.append({"kind": "complete_tail_without_newline"})
+            else:
+                diagnostics.append({"kind": "incomplete_tail", "excerpt": incomplete[:200]})
     rows: list[dict[str, Any]] = []
     for index, line in enumerate(lines[:max_lines]):
         if not line.strip():

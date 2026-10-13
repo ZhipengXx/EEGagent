@@ -203,12 +203,20 @@ class ResearchPlanProposal(DomainOutput):
     task_kind: Literal["new_method", "confirmation", "diagnosis", "validation"]
     question: str = Field(min_length=1, max_length=1200)
     task_description: str = Field(min_length=1, max_length=2500)
-    target_candidate_ref: str | None = None
+    target_candidate_ref: str | None = Field(default=None, description=(
+        "Existing exact runtime candidate_id for diagnosis, validation or confirmation; new_method uses null."
+        " Use only delivered candidate IDs, such as baseline; method names and example IDs are not targets."))
     scientific_intent: str = Field(min_length=1, max_length=2000)
-    evaluation_scope: dict[str, Any]
+    evaluation_scope: dict[str, Any] = Field(json_schema_extra={
+        "properties": {"phase": {"type": "string", "enum": ["screening_2fold", "confirmation_10fold", "full", "pilot", "diagnostic"]},
+            "folds": {"type": "array", "items": {"type": "string"}}, "seed": {"type": "integer"},
+            "controls": {"type": "array", "items": {"type": "string"}}, "scope": {"type": "string"}},
+        "required": ["phase"]})
     expected_observation: str = Field(min_length=1, max_length=1200)
     completion_condition: str = Field(min_length=1, max_length=1200)
-    required_context_refs: list[str] = Field(default_factory=list, max_length=8)
+    required_context_refs: list[str] = Field(default_factory=list, max_length=8, description=(
+        "Use only delivered verified artifact_id or context:// source refs. Use [] when none are required."
+        " JSON pointers, hashes, paths and prospective sources are not references."))
     cost_assessment: dict[str, Any] = Field(default_factory=dict)
     value_rationale: str = Field(min_length=1, max_length=1500)
 
@@ -223,8 +231,8 @@ class ResearchPlanEvaluation(DomainOutput):
 class ResearchRoundDraft(DomainOutput):
     """Provider drafts have no duplicate selected action or execution metadata."""
     protocol_version: Literal["research_plan_draft.v1"]
-    proposals: list[Any] = Field(max_length=4)
-    evaluations: list[Any] = Field(max_length=4)
+    proposals: list[Any] = Field(max_length=4, json_schema_extra={"items": ResearchPlanProposal.model_json_schema()})
+    evaluations: list[Any] = Field(max_length=4, json_schema_extra={"items": ResearchPlanEvaluation.model_json_schema()})
     selected_proposal_id: str | None = None
     selection_rationale: str = Field(min_length=1, max_length=1800)
 

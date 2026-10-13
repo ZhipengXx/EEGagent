@@ -12,6 +12,12 @@ POLICY_VERSION = "eeg.context.policy.v1"
 RENDER_VERSION = "eeg.context.render.v1"
 
 
+class MaintenanceDeferred(RuntimeError):
+    """Native admission proved the maintenance callback sent no new request."""
+    api_calls_added = 0
+    transport_started = False
+
+
 def canonical(value: Any) -> str:
     # Matches the repository's compaction digest, including full float precision.
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),

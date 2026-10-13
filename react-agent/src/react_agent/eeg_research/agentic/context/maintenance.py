@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
 from .snapshot import GroupBatch, SnapshotStore
-from .types import canonical, digest
+from .types import MaintenanceDeferred, canonical, digest
 from .correction import build_child_request, child_operation_id, register_invalid_draft, split_transport
 
 MAINTENANCE_VERSION = "eeg.context.maintenance.v1"
@@ -275,6 +275,14 @@ class MaintenanceCoordinator:
                     if any(word in last_error for word in ("budget_exceeded", "input_too_large", "source_hash", "stale_source", "revoked", "lease", "source_or_lease_changed")):
                         break
                 except Exception as exc:
+                    if isinstance(exc, MaintenanceDeferred):
+                        calls -= 1
+                        self.store.persistence.release_cached_reservation(turn_id=turn_id, reserved=policy.reserved_cost_per_call)
+                        self.store.persistence.finish_job(job_digest, owner=owner, status="deferred", error=str(exc),
+                            output_chars=output_size, backoff_seconds=policy.backoff_seconds,
+                            generation_deferred_before_transport=calls == 0)
+                        return MaintenanceResult("deferred", **base_result, input_digest=job_digest, reason=str(exc),
+                            calls=calls, input_chars=input_size, output_chars=output_size, elapsed_seconds=time.monotonic() - start)
                     if not invocation_started:
                         calls -= 1
                         self.store.persistence.release_cached_reservation(turn_id=turn_id, reserved=policy.reserved_cost_per_call)

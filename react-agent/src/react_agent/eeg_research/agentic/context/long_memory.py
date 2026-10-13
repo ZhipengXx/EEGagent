@@ -23,6 +23,7 @@ from react_agent.eeg_research.agentic.embedding import canonical, content_hash
 from react_agent.eeg_research.agentic.memory import open_store
 from react_agent.eeg_research.agentic.semantic_memory import require_eeg_campaign, unsafe_source, unsafe_source_path
 from .correction import build_child_request, register_invalid_draft, split_transport
+from .types import MaintenanceDeferred
 
 VERSION = "eeg_research.memory_pipeline.v1"
 CLOSED = {"complete", "completed", "failed", "cancelled", "canceled"}
@@ -402,8 +403,8 @@ class LongMemoryPipeline:
         return {"scanned": len(rows), "revoked": revoked}
 
     def _calls_available(self, conn, turn_id):
-        total = conn.execute("SELECT COUNT(*) FROM memory_pipeline_calls WHERE status<>'cache_adopted'").fetchone()[0]
-        per_turn = conn.execute("SELECT COUNT(*) FROM memory_pipeline_calls WHERE turn_id=? AND status<>'cache_adopted'", (turn_id,)).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM memory_pipeline_calls WHERE status NOT IN ('cache_adopted','deferred_before_transport')").fetchone()[0]
+        per_turn = conn.execute("SELECT COUNT(*) FROM memory_pipeline_calls WHERE turn_id=? AND status NOT IN ('cache_adopted','deferred_before_transport')", (turn_id,)).fetchone()[0]
         return total < self.config.max_calls_per_campaign and per_turn < self.config.max_calls_per_turn
 
     def _request(self, phase: str, digest: str, turn_id: str, payload: dict) -> dict:
@@ -517,7 +518,7 @@ class LongMemoryPipeline:
             if active >= self.config.extraction_concurrency:
                 return {"status": "leased_elsewhere"}
             rows = conn.execute("SELECT * FROM memory_pipeline_jobs WHERE processed=0 AND "
-                "status IN ('pending','failed','leased','needs_sections') AND next_attempt<=? "
+                "(status IN ('pending','failed','leased','needs_sections') OR (status='deferred' AND error LIKE 'native_admission_deferred:%')) AND next_attempt<=? "
                 "AND (lease_until IS NULL OR lease_until<=?) AND attempts<? "
                 "AND NOT (in_flight=1 AND lease_deadline>?) "
                 "AND (last_turn IS NULL OR last_turn<>?) ORDER BY created_at,digest LIMIT ?",
@@ -700,6 +701,18 @@ class LongMemoryPipeline:
                                  (result["status"], request_digest))
                 return result
             except Exception as exc:
+                if isinstance(exc, MaintenanceDeferred):
+                    with self.connect(write=True) as conn:
+                        if call_id:
+                            conn.execute("UPDATE memory_pipeline_calls SET status='deferred_before_transport' WHERE call_id=?", (call_id,))
+                        paid_this_epoch = conn.execute("SELECT 1 FROM memory_pipeline_calls WHERE digest=? AND epoch=? AND status NOT IN ('cache_adopted','deferred_before_transport') LIMIT 1", (claim["digest"], claim["epoch"])).fetchone()
+                        conn.execute("UPDATE memory_pipeline_proposals SET status='deferred_before_transport' WHERE request_digest=? AND response IS NULL", (request_digest,))
+                        reason = "native_admission_deferred:" + str(exc)
+                        if claim["phase"] == "extraction":
+                            conn.execute("UPDATE memory_pipeline_jobs SET status='deferred',error=?,next_attempt=?,lease_owner=NULL,lease_until=NULL,in_flight=0,attempts=MAX(0,attempts-?) WHERE digest=? AND lease_owner=?", (reason, self.clock() + self.config.backoff_seconds, int(not paid_this_epoch), claim["digest"], claim["owner"]))
+                        else:
+                            conn.execute("UPDATE memory_pipeline_writer SET error=?,next_attempt=?,lease_owner=NULL,lease_until=NULL,in_flight=0,attempts=MAX(0,attempts-?) WHERE singleton=1 AND lease_owner=?", (reason, self.clock() + self.config.backoff_seconds, int(not paid_this_epoch), claim["owner"]))
+                    return {"status": "deferred", "reason": str(exc), "digest": claim["digest"], "api_calls": 0}
                 if call_id:
                     self._finish_call(call_id, "failed", {})
                 return self._fail(claim, str(exc))

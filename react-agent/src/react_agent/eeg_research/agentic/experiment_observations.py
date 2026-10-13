@@ -212,24 +212,36 @@ def _native_facts(camp: Path, state: dict, plan: dict) -> tuple[dict, list]:
                 facts.setdefault("metrics", None)
                 facts["missing"] = [key for key in ("scope", "coverage", "seed") if key not in facts]
             elif row["kind"] in {"diagnostic_bundle", "learning_profile"}:
-                from .suite_diagnostics import VERSION as DIAGNOSTIC_VERSION, verified_facts
+                from .suite_diagnostics import VERSION as DIAGNOSTIC_VERSION, select_verified_facts
                 from .artifacts import file_digest
                 if result.get("schema_version") != DIAGNOSTIC_VERSION or result.get("final_test_accessed") is not False:
                     raise ValueError("observation_diagnostic_source_not_native")
                 if any(file_digest(Path(dep["path"])) != dep["sha256"] for dep in result.get("dependencies", [])):
                     raise ValueError("observation_diagnostic_dependencies_changed")
-                verified = [item for item in verified_facts(camp, state, target_ids={target} if target else None, max_facts=12)
-                    if item.get("artifact_id") == ref]
+                selected = select_verified_facts(camp, state, plan, ref, max_facts=12)
+                verified, selection = selected["facts"], copy.deepcopy(selected["selection"])
                 readings = []
+                missing = list(selection["missing"])
                 for item in verified:
                     profile = item.get("learning_profile") or {}
-                    readings.append({key: copy.deepcopy(item[key]) for key in ("candidate_id", "suite_id", "fold_id", "held_out_subject", "seed", "phase", "scope", "source_hash", "method_revision", "job_id", "diagnostics") if key in item} |
+                    readings.append({key: copy.deepcopy(item[key]) for key in ("candidate_id", "suite_id", "fold_id", "held_out_subject", "seed", "phase", "scope", "source_hash", "spec_hash", "method_revision", "job_id", "diagnostics", "source_ref", "source_identity_missing") if key in item} |
                         {"learning_profile": {key: copy.deepcopy(profile[key]) for key in ("status", "reason", "epochs", "best_epoch", "best_fixed_bank_top1", "first_train_loss", "last_train_loss", "read_coverage", "metric_scope") if key in profile}})
+                    label = str(item.get("job_id") or item.get("suite_id") or item.get("fold_id") or "unknown_source")
+                    missing.extend("source_identity:" + label + ":" + field for field in item.get("source_identity_missing", []))
+                    if profile.get("status") != "ready":
+                        missing.append("partial_or_missing_history:" + label)
+                    if (item.get("diagnostics") or {}).get("status") in {"unavailable", "partial"}:
+                        missing.append("partial_or_missing_diagnostic_export:" + label)
+                selection["satisfies_development_read_receipt"] = False
                 facts = {"scope": result["diagnostic_scope"], "metrics": None, "paired_delta_pp": None,
                     "measurement_kind": "existing_development_diagnostic", "source_epoch": result["source_epoch"],
                     "diagnostic_status": result["status"], "summary": copy.deepcopy(result.get("summary") or {}),
+                    "summary_authority": "native_collector_summary_not_planner_read_receipt",
                     "native_diagnostics": readings, "additional_training_jobs": 0,
-                    "missing": [] if readings else [result.get("reason") or "verified_target_diagnostics"],
+                    "diagnostic_selection": selection, "source_count": selection["native_report_source_count"],
+                    "delivered_source_count": selection["delivered_source_count"],
+                    "omitted_scoped_source_count": selection["omitted_scoped_source_count"],
+                    "missing": list(dict.fromkeys(missing)),
                     "independently_replicated": False}
             else:
                 continue
@@ -286,6 +298,11 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
         "engineering_failure": failure if engineering else None,
         "unresolved_questions": copy.deepcopy(plan.get("unresolved_questions") or []),
         "source_refs": sources, "applicability": {"campaign_id": camp.name, "scope": facts.get("scope"), "seed": facts.get("seed"), "scientific_intent_digest": plan.get("scientific_intent_digest")}}
+    if facts.get("measurement_kind") == "existing_development_diagnostic":
+        body["identity"]["binding_level"] = "plan_target_with_per_source_diagnostic_identity"
+        body["identity"]["unknown_top_level_fields"] = [key for key in ("source_hash", "spec_hash", "method_revision")
+            if body["identity"].get(key) is None]
+        body["identity"]["single_scientific_revision_claimed"] = False
     return ExperimentObservationStore(camp).record(body)
 
 
@@ -337,6 +354,43 @@ HISTORY_FIELDS = frozenset({"evidence", "method_screenings", "method_suites", "a
     "stdout", "stderr", "lessons", "retrieved_memory", "verified_development_facts", "latest_comparison", "latest_diagnostics"})
 
 
+def _admission_view(rows) -> tuple[Any, dict]:
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return copy.deepcopy(rows), {}
+    receipt_fields = {"schema_version", "campaign_id", "execution_fingerprint", "refund_on_failure"}
+    common = {key: copy.deepcopy(rows[0][key]) for key in receipt_fields if rows and key in rows[0]
+        and all(key in row and canonical(row[key]) == canonical(rows[0][key]) for row in rows)}
+    compact = [{key: copy.deepcopy(value) for key, value in row.items() if key not in common and key != "committed_at"} for row in rows]
+    return compact, {"version": "candidate_admission_delivery.v1", "common_exact_fields": common,
+        "total_count": len(rows), "omitted_receipt_fields": ["committed_at"], "full_receipts_readable": True}
+
+
+def _cost_view(costs) -> tuple[Any, dict]:
+    if not isinstance(costs, dict):
+        return copy.deepcopy(costs), {}
+    rows = costs.get("by_action_target") if isinstance(costs.get("by_action_target"), dict) else costs
+    archived = {"components", "historical_samples", "full_followup_pipeline_cost", "conditional_followup"}
+    independent = {"diagnose_results", "collect_diagnostics", "retrieve_memory"}
+    result, generic = {}, set()
+    for key, row in rows.items():
+        if not isinstance(key, str) or not isinstance(row, dict):
+            result[key] = copy.deepcopy(row)
+            continue
+        action, _, target = key.partition(":")
+        base = rows.get(action + ":")
+        if target and action in independent and isinstance(base, dict) and canonical(base) == canonical(row):
+            generic.add(action)
+            continue
+        # Known detailed old-action material is readable as one original table;
+        # new/unknown cost/control fields remain literal and require packing.
+        result[key] = {field: copy.deepcopy(value) for field, value in row.items() if field not in archived}
+    view = {**copy.deepcopy(costs), "by_action_target": result} if "by_action_target" in costs else result
+    return view, {"version": "native_action_cost_delivery.v1", "generic_target_independent_actions": sorted(generic),
+        "total_original_rows": len(rows), "delivered_rows": len(result), "archived_detail_fields": sorted(archived),
+        "cost_scope": "native action facts; selected task envelope adds necessary preparation and feedback; future confirmation requires another selected plan",
+        "full_details_readable": True}
+
+
 def compact_planner_view(camp: Path, fullobs: dict) -> dict:
     if not single_plan_enabled(camp):
         return copy.deepcopy(fullobs)
@@ -349,6 +403,16 @@ def compact_planner_view(camp: Path, fullobs: dict) -> dict:
     for key, value in fullobs.items():
         if key in HISTORY_FIELDS:
             register(key, value)
+        elif key in {"candidate_admissions", "inherited_candidate_admissions"}:
+            result[key], projection = _admission_view(value)
+            if projection:
+                register(key, value)
+                result[key + "_projection"] = projection
+        elif key == "action_cost_estimates":
+            result[key], projection = _cost_view(value)
+            if projection:
+                register(key, value)
+                result["action_cost_estimates_projection"] = projection
         elif key == "controller_state" and isinstance(value, dict):
             result[key] = {}
             for field, item in value.items():

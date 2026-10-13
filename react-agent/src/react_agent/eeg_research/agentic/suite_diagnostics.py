@@ -42,7 +42,8 @@ def sources(camp: Path, state: dict) -> list[dict]:
                     "phase": scientific.get("phase", "confirmation_10fold"),
                     "scope": scientific.get("scope", "method_development_benchmark"),
                     "coverage": scientific.get("coverage", len(scientific.get("scores") or [])),
-                    "source_hash": (j.get("manifest") or {}).get("entry_sha256"),
+                    "source_hash": (j.get("manifest") or {}).get("entry_sha256") or record.get("source_hash"),
+                    "spec_hash": record.get("spec_hash"),
                     "method_revision": record.get("method_revision"), "job_id": j.get("job_id", job.name),
                     "resolver_gap": None if j else "job_record_missing",
                     "job_dir": str(job), "freeze_ref": str(path), "freeze_sha256": file_digest(path),
@@ -54,7 +55,7 @@ def sources(camp: Path, state: dict) -> list[dict]:
             job = Path(record["job_dir"]).resolve()
             if not job.is_relative_to(camp):
                 raise ValueError("diagnostic_job_outside_campaign")
-            rows.append({key: record[key] for key in ("candidate_id", "job_id", "seed", "fidelity", "source_hash") if key in record} | {"job_dir": str(job), "scope": "source_development"})
+            rows.append({key: record[key] for key in ("candidate_id", "job_id", "seed", "fidelity", "source_hash", "spec_hash") if key in record} | {"job_dir": str(job), "scope": "source_development"})
     # A ten-fold record supersedes its two-fold navigation, not its historical scores.
     unique = {}
     for row in rows:
@@ -172,9 +173,84 @@ def verified_facts(camp: Path, state: dict, *, job_ids=None, target_ids=None, su
                         continue
                     if job_ids is not None and run.get("job_id") not in job_ids and suite_ids is None:
                         continue
-                    facts.append({key: run.get(key) for key in ("candidate_id", "suite_id", "fold_id", "held_out_subject", "seed", "phase", "scope", "coverage", "source_hash", "method_revision", "job_id", "diagnostics", "learning_profile")} | {"evidence_id": row["evidence_id"], "artifact_id": ref, "artifact_sha256": artifact["sha256"], "final_test_accessed": False})
+                    facts.append({key: run.get(key) for key in ("candidate_id", "suite_id", "fold_id", "held_out_subject", "seed", "phase", "scope", "coverage", "source_hash", "spec_hash", "method_revision", "job_id", "diagnostics", "learning_profile")} | {"evidence_id": row["evidence_id"], "artifact_id": ref, "artifact_sha256": artifact["sha256"], "final_test_accessed": False})
             except (OSError, ValueError, KeyError, TypeError):
                 continue
         if facts:
             break
     return facts[:max_facts]
+
+
+def select_verified_facts(camp: Path, state: dict, plan: dict, artifact_ref: str, *, max_facts=12) -> dict:
+    """Select current task sources before the card cap, without rewriting facts.
+
+    Explicit native refs and scope filters precede recency. The bounded card is
+    an annotation window into the complete immutable diagnostic artifact.
+    """
+    max_facts = max(0, min(int(max_facts), 12))
+    proposal = plan.get("proposal") or {}
+    scope = proposal.get("evaluation_scope") or {}
+    target = plan.get("candidate_id") or proposal.get("target_candidate_ref")
+    report_row = resolve_verified_artifact(camp, artifact_ref)
+    report = _read(report_row["path"])
+    # Existing validation resolves active source identities and dependencies;
+    # defer the delivery cap until after selecting the exact requested report.
+    candidates = [row for row in verified_facts(camp, state, target_ids={target} if target else None,
+        max_facts=max(len(report.get("runs") or []), 12)) if row.get("artifact_id") == artifact_ref]
+    preferred_jobs = list(dict.fromkeys(scope.get("job_ids") or []))
+    preferred_suites = list(dict.fromkeys(scope.get("suite_ids") or []))
+    for ref in proposal.get("required_context_refs") or []:
+        if str(ref).startswith("art_"):
+            matching = [row for row in state.get("evidence") or [] if ref == row.get("artifact_id")
+                or ref == row.get("analysis_artifact_id") or ref in (row.get("artifact_refs") or [])]
+            for row in matching:
+                if row.get("job_id") and row["job_id"] not in preferred_jobs:
+                    preferred_jobs.append(row["job_id"])
+                if row.get("suite_id") and row["suite_id"] not in preferred_suites:
+                    preferred_suites.append(row["suite_id"])
+        elif str(ref).startswith("context://"):
+            from .context.sources import ContextSourceRegistry
+            registry = ContextSourceRegistry(camp)
+            identity = registry.get(ref, role="research_planner").identity
+            if identity.get("job_id") and identity["job_id"] not in preferred_jobs:
+                preferred_jobs.append(identity["job_id"])
+            if identity.get("suite_id") and identity["suite_id"] not in preferred_suites:
+                preferred_suites.append(identity["suite_id"])
+    # A declared job/suite scope restricts the task; refs provide precedence
+    # among its matching sources. Unknown requested identities stay missing.
+    scoped = [row for row in candidates if
+        (not scope.get("job_ids") or row.get("job_id") in scope["job_ids"])
+        and (not scope.get("suite_ids") or row.get("suite_id") in scope["suite_ids"])
+        and (scope.get("seed") is None or row.get("seed") == scope["seed"])
+        and (not scope.get("folds") or row.get("fold_id") in scope["folds"])
+        and (not scope.get("subjects") or row.get("held_out_subject") in scope["subjects"])
+        and (not scope.get("source_hash") or row.get("source_hash") == scope["source_hash"])
+        and (not scope.get("spec_hash") or row.get("spec_hash") == scope["spec_hash"])]
+    current_sources = sources(camp, state)
+    recency = {(row.get("job_id"), row.get("suite_id"), row.get("fold_id")): index
+               for index, row in enumerate(current_sources)}
+    scoped.sort(key=lambda row: (
+        0 if row.get("job_id") in preferred_jobs else 1 if row.get("suite_id") in preferred_suites else 2,
+        -recency.get((row.get("job_id"), row.get("suite_id"), row.get("fold_id")), -1)))
+    selected = scoped[:max_facts]
+    for row in selected:
+        row["source_ref"] = artifact_ref
+        row["source_identity_missing"] = [key for key in ("source_hash", "spec_hash") if row.get(key) is None]
+    delivered_jobs = {row.get("job_id") for row in selected}
+    delivered_suites = {row.get("suite_id") for row in selected}
+    missing = ["requested_job:" + str(job) for job in preferred_jobs if job not in delivered_jobs]
+    missing += ["requested_suite:" + str(suite) for suite in preferred_suites if suite not in delivered_suites]
+    missing += ["requested_subject:" + str(subject) for subject in scope.get("subjects") or []
+                if subject not in {row.get("held_out_subject") for row in selected}]
+    if len(scoped) > len(selected):
+        missing.append("historical_sources_outside_card_window")
+    if not selected:
+        missing.append("verified_scoped_diagnostics")
+    return {"facts": selected, "selection": {"selection_basis": "explicit_refs_and_task_scope_then_latest_related",
+        "native_report_source_count": len(report.get("runs") or []), "target_source_count": len(candidates),
+        "scoped_source_count": len(scoped), "delivered_source_count": len(selected),
+        "omitted_scoped_source_count": max(0, len(scoped) - len(selected)),
+        "outside_scope_source_count": max(0, len(candidates) - len(scoped)),
+        "selected_job_ids": [row.get("job_id") for row in selected], "missing": missing,
+        "complete_source_read_ref": artifact_ref, "complete_source_sha256": report_row["sha256"],
+        "scope_authority": "campaign_history_development_annotation_not_scientific_measurement"}}

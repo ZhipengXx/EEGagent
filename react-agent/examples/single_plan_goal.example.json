@@ -1,0 +1,93 @@
+{
+  "goal_id": "single_plan_example",
+  "objective": "Compare one bounded research task at a time, preserving matched controls and declared evaluation scope.",
+  "task_type": "eeg_image_retrieval",
+  "research_scope": "pooled_subject_retrieval",
+  "evaluation_mode": "loso_method_search",
+  "evaluation_schedule": "screen_then_confirm",
+  "screening": {
+    "fold_count": 2,
+    "selection": "seeded_random_without_replacement",
+    "selection_seed": 0,
+    "subjects": null,
+    "training_recipe": "same_as_confirmation",
+    "min_mean_gain_pp": 0.5,
+    "reuse_compatible_full_fold_runs": true
+  },
+  "confirmation": {
+    "fold_count": 10,
+    "subject_aggregation": "macro_mean",
+    "freeze_method_before_screening": true,
+    "max_exploration_confirmations": 0,
+    "feedback_llm_calls_reserved": 2
+  },
+  "coding_recovery": null,
+  "role_models": {
+    "research_planner": {
+      "model": "deepseek-flash",
+      "max_tokens": 16384
+    }
+  },
+  "benchmark_feedback_enabled": true,
+  "allow_shared_gpus": false,
+  "subject_aggregation": "macro_mean",
+  "benchmark_subjects": [
+    "sub-01",
+    "sub-02",
+    "sub-03",
+    "sub-04",
+    "sub-05",
+    "sub-06",
+    "sub-07",
+    "sub-08",
+    "sub-09",
+    "sub-10"
+  ],
+  "required_fold_count": 10,
+  "checkpoint_policy": "strict_best",
+  "selection_min_delta": 0.001,
+  "method_suite_gpu_seconds_estimate": null,
+  "primary_metric": "benchmark.loso_mean_fixed_gallery_top1",
+  "direction": "maximize",
+  "min_practical_gain_pp": null,
+  "final_test_enabled": false,
+  "max_candidates": 20,
+  "max_training_jobs": 80,
+  "max_llm_calls": 300,
+  "max_gpu_seconds": 288000.0,
+  "max_concurrent_training_jobs": 1,
+  "max_api_usd": null,
+  "max_input_tokens": null,
+  "max_output_tokens": null,
+  "max_total_tokens": null,
+  "max_repairs_per_candidate": 2,
+  "require_audit_before_completion": false,
+  "planner_mode": "compare_options",
+  "action_planning": null,
+  "research_execution": {
+    "version": "single_plan_v1",
+    "target_k": 3,
+    "allow_degraded_singleton": false,
+    "proposal_correction_calls": 1,
+    "max_planner_api_attempts": 2,
+    "max_engineering_repairs": 2,
+    "paid_maintenance": null,
+    "budget": {}
+  },
+  "paid_maintenance": "off",
+  "api_request_policy": {},
+  "allowed_training_actions": [
+    "run_screening",
+    "run_confirmation"
+  ],
+  "confirmation_target_pairs": 1,
+  "training_seeds": [
+    0
+  ],
+  "allowed_changes": [],
+  "frozen_components": [],
+  "schema_version": "eeg_research.v1.9",
+  "memory": {
+    "enabled": true
+  }
+}

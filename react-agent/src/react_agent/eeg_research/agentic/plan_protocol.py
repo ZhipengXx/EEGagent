@@ -66,7 +66,7 @@ def measurement_action(proposal: dict, observation: dict) -> str:
 def scientific_projection(spec: dict | None) -> dict:
     """Engineering attempts may change source bytes; approved science may not."""
     spec = spec or {}
-    return {key: spec.get(key) for key in ("intervention", "hypothesis", "model", "objective", "transform",
+    return {key: spec.get(key) for key in ("intervention", "principal_intervention", "hypothesis", "model", "objective", "transform",
         "parent_candidate_id", "control_candidate_id", "initial_fidelity", "implementation_requirements",
         "required_capability_ids", "evaluation_scope")}
 

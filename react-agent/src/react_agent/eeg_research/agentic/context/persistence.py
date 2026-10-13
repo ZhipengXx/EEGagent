@@ -294,8 +294,8 @@ class ContextPersistence:
 
     def finish_job(self, input_digest: str, *, owner: str, status: str,
                    error: str = "", result_ref: str = "", output_chars: int = 0,
-                   backoff_seconds: float = 0) -> bool:
-        if status not in {"published", "no_signal", "no_op", "failed", "stale", "budget_exhausted"}:
+                   backoff_seconds: float = 0, generation_deferred_before_transport: bool = False) -> bool:
+        if status not in {"published", "no_signal", "no_op", "failed", "stale", "budget_exhausted", "deferred"}:
             raise ValueError("unknown maintenance job outcome")
         with self.db(immediate=True) as db:
             row = db.execute("SELECT lease_owner,status FROM context_maintenance_jobs WHERE input_digest=?", (input_digest,)).fetchone()
@@ -304,4 +304,6 @@ class ContextPersistence:
             db.execute("UPDATE context_maintenance_jobs SET status=?,lease_owner=NULL,lease_until=0,in_flight=0,last_error=?,result_ref=?,output_chars=?,next_attempt_at=? WHERE input_digest=?",
                        (status, error[:2_000], result_ref, output_chars,
                         self.clock() + max(0, backoff_seconds), input_digest))
+            if generation_deferred_before_transport:
+                db.execute("UPDATE context_maintenance_jobs SET retry_count=MAX(0,retry_count-1) WHERE input_digest=?", (input_digest,))
         return True

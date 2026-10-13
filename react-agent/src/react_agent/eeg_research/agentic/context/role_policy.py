@@ -37,6 +37,7 @@ CONTROL_FIELDS = frozenset({
     "full_required_fold_count", "declared_full_primary_metric", "primary_metric", "state", "authoritative_state",
     "task", "intent", "permissions", "resources", "frontier", "active_tasks", "pending_tasks", "current_feedback",
     "selected_research_task", "origin_plan_id", "selected_plan",
+    "candidate_admissions_projection", "inherited_candidate_admissions_projection", "action_cost_estimates_projection",
 })
 FACT_FIELDS = frozenset({"evidence", "method_screenings", "method_suites", "method_suite", "run", "metrics",
     "diagnostics", "verified_training_diagnostics", "latest_comparison", "latest_diagnostics", "checks",

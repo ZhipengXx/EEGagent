@@ -257,6 +257,11 @@ def dispose_unknown_intent(camp: Path, call_id: str, *, reason: str,
         row.update(success=False, error="abandoned_unknown_response", transport_outcome="unknown_after_process_exit",
                    unconfirmed_charge_possible=True, input_tokens=None, output_tokens=None, reasoning_tokens=None,
                    budget_charge_calls=1, cost_status="uncertain")
+        from .owner_budget import settled_provider_usage
+        known=settled_provider_usage(camp,call_id)
+        if known is not None:
+            row.update({key:known.get(key) for key in ("input_tokens","output_tokens","api_usd","pricing_source","pricing_date")})
+            row["charge_usage_source"]="durable_owner_provider_settlement"
         _ledger(camp, row)
     elif call_id not in unresolved_charge_ids(camp):
         raise ValueError("api_intent_not_unresolved")

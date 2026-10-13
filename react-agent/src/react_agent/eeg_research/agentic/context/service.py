@@ -22,7 +22,7 @@ from .recovery import incorporate_partial_reads, recover_context
 from .representations import NARRATIVE_FIELDS, handle, representations_for, source_kind
 from .snapshot import SnapshotStore, _existing_items, _changed_ids, _item_rows
 from .sources import ContextSourceRegistry, pointer_escape
-from .types import Blocked, BudgetConfig, CompileRequest, NeedsContext, Ready, canonical, digest
+from .types import Blocked, BudgetConfig, CompileRequest, MaintenanceDeferred, NeedsContext, Ready, canonical, digest
 
 _TURN = contextvars.ContextVar("eeg_context_turn", default="")
 _ACTIVE = contextvars.ContextVar("eeg_context_service_maintenance", default=False)
@@ -392,14 +392,34 @@ class ContextService:
         elif mode == "batch":
             from ..owner_budget import auxiliary_owner
             with auxiliary_owner(self.camp, purpose="memory_maintenance"):
-                return self.callback(request, **{**kwargs, "maintenance_policy": "batch"})
+                return self._maintenance_callback(request, **{**kwargs, "maintenance_policy": "batch"})
         elif mode == "emergency":
             from ..owner_budget import current_owner
             owner = current_owner(self.camp)
             if not owner or owner.get("kind") != "role_preparation":
-                raise RuntimeError("maintenance_deferred_no_role_preparation_owner")
+                raise MaintenanceDeferred("maintenance_deferred_no_role_preparation_owner")
             kwargs = {**kwargs, "maintenance_policy": "emergency"}
-        return self.callback(request, **kwargs)
+        return self._maintenance_callback(request, **kwargs)
+
+    def _maintenance_callback(self, request, **kwargs):
+        """Keep a zero-transport admission rejection distinct from paid failure."""
+        def journal_ids():
+            ids = set()
+            for name in ("llm_api_intents.jsonl", "api_operation_attempts.jsonl", "llm_calls.jsonl"):
+                path = self.camp / name
+                if path.is_file():
+                    ids.update(json.loads(line).get("call_id") for line in path.read_text(encoding="utf-8").splitlines() if line.strip())
+            return ids - {None}
+        before = journal_ids()
+        try:
+            return self.callback(request, **kwargs)
+        except Exception as exc:
+            rejected = str(exc).startswith(("auxiliary_request_deferred:", "owner_request_unavailable:",
+                "emergency_requires_role_preparation_owner", "batch_requires_unreserved_auxiliary",
+                "paid_maintenance_off_deferred", "paid_maintenance_recovery_cache_miss_deferred"))
+            if rejected and journal_ids() == before:
+                raise MaintenanceDeferred(str(exc)) from exc
+            raise
 
     def _background_maintenance(self, base_turn_id: str):
         """Apply only an explicitly authorized closed-turn recovery scope."""
@@ -445,6 +465,8 @@ class ContextService:
         mode = paid_maintenance_mode(self.camp)
         if mode in {"off", "batch"}:
             return {"status": "deferred", "reason": "paid_maintenance_" + mode, "calls": 0}
+        if mode == "emergency" and budget_report.get("ready_budget_ok"):
+            return {"status": "deferred", "reason": "necessary_context_already_deliverable", "calls": 0}
         if mode == "emergency" and budget_report.get("chars", 0) <= request.budget.high_chars and budget_report.get("provider_budget_ok"):
             return {"status": "deferred", "reason": "no_necessary_context_emergency", "calls": 0}
         token = _ACTIVE.set(True)
@@ -478,6 +500,21 @@ class ContextService:
     def _current_kernel(self, request: CompileRequest, *, callbacks: bool) -> CompileRequest:
         payload = copy.deepcopy(request.payload)
         authority = native_authority(self.camp)
+        from ..research_execution import single_plan_enabled
+        if single_plan_enabled(self.camp) and request.role == "research_planner":
+            from ..experiment_observations import _admission_view
+            controls = authority.get("controls") or {}
+            admissions = controls.get("candidate_admissions")
+            compact, projection = _admission_view(admissions)
+            if projection:
+                block = self.registry.capture(admissions, block_id="planner-history:candidate_admissions",
+                    kind="checks", role=request.role)
+                controls["candidate_admissions"] = compact
+                controls["candidate_admissions_projection"] = {**projection, "receipt_source_ref": block.source_ref,
+                    "source_hash": block.source_hash}
+                authority["delivery_version"] = "single_plan.native_authority_delivery.v1"
+            # CAS and execution still hash/check the complete native authority;
+            # only this provider delivery view shares the compact receipt cards.
         state = _read(self.camp / "campaign_state.json")
         if state and (self.camp / "cost.json").is_file():
             from react_agent.eeg_research.agentic.budget import snapshot as native_budget
@@ -652,7 +689,12 @@ class ContextService:
         groups = self.capture_closed(payload)
         token = _ACTIVE.set(True)
         try:
-            return self.pipeline.run_turn(groups, turn_id=turn_id, callback=callback)
+            result = self.pipeline.run_turn(groups, turn_id=turn_id, callback=callback)
+            if paid_maintenance_mode(self.camp) == "batch":
+                statuses = {item.get("status") for item in result.get("extraction", [])} | {result.get("consolidation", {}).get("status")}
+                if statuses & {"failed", "stale", "blocked", "deferred", "budget_exhausted"}:
+                    result = {**result, "status": "deferred", "reason": "optional_batch_maintenance_deferred"}
+            return result
         finally:
             _ACTIVE.reset(token)
 
@@ -805,7 +847,7 @@ class ContextService:
             nested_statuses.update(row.get("status") for row in memory.get("extraction", []))
             nested_statuses.add(memory.get("consolidation", {}).get("status", memory.get("status")))
             if nested_statuses & {"failed", "stale", "blocked"}:
-                status = "failed"
+                status = "deferred" if paid_maintenance_mode(self.camp) == "batch" else "failed"
             elif nested_statuses & {"budget_exhausted", "deferred", "backoff", "leased", "attempts_exhausted", "concurrency_limit"}:
                 status = "deferred"
             else:

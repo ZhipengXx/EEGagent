@@ -43,7 +43,7 @@ def _framework_dependencies() -> list[dict]:
                  "multigpu_check.py", "multigpu_probe.py", "process_identity.py", "coder.py", "interface.py")]]
     # New phase logic participates in newly created protocol provenance. Old
     # manifests keep their original exact dependency rows and remain strict.
-    paths.extend(Path(__file__).parent / name for name in ("screening.py", "budget.py"))
+    paths.extend(Path(__file__).parent / name for name in ("screening.py", "budget.py", "jsonl_read.py"))
     return [{"path": str(path), "sha256": digest(path)} for path in paths]
 
 

@@ -550,8 +550,13 @@ def _ledger(camp: Path, row: dict[str, Any]) -> None:
         record_usage(camp, call_id=row["call_id"], role=row["role"],
             model=row["requested_model"], mode=row.get("context_mode", "normal"),
             estimated=report["model_tokens"], observed=row["input_tokens"])
-    _price_usage(row,camp=camp)
-    from .owner_budget import enabled, settle_request
+    from .owner_budget import enabled, settle_request, settled_provider_usage
+    if row.get("charge_usage_source")=="durable_owner_provider_settlement":
+        proof=settled_provider_usage(camp,str(row.get("call_id") or ""))
+        if proof is None or any(row.get(key)!=proof.get(key) for key in ("input_tokens","output_tokens","api_usd")):
+            raise LlmUnavailable("owner_charge_usage_proof_mismatch")
+    else:
+        _price_usage(row,camp=camp)
     if enabled(camp) and row.get("resource_claim_id"):
         settle_request(camp, row["resource_claim_id"], row)
     method_mode = _method_api_accounting(camp)
