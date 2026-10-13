@@ -80,6 +80,8 @@ def _collect(camp: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         items.append(row)
 
     state = _read(camp / "campaign_state.json") or {}
+    from react_agent.eeg_research.agentic.decision_receipts import project_decisions
+    project_decisions(camp, state)
     events = read_jsonl(camp / "events.jsonl")
     decision_events = {str(row["decision_id"]): row for row in events["rows"]
                        if row.get("event") == "decision" and row.get("decision_id")}

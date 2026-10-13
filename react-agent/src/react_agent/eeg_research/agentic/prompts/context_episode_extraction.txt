@@ -1,14 +1,16 @@
-Extract one bounded closed-operation EpisodeMemory or return no_signal.
-Pending/running calls and training are not completed experience. Use only the
-given native fact card, verified source IDs/hashes, scope and bounded excerpts.
-Engineering failure differs from a valid negative scientific result. Full
-training fidelity does not establish ten-fold coverage. Keep precise numerical
-facts in their source cards; interpretation does not change them.
-Return {"status":"no_signal"} if no conditional future behavior is supported.
-Otherwise return {"status":"extracted","episode":{"future_behavior":"short
-conditional lesson candidate","interpretation":"bounded source-grounded
-explanation","conditions":[],"source_refs":["exact supplied source ID"]}}.
-Keep the full JSON under 8000 characters. Proposals are not validated lessons,
-new scientific evidence, approval or artifact-read receipts. Use no other IDs,
-permissions or current resource values inferred from a historical source.
-This maintenance request must not invoke another curator, router or summarizer.
+Extract a conditional future behavior from the supplied closed operation, or
+return {"status":"no_signal"}. Use the native fact card, verified source refs
+and bounded excerpts. Pending work is not a completed experience. A negative
+two-fold development screen remains useful feedback, separate from an
+engineering failure and from ten-fold confirmation.
+
+Minimal valid example (replace only source_one with a supplied source ID):
+{"status":"extracted","episode":{"future_behavior":"Compare a matched development screen before confirmation.","interpretation":"This completed development result motivates a matched comparison.","conditions":{"applies_when":"a comparable development protocol is available"},"source_refs":["source_one"]}}
+
+conditions is a nonempty JSON object. Native publication inherits the supplied
+scope, seed, method revision, protocol and screening identities; omit that
+metadata rather than copying it. Any identity you do supply must match its
+source. Engineering failure supports only engineering_repair conditions and
+repair behavior, never a scientific improvement claim. No useful conditional
+behavior means no_signal, not an empty episode. Keep JSON below 8000 characters.
+Do not invoke another memory operation.

@@ -61,7 +61,8 @@ def code_outline(text: str) -> list[dict[str, Any]]:
 
 
 def representations_for(block: SourceBlock, payload: Any, *, role: str, string_cap: int = 1_200,
-                        excerpt_cap: int = 8_000, abstracted=None) -> tuple[list[Representation], list[dict[str, Any]]]:
+                        excerpt_cap: int = 8_000, abstracted=None,
+                        complete_read_paths: frozenset[str] = frozenset()) -> tuple[list[Representation], list[dict[str, Any]]]:
     """Preserve every control/scientific scalar; classify only bulky prose/data.
 
     The adapter deliberately traverses new fields. Unclassified bulky content and
@@ -74,6 +75,11 @@ def representations_for(block: SourceBlock, payload: Any, *, role: str, string_c
     covered_sections: list[str] = []
 
     def visit(value: Any, path: str, key: str = "") -> Any:
+        if path in complete_read_paths:
+            # A verified full-field read must remain literally delivered after
+            # packing. Reading the bytes does not grant execution permission.
+            exact.append(path)
+            return copy.deepcopy(value)
         if isinstance(value, dict):
             if value.get("fidelity") == "PARTIAL" and ("actual_read_scope" in value or "actual_read_scopes" in value):
                 # Exact code pages already bounded by a registry read cannot be

@@ -500,8 +500,8 @@ class GoalSpec(BaseModel):
             raise ValueError("loso_requires_strict_best_checkpoint_policy")
         if self.training_seeds != [0] or self.confirmation_target_pairs != 1:
             raise ValueError("loso_method_runtime_requires_one_seed0_suite_pair")
-        if self.max_concurrent_training_jobs != 1 or not 0 <= self.max_candidates <= 2:
-            raise ValueError("loso_method_runtime_requires_serial_jobs_and_at_most_two_methods")
+        if self.max_concurrent_training_jobs != 1 or not 0 <= self.max_candidates <= 20:
+            raise ValueError("loso_method_runtime_requires_serial_jobs_and_at_most_twenty_methods")
         if not 0 <= self.max_repairs_per_candidate <= 2 or "replicate" in self.allowed_training_actions:
             raise ValueError("loso_method_runtime_requires_bounded_repairs_without_replication")
         return self

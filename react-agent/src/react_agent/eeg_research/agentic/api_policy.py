@@ -12,7 +12,9 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
 ROUND = contextvars.ContextVar("eeg_planner_api_round", default=None)
+ROUND_AUTHORIZATION = contextvars.ContextVar("eeg_planner_round_authorization", default=None)
 ATTEMPTS = "api_operation_attempts.jsonl"
+AUTHORIZATION_BINDINGS = "planner_authorization_bindings.jsonl"
 
 
 class ApiRequestPolicy(BaseModel):
@@ -38,13 +40,94 @@ def api_request_policy(camp: Path) -> ApiRequestPolicy:
 
 @contextlib.contextmanager
 def planner_api_round(camp: Path, round_id: str, max_attempts: int = 6):
+    with authorized_planner_round(camp, round_id, max_attempts=max_attempts):
+        yield
+
+
+def _authorization_completion(camp: Path, authorization: dict) -> str | None:
+    """A created decision or legacy inline flag cannot complete recovery."""
+    from .decision_receipts import read_projected_decision
+    path = camp / "campaign_state.json"
+    state = json.loads(path.read_text()) if path.is_file() else {}
+    before = set(authorization["decision_ids_at_authorization"])
+    for decision in state.get("decisions") or []:
+        decision_id = str(decision.get("decision_id") or "")
+        if not decision_id or decision_id in before or decision.get("ok") is not True or decision.get("executed") is not True:
+            continue
+        projected = read_projected_decision(camp, decision_id)["decision"]
+        if (projected.get("ok") is True and projected.get("executed") is True
+                and projected.get("receipt_status") == "executed" and projected.get("consumed") is True
+                and projected.get("decision_receipt") == decision.get("decision_receipt")):
+            return decision_id
+    return None
+
+
+def _bind_authorized_round(camp: Path, requested_round: str, authorization: dict) -> dict:
+    identity = {"authorization_id": authorization["authorization_id"],
+        "authorization_hash": authorization["authorization_hash"],
+        "parent_planner_round_id": authorization["parent_planner_round_id"],
+        "parent_planner_call_ids": list(authorization["parent_planner_call_ids"]),
+        "max_recovery_calls": min(2, int(authorization["planner_recovery_max_calls"]))}
+    child = "authorized_round_" + hashlib.sha256(json.dumps(identity, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()[:32]
+    path = camp / AUTHORIZATION_BINDINGS
+    with (camp / "api_operation.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.is_file() else []
+        for row in rows:
+            if row.get("authorization_id") == identity["authorization_id"]:
+                if any(row.get(key) != value for key, value in identity.items()) or row.get("child_planner_round_id") != child:
+                    raise ValueError("planner_authorization_binding_conflict")
+                return row
+        row = {"schema_version": "eeg.planner_authorization_binding.v1", **identity,
+            "child_planner_round_id": child, "initial_requested_round_id": requested_round,
+            "created_at": time.time()}
+        with path.open("a") as stream:
+            stream.write(json.dumps(row, sort_keys=True) + "\n")
+            stream.flush(); os.fsync(stream.fileno())
+        return row
+
+
+@contextlib.contextmanager
+def authorized_planner_round(camp: Path, round_id: str, max_attempts: int = 6):
     if not round_id or not 1 <= max_attempts <= 100:
         raise ValueError("invalid_planner_api_round")
     max_attempts = min(max_attempts, api_request_policy(camp).max_attempts_per_planner_round)
+    from .native_authorization import current_authorization
+    authorization = current_authorization(camp)
+    binding = None
+    if authorization is not None:
+        binding = _bind_authorized_round(camp, round_id, authorization)
+        if _authorization_completion(camp, authorization) is None:
+            round_id = binding["child_planner_round_id"]
+            max_attempts = min(max_attempts, binding["max_recovery_calls"])
+        else:
+            binding = None
     token = ROUND.set((str(camp.resolve()), round_id, max_attempts))
+    authorization_token = ROUND_AUTHORIZATION.set(binding)
     try:
         yield
     finally:
+        ROUND_AUTHORIZATION.reset(authorization_token)
+        ROUND.reset(token)
+
+
+@contextlib.contextmanager
+def authorized_memory_api_scope(camp: Path, *, base_turn_id: str, recovery_turn_id: str,
+                                authorization_ref: str):
+    """Only the separately authorized memory turn may leave Planner's quota."""
+    from .native_authorization import current_authorization
+    authorization = current_authorization(camp)
+    if (authorization is None or authorization_ref != authorization["authorization_hash"]
+            or base_turn_id != authorization["parent_memory_turn_id"]
+            or recovery_turn_id != authorization["memory_recovery_turn"]):
+        raise ValueError("memory_authorization_scope_mismatch")
+    token = ROUND.set(None)
+    authorization_token = ROUND_AUTHORIZATION.set(None)
+    try:
+        yield
+    finally:
+        ROUND_AUTHORIZATION.reset(authorization_token)
         ROUND.reset(token)
 
 
@@ -84,6 +167,9 @@ def reserve_operation_attempt(camp: Path, *, operation: str, call_id: str,
     round_ = ROUND.get()
     if round_ and round_[0] != str(camp.resolve()):
         raise LlmUnavailable("planner_api_round_campaign_mismatch")
+    authorization = ROUND_AUTHORIZATION.get()
+    if authorization is not None and (metadata or {}).get("role") != "research_planner":
+        raise LlmUnavailable("planner_recovery_scope_role_mismatch")
     with (camp / "api_operation.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = camp / ATTEMPTS
@@ -95,11 +181,15 @@ def reserve_operation_attempt(camp: Path, *, operation: str, call_id: str,
             raise LlmUnavailable("planner_round_attempt_limit", diagnostics={"planner_round_id": round_[1]})
         safe_metadata = {key: (metadata or {}).get(key) for key in ("role", "task_id", "attempt_id", "input_digest",
             "prompt_hash", "requested_model", "role_config_hash", "role_model_config", "request_trace_ref",
-            "request_system_sha256", "request_user_sha256")}
+            "request_system_sha256", "request_user_sha256", "research_authorization_ref", "parent_planner_round_id",
+            "original_maintenance_turn_id", "maintenance_authorization_ref")}
         row = {**safe_metadata, "operation_id": operation, "call_id": call_id, "operation_attempt": used + 1,
                "planner_round_id": round_[1] if round_ else None,
                "max_operation_attempts": max_attempts, "max_round_attempts": round_[2] if round_ else None,
                "unknown_usd_reserve": reserve_usd, "recorded_at": time.time(), "status": "reserved_before_transport"}
+        if authorization is not None:
+            row.update(research_authorization_ref=authorization["authorization_hash"],
+                       parent_planner_round_id=authorization["parent_planner_round_id"])
         with path.open("a") as stream:
             stream.write(json.dumps(row) + "\n")
             stream.flush()

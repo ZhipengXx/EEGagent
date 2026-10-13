@@ -57,6 +57,10 @@ def native_authority(camp: Path, *, owned_calls: set[str] | None = None) -> dict
     """Use current native truth, accounting only for this upkeep's own calls."""
     state = _read(camp / "campaign_state.json")
     goal = _read(camp / "goal.json")
+    if (camp / "goal.json").is_file():
+        from react_agent.eeg_research.agentic.native_authorization import effective_goal, apply_authorized_scope
+        goal = effective_goal(camp)
+        apply_authorized_scope(camp, state)
     cost = _read(camp / "cost.json")
     controls = {key: state.get(key) for key in (
         "status", "pause_after_step", "live_job", "gpu", "max_candidates", "max_llm_calls",
@@ -381,6 +385,43 @@ class ContextService:
                        "allow_sync_memory_maintenance": False}
         return self.callback(request, **kwargs)
 
+    def _background_maintenance(self, base_turn_id: str):
+        """Apply only an explicitly authorized closed-turn recovery scope."""
+        from react_agent.eeg_research.agentic.native_authorization import authorized_maintenance_turn
+        authorized = authorized_maintenance_turn(self.camp, base_turn_id)
+        if authorized is None:
+            return base_turn_id, self._call_maintenance
+        recovery_turn_id, authorization_ref = authorized
+
+        def callback(request, **kwargs):
+            from react_agent.eeg_research.agentic.api_policy import authorized_memory_api_scope
+            with authorized_memory_api_scope(self.camp, base_turn_id=base_turn_id,
+                    recovery_turn_id=recovery_turn_id, authorization_ref=authorization_ref):
+                return self._call_maintenance(request, **{**kwargs,
+                    "original_maintenance_turn_id": base_turn_id,
+                    "maintenance_authorization_ref": authorization_ref})
+
+        return recovery_turn_id, callback
+
+    def _upkeep_api_allowance(self, request) -> int | None:
+        remaining = request.remaining_api_calls
+        if request.role != "research_planner":
+            return remaining
+        from react_agent.eeg_research.agentic.api_policy import ATTEMPTS, ROUND, api_request_policy
+        round_ = ROUND.get()
+        if round_ is None or round_[0] != str(self.camp.resolve()):
+            return remaining
+        policy = api_request_policy(self.camp)
+        path = self.camp / ATTEMPTS
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.is_file() else []
+        used = sum(row.get("planner_round_id") == round_[1] for row in rows)
+        round_remaining = max(0, min(round_[2], policy.max_attempts_per_planner_round) - used)
+        # The paid Planner request and its existing one-correction allowance
+        # take priority over optional inline summary work. Native reservation
+        # still atomically rechecks every actual call against the same round.
+        allowance = max(0, round_remaining - policy.max_attempts_per_operation)
+        return allowance if remaining is None else min(remaining, allowance)
+
     def _upkeep(self, *, request, blocks, effective_payload, budget_report):
         if self.callback is None or _ACTIVE.get():
             return {"status": "unavailable"}
@@ -397,7 +438,7 @@ class ContextService:
                 effective_chars=budget_report["chars"],
                 provider_high=not budget_report["provider_budget_ok"],
                 authoritative_revision=authoritative_revision(self.camp, self.owned_calls),
-                remaining_api_calls=request.remaining_api_calls,
+                remaining_api_calls=self._upkeep_api_allowance(request),
                 role=request.role, task_id=request.task_id, intent_id=request.intent_id,
                 purpose=request.purpose, identity=request.identity,
                 removable_chars=max(0, budget_report["chars"] - request.budget.target_chars))
@@ -540,6 +581,8 @@ class ContextService:
                     "delivery_scope": r.delivered_scope,
                     "native_read_receipt": False} for r in reads]
                 return replace(targeted, payload=next_payload,
+                               source_blocks=tuple({block.source_ref: block for block in
+                                   (*targeted.source_blocks, *(read.source_block for read in reads if read.source_block is not None))}.values()),
                                allow_semantic_compaction=False,
                                allow_sync_memory_maintenance=False)
             recovery = recover_context(self.compiler, current, result, incorporate=incorporate)
@@ -567,10 +610,11 @@ class ContextService:
     def run_long_memory(self, payload: dict, *, turn_id: str) -> dict:
         if self.pipeline is None or self.callback is None or _ACTIVE.get():
             return {"status": "unavailable"}
+        turn_id, callback = self._background_maintenance(turn_id)
         groups = self.capture_closed(payload)
         token = _ACTIVE.set(True)
         try:
-            return self.pipeline.run_turn(groups, turn_id=turn_id, callback=self._call_maintenance)
+            return self.pipeline.run_turn(groups, turn_id=turn_id, callback=callback)
         finally:
             _ACTIVE.reset(token)
 
@@ -580,11 +624,12 @@ class ContextService:
             return {"status": "unavailable"}
         if remaining_api_calls is not None and remaining_api_calls <= 0:
             return {"status": "budget_exhausted"}
+        turn_id, callback = self._background_maintenance(turn_id)
         self.capture_closed(payload)
         token = _ACTIVE.set(True)
         try:
             # An idle snapshot is independent of one role's transient input size.
-            outcome = MaintenanceCoordinator(self.snapshot, self._call_maintenance).maintain(
+            outcome = MaintenanceCoordinator(self.snapshot, callback).maintain(
                 turn_id=turn_id, idle=True, authoritative_revision=authoritative_revision(self.camp, self.owned_calls),
                 remaining_api_calls=remaining_api_calls, purpose="closed_task_background")
             remaining = max(0, 2 - outcome.calls)
@@ -595,7 +640,7 @@ class ContextService:
                 previous_config = self.pipeline.config
                 self.pipeline.config = replace(previous_config, max_calls_per_turn=min(remaining, previous_config.max_calls_per_turn))
                 try:
-                    memory = self.pipeline.run_turn([], turn_id=turn_id, callback=self._call_maintenance)
+                    memory = self.pipeline.run_turn([], turn_id=turn_id, callback=callback)
                 finally:
                     self.pipeline.config = previous_config
             nested_statuses = {outcome.status}

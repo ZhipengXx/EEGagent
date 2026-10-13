@@ -166,19 +166,66 @@ def object_identity(value, hasher):
     scope = _SCOPE.get()
     if scope is None or not isinstance(value, dict):
         return hasher(value)
-    parts = []
-    retained = []
-    for key, item in sorted(value.items()):
-        if isinstance(item, (FrozenDict, FrozenList)):
-            parts.append((key, "frozen", id(item)))
-            retained.append(item)
-        elif item is None or type(item) in {str, int, float, bool}:
-            parts.append((key, type(item).__name__, item))
-        else:
-            return hasher(value)
-    key = tuple(parts)
+    # Canonical fold identities contain a small mutable ``protocol`` wrapper
+    # around enormous immutable query/map arrays. Fingerprint that wrapper's
+    # structure; only the Frozen leaves may use object identity. Mutable
+    # wrappers are inspected on every lookup, never cached by their own id.
+    unavailable = object()
+
+    def fingerprint(root):
+        retained = []
+        remaining = [256]
+        active = set()
+
+        def visit(item, depth):
+            remaining[0] -= 1
+            if remaining[0] < 0 or depth > 4:
+                return unavailable
+            if isinstance(item, (FrozenDict, FrozenList)):
+                retained.append(item)
+                return (type(item).__name__, id(item))
+            if item is None or type(item) in {str, int, bool}:
+                return (type(item).__name__, item)
+            if type(item) is float:
+                # Python equates -0.0 with 0.0, but their exact JSON differs.
+                return ("float", item.hex())
+            if type(item) not in {dict, list, tuple} or len(item) > 64 or id(item) in active:
+                return unavailable
+            active.add(id(item))
+            try:
+                if type(item) is dict:
+                    if any(type(key) is not str for key in item):
+                        return unavailable
+                    parts = []
+                    for name in sorted(item):
+                        child = visit(item[name], depth + 1)
+                        if child is unavailable:
+                            return unavailable
+                        parts.append((name, child))
+                    return ("dict", tuple(parts))
+                parts = []
+                for child in item:
+                    part = visit(child, depth + 1)
+                    if part is unavailable:
+                        return unavailable
+                    parts.append(part)
+                return (type(item).__name__, tuple(parts))
+            finally:
+                active.remove(id(item))
+
+        return visit(root, 0), retained
+
+    key, retained = fingerprint(value)
+    if key is unavailable:
+        return hasher(value)
     if key not in scope["identities"]:
         # Keep immutable children alive for the key's lifetime. Objects not
         # owned by the JSON cache can otherwise die and have their IDs reused.
-        scope["identities"][key] = (hasher(value), retained)
+        result = hasher(value)
+        # A callback or concurrent producer changing a wrapper during hashing
+        # cannot install that result under the wrapper's previous fingerprint.
+        after, _ = fingerprint(value)
+        if after != key:
+            return result
+        scope["identities"][key] = (result, retained)
     return scope["identities"][key][0]

@@ -32,11 +32,17 @@ def _parser() -> argparse.ArgumentParser:
         "command",
         choices=["create", "start", "run", "status", "pause", "resume", "stop", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents", "validate-goal", "evaluate-export", "evaluate-pack",
                  "study-create", "study-status", "study-run", "study-freeze", "study-evaluate", "study-aggregate",
-                 "suite-retry-fold", "role-config-preview", "screening-dry-run", "dispose-unknown-intent", "detach-candidate", "historical-runtime-preview"],
+                 "suite-retry-fold", "role-config-preview", "screening-dry-run", "dispose-unknown-intent", "detach-candidate", "historical-runtime-preview", "authorize-research-recovery"],
     )
     parser.add_argument("--campaign", default="eeg_retrieval_research_v1")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--request-id", default="")
+    parser.add_argument("--max-candidates", type=int, default=20,
+                        help="authorize-research-recovery only: explicitly approved candidate scope")
+    parser.add_argument("--planner-recovery-max-calls", type=int, default=2)
+    parser.add_argument("--memory-recovery-max-calls", type=int, default=2)
+    parser.add_argument("--parent-planner-round-id", default=None)
+    parser.add_argument("--parent-memory-turn-id", default="native_closed:11")
     parser.add_argument("--gpu", default="0", help="Comma-separated GPU indices for training jobs")
     parser.add_argument("--subject", type=parse_subject_selection, default="all",
                         help="Training subjects, comma-separated; LOSO selects nine source subjects")
@@ -527,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
     if not (camp / "campaign_state.json").is_file():
         print(json.dumps({"error": "campaign_missing"}))
         return 2
-    if args.command in {"start", "resume", "run", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents"}:
+    if args.command in {"start", "resume", "run", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents", "authorize-research-recovery"}:
         from react_agent.eeg_research.agentic.budget_inheritance import delegated_successor
         successor = delegated_successor(camp)
         if successor:
@@ -549,6 +555,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "status":
         print(json.dumps(status_view(camp), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "authorize-research-recovery":
+        from .native_authorization import authorize_research_recovery
+        try:
+            receipt = authorize_research_recovery(camp, authorization_id=args.request_id,
+                max_candidates=args.max_candidates,
+                planner_recovery_max_calls=args.planner_recovery_max_calls,
+                memory_recovery_max_calls=args.memory_recovery_max_calls,
+                parent_planner_round_id=args.parent_planner_round_id,
+                parent_memory_turn_id=args.parent_memory_turn_id)
+        except (ValueError, OSError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
+        print(json.dumps({"status": "research_recovery_authorized", "authorization": receipt}, ensure_ascii=False))
         return 0
     state = load_state(camp)
     if args.command == "detach-candidate":

@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import sqlite3
 import time
 import uuid
@@ -21,10 +22,29 @@ from typing import Any, Callable
 from react_agent.eeg_research.agentic.embedding import canonical, content_hash
 from react_agent.eeg_research.agentic.memory import open_store
 from react_agent.eeg_research.agentic.semantic_memory import require_eeg_campaign, unsafe_source, unsafe_source_path
+from .correction import build_child_request, register_invalid_draft, split_transport
 
 VERSION = "eeg_research.memory_pipeline.v1"
 CLOSED = {"complete", "completed", "failed", "cancelled", "canceled"}
 VALIDATION_LEVELS = {"proposal", "procedural_hint", "preconditions_unknown", "validated"}
+CONDITION_IDENTITIES = ("scope", "seed", "method_revision", "selection_manifest_hash", "screening_subjects",
+                        "evaluation_identity", "protocol_id", "protocol_fingerprint", "method_id", "candidate_id",
+                        "phase", "fidelity", "dataset")
+
+
+def inherited_conditions(payload: dict) -> dict:
+    """Read legacy list conditions as navigation without rewriting old rows."""
+    conditions = payload.get("conditions")
+    if isinstance(conditions, dict):
+        return copy.deepcopy(conditions)
+    if isinstance(conditions, list):
+        scope = payload.get("scientific_scope") or {}
+        if not isinstance(scope, dict):
+            scope = {"scope": scope}
+        return {**{key: value for key, value in scope.items() if key in CONDITION_IDENTITIES},
+                "legacy_condition_text": [value for value in conditions if isinstance(value, str)],
+                "scope": scope.get("scope") or payload.get("scope") or "development"}
+    return {}
 
 
 def valid_source_ref(camp: Path, ref: dict) -> bool:
@@ -136,6 +156,7 @@ class PipelineConfig:
     consolidation_batch: int = 8
     related_limit: int = 8
     lease_seconds: float = 300
+    call_deadline_seconds: float = 600
     extraction_concurrency: int = 2
     max_attempts_per_digest: int = 3
     backoff_seconds: float = 30
@@ -155,6 +176,9 @@ class PipelineConfig:
                 raise ValueError("invalid_pipeline_config:" + name)
         if self.input_chars > 24000 or self.output_chars > 12000 or self.scan_limit > 256:
             raise ValueError("pipeline_budget_exceeds_protocol")
+        if (self.lease_seconds <= 0 or self.call_deadline_seconds <= 0
+                or not math.isfinite(self.lease_seconds) or not math.isfinite(self.call_deadline_seconds)):
+            raise ValueError("invalid_pipeline_lease_deadline")
 
 
 class LongMemoryPipeline:
@@ -217,7 +241,27 @@ class LongMemoryPipeline:
                     record_type TEXT NOT NULL, record_id TEXT NOT NULL, version INTEGER NOT NULL,
                     content_hash TEXT NOT NULL, payload TEXT NOT NULL, created_at REAL NOT NULL,
                     PRIMARY KEY(record_type,record_id,version), UNIQUE(record_type,record_id,content_hash));
+                CREATE TABLE IF NOT EXISTS memory_pipeline_proposals(
+                    request_digest TEXT PRIMARY KEY, parent_digest TEXT NOT NULL,
+                    phase TEXT NOT NULL, request TEXT NOT NULL, response TEXT,
+                    status TEXT NOT NULL, errors TEXT, metadata TEXT, created_at REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS memory_pipeline_consolidation_sections(
+                    sequence INTEGER NOT NULL, record_hash TEXT NOT NULL,
+                    part_index INTEGER NOT NULL, part_total INTEGER NOT NULL,
+                    payload TEXT NOT NULL, processed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(sequence,record_hash,part_index));
             """)
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_pipeline_jobs)")}
+            for name, definition in (("parent_digest", "TEXT"), ("part_index", "INTEGER"),
+                                     ("part_total", "INTEGER"), ("lease_deadline", "REAL NOT NULL DEFAULT 0"),
+                                     ("in_flight", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in columns:
+                    conn.execute("ALTER TABLE memory_pipeline_jobs ADD COLUMN " + name + " " + definition)
+            writer_columns = {row[1] for row in conn.execute("PRAGMA table_info(memory_pipeline_writer)")}
+            for name, definition in (("lease_deadline", "REAL NOT NULL DEFAULT 0"),
+                                     ("in_flight", "INTEGER NOT NULL DEFAULT 0")):
+                if name not in writer_columns:
+                    conn.execute("ALTER TABLE memory_pipeline_writer ADD COLUMN " + name + " " + definition)
             conn.commit()
         finally:
             conn.close()
@@ -358,8 +402,8 @@ class LongMemoryPipeline:
         return {"scanned": len(rows), "revoked": revoked}
 
     def _calls_available(self, conn, turn_id):
-        total = conn.execute("SELECT COUNT(*) FROM memory_pipeline_calls").fetchone()[0]
-        per_turn = conn.execute("SELECT COUNT(*) FROM memory_pipeline_calls WHERE turn_id=?", (turn_id,)).fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM memory_pipeline_calls WHERE status<>'cache_adopted'").fetchone()[0]
+        per_turn = conn.execute("SELECT COUNT(*) FROM memory_pipeline_calls WHERE turn_id=? AND status<>'cache_adopted'", (turn_id,)).fetchone()[0]
         return total < self.config.max_calls_per_campaign and per_turn < self.config.max_calls_per_turn
 
     def _request(self, phase: str, digest: str, turn_id: str, payload: dict) -> dict:
@@ -372,6 +416,97 @@ class LongMemoryPipeline:
             raise ValueError("maintenance_input_too_large")
         return request
 
+    @staticmethod
+    def _sections(value: Any, *, pointer: str = "", max_chars: int = 3_000,
+                  depth: int = 0) -> list[dict]:
+        """Finite exact field/range views, with no fabricated whole-record read."""
+        if depth > 32:
+            raise ValueError("memory_section_nesting_too_deep")
+        if len(canonical(value)) <= max_chars:
+            return [{"json_pointer": pointer or "/", "value": copy.deepcopy(value), "complete": True}]
+        if isinstance(value, str):
+            width = max(128, max_chars // 2)
+            if math.ceil(len(value) / width) > 4_096:
+                raise ValueError("memory_section_count_exceeded")
+            return [{"json_pointer": pointer or "/", "value": value[start:start + width],
+                     "character_range": [start, min(start + width, len(value))],
+                     "original_chars": len(value), "complete": False}
+                    for start in range(0, len(value), width)]
+        if isinstance(value, (dict, list)):
+            items = value.items() if isinstance(value, dict) else enumerate(value)
+            result = []
+            for key, item in items:
+                token = str(key).replace("~", "~0").replace("/", "~1")
+                result.extend(LongMemoryPipeline._sections(item, pointer=pointer + "/" + token,
+                                                          max_chars=max_chars, depth=depth + 1))
+                if len(result) > 4_096:
+                    raise ValueError("memory_section_count_exceeded")
+            return result
+        raise ValueError("memory_exact_scalar_too_large")
+
+    def _split_extraction(self, conn, row, raw):
+        """Create immutable child parts while keeping the original parent intact."""
+        base = {key: copy.deepcopy(value) for key, value in raw.items()
+                if key not in {"fact_card", "excerpts", "section_ids"}}
+        base["source_refs"] = [{key: value for key, value in ref.items() if key != "payload"}
+                               for ref in raw["source_refs"]]
+        try:
+            exact_sections = self._sections(raw.get("fact_card", {}), pointer="/fact_card",
+                                           max_chars=min(3_000, max(256, self.config.input_chars // 4)))
+            # Group consecutive real fields into a bounded part; identities are
+            # inherited unchanged and each part points at the original source.
+            bins, current = [], []
+            refs = [{key: ref[key] for key in ("source_id", "source_hash", "source_revision", "visibility", "campaign_id")
+                     if key in ref} for ref in raw["source_refs"]]
+            for section in exact_sections:
+                candidate = current + [section]
+                card = {key: base[key] for key in ("operation_id", "status", "action", "outcome",
+                        "engineering_failure", "scientific_scope") if key in base}
+                card["fact_card"] = {"source_sections": candidate}
+                try:
+                    probe = self._request("extraction", row["digest"], "section-preview",
+                        {"operation": card, "source_refs": refs, "excerpts": []}) if len(canonical(card)) < self.config.input_chars - 2_000 else None
+                except ValueError:
+                    probe = None
+                if probe is None:
+                    if not current:
+                        raise ValueError("memory_section_kernel_too_large")
+                    bins.append(current)
+                    current = [section]
+                else:
+                    current = candidate
+            if current:
+                bins.append(current)
+            if not bins or len(bins) > 256:
+                raise ValueError("memory_section_parts_exceeded")
+            for index, sections in enumerate(bins):
+                part = {**base, "fact_card": {"source_sections": sections}, "excerpts": [],
+                        "part_lineage": {"parent_digest": row["digest"], "parent_operation_id": raw["operation_id"],
+                                         "parent_source_digest": row["source_digest"],
+                                         "part_index": index, "part_total": len(bins)}}
+                part_digest = content_hash({"version": VERSION, "parent_digest": row["digest"],
+                                            "part": part})
+                conn.execute("INSERT OR IGNORE INTO memory_pipeline_jobs "
+                    "(digest,operation_id,source_digest,payload,status,created_at,parent_digest,part_index,part_total) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)", (part_digest, raw["operation_id"], row["source_digest"],
+                        canonical(part), "pending", self.clock() + (index + 1) * 1e-6,
+                        row["digest"], index, len(bins)))
+            return len(bins)
+        except ValueError as exc:
+            conn.execute("UPDATE memory_pipeline_jobs SET status='deferred',error=? WHERE digest=?",
+                         (str(exc), row["digest"]))
+            return 0
+
+    def _complete_parent(self, conn, row):
+        parent = row["parent_digest"]
+        if not parent:
+            return
+        parts = conn.execute("SELECT processed,status FROM memory_pipeline_jobs WHERE parent_digest=? ORDER BY part_index", (parent,)).fetchall()
+        if len(parts) == row["part_total"] and all(part["processed"] for part in parts):
+            status = "no_signal" if all(part["status"] == "no_signal" for part in parts) else "processed"
+            conn.execute("UPDATE memory_pipeline_jobs SET processed=1,abstracted=0,status=?,error=NULL WHERE digest=? AND status='needs_sections'",
+                         (status, parent))
+
     def claim_extraction(self, turn_id: str) -> dict:
         with self.connect(write=True) as conn:
             now = self.clock()
@@ -382,17 +517,21 @@ class LongMemoryPipeline:
             if active >= self.config.extraction_concurrency:
                 return {"status": "leased_elsewhere"}
             rows = conn.execute("SELECT * FROM memory_pipeline_jobs WHERE processed=0 AND "
-                "status IN ('pending','failed','leased') AND next_attempt<=? "
+                "status IN ('pending','failed','leased','needs_sections') AND next_attempt<=? "
                 "AND (lease_until IS NULL OR lease_until<=?) AND attempts<? "
+                "AND NOT (in_flight=1 AND lease_deadline>?) "
                 "AND (last_turn IS NULL OR last_turn<>?) ORDER BY created_at,digest LIMIT ?",
-                (now, now, self.config.max_attempts_per_digest, turn_id, self.config.scan_limit)).fetchall()
+                (now, now, self.config.max_attempts_per_digest, now, turn_id, self.config.scan_limit)).fetchall()
             for row in rows:
                 raw = json.loads(row["payload"])
+                if row["status"] == "needs_sections":
+                    if conn.execute("SELECT 1 FROM memory_pipeline_jobs WHERE parent_digest=? LIMIT 1", (row["digest"],)).fetchone():
+                        continue
                 if not all(self._valid(conn, ref) for ref in raw["source_refs"]):
                     conn.execute("UPDATE memory_pipeline_jobs SET status='stale',error='source_invalid' WHERE digest=?", (row["digest"],))
                     continue
                 card = {key: raw[key] for key in ("operation_id", "status", "action", "outcome",
-                        "engineering_failure", "scientific_scope", "fact_card", "section_ids") if key in raw}
+                        "engineering_failure", "scientific_scope", "fact_card", "section_ids", "part_lineage") if key in raw}
                 # Exact cards are never cut silently: a producer must split a
                 # large closed group into real sections before retrying.
                 excerpts = raw.get("excerpts") or []
@@ -412,13 +551,20 @@ class LongMemoryPipeline:
                                             {"operation": card, "source_refs": refs, "excerpts": selected})
                 except ValueError:
                     conn.execute("UPDATE memory_pipeline_jobs SET status='needs_sections',error='maintenance_input_too_large' WHERE digest=?", (row["digest"],))
+                    self._split_extraction(conn, row, raw)
                     continue
                 owner = uuid.uuid4().hex
                 conn.execute("UPDATE memory_pipeline_jobs SET status='leased',lease_owner=?,lease_until=?,"
-                    "attempts=attempts+1,last_turn=? WHERE digest=?",
+                    "attempts=attempts+1,last_turn=?,lease_deadline=0,in_flight=0 WHERE digest=?",
                     (owner, now + self.config.lease_seconds, turn_id, row["digest"]))
                 return {"status": "claimed", "phase": "extraction", "digest": row["digest"],
                         "owner": owner, "epoch": row["attempts"] + 1, "request": request}
+            deferred = conn.execute("SELECT digest,error FROM memory_pipeline_jobs WHERE processed=0 "
+                "AND (status='deferred' OR (status='failed' AND attempts>=?)) ORDER BY created_at,digest LIMIT 1",
+                (self.config.max_attempts_per_digest,)).fetchone()
+            if deferred:
+                return {"status": "deferred", "digest": deferred["digest"],
+                        "reason": deferred["error"] or "maintenance_attempts_exhausted"}
             return {"status": "noop", "reason": "no_eligible_closed_operation"}
 
     def _begin_call(self, claim: dict, *, correction=False) -> str:
@@ -438,8 +584,35 @@ class LongMemoryPipeline:
                  "started", None, self.clock()))
         return call_id
 
+    def _renew_claim(self, claim: dict, *, in_flight: bool) -> bool:
+        now = self.clock()
+        with self.connect(write=True) as conn:
+            if claim["phase"] == "extraction":
+                row = conn.execute("SELECT * FROM memory_pipeline_jobs WHERE digest=?", (claim["digest"],)).fetchone()
+                raw = json.loads(row["payload"]) if row else {}
+                matches = row and row["status"] == "leased" and all(self._valid(conn, ref) for ref in raw.get("source_refs", []))
+                table, where, params = "memory_pipeline_jobs", "digest=?", (claim["digest"],)
+            else:
+                row = conn.execute("SELECT * FROM memory_pipeline_writer WHERE singleton=1").fetchone()
+                matches = (row and row["revision"] == claim["base_revision"] and row["baseline"] == claim["baseline"]
+                           and row["input_digest"] == claim["digest"]
+                           and all(self._valid(conn, ref) for ref in claim.get("dependency_refs", [])))
+                table, where, params = "memory_pipeline_writer", "singleton=1", ()
+            if not matches or row["lease_owner"] != claim["owner"]:
+                return False
+            deadline = row["lease_deadline"] or now + 2 * self.config.call_deadline_seconds + self.config.lease_seconds
+            if deadline <= now:
+                return False
+            duration = max(self.config.lease_seconds, self.config.call_deadline_seconds) if in_flight else self.config.lease_seconds
+            conn.execute("UPDATE " + table + " SET lease_until=?,lease_deadline=?,in_flight=? WHERE " + where + " AND lease_owner=?",
+                         (min(deadline, now + duration), deadline, int(in_flight), *params, claim["owner"]))
+        return True
+
     def _finish_call(self, call_id, status, response):
-        usage = response.get("usage") if isinstance(response, dict) else None
+        proposal, metadata = split_transport(response)
+        usage = proposal.get("usage") if isinstance(proposal, dict) else None
+        if metadata.get("cache_adopted") and metadata.get("api_calls", 0) == 0:
+            status = "cache_adopted"
         with self.connect(write=True) as conn:
             conn.execute("UPDATE memory_pipeline_calls SET status=?,usage=? WHERE call_id=?",
                          (status, canonical(usage), call_id))
@@ -449,17 +622,18 @@ class LongMemoryPipeline:
         with self.connect(write=True) as conn:
             if claim["phase"] == "extraction":
                 conn.execute("UPDATE memory_pipeline_jobs SET status='failed',error=?,next_attempt=?,"
-                    "lease_owner=NULL,lease_until=NULL WHERE digest=? AND lease_owner=?",
+                    "lease_owner=NULL,lease_until=NULL,in_flight=0 WHERE digest=? AND lease_owner=?",
                     (str(reason)[:1000], self.clock() + delay, claim["digest"], claim["owner"]))
             else:
                 conn.execute("UPDATE memory_pipeline_writer SET error=?,next_attempt=?,lease_owner=NULL,"
-                    "lease_until=NULL WHERE singleton=1 AND lease_owner=?",
+                    "lease_until=NULL,in_flight=0 WHERE singleton=1 AND lease_owner=?",
                     (str(reason)[:1000], self.clock() + delay, claim["owner"]))
         return {"status": "failed", "reason": str(reason), "digest": claim["digest"]}
 
     def _response(self, value):
         if hasattr(value, "model_dump"):
             value = value.model_dump()
+        value, _ = split_transport(value)
         if not isinstance(value, dict) or unsafe_source(value):
             raise ValueError("maintenance_response_invalid")
         if len(canonical(value)) > self.config.output_chars:
@@ -469,17 +643,66 @@ class LongMemoryPipeline:
     def extract(self, claim: dict, callback: Callable[[dict], dict]) -> dict:
         if claim.get("status") != "claimed" or claim.get("phase") != "extraction":
             return claim
-        try:
-            call_id = self._begin_call(claim)
+        return self._generate_and_publish(claim, callback, self.publish_extraction)
+
+    def _generate_and_publish(self, claim, callback, publisher):
+        base = copy.deepcopy(claim["request"])
+        parent_operation = claim["digest"] + ":generate"
+        request = base
+        response, metadata = None, {}
+        for correction in (False, True):
+            call_id = None
+            semantic_request = {key: value for key, value in request.items() if key != "turn_id"}
+            request_digest = content_hash(semantic_request)
             try:
-                response = callback(copy.deepcopy(claim["request"]))
-                self._finish_call(call_id, "completed", response)
-            except Exception:
-                self._finish_call(call_id, "failed", {})
-                raise
-            return self.publish_extraction(claim, self._response(response))
-        except Exception as exc:
-            return self._fail(claim, str(exc))
+                if not self._renew_claim(claim, in_flight=True):
+                    return self._fail(claim, "maintenance_source_or_lease_changed")
+                call_id = self._begin_call(claim, correction=correction)
+                with self.connect(write=True) as conn:
+                    conn.execute("INSERT OR IGNORE INTO memory_pipeline_proposals VALUES(?,?,?,?,?,?,?,?,?)",
+                        (request_digest, claim["digest"], claim["phase"], canonical(semantic_request), None,
+                         "in_flight", None, None, self.clock()))
+                raw_response = callback(copy.deepcopy(request))
+                response, metadata = split_transport(raw_response)
+                self._finish_call(call_id, "completed", raw_response)
+                with self.connect(write=True) as conn:
+                    conn.execute("UPDATE memory_pipeline_proposals SET response=?,status='proposal_only',metadata=? WHERE request_digest=?",
+                                 (canonical(response), canonical(metadata), request_digest))
+                if not self._renew_claim(claim, in_flight=False):
+                    return self._fail(claim, "maintenance_source_or_lease_changed")
+                try:
+                    result = publisher(claim, self._response(response))
+                except (ValueError, TypeError, KeyError) as exc:
+                    error = str(exc)[:2_000]
+                    with self.connect(write=True) as conn:
+                        conn.execute("UPDATE memory_pipeline_proposals SET status='publication_invalid',errors=? WHERE request_digest=?",
+                                     (canonical([error]), request_digest))
+                    if correction:
+                        return self._fail(claim, error)
+                    invalid_draft_ref = register_invalid_draft(self.camp, response)
+                    request = build_child_request(base, response, [error], parent_operation_id=parent_operation,
+                        kind=claim["phase"] + "_publication", parent_task_ref=str(metadata.get("task_ref") or ""),
+                        invalid_draft_ref=invalid_draft_ref,
+                        max_draft_chars=min(3_000, self.config.input_chars // 4))
+                    if len(canonical(request)) > self.config.input_chars:
+                        # Refer to the already durable draft when its complete
+                        # text would crowd the exact input/source card.
+                        request["maintenance_correction"].pop("bounded_invalid_draft", None)
+                        request["maintenance_correction"]["invalid_draft_ref"] = invalid_draft_ref
+                        request["input_digest"] = content_hash({"parent_input_digest": base["input_digest"],
+                            "maintenance_correction": request["maintenance_correction"]})
+                    if len(canonical(request)) > self.config.input_chars:
+                        return self._fail(claim, "maintenance_correction_input_too_large")
+                    continue
+                with self.connect(write=True) as conn:
+                    conn.execute("UPDATE memory_pipeline_proposals SET status=? WHERE request_digest=?",
+                                 (result["status"], request_digest))
+                return result
+            except Exception as exc:
+                if call_id:
+                    self._finish_call(call_id, "failed", {})
+                return self._fail(claim, str(exc))
+        return self._fail(claim, "maintenance_correction_exhausted")
 
     def publish_extraction(self, claim: dict, response: dict) -> dict:
         response = self._response(response)
@@ -497,6 +720,7 @@ class LongMemoryPipeline:
                 # Explicitly processed, never semantically abstracted.
                 conn.execute("UPDATE memory_pipeline_jobs SET status='no_signal',processed=1,abstracted=0,"
                     "lease_owner=NULL,lease_until=NULL WHERE digest=?", (claim["digest"],))
+                self._complete_parent(conn, row)
                 return {"status": "no_signal", "processed": True, "abstracted": False}
             if response.get("status") not in {"extracted", "success", "ok"}:
                 raise ValueError("extraction_status_invalid")
@@ -515,6 +739,18 @@ class LongMemoryPipeline:
             if isinstance(scope, str):
                 scope = {"scope": scope}
             engineering = bool(raw.get("engineering_failure")) or scope.get("scope") == "engineering_repair"
+            conditions = extracted.get("conditions")
+            if not isinstance(conditions, dict) or not conditions:
+                raise ValueError("extraction_conditions_object_required")
+            # Conditions are a source-inherited object. The model supplies only
+            # additional qualitative applicability; it cannot widen scope.
+            conditions = copy.deepcopy(conditions)
+            for key in CONDITION_IDENTITIES:
+                expected = "engineering_repair" if key == "scope" and engineering else scope.get(key)
+                if expected is not None:
+                    if key in conditions and conditions[key] != expected:
+                        raise ValueError("extraction_conditions_scope_mismatch:" + key)
+                    conditions[key] = copy.deepcopy(expected)
             episode_id = "ep_mem_" + claim["digest"][:24]
             payload = {"schema_version": VERSION + ".episode", "episode_id": episode_id,
                 "origin_campaign_id": self.camp.name, "operation_id": raw["operation_id"],
@@ -530,7 +766,8 @@ class LongMemoryPipeline:
                                                                   for ref in raw["source_refs"]],
                 "future_behavior": str(extracted["future_behavior"]),
                 "interpretation": str(extracted.get("interpretation") or ""),
-                "conditions": extracted.get("conditions") or {}, "status": "extracted",
+                "conditions": conditions, "status": "extracted",
+                **({"part_lineage": raw["part_lineage"]} if raw.get("part_lineage") else {}),
                 "validation_status": "source_validated_interpretation", "processed": True,
                 "abstracted": False, "source_digest": row["source_digest"]}
             self._insert_episode(conn, payload)
@@ -538,6 +775,7 @@ class LongMemoryPipeline:
             self._change(conn, "episode", episode_id, content_hash(payload), "added", payload)
             conn.execute("UPDATE memory_pipeline_jobs SET status='processed',processed=1,abstracted=0,episode_id=?,"
                 "lease_owner=NULL,lease_until=NULL WHERE digest=?", (episode_id, claim["digest"]))
+            self._complete_parent(conn, row)
         return {"status": "processed", "episode_id": episode_id, "processed": True, "abstracted": False}
 
     def _insert_episode(self, conn, payload):
@@ -671,6 +909,8 @@ class LongMemoryPipeline:
                 if kind == "episode" else ("lesson_id", "statement", "conditions", "invalidation_conditions",
                  "supporting_episode_ids", "contradicting_episode_ids", "validation_status", "status"))
         view = {key: payload[key] for key in keys if key in payload}
+        if "conditions" in view:
+            view["conditions"] = inherited_conditions(payload)
         # Large exact fields require a narrower native section, not clipping.
         if len(canonical(view)) > 4000:
             return {"record_id": payload.get("episode_id") or payload.get("lesson_id"),
@@ -695,7 +935,7 @@ class LongMemoryPipeline:
             refs = set(payload.get("supporting_episode_ids") or []) | set(payload.get("contradicting_episode_ids") or [])
             supports = conn.execute("SELECT source_id FROM memory_pipeline_record_sources WHERE record_type='lesson' "
                                    "AND record_id=?", (payload["lesson_id"],)).fetchall()
-            conditions = payload.get("conditions") or {}
+            conditions = inherited_conditions(payload)
             overlaps = [context for context in contexts if isinstance(context, dict) and any(
                 conditions.get(key) is not None and conditions.get(key) == context.get(key)
                 for key in ("scope", "dataset", "intervention", "method_revision", "error_type"))]
@@ -711,73 +951,128 @@ class LongMemoryPipeline:
                 break
         return related
 
+    def _local_record_parts(self, conn, item, payload):
+        """Persist real local sections of one bulky record for bounded progress."""
+        known = conn.execute("SELECT * FROM memory_pipeline_consolidation_sections WHERE sequence=? AND record_hash=? ORDER BY part_index",
+                             (item["sequence"], item["record_hash"])).fetchall()
+        if known:
+            return known
+        head = {key: copy.deepcopy(payload[key]) for key in ("episode_id", "lesson_id", "scope", "kind",
+                "scientific_scope", "engineering_failure", "validation_status") if key in payload}
+        head["conditions"] = inherited_conditions(payload)
+        if len(canonical(head)) > 2_000:
+            raise ValueError("consolidation_exact_identity_kernel_too_large")
+        fields = {key: payload[key] for key in ("future_behavior", "interpretation", "action", "outcome", "fact_card",
+                  "statement", "invalidation_conditions", "supporting_episode_ids", "contradicting_episode_ids") if key in payload}
+        sections = self._sections(fields, max_chars=1_500)
+        bins, current = [], []
+        for section in sections:
+            if current and len(canonical({**head, "source_sections": current + [section]})) > 4_000:
+                bins.append(current); current = []
+            current.append(section)
+        if current:
+            bins.append(current)
+        if not bins or len(bins) > 256:
+            raise ValueError("consolidation_section_parts_exceeded")
+        for index, sections in enumerate(bins):
+            view = {**head, "source_sections": sections, "record_hash": item["record_hash"],
+                    "representation": "partial_source_sections", "complete_record": False,
+                    "part_index": index, "part_total": len(bins),
+                    "local_read_ref": "sqlite:memory_pipeline_changes:" + str(item["sequence"])}
+            conn.execute("INSERT OR IGNORE INTO memory_pipeline_consolidation_sections VALUES(?,?,?,?,?,0)",
+                         (item["sequence"], item["record_hash"], index, len(bins), canonical(view)))
+        return conn.execute("SELECT * FROM memory_pipeline_consolidation_sections WHERE sequence=? AND record_hash=? ORDER BY part_index",
+                            (item["sequence"], item["record_hash"])).fetchall()
+
     def claim_consolidation(self, turn_id: str) -> dict:
         with self.connect(write=True) as conn:
             writer = conn.execute("SELECT * FROM memory_pipeline_writer WHERE singleton=1").fetchone()
             now = self.clock()
-            if writer["lease_until"] and writer["lease_until"] > now:
+            if ((writer["lease_until"] and writer["lease_until"] > now)
+                    or (writer["in_flight"] and writer["lease_deadline"] > now)):
                 return {"status": "leased_elsewhere"}
             changes = [dict(row) for row in conn.execute("SELECT * FROM memory_pipeline_changes "
                 "WHERE sequence>? ORDER BY sequence LIMIT ?", (writer["baseline"], self.config.consolidation_batch)).fetchall()]
             if not changes:
                 return {"status": "noop", "reason": "no_new_changed_or_revoked_source"}
-            digest = content_hash({"version": VERSION, "base_revision": writer["revision"],
-                                   "changes": [(item["sequence"], item["record_hash"], item["change_kind"]) for item in changes]})
-            same = writer["input_digest"] == digest
-            if same and (writer["last_turn"] == turn_id or writer["next_attempt"] > now
-                         or writer["attempts"] >= self.config.max_attempts_per_digest):
-                return {"status": "backoff", "digest": digest}
             if not self._calls_available(conn, turn_id):
                 return {"status": "budget_exhausted"}
-            prepared_changes = []
-            dependency_refs = []
+            prepared_changes, selected, dependency_refs = [], [], []
+            dependencies_by_record = {}
+            section = None
             for item in changes:
                 payload = json.loads(item["payload"])
                 if unsafe_source(payload):
                     return {"status": "blocked", "reason": "consolidation_source_forbidden"}
                 view = self._bounded_record(item["record_type"], payload) if item["record_type"] != "source" else {
                     "source_id": payload.get("source_id"), "source_hash": payload.get("source_hash"), "status": "revoked"}
-                prepared_changes.append({**{k: item[k] for k in ("sequence", "record_type", "record_id", "record_hash", "change_kind")},
+                if view.get("requires_read"):
+                    if selected:
+                        break
+                    try:
+                        parts = self._local_record_parts(conn, item, payload)
+                    except ValueError as exc:
+                        conn.execute("UPDATE memory_pipeline_writer SET error=? WHERE singleton=1", (str(exc),))
+                        return {"status": "deferred", "reason": str(exc), "sequence": item["sequence"]}
+                    unfinished = next((part for part in parts if not part["processed"]), None)
+                    if unfinished is None:
+                        return {"status": "blocked", "reason": "consolidation_section_baseline_inconsistent"}
+                    view = json.loads(unfinished["payload"])
+                    section = {"sequence": item["sequence"], "record_hash": item["record_hash"],
+                               "part_index": unfinished["part_index"], "part_total": unfinished["part_total"]}
+                prepared_changes.append({**{key: item[key] for key in ("sequence", "record_type", "record_id", "record_hash", "change_kind")},
                                          "record": view})
+                selected.append(item)
                 if item["record_type"] == "episode":
                     refs = conn.execute("SELECT s.payload FROM memory_pipeline_record_sources r JOIN memory_pipeline_sources s "
                         "ON r.source_id=s.source_id AND r.source_hash=s.source_hash WHERE r.record_type='episode' AND r.record_id=?",
                         (item["record_id"],)).fetchall()
-                    for ref in refs:
-                        current_ref = json.loads(ref[0])
-                        if self._valid(conn, current_ref):
-                            dependency_refs.append(current_ref)
-            related = self._related(conn, changes)
-            try:
-                request = self._request("consolidation", digest, turn_id,
-                    {"base_revision": writer["revision"], "baseline": writer["baseline"],
-                     "changes": prepared_changes, "related_lessons": related})
-            except ValueError:
-                # Defer bulky batches; never hand the whole archive to Curator.
-                return {"status": "needs_sections", "reason": "maintenance_input_too_large"}
+                    dependencies_by_record[item["record_id"]] = [ref for row in refs if self._valid(conn, ref := json.loads(row[0]))]
+                if section:
+                    break
+            related = self._related(conn, selected)
+            while prepared_changes:
+                digest = content_hash({"version": VERSION, "base_revision": writer["revision"],
+                    "changes": [(item["sequence"], item["record_hash"], item["change_kind"]) for item in selected],
+                    **({"record_section": section} if section else {})})
+                try:
+                    request = self._request("consolidation", digest, turn_id,
+                        {"base_revision": writer["revision"], "baseline": writer["baseline"],
+                         "changes": prepared_changes, "related_lessons": related,
+                         **({"record_section": section} if section else {})})
+                    break
+                except ValueError:
+                    if related:
+                        related = related[:-1]
+                    elif len(prepared_changes) > 1:
+                        prepared_changes.pop(); selected.pop()
+                    else:
+                        conn.execute("UPDATE memory_pipeline_writer SET error='maintenance_input_too_large' WHERE singleton=1")
+                        return {"status": "deferred", "reason": "consolidation_exact_kernel_too_large", "sequence": selected[0]["sequence"]}
+            same = writer["input_digest"] == digest
+            if same and writer["attempts"] >= self.config.max_attempts_per_digest:
+                return {"status": "deferred", "digest": digest, "reason": "maintenance_attempts_exhausted"}
+            if same and (writer["last_turn"] == turn_id or writer["next_attempt"] > now
+                         or writer["attempts"] >= self.config.max_attempts_per_digest):
+                return {"status": "backoff", "digest": digest}
+            through = selected[-1]["sequence"]
+            dependency_refs = [ref for item in selected for ref in dependencies_by_record.get(item["record_id"], [])]
+            if section and section["part_index"] + 1 < section["part_total"]:
+                through = writer["baseline"]
             owner = uuid.uuid4().hex
             epoch = writer["attempts"] + 1 if same else 1
             conn.execute("UPDATE memory_pipeline_writer SET lease_owner=?,lease_until=?,input_digest=?,last_turn=?,"
-                "attempts=?,next_attempt=0,error=NULL WHERE singleton=1",
+                "attempts=?,next_attempt=0,error=NULL,lease_deadline=0,in_flight=0 WHERE singleton=1",
                 (owner, now + self.config.lease_seconds, digest, turn_id, epoch))
             return {"status": "claimed", "phase": "consolidation", "digest": digest, "owner": owner,
                 "epoch": epoch, "base_revision": writer["revision"], "baseline": writer["baseline"],
-                "through_sequence": changes[-1]["sequence"], "dependency_refs": dependency_refs, "request": request}
+                "through_sequence": through, "dependency_refs": dependency_refs, "request": request,
+                **({"record_section": section} if section else {})}
 
     def consolidate(self, claim: dict, callback: Callable[[dict], dict]) -> dict:
         if claim.get("status") != "claimed":
             return claim
-        try:
-            call_id = self._begin_call(claim)
-            try:
-                response = callback(copy.deepcopy(claim["request"]))
-                self._finish_call(call_id, "completed", response)
-            except Exception:
-                self._finish_call(call_id, "failed", {})
-                raise
-            return self.publish(claim, self._response(response))
-        except Exception as exc:
-            return self._fail(claim, str(exc))
+        return self._generate_and_publish(claim, callback, self.publish)
 
     def _episode_refs(self, conn, episode_id):
         rows = conn.execute("SELECT s.payload FROM memory_pipeline_record_sources r JOIN memory_pipeline_sources s "
@@ -808,6 +1103,7 @@ class LongMemoryPipeline:
                 if (not isinstance(text, str) or not text.strip() or not isinstance(conditions, dict)
                         or not conditions or not isinstance(supports, list) or not supports):
                     raise ValueError("memory_proposal_conditions_or_support_missing")
+                conditions = copy.deepcopy(conditions)
                 if not set(supports + counters).issubset(available):
                     raise ValueError("consolidation_unknown_episode_ref")
                 support_refs = []; counter_refs = []; support_payloads = []
@@ -822,17 +1118,25 @@ class LongMemoryPipeline:
                             support_payloads.append(json.loads(row[0]))
                 engineering = any(item.get("scope") == "engineering" or item.get("kind") == "implementation_failure" for item in support_payloads)
                 if engineering and conditions.get("scope") != "engineering_repair":
-                    raise ValueError("engineering_memory_scope_mismatch")
+                    if "scope" in conditions:
+                        raise ValueError("engineering_memory_scope_mismatch")
+                    conditions["scope"] = "engineering_repair"
                 if engineering:
                     import re
                     if re.search(r"(?i)top[_ -]?[15]|accuracy|\b\d+(?:\.\d+)?\s*(?:pp|percentage points)|准确率", text):
                         raise ValueError("engineering_memory_not_scientific_evidence")
+                conditions = copy.deepcopy(conditions)
                 for ep in support_payloads:
                     scope = ep.get("scientific_scope") or {}
-                    if scope.get("scope") == "two_fold_development":
-                        for key in ("scope", "seed", "method_revision", "selection_manifest_hash", "screening_subjects"):
-                            if scope.get(key) is not None and conditions.get(key) != scope[key]:
-                                raise ValueError("screening_lesson_scope_mismatch:" + key)
+                    if isinstance(scope, str):
+                        scope = {"scope": scope}
+                    for key in CONDITION_IDENTITIES:
+                        expected = "engineering_repair" if key == "scope" and engineering else scope.get(key)
+                        if expected is not None:
+                            if key in conditions and conditions[key] != expected:
+                                prefix = "screening_lesson_scope_mismatch:" if scope.get("scope") == "two_fold_development" else "memory_lesson_scope_mismatch:"
+                                raise ValueError(prefix + key)
+                            conditions[key] = copy.deepcopy(expected)
                 status = proposed.get("validation_status", "procedural_hint" if kind == "skill" else "proposal")
                 if status not in VALIDATION_LEVELS:
                     raise ValueError("memory_validation_status_invalid")
@@ -848,7 +1152,8 @@ class LongMemoryPipeline:
                     related_ids = {item.get("lesson_id") for item in related}
                     if kind != "lesson" or record_id not in related_ids:
                         raise ValueError("memory_record_not_supplied_for_update")
-                payload = {**copy.deepcopy(proposed), kind + "_id": record_id, "origin_campaign_id": self.camp.name,
+                payload = {**copy.deepcopy(proposed), "conditions" if kind == "lesson" else "preconditions": conditions,
+                           kind + "_id": record_id, "origin_campaign_id": self.camp.name,
                            "status": "active", "validation_status": status, "is_current": True,
                            "pipeline_schema_version": VERSION, "source_refs": support_refs,
                            "counterexample_source_refs": counter_refs,
@@ -927,6 +1232,10 @@ class LongMemoryPipeline:
                 self._record_sources(conn, kind, record_id, supports, "support")
                 self._record_sources(conn, kind, record_id, counters, "counterexample")
                 accepted.append({"record_type": kind, "record_id": record_id})
+            if claim.get("record_section"):
+                section = claim["record_section"]
+                conn.execute("UPDATE memory_pipeline_consolidation_sections SET processed=1 WHERE sequence=? AND record_hash=? AND part_index=?",
+                             (section["sequence"], section["record_hash"], section["part_index"]))
             conn.execute("UPDATE memory_pipeline_writer SET revision=revision+1,baseline=?,lease_owner=NULL,lease_until=NULL,"
                 "error=NULL,next_attempt=0 WHERE singleton=1 AND revision=? AND lease_owner=?",
                 (claim["through_sequence"], claim["base_revision"], claim["owner"]))

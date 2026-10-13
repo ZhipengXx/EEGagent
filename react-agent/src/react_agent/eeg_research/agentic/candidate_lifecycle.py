@@ -5,6 +5,7 @@ import json
 import os
 import time
 import copy
+import math
 from pathlib import Path
 
 from .action_planning import digest
@@ -122,8 +123,36 @@ def require_reconciled(camp: Path, state: dict) -> None:
             continue
         record = _read(path)
         child = {"pid": record.get("child_pid"), "proc_start": record.get("child_proc_start")}
-        if record.get("status") not in {"finished", "failed", "cancelled", "deadline"} or _alive(record) or _alive(child):
+        if record.get("status") not in {"finished", "failed", "cancelled", "deadline", "invalid"} or _alive(record) or _alive(child):
             raise ValueError("candidate_detach_requires_process_reconciliation")
+        if record.get("status") == "invalid":
+            # Native metrics rejection is terminal scientific invalidity. It
+            # may release a failed branch only after its physical job and GPU
+            # cost have genuinely settled; neither fact becomes successful.
+            job_id = str(record.get("job_id") or directory.name)
+            cost = _read(camp / "cost.json")
+            ended, started, used = record.get("ended_at"), record.get("started_at"), record.get("gpu_seconds")
+            numeric = lambda value: type(value) in (int, float) and math.isfinite(value)
+            if (job_id != directory.name or not isinstance(record.get("pid"), int)
+                    or record["pid"] <= 0 or not record.get("proc_start")
+                    or not numeric(ended) or not numeric(started) or ended < started
+                    or not numeric(used) or used < 0
+                    or job_id not in set(cost.get("settled_job_ids") or [])
+                    or not numeric(cost.get("gpu_seconds_used")) or cost["gpu_seconds_used"] < used):
+                raise ValueError("candidate_detach_requires_invalid_job_settlement")
+            settlement = _read(directory / "settlement.json")
+            if settlement and (settlement.get("status") != "complete" or settlement.get("job_id") != job_id):
+                raise ValueError("candidate_detach_requires_invalid_job_settlement")
+            from .budget import phase_reservation
+            # A suite can settle through its phase receipt instead of the
+            # ordinary per-job settlement file. Outstanding consumed jobs
+            # retain their reservation until native phase settlement.
+            if state.get("active_suite"):
+                progress = _read(camp / "suites" / state["active_suite"] / "suite_state.json")
+                if progress.get("phase_receipt_id"):
+                    reservation = phase_reservation(camp, progress["phase_receipt_id"])
+                    if job_id in set((reservation or {}).get("consumed_job_ids") or []) and job_id not in set((reservation or {}).get("settled_phase_job_ids") or []):
+                        raise ValueError("candidate_detach_requires_invalid_job_settlement")
     for intent in (camp / "engineering_checks" / "multigpu").glob("*/intent.json"):
         process = _read(intent.parent / "process.json")
         receipt = _read(intent.parent / "receipt.json")
@@ -159,6 +188,7 @@ def detach_failed_candidate(camp: Path, state: dict, candidate_id: str, reason: 
         raise ValueError("baseline_cannot_be_detached")
     suite_id = state.get("active_suite")
     suite_failure = None
+    invalid_failure = None
     if suite_id:
         suite = _read(camp / "suites" / suite_id / "suite_manifest.json")
         progress = _read(camp / "suites" / suite_id / "suite_state.json")
@@ -166,7 +196,28 @@ def detach_failed_candidate(camp: Path, state: dict, candidate_id: str, reason: 
                 and progress.get("scheduling_status") == "engineering_failed"
                 and (progress.get("failure") or {}).get("scientific_negative") is False):
             suite_failure = progress.get("failure")
-    if row is None or (row.get("status") not in {"implementation_failed", "review_needs_fix", "review_blocked", "abandoned", "requires_framework_extension", "failed"} and not suite_failure):
+        if suite.get("method", {}).get("candidate_id") == candidate_id:
+            for fold_id, job_id in (progress.get("jobs") or {}).items():
+                job = _read(camp / "jobs" / job_id / "job.json")
+                if (job.get("candidate_id") == candidate_id and job.get("status") == "invalid"
+                        and (job.get("result") or {}).get("evaluation_valid") is False
+                        and fold_id not in set(progress.get("completed_folds") or [])):
+                    invalid_failure = {"kind": "invalid_training_acceptance", "job_id": job_id, "fold_id": fold_id,
+                        "job_status": "invalid", "reason": (job.get("result") or {}).get("reason"), "scientific_negative": False}
+                    suite_failure = suite_failure or invalid_failure
+                    break
+    if row and not suite_failure:
+        for path in (camp / "jobs").glob("*/job.json"):
+            job = _read(path)
+            frozen = _read(path.parent / "frozen_run_spec.json")
+            if (job.get("candidate_id") == candidate_id and job.get("status") == "invalid"
+                    and (job.get("result") or {}).get("evaluation_valid") is False
+                    and row.get("source_hash") and job.get("source_hash") == row["source_hash"]
+                    and row.get("spec_hash") and frozen.get("spec_hash") == row["spec_hash"]):
+                invalid_failure = {"kind": "invalid_training_acceptance", "job_id": path.parent.name,
+                    "job_status": "invalid", "reason": (job.get("result") or {}).get("reason"), "scientific_negative": False}
+                break
+    if row is None or (row.get("status") not in {"implementation_failed", "review_needs_fix", "review_blocked", "abandoned", "requires_framework_extension", "failed"} and not suite_failure and not invalid_failure):
         raise ValueError("candidate_detach_requires_local_failed_candidate")
     repair = state.get("repair_task") or {}
     if repair.get("candidate_id") == candidate_id and int(repair.get("remaining") or 0) > 0:
@@ -182,6 +233,8 @@ def detach_failed_candidate(camp: Path, state: dict, candidate_id: str, reason: 
     task_ids = [key for key, task in tasks.items() if task.get("candidate_id") == candidate_id
                 and task.get("status") not in {"completed", "failed", "superseded", "cancelled"}]
     decision_ids = []
+    from .decision_receipts import project_decisions
+    project_decisions(camp, state)
     for decision in state.get("decisions") or []:
         path = camp / "decisions" / (str(decision.get("decision_id")) + ".json")
         body = _read(path)
@@ -189,11 +242,12 @@ def detach_failed_candidate(camp: Path, state: dict, candidate_id: str, reason: 
         pending_branch = state.get("candidate_id") == candidate_id or state.get("pending_candidate_id") == candidate_id
         implicit_branch_action = execution.get("target_id") is None and pending_branch and execution.get("action") in {
             "design_experiment", "propose_experiment", "implement_candidate", "repair_candidate"}
-        if decision.get("executed") is False and (execution.get("target_id") == candidate_id or implicit_branch_action):
+        if decision.get("executed") is False and not decision.get("consumed") and (execution.get("target_id") == candidate_id or implicit_branch_action):
             decision_ids.append(decision["decision_id"])
     receipt = _append(camp / DETACHMENTS, {"schema_version": "eeg_research.candidate_detach.v1",
         "candidate_id": candidate_id, "reason": reason, "candidate_failure": row,
         "suite_engineering_failure": suite_failure,
+        "invalid_job_failure": invalid_failure,
         "active_selector_snapshot": {key: state.get(key) for key in (
             "active_issue_ids", "active_artifact_refs", "active_read_digests", "active_implementation_target_id")},
         "repair_task": repair if repair.get("candidate_id") == candidate_id else None,
@@ -228,13 +282,18 @@ def apply_detachments(camp: Path, state: dict) -> None:
                 row["detach_receipt"] = receipt["receipt_hash"]
         for decision in state.get("decisions") or []:
             if decision.get("decision_id") in receipt["decision_ids"] and decision.get("detach_receipt") != receipt["receipt_hash"]:
-                decision.update(executed=True, detached=True, detach_receipt=receipt["receipt_hash"])
                 path = camp / "decisions" / (decision["decision_id"] + ".json")
                 if path.is_file():
-                    body = _read(path)
-                    body["decision"] = dict(decision)
-                    from .loop import _write
-                    _write(path, body)
+                    from .decision_receipts import append_receipt, project_decisions
+                    append_receipt(camp, decision, status="detached", reason=receipt["reason"],
+                                   source="candidate_lifecycle.apply_detachments",
+                                   result={"candidate_id": target, "detach_receipt": receipt["receipt_hash"]},
+                                   task_refs=receipt["task_ids"])
+                    project_decisions(camp, state)
+                else:
+                    # Legacy projections can omit the decision artifact. Keep
+                    # their consumed state without manufacturing raw bytes.
+                    decision.update(executed=True, detached=True, consumed=True, detach_receipt=receipt["receipt_hash"])
         if (state.get("repair_task") or {}).get("candidate_id") == target:
             state["repair_task"] = None
         if state.get("candidate_id") == target or state.get("pending_candidate_id") == target:

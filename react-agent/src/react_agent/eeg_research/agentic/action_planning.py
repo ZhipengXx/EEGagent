@@ -35,7 +35,8 @@ def planner_round_identity(observation: dict) -> str:
         "eligible_targets", "evidence", "candidate_id", "candidate_ready", "candidates", "candidate_admissions",
         "detached_candidates", "repair_task", "pending_candidate_check", "implementation_target_id",
         "implementation_source", "implementation_lifecycle", "training_target_sources", "artifact_read_index",
-        "audit_feedback", "report_draft", "research_questions", "hypothesis", "experiment")
+        "audit_feedback", "report_draft", "research_questions", "hypothesis", "experiment",
+        "action_input_epochs", "verified_development_facts")
     plan = (observation.get("research_plan") or {}).get("plan") or {}
     return "round_" + digest({**{key: observation.get(key) for key in keys}, "research_plan": plan})[:32]
 

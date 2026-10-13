@@ -275,6 +275,9 @@ class ContextCompiler:
                 registered = self.registry.get(supplied.source_ref, role=request.role)
                 if registered.source_hash != supplied.source_hash:
                     return Blocked("stale_source", {"block_id": supplied.block_id})
+            from .reads import complete_field_reads
+            read_paths, read_proofs = complete_field_reads(self.registry, request.source_blocks, role=request.role)
+            source_blocks.extend(read_proofs)
             # Capture complete producer output before producing any model view.
             for path, payload in _sections(merged_input):
                 row = isinstance(path[-1], int) and path[-2] in CLOSED_COLLECTIONS and isinstance(payload, dict)
@@ -312,7 +315,8 @@ class ContextCompiler:
                 if self.snapshot_store is not None and snapshot_delivery:
                     abstracted = lambda section, b=block: self.snapshot_store.is_abstracted(b.block_id, b.source_hash, section)
                 choices, unknown = representations_for(block, payload, role=request.role,
-                                                        excerpt_cap=request.budget.excerpt_chars, abstracted=abstracted)
+                                                        excerpt_cap=request.budget.excerpt_chars, abstracted=abstracted,
+                                                        complete_read_paths=frozenset(read_paths.get((block.source_ref, block.source_hash), ())))
                 frontier = _scientific_frontier(block, payload, active_candidates)
                 if frontier is not None:
                     # Native active identities, not recency/FIFO, select this set.
@@ -559,7 +563,8 @@ class ContextCompiler:
                                 old_kind = entry["choices"][entry["choice"]].kind
                                 new_choices, new_unknown = representations_for(block, original, role=request.role,
                                     excerpt_cap=request.budget.excerpt_chars,
-                                    abstracted=lambda section, b=block: self.snapshot_store.is_abstracted(b.block_id, b.source_hash, section))
+                                    abstracted=lambda section, b=block: self.snapshot_store.is_abstracted(b.block_id, b.source_hash, section),
+                                    complete_read_paths=frozenset(read_paths.get((block.source_ref, block.source_hash), ())))
                                 entry["choices"] = new_choices
                                 entry["choice"] = next((index for index, rep in enumerate(new_choices) if rep.kind == old_kind), 0)
                                 entry["unknown"] = new_unknown

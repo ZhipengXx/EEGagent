@@ -293,8 +293,29 @@ def _ledgered_memory_maintenance(camp: Path, request: dict, **kwargs) -> dict:
     if mode not in {"summary", "extraction", "consolidation"}:
         raise LlmUnavailable("invalid_memory_maintenance_mode")
     payload = dict(request.get("payload", request))
+    correction = request.get("maintenance_correction") or kwargs.get("correction_context")
+    if correction:
+        payload["maintenance_correction"] = dict(correction)
+    operation_ref = kwargs.get("operation_id")
+    if operation_ref is None and request.get("input_digest"):
+        from .context.correction import child_operation_id
+        operation_ref = (child_operation_id(str(request["input_digest"]), request)
+                         if correction else str(request["input_digest"]) + ":generate")
+    if operation_ref:
+        payload["maintenance_operation_id"] = str(operation_ref)
+    if request.get("input_digest"):
+        payload["maintenance_input_digest"] = request["input_digest"]
     payload.update(allow_semantic_compaction=False, allow_sync_memory_maintenance=False)
     turn = str(request.get("turn_id") or kwargs.get("turn_id") or payload.get("turn_id") or kwargs.get("operation_id", ""))
+    operation_metadata = {key: kwargs[key] for key in (
+        "original_maintenance_turn_id", "maintenance_authorization_ref") if kwargs.get(key)}
+    if operation_metadata:
+        from .native_authorization import current_authorization
+        authorization = current_authorization(camp)
+        if (not authorization or operation_metadata.get("maintenance_authorization_ref") != authorization["authorization_hash"]
+                or operation_metadata.get("original_maintenance_turn_id") != authorization["parent_memory_turn_id"]
+                or turn != authorization["memory_recovery_turn"]):
+            raise LlmUnavailable("maintenance_authorization_metadata_invalid")
     # Scheduling epochs are routing metadata, not a new source version. A
     # restart in a later turn must be able to adopt an already paid proposal.
     payload.pop("turn_id", None)
@@ -328,18 +349,32 @@ def _ledgered_memory_maintenance(camp: Path, request: dict, **kwargs) -> dict:
         inputs=[original_path], resolved=resolved, system=system,
         operation="context_maintenance:" + mode)
     if recovered is not None:
-        return recovered
+        from .task_ledger import task_snapshots
+        recovered_task = next((row for row in reversed(task_snapshots(camp))
+            if (row.get("recovery_identity") or {}).get("source_dependency_digest") == source.source_hash), {})
+        return {"output": recovered, "_maintenance_transport": {"api_calls": 0,
+            "cache_adopted": True, "task_ref": recovered_task.get("task_id", "")}}
     if len(upkeep) >= 100 or sum(r.get("maintenance_turn_id") == turn for r in upkeep) >= 2:
         raise LlmUnavailable("memory_maintenance_budget_exhausted")
     task = begin_role_task(camp, role="memory_curator", inputs=[original_path],
                            request=payload, recovery_identity=recovery)
+    calls_path = camp / "llm_calls.jsonl"
+    prior_calls = [json.loads(line) for line in calls_path.read_text().splitlines() if line.strip()] if calls_path.is_file() else []
+    prior_call = next((row for row in reversed(prior_calls) if row.get("task_id") == task["task_id"]), None)
+    if (prior_call and prior_call.get("success") is True
+            and prior_call.get("transport_outcome") == "confirmed_response"
+            and not task.get("_cached_role_result")):
+        # A paid object that failed proof checks is not permission to resend
+        # the original generation. A semantic correction has its own input.
+        raise LlmUnavailable("maintenance_paid_response_requires_recovery")
     cached = task.get("_cached_role_result")
     if cached:
         from react_agent.eeg_research.agentic.roles import assert_role_task_dependencies
         from react_agent.eeg_research.agentic.task_ledger import record_task_reuse
         assert_role_task_dependencies(camp, task)
         record_task_reuse(camp, cached)
-        return cached["envelope"]["payload"]["proposal"]
+        return {"output": cached["envelope"]["payload"]["proposal"],
+                "_maintenance_transport": {"api_calls": 0, "cache_adopted": True, "task_ref": task["task_id"]}}
     payload["turn_id"] = turn
     payload.update({k:task[k] for k in ("task_id", "attempt_id", "input_digest")})
     config = FmriCheckConfig(deepseek_api_key=os.environ.get("DEEPSEEK_API_KEY"),
@@ -351,12 +386,14 @@ def _ledgered_memory_maintenance(camp: Path, request: dict, **kwargs) -> dict:
             max_tokens=resolved.max_tokens, system=system, payload=payload, task=task,
             validate=lambda output: output if isinstance(output, dict) else (_ for _ in ()).throw(ValueError("proposal_not_object")),
             context_budget_chars=100_000, operation_name="context_maintenance:" + mode,
-            mode=mode, attempts=1)
+            mode=mode, attempts=1,
+            **({"operation_metadata": operation_metadata} if operation_metadata else {}))
         finish_role_task(camp, task, {"status":"completed", "proposal":response,
             "publication_status":"proposal_only", "scientific_evidence":False,
             "execution_authority":False}, kind="handoff_compaction",
             path=camp / "context_proposals" / (task["task_id"] + ".json"))
-        return response
+        return {"output": response, "_maintenance_transport": {"api_calls": 1,
+            "cache_adopted": False, "task_ref": task["task_id"]}}
     except Exception as exc:
         finish_role_task(camp, task, {"status":"failed", "error":str(exc),
             "publication_status":"not_published", "scientific_evidence":False},
@@ -453,10 +490,11 @@ def _reserve_api_intent(camp: Path, row: dict[str, Any]) -> None:
     # Durability precedes transport. A crash between fsync and cost.json rename
     # is reconciled from the append-only intent on the next native budget read.
     intent = {name: row.get(name) for name in
-              ("call_id", "role", "task_id", "attempt_id", "input_digest", "prompt_hash",
+              ("call_id", "role", "task_id", "attempt_id", "input_digest", "prompt_hash", "candidate_id", "input_hash",
                "request_trace_ref", "request_system_sha256", "request_user_sha256", "operation_id",
                "planner_round_id", "role_config_hash", "role_model_config", "requested_model",
                "maintenance_turn_id", "context_mode", "context_request_digest", "context_policy_version",
+               "original_maintenance_turn_id", "maintenance_authorization_ref", "research_authorization_ref", "parent_planner_round_id",
                "thinking", "reasoning_effort", "unknown_usd_reserve")}
     if row.get("operation"):
         intent["operation"] = row["operation"]
@@ -534,6 +572,8 @@ def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
               "role_config_sources": row.get("role_config_sources"),
               "status": "prepared_before_transport", "recorded_at": time.time(),
               "scope": "Exact application-level system/user strings supplied to complete_json; no transport credentials or HTTP wire-body claim."}
+    if row.get("context_transport_fields") is not None:
+        record["transport_fields"] = row["context_transport_fields"]
     record["context_measurement"] = {"system_chars": len(system), "user_chars": len(user),
                                      "total_application_chars": len(system) + len(user)}
     temp = path.with_suffix(".json.tmp")
@@ -733,7 +773,8 @@ def _adjust_output_budget(camp: Path, config: Any, row: dict) -> bool:
 def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_tokens: int,
                        system: str, payload: dict, task: dict, validate: Callable,
                        context_budget_chars: int, operation_name: str = "handoff_compaction",
-                       mode: str = "summary", attempts: int | None = None) -> dict:
+                       mode: str = "summary", attempts: int | None = None,
+                       operation_metadata: dict | None = None) -> dict:
     """One bounded delivery operation through the existing durable API ledger."""
     from react_agent.fmri.llm.deepseek import DeepSeekParseError
     from react_agent.eeg_research.agentic.roles import assert_role_task_dependencies
@@ -789,10 +830,13 @@ def _invoke_compaction(camp: Path, client: Any, loop: Any, *, model: str, max_to
                    reasoning_effort=resolved.reasoning_effort,
                    application_retry_kind="compaction_validation" if error else None)
         row.update(context_request_digest=prepared.request_digest,
+                   context_transport_fields=prepared.transport_fields,
                    context_sidecars=prepared.sidecar_refs, context_mode=mode,
                    context_policy_version=prepared.policy_version,
                    context_budget_report=prepared.budget_report,
                    maintenance_turn_id=payload.get("turn_id"))
+        row.update({key: value for key, value in (operation_metadata or {}).items()
+                    if key in {"original_maintenance_turn_id", "maintenance_authorization_ref"}})
         row.update(_request_trace(camp, row, system=prepared.system, user=user, max_tokens=max_tokens))
         row.update(reserve_operation_attempt(camp, operation=logical_operation, call_id=row["call_id"],
                    reserve_usd=_unknown_reserve(camp), metadata=row))
@@ -928,12 +972,11 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             saved_config = saved_config if isinstance(saved_config, dict) else None
             if persisted and persisted.get("input_digest") != task.get("input_digest"):
                 raise LlmUnavailable("role_result_task_identity_mismatch")
-            if persisted and persisted.get("status") == "completed" and (saved_config or {}).get("role_config_hash") != resolved.role_config_hash:
-                raise LlmUnavailable("role_config_changed_requires_new_task")
-            if persisted and persisted.get("status") in {"pending", "running", "waiting_for_evidence"}:
+            if persisted and persisted.get("status") in {"pending", "running", "waiting_for_evidence", "completed"}:
                 if (not isinstance(saved_config, dict) or not saved_config.get("role_config_hash")
                         or any(name not in saved_config for name in (*FIELDS, "base_url"))):
-                    raise LlmUnavailable("started_role_config_proof_missing")
+                    raise LlmUnavailable("role_config_changed_requires_new_task" if persisted.get("status") == "completed"
+                                         else "started_role_config_proof_missing")
                 # A started role task resumes with its bound routing. Switching
                 # settings must create a new tracked attempt at the caller.
                 fields = {name: saved_config[name] for name in FIELDS}
@@ -971,6 +1014,66 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 if cached and cached["task"]["task_id"] == task["task_id"]:
                     record_task_reuse(camp, cached)
                     return cached["envelope"]
+            if persisted:
+                task = persisted
+        from .context.role_recovery import recover_role_reply, require_current_prompt
+        from .roles import RoleResultError
+        from .api_policy import operation_id
+        logical_operation = operation_id(role, payload, bound, resolved.role_config_hash)
+        request_semantics = operation_id(role, payload,
+            {key: value for key, value in bound.items() if key != "operation_id"}, "")
+
+        def validate_recovered(reply, frozen_payload, frozen_prompt_hash):
+            parsed = dict(reply)
+            if role == "research_planner":
+                from .planner_context import normalize_input_echoes
+                parsed, _ = normalize_input_echoes(parsed, frozen_payload)
+            if role == "candidate_coder":
+                from .coder import validate_tool_request
+                _, _, error = validate_tool_request(parsed)
+                if error:
+                    raise RoleResultError("recovered_coder_tool_request_invalid")
+            else:
+                model = domain_model_for(role, memory)
+                body = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else parsed
+                identities = {"schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "artifact_refs", "candidate_id"}
+                if model is not None:
+                    body = {key: value for key, value in body.items() if key not in identities
+                            and (key != "status" or "status" in model.model_fields)}
+                    model.model_validate(body)
+                if role == "candidate_reviewer":
+                    from .review_context import review_reference_errors
+                    if review_reference_errors(body, frozen_payload):
+                        raise RoleResultError("recovered_review_evidence_reference_invalid")
+            if role in ENVELOPE_ROLES:
+                from .roles import bind_role_output
+                return bind_role_output(parsed, task=task, prompt_hash=frozen_prompt_hash)
+            return parsed
+        try:
+            recovered = recover_role_reply(camp, role=role, resolved=resolved,
+                validate_reply=validate_recovered, task=task, operation_id=logical_operation, identity=bound,
+                request_semantics_digest=request_semantics)
+            if recovered is not None:
+                return recovered
+            require_current_prompt(task, prompt_hash)
+        except (RoleResultError, ValueError) as exc:
+            raise LlmUnavailable(str(exc)) from exc
+        compile_identity = dict(bound)
+        if task is not None:
+            compile_identity.update({key: task.get(key) for key in (
+                "task_id", "attempt_id", "input_digest", "candidate_id")})
+        compile_task_id = str(compile_identity.get("task_id") or "")
+        option_repair = payload.get("option_repair_request")
+        failed_options = option_repair.get("failed_options") if isinstance(option_repair, dict) else None
+        external_repair = role == "research_planner" and (
+            (isinstance(option_repair, dict)
+             and option_repair.get("kind") in {"repair_failed_options", "replace_unsupported_options"}
+             and isinstance(failed_options, list) and bool(failed_options)
+             and all(isinstance(item, dict) and item.get("status") == "rejected"
+                     and isinstance(item.get("error"), str) and bool(item["error"])
+                     and isinstance(item.get("draft"), dict) for item in failed_options))
+            or (isinstance(payload.get("schema_error"), str) and bool(payload["schema_error"])
+                and isinstance(payload.get("previous"), dict) and bool(payload["previous"])))
         transport_retry_prepared = None
         last: DeepSeekParseError | None = None
         schema_error = None
@@ -979,15 +1082,24 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         schema_feedback = None
         logical_operation = operation_id(role, payload, bound, resolved.role_config_hash)
         for _attempt in range(PARSE_ATTEMPTS):
+            request_mode = "repair" if external_repair or last is not None or schema_error is not None else "normal"
             call_payload = payload
             if last is not None:
+                failure = getattr(last.usage, "failure_kind", None)
+                error_feedback = {
+                    "kind": "output_truncated" if failure == "output_truncated" else "invalid_json",
+                    "finish_reason": getattr(last.usage, "finish_reason", None),
+                    "instruction": "Return one complete JSON object matching OUTPUT_SCHEMA. Escape Python newlines and quotes inside content. Keep the implementation concise; do not omit requested interventions.",
+                }
+                if failure == "output_truncated":
+                    from .context.types import digest as response_digest
+                    error_feedback.update(correction_kind="concise_final_json", parent_call_id=row["call_id"],
+                        parent_task_ref=row.get("task_id"), invalid_response_digest=response_digest(last.raw),
+                        max_output_tokens=int(config.fast.max_tokens),
+                        instruction="The previous final JSON was truncated. Return a concise complete OUTPUT_SCHEMA object within the current output cap. Preserve required executable hooks, parameter values, core implementation requirements and source references; omit repeated input context, policies and optional narrative. Finish the final JSON promptly.")
                 call_payload = {
                     **payload,
-                    "previous_response_error": {
-                        "kind": "invalid_json",
-                        "finish_reason": getattr(last.usage, "finish_reason", None),
-                        "instruction": "Return one complete JSON object matching OUTPUT_SCHEMA. Escape Python newlines and quotes inside content. Keep the implementation concise; do not omit requested interventions.",
-                    },
+                    "previous_response_error": error_feedback,
                 }
             if schema_error is not None:
                 call_payload = {**call_payload, "schema_error": schema_error, "previous": previous_domain,
@@ -1004,18 +1116,18 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             else:
                 outcome = context_service.compile(CompileRequest(
                     camp.name, role, call_payload, system=system, model=config.fast.model,
-                    max_output_tokens=int(config.fast.max_tokens), task_id=bound.get("task_id", ""),
+                    max_output_tokens=int(config.fast.max_tokens), task_id=compile_task_id,
                     intent_id=logical_operation, purpose=bound.get("phase", role),
-                    mode="repair" if last is not None or schema_error is not None else "normal",
-                    identity=dict(bound), budget=budget_for_role(role),
+                    mode=request_mode,
+                    identity=compile_identity, budget=budget_for_role(role),
                     transport_options=transport_options(config.fast),
                     tokenizer=tokenizer_for(
                         camp, role=role, model=config.fast.model,
-                        mode="repair" if last is not None or schema_error is not None else "normal"),
+                        mode=request_mode),
                     # Native task identities are already frozen. Upkeep happens
                     # in the Planner/controller or an independent closed-group turn.
-                    allow_semantic_compaction=not bool(bound.get("task_id")),
-                    allow_sync_memory_maintenance=not bool(bound.get("task_id")),
+                    allow_semantic_compaction=not bool(compile_task_id),
+                    allow_sync_memory_maintenance=not bool(compile_task_id),
                     remaining_api_calls=_remaining_api_calls(camp)))
                 if not isinstance(outcome, Ready):
                     raise LlmUnavailable("context_" + outcome.status,
@@ -1041,12 +1153,14 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 row.update({name: task.get(name) for name in ("task_id", "attempt_id", "input_digest")})
                 row.setdefault("input_hash", task.get("input_digest"))
             row.update(application_attempt=_attempt + 1,
+                       role_request_semantics_digest=request_semantics,
                        operation_id=logical_operation, role_config_hash=resolved.role_config_hash,
                        role_config_sources=resolved.sources,
                        role_model_config=resolved.semantics(), thinking=resolved.thinking,
                        reasoning_effort=resolved.reasoning_effort,
                        application_retry_kind=("domain_schema" if schema_error is not None else
-                                               "invalid_json" if last is not None else None),
+                                               "output_truncated" if last is not None and getattr(last.usage, "failure_kind", None) == "output_truncated" else
+                                               "invalid_json" if last is not None else "native_planner_repair" if external_repair else None),
                        role_context_revision=projection["revision"],
                        role_context_original_user_chars=projection["original_user_chars"],
                        role_context_projected_total_chars=projection["projected_total_chars"],
@@ -1064,7 +1178,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             )
             user_text = prepared.user
             row.update(context_request_digest=prepared.request_digest,
-                       context_mode="repair" if last is not None or schema_error is not None else "normal",
+                       context_transport_fields=prepared.transport_fields,
+                       context_mode=request_mode,
                        context_sidecars=prepared.sidecar_refs, context_policy_version=prepared.policy_version,
                        context_budget_report=prepared.budget_report)
             row.update(_request_trace(camp, row, system=prepared.system, user=user_text,
@@ -1091,9 +1206,14 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 )
                 kind = getattr(exc.usage, "failure_kind", None)
                 if kind == "output_truncated":
-                    if not _adjust_output_budget(camp, config, row):
+                    if (_attempt + 1 >= PARSE_ATTEMPTS or exc.usage.unconfirmed_charge_possible
+                            or getattr(exc.usage, "transport_outcome", None) != "confirmed_response"):
                         raise LlmUnavailable("output_truncated") from exc
-                    resolved = resolve_role_config(camp, role, {name: getattr(config.fast, name) for name in FIELDS})
+                    if _adjust_output_budget(camp, config, row):
+                        resolved = resolve_role_config(camp, role, {name: getattr(config.fast, name) for name in FIELDS})
+                    # A confirmed length failure can use the existing second
+                    # mechanical attempt at the same cap when expansion is not
+                    # authorized. Operation/round/global gates still reserve it.
                 elif kind not in {None, "format_error", "missing_final_content"}:
                     raise LlmUnavailable(kind) from exc
                 continue
@@ -1128,6 +1248,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     "elapsed_seconds": round(time.time() - started, 3),
                 }
             )
+            from .context.types import digest as response_digest
+            row["response_reply_sha256"] = response_digest(reply)
             _ledger(camp, row)
             _response_trace(camp, row, reply, validation="pending")
             parsed = reply if isinstance(reply, dict) else {"_not_object": reply}

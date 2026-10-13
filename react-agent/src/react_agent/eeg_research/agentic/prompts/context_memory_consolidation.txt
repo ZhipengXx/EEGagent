@@ -1,14 +1,22 @@
-Consolidate only the supplied incremental new/changed/revoked operation episodes
-and their bounded relevant prior knowledge. Preserve source conditions, validity,
-counterexamples, scope and validation level; similarity/frequency never upgrades
-truth or permission. Withdrawal retires a claim only when no other valid support
-remains. Scientific two-fold development findings remain two-fold findings.
-Return {"status":"no_signal"} for no meaningful change. Otherwise return
-{"status":"consolidated","lessons":[{"statement":"conditional source-grounded
-claim","conditions":[],"supporting_episode_ids":["supplied episode ID"],
-"contradicting_episode_ids":[],"validation_status":"proposal"}],"skills":[]}.
-Skills, when justified, include description_en, procedure, preconditions and their
-supplied supporting episode IDs; preserve procedural_hint/preconditions_unknown.
-Keep the entire JSON under 8000 characters. Do not modify native controls,
-metrics, execution status, source IDs/hashes or existing unrelated records.
-This maintenance operation must not recursively invoke memory maintenance.
+Consolidate the incremental operation episodes and relevant prior knowledge.
+Update a conditional claim only when supplied support or counterexamples warrant
+it. A negative development screen updates the hypothesis; it does not exhaust
+all untested mechanisms. Similarity or repeated mentions do not strengthen
+scientific validation. Retain a claim while any valid support remains.
+
+Minimal valid example (replace ep_one with a supplied episode ID):
+{"status":"consolidated","lessons":[{"statement":"Compare matched development screens before confirmation.","conditions":{"applies_when":"a comparable development protocol is available"},"supporting_episode_ids":["ep_one"],"contradicting_episode_ids":[],"validation_status":"proposal"}],"skills":[]}
+
+conditions is a nonempty JSON object. Native publication inherits exact scope,
+seed, method revision, protocol, selection manifest and screening subjects from
+supporting episodes; omit that metadata rather than copying it. Supplied values
+must match all support. Two-fold findings remain two-fold findings. Engineering
+failure supports only engineering_repair behavior, never scientific gains.
+Legacy list conditions are a read compatibility view; new proposals use objects.
+Use supplied episode IDs for both support and counterexamples. Skills, when
+justified, need description_en, a nonempty procedure list, a preconditions object
+and supporting_episode_ids; retain procedural_hint/preconditions_unknown.
+Return {"status":"no_signal"} when no meaningful change is supported. A ref-only
+or partial record is partial coverage; use its actual supplied source section,
+not an invented whole-record read. Keep JSON below 8000 characters. Do not invoke
+another memory operation.

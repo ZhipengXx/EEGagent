@@ -119,6 +119,9 @@ def validate_role_result(payload: Any, task: dict[str, Any]) -> dict[str, Any]:
     payload = _coerce_role_fields(payload)
     if payload.get("schema_version") != ROLE_RESULT_VERSION:
         raise RoleResultError("role_result_schema")
+    expected_prompt = (task.get("recovery_identity") or {}).get("prompt_hash")
+    if expected_prompt and payload.get("prompt_hash") != expected_prompt:
+        raise RoleResultError("role_result_prompt_mismatch")
     if not reusable(
         payload,
         task_id=str(task["task_id"]),
@@ -171,6 +174,10 @@ def bind_role_output(reply: Any, *, task: dict[str, Any], prompt_hash: str = "")
     claimed_attempt = _claimed(reply, "attempt_id")
     claimed_digest = _claimed(reply, "input_digest")
     claimed_candidate = _claimed(reply, "candidate_id")
+    claimed_prompt = _claimed(reply, "prompt_hash")
+    expected_prompt = (task.get("recovery_identity") or {}).get("prompt_hash") or prompt_hash
+    if claimed_prompt is not None and expected_prompt and claimed_prompt != expected_prompt:
+        raise RoleResultError("role_result_prompt_mismatch")
     if claimed_task is not None and claimed_task != str(task["task_id"]):
         raise RoleResultError("role_result_identity_mismatch")
     if claimed_attempt is not None and claimed_attempt != str(task["attempt_id"]):
@@ -215,6 +222,7 @@ def begin_role_task(
     recovery_identity: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Open a ledger task whose digest covers the business request and input files."""
+    pending_parent = None
     from react_agent.eeg_research.agentic.role_config import resolve_role_config
     resolved = resolve_role_config(camp, role)
     request = {**(request or {}), "role_model_config": resolved.semantics()}
@@ -240,16 +248,65 @@ def begin_role_task(
         dependencies = input_dependency_manifest(camp, paths=inputs, artifacts=artifacts)
         recovery_identity = {**(recovery_identity or role_recovery_identity(
             camp, role, candidate_id, request or {}, digest)), "input_dependencies": dependencies}
-        from react_agent.eeg_research.agentic.task_ledger import find_completed_task, no_progress_repetitions
+        from react_agent.eeg_research.agentic.task_ledger import (
+            find_completed_task, no_progress_repetitions, task_snapshots, recovery_identity_digest,
+        )
+        from react_agent.eeg_research.agentic.context.role_recovery import has_confirmed_reply, unresolved_task_intents
+        wanted = recovery_identity_digest(recovery_identity)
+        matching = [task for task in task_snapshots(camp)
+                    if task.get("role") == role and task.get("candidate_id") == candidate_id
+                    and task.get("recovery_identity_digest") == wanted]
         cached = find_completed_task(camp, role=role, recovery_identity=recovery_identity,
                                      candidate_id=candidate_id, input_digest=digest)
-        if cached and "input_dependencies" in (cached["task"].get("recovery_identity") or {}):
+        if (cached and (not matching or matching[-1]["task_id"] == cached["task"]["task_id"])
+                and "input_dependencies" in (cached["task"].get("recovery_identity") or {})):
             task = dict(cached["task"])
             task["_cached_role_result"] = cached
             return task
         if no_progress_repetitions(camp, recovery_identity=recovery_identity) >= 3:
             from react_agent.eeg_research.agentic.llm import LlmUnavailable
             raise LlmUnavailable("role_no_progress_retry_limit")
+        if matching and matching[-1].get("status") in {"pending", "running", "waiting_for_evidence"}:
+            task = dict(matching[-1])
+            assert_role_task_dependencies(camp, task)
+            task["_resumed_role_task"] = True
+            return task
+        # Prompt upgrades preserve a paid parent's exact task/request. If no
+        # reply exists, a new child names the old attempt instead of overwriting
+        # its prompt provenance. A pending unknown call stays a native barrier.
+        def business_identity(value):
+            copied = {key: item for key, item in value.items() if key not in {"prompt_hash", "schema_hash"}}
+            copied["config"] = {key: item for key, item in (copied.get("config") or {}).items()
+                                if key not in {"role_model_config", "role_config_sources"}}
+            return copied
+        def same_upgrade_input(old_task):
+            old_identity = old_task.get("recovery_identity") or {}
+            compare = dict(recovery_identity)
+            old_model = (old_identity.get("config") or {}).get("role_model_config")
+            if old_model and old_model != resolved.semantics():
+                # Request semantics contains routing too. Compare the unchanged
+                # business input under the parent's original routing identity.
+                compare["request_semantics"] = role_recovery_identity(
+                    camp, role, candidate_id, {**request, "role_model_config": old_model}, digest)["request_semantics"]
+            return business_identity(old_identity) == business_identity(compare)
+        upgrade_parent = next((task for task in reversed(task_snapshots(camp))
+            if task.get("role") == role and task.get("candidate_id") == candidate_id
+            and same_upgrade_input(task)), None)
+        pending_parent = (upgrade_parent if upgrade_parent and upgrade_parent.get("status")
+                          in {"pending", "running", "waiting_for_evidence"} else None)
+        if upgrade_parent and upgrade_parent.get("status") == "completed" and has_confirmed_reply(camp, upgrade_parent):
+            original_cached = find_completed_task(camp, role=role,
+                recovery_identity=upgrade_parent["recovery_identity"], candidate_id=candidate_id,
+                input_digest=upgrade_parent["input_digest"])
+            if original_cached and original_cached["task"]["task_id"] == upgrade_parent["task_id"]:
+                return {**upgrade_parent, "_cached_role_result": original_cached, "_original_paid_prompt": True}
+        if pending_parent:
+            assert_role_task_dependencies(camp, pending_parent)
+            if has_confirmed_reply(camp, pending_parent):
+                return {**pending_parent, "_resumed_role_task": True, "_original_paid_prompt": True}
+            if unresolved_task_intents(camp, pending_parent):
+                from react_agent.eeg_research.agentic.llm import LlmUnavailable
+                raise LlmUnavailable("unsettled_api_intent_requires_recovery")
     return create_task(
         camp,
         role=role,
@@ -258,6 +315,7 @@ def begin_role_task(
         expected_output_schema=ROLE_RESULT_VERSION,
         candidate_id=candidate_id,
         recovery_identity=recovery_identity,
+        supersedes_task_id=pending_parent["task_id"] if (request is not None or recovery_identity is not None) and pending_parent else None,
     )
 
 
@@ -368,14 +426,63 @@ def finish_role_task(
                 if row.get("task_id") == task["task_id"] and row.get("role") == task["role"] and row.get("success") is True:
                     payload = {**payload, "prompt_hash": row.get("prompt_hash", "")}
                     break
+    if not payload.get("prompt_hash"):
+        # Native deterministic producers and failed attempts still bind their
+        # task's frozen prompt identity; this is not a transport-call receipt.
+        payload = {**payload, "prompt_hash": (task.get("recovery_identity") or {}).get("prompt_hash", "")}
     path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_id = allocate_artifact_id()
     envelope = wrap_role_result(payload, task=task, prompt_hash=str(payload.get("prompt_hash") or ""))
+    validate_role_result(envelope, task)
+    def comparable(value):
+        copied = {key: item for key, item in value.items() if key != "artifact_refs"}
+        if isinstance(copied.get("payload"), dict):
+            copied["payload"] = {key: item for key, item in copied["payload"].items() if key != "artifact_refs"}
+        return copied
+    from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
+    from react_agent.eeg_research.agentic.task_ledger import latest
+    registered = camp / "artifact_registry.jsonl"
+    registered_rows = ([json.loads(line) for line in registered.read_text(encoding="utf-8").splitlines() if line.strip()]
+                       if registered.is_file() else [])
+    for row in reversed(registered_rows):
+        if row.get("producer_task_id") != task["task_id"] or row.get("kind") != kind:
+            continue
+        artifact = resolve_verified_artifact(camp, row["artifact_id"])
+        saved = validate_role_result(json.loads(Path(artifact["path"]).read_text(encoding="utf-8")), task)
+        if comparable(saved) != comparable(envelope):
+            continue
+        persisted = latest(camp, task["task_id"]) or {}
+        if persisted.get("artifact_id") != artifact["artifact_id"] or persisted.get("status") != saved.get("status"):
+            saved_status = str(saved.get("status") or "partial")
+            saved_status = "blocked" if saved_status == "requires_framework_extension" else saved_status
+            saved_status = saved_status if saved_status in {"completed", "partial", "blocked", "failed"} else "partial"
+            mark(camp, task["task_id"], saved_status, role=task.get("role"),
+                 attempt_id=task.get("attempt_id"), candidate_id=candidate_id or task.get("candidate_id"),
+                 artifact_id=artifact["artifact_id"], path=artifact["path"], recovered_artifact_registration=True,
+                 recovered_transport_call_id=persisted.get("recovered_transport_call_id"))
+        return saved
+    if path.exists():
+        # A crash after writing but before registration retains its preallocated
+        # id and bytes. An unrelated or partial file cannot be overwritten.
+        try:
+            saved = validate_role_result(json.loads(path.read_text(encoding="utf-8")), task)
+        except (OSError, ValueError) as exc:
+            raise RoleResultError("role_artifact_path_conflict") from exc
+        if comparable(saved) != comparable(envelope) or not saved.get("artifact_refs"):
+            raise RoleResultError("role_artifact_path_conflict")
+        envelope = saved
+        artifact_id = saved["artifact_refs"][-1]
+    else:
+        artifact_id = allocate_artifact_id()
     refs = list(envelope.get("artifact_refs") or [])
     if artifact_id not in refs:
         refs.append(artifact_id)
     envelope["artifact_refs"] = refs
-    path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not path.exists():
+        # No truncation of an already written role artifact on recovery.
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(envelope, ensure_ascii=False, indent=2))
+            handle.flush()
+            __import__("os").fsync(handle.fileno())
     artifact = register(
         camp,
         path,

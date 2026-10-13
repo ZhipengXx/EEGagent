@@ -36,6 +36,120 @@ _TERMINAL = {"paused", "finished", "blocked", "cancelled"}
 CODER_STEPS = 8
 POLLS_PER_DECISION_TICK = 50
 IMPLEMENT_ATTEMPTS = 3
+
+
+def _context_maintenance_boundary(state: dict[str, Any]) -> bool:
+    """Closed memory can finish after this exact recoverable Planner limit."""
+    if state.get("status") in {"created", "planning"}:
+        return True
+    failure = state.get("failure") or {}
+    return bool(state.get("status") == "blocked"
+        and state.get("detail") == "planner_round_attempt_limit"
+        and failure.get("phase") == "planner" and failure.get("recoverable") is True
+        and failure.get("error_type") == "planner_round_attempt_limit")
+
+
+def _run_context_maintenance(camp: Path, state: dict[str, Any], services: dict[str, Any]) -> None:
+    upkeep = services.get("context_maintenance")
+    if not upkeep or not _context_maintenance_boundary(state):
+        return
+    try:
+        result = upkeep(camp, state)
+        event(camp, "context_memory_maintenance", status=result.get("status", "completed"))
+    except (LlmUnavailable, ValueError, OSError) as exc:
+        event(camp, "context_memory_maintenance_deferred", reason=str(exc))
+    finally:
+        # Paid upkeep updates only the real native cost projection; it neither
+        # resets the Planner round nor removes its blocked failure.
+        _sync_ledger(camp, state)
+        save_state(camp, state)
+
+
+def candidate_seed_coverage(latest: dict[str, Any], scientific_rows: list[dict[str, Any]],
+                            declared: list[int]) -> dict[str, Any]:
+    """Measure seeds in their actual phase; folds never count as seeds."""
+    import math
+
+    method = latest.get("kind") in {"method_screening", "method_suite"}
+    screening = latest.get("kind") == "method_screening"
+    same_identity = lambda row: (row.get("evaluation_valid") is True
+        and row.get("candidate_id") == latest.get("candidate_id")
+        and row.get("fidelity") == latest.get("fidelity")
+        and all(row.get(key) == latest.get(key) for key in ("source_hash", "spec_hash", "execution_fingerprint"))
+        and (not method or row.get("method_revision") == latest.get("method_revision")))
+    phase_rows = [row for row in scientific_rows if same_identity(row)
+                  and (not method or row.get("kind") == latest.get("kind"))]
+    phase_rows = list({row.get("seed"): row for row in phase_rows}.values())
+    required = sorted(set(declared))
+
+    def measured(rows: list[dict], *, primary: bool = False) -> dict[int, float]:
+        values = {}
+        for row in rows:
+            seed = row.get("seed")
+            if type(seed) is not int or seed not in required:
+                continue
+            if row.get("kind") == "method_screening":
+                result = row.get("screening") or {}
+                value = result.get("screening_mean_top1")
+                valid = not primary and result.get("status") == "complete" and result.get("coverage") == 2
+            elif row.get("kind") == "method_suite":
+                result = row.get("aggregate") or {}
+                value = result.get("benchmark.loso_mean_fixed_gallery_top1", result.get("mean_top1"))
+                valid = result.get("status") == "complete" and result.get("coverage") == 10
+            else:
+                value, valid = row.get("fixed_bank_top1"), True
+            if valid and type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1:
+                values[seed] = float(value)
+        return values
+
+    def bounds(values: dict[int, float], metric: str, scope: str) -> dict:
+        absent = [seed for seed in required if seed not in values]
+        return {"metric": metric, "metric_range": [0.0, 1.0], "required_seed_count": len(required),
+            "measured_scores_by_seed": values, "unmeasured_seed_ids": absent, "unmeasured_count": len(absent),
+            "current_observed_mean": sum(values.values()) / len(values) if values else None,
+            "minimum_possible_complete_mean": sum(values.values()) / len(required) if required else None,
+            "maximum_possible_complete_mean": (sum(values.values()) + len(absent)) / len(required) if required else None,
+            "complete_mean_measured": bool(required) and not absent, "scope": scope,
+            "interpretation": "Read-only same-revision measured-seed arithmetic. Missing performance is unknown; bounds do not authorize promotion."}
+
+    values = measured(phase_rows)
+    observed = sorted(values)
+    scope = "two_fold_development" if screening else "method_development_benchmark" if method else "frozen_development"
+    metric = "screening_mean_top1" if screening else "benchmark.loso_mean_fixed_gallery_top1" if method else "fixed_bank_top1"
+    result = {"fidelity": latest.get("fidelity"), "source_hash": latest.get("source_hash"),
+        "spec_hash": latest.get("spec_hash"), "observed_training_seeds": observed,
+        "declared_training_seeds": required, "missing_training_seeds": [seed for seed in required if seed not in observed],
+        "scope": scope, "phase": latest.get("phase") or ("screening_2fold" if screening else "complete_10fold_suite" if method else "ordinary_run"),
+        "independent_seed_count": len(observed), "mean_arithmetic_bounds": bounds(values, metric, scope)}
+    if method:
+        full_rows = [row for row in scientific_rows if same_identity(row) and row.get("kind") == "method_suite"]
+        primary = measured(full_rows, primary=True)
+        result.update(method_revision=latest.get("method_revision"), required_fold_count=2 if screening else 10,
+            complete_fold_count=2 if screening else 10, full_required_fold_count=10,
+            primary_10fold_coverage={"metric": "benchmark.loso_mean_fixed_gallery_top1", "scope": "method_development_benchmark",
+                "observed_training_seeds": sorted(primary), "missing_training_seeds": [seed for seed in required if seed not in primary],
+                "independent_seed_count": len(primary), "required_fold_count": 10,
+                "complete_fold_count": 10 if primary else 0,
+                "status": "complete" if primary and not (set(required) - set(primary)) else "not_measured",
+                "mean_arithmetic_bounds": bounds(primary, "benchmark.loso_mean_fixed_gallery_top1", "method_development_benchmark")})
+        result["seed_records"] = []
+        for row in phase_rows:
+            body = row.get("screening") if screening else row.get("aggregate")
+            body = body or {}
+            comparison = row.get("comparison") or {}
+            result["seed_records"].append({"training_seed": row.get("seed"), "suite_id": row.get("suite_id"),
+                "suite_hash": row.get("suite_hash"), "evidence_id": row.get("evidence_id"),
+                "candidate_top1": values.get(row.get("seed")), "scope": scope,
+                "complete_fold_count": body.get("coverage"), "required_fold_count": 2 if screening else 10,
+                "paired_delta_pp": body.get("screening_mean_delta_pp") if screening else comparison.get("delta_pp"),
+                "matched_baseline_status": "baseline_reference" if row.get("candidate_id") == "baseline" else
+                    "verified" if (body.get("baseline_suite_hash") if screening else comparison.get("comparable") is True) else "missing",
+                "result_status": body.get("screening_result") if screening else (row.get("promotion") or {}).get("status"),
+                "selection_manifest_hash": body.get("selection_manifest_hash"),
+                "screening_subjects": body.get("screening_subjects"),
+                "promotion_authority": "separate_native_gate"})
+    return result
+
 _METHOD_ROLE_HARD_BLOCKS = {
     "role_no_progress_retry_limit", "unsettled_api_intent_requires_recovery",
     "handoff_compaction_failed", "handoff_compaction_forbidden_input",
@@ -831,9 +945,12 @@ def build_services(camp: Path) -> dict[str, Any]:
             "hypothesis_binding_missing": bound_hypothesis is None,
             "development_feedback": feedback,
             "controls": [
-                {key: row.get(key) for key in ("evidence_id", "candidate_id", "fidelity", "fixed_bank_top1", "seed")}
+                {key: row.get(key) for key in ("evidence_id", "candidate_id", "fidelity", "fixed_bank_top1", "seed",
+                    "kind", "scope", "metric_scope", "phase", "suite_id", "suite_hash")}
                 for row in scientific_rows
                 if row.get("candidate_id") == "baseline" and row.get("evaluation_valid")
+                and (not method_mode or row.get("kind") == latest.get("kind")
+                     and row.get("execution_fingerprint") == latest.get("execution_fingerprint"))
             ],
         }
         from react_agent.eeg_research.agentic.artifacts import request_digest, resolve_verified_artifact
@@ -872,10 +989,13 @@ def build_services(camp: Path) -> dict[str, Any]:
             if row.get("evaluation_valid") is True and row.get("candidate_id") == latest["candidate_id"]
             and row.get("fidelity") == latest["fidelity"] and row.get("source_hash") == latest.get("source_hash")
             and row.get("spec_hash") == latest.get("spec_hash")
-            and row.get("execution_fingerprint") == latest.get("execution_fingerprint")]
+            and row.get("execution_fingerprint") == latest.get("execution_fingerprint")
+            and (not method_mode or row.get("kind") == latest.get("kind")
+                 and row.get("method_revision") == latest.get("method_revision"))]
         # Repeated runs of the same actual seed are not independent seeds.
         same_revision = list({row.get("seed"):row for row in same_revision}.values())
         control_ids = {row.get("control_id") for row in same_revision if row.get("control_id")}
+        baseline_suite_hashes = {(row.get("screening") or {}).get("baseline_suite_hash") for row in same_revision}
         parent_experiment = binding.get("experiment") or {}
         parent_id = parent_experiment.get("ablation_of_candidate_id") or parent_experiment.get("parent_candidate_id")
         if parent_id == "baseline":
@@ -891,7 +1011,11 @@ def build_services(camp: Path) -> dict[str, Any]:
                 continue
             if row.get("execution_fingerprint") != latest.get("execution_fingerprint"):
                 continue
+            if method_mode and row.get("kind") != latest.get("kind"):
+                continue
             if row.get("evidence_id") in control_ids:
+                matched.append(row)
+            elif screening_mode and row.get("candidate_id") == "baseline" and row.get("suite_hash") in baseline_suite_hashes:
                 matched.append(row)
             elif (parent_binding and row.get("candidate_id") == parent_id and row.get("seed") in paired_seeds
                   and row.get("source_hash") == parent_binding.get("source_hash")
@@ -907,32 +1031,22 @@ def build_services(camp: Path) -> dict[str, Any]:
                     pass  # An unavailable diagnostic is explicit in supplied coverage.
             payload["matched_run_history"].append({key:row.get(key) for key in (
                 "evidence_id", "job_id", "candidate_id", "fidelity", "seed", "source_hash", "spec_hash", "checkpoint_id",
-                "execution_fingerprint", "evaluation_valid", "fixed_bank_top1", "control_id", "comparison", "promotion")})
+                "execution_fingerprint", "evaluation_valid", "fixed_bank_top1", "control_id", "comparison", "promotion",
+                "kind", "scope", "metric_scope", "phase", "suite_id", "suite_hash", "method_revision")})
+            if method_mode:
+                native = row.get("screening") if screening_mode else row.get("aggregate")
+                native = native or {}
+                payload["matched_run_history"][-1].update(
+                    phase_metric="screening_mean_top1" if screening_mode else "benchmark.loso_mean_fixed_gallery_top1",
+                    phase_top1=native.get("screening_mean_top1") if screening_mode else native.get("mean_top1"),
+                    complete_fold_count=native.get("coverage"), required_fold_count=2 if screening_mode else 10,
+                    independent_seed_count=1)
         declared = [int(seed) for seed in (state.get("training_seeds") or json.loads((camp_dir / "goal.json").read_text()).get("training_seeds") or [])]
-        observed = sorted(seed for seed in paired_seeds if isinstance(seed,int))
-        payload["candidate_seed_coverage"] = {"fidelity":latest["fidelity"], "source_hash":latest.get("source_hash"),
-            "spec_hash":latest.get("spec_hash"), "observed_training_seeds":observed,
-            "declared_training_seeds":declared,"missing_training_seeds":[seed for seed in declared if seed not in observed]}
-        # Fixed-gallery top1 is a bounded fraction. Missing seeds have not been
-        # measured; a negative observed seed is not a bound on their outcomes.
-        import math
-        required = sorted(set(declared))
-        values = {row["seed"]: float(row["fixed_bank_top1"]) for row in same_revision
-                  if row.get("seed") in required and isinstance(row.get("fixed_bank_top1"), (int, float))
-                  and math.isfinite(row["fixed_bank_top1"]) and 0 <= row["fixed_bank_top1"] <= 1}
-        absent = [seed for seed in required if seed not in values]
-        payload["candidate_seed_coverage"]["mean_arithmetic_bounds"] = {
-            "metric": "fixed_bank_top1", "metric_range": [0.0, 1.0],
-            "required_seed_count": len(required), "measured_scores_by_seed": values,
-            "unmeasured_seed_ids": absent, "unmeasured_count": len(absent),
-            "current_observed_mean": sum(values.values()) / len(values) if values else None,
-            "minimum_possible_complete_mean": sum(values.values()) / len(required) if required else None,
-            "maximum_possible_complete_mean": (sum(values.values()) + len(absent)) / len(required) if required else None,
-            "complete_mean_measured": bool(required) and not absent,
-            "scope": "Read-only arithmetic bounds from measured same-source/spec/fidelity seeds and top1 range. Missing-seed performance is unknown; bounds are not forecasts, measurements, promotion or authorization."
-        }
+        payload["candidate_seed_coverage"] = candidate_seed_coverage(latest, scientific_rows, declared)
         payload["verified_development_facts"] = verified_diagnostic_facts(camp_dir, state,
-            job_ids={str(row["job_id"]) for row in matched if row.get("job_id")},max_facts=12)
+            job_ids={str(row["job_id"]) for row in matched if row.get("job_id")},
+            suite_ids={str(row["suite_id"]) for row in matched if row.get("suite_id")} if method_mode else None,
+            max_facts=12)
         payload["development_feedback_history"] = [] if method_mode else [
             {"job_id":row.get("job_id"), "training_seed":row.get("seed"),
              **ensure_development_feedback(camp_dir, state, row)} for row in same_revision]
@@ -991,7 +1105,8 @@ def build_services(camp: Path) -> dict[str, Any]:
                 payload.pop("method_suite", None)
                 payload["verified_run_coverage"].update(authority="native_verified_two_fold_screening",
                     scope="two_fold_development", required_fold_count=2, full_required_fold_count=10,
-                    matched_complete_baseline_pair=False, matched_two_fold_baseline_pair=latest["candidate_id"] != "baseline")
+                    matched_complete_baseline_pair=False,
+                    matched_two_fold_baseline_pair=bool(suite_result.get("baseline_suite_hash") and len(suite_result.get("paired_scores") or []) == 2))
                 payload["latest"].update(metric_scope="two_fold_development", phase="screening_2fold",
                                         screening_result=suite_result["screening_result"])
         payload = development_view(payload)
@@ -1254,6 +1369,15 @@ def build_services(camp: Path) -> dict[str, Any]:
                        "upstream_evidence_id":latest["evidence_id"], "upstream_job_id":latest.get("job_id")}
             _analyze_run(camp_dir, state, row, trigger=trigger)
 
+    def analyze_diagnostics(camp_dir: Path, state: dict[str, Any], diagnostic: dict | None = None) -> None:
+        """Deliver a newly verified report through the existing Analyst gate.
+
+        The same source-bound diagnostic produces the same input digest and
+        native task, so restart or cached collection does not create a new paid
+        analysis. The caller invokes this only after committing new information.
+        """
+        analyze(camp_dir, state)
+
     def _lazy(role: str):
         def call(payload: dict[str, Any]) -> dict[str, Any]:
             return role_backend(camp, role)(payload)
@@ -1279,9 +1403,18 @@ def build_services(camp: Path) -> dict[str, Any]:
 
     def maintain_context(camp_dir: Path, state: dict[str, Any]) -> dict:
         """Process closed sources at a quiescent native controller boundary."""
-        from react_agent.eeg_research.agentic.llm import external_api_disabled, _remaining_api_calls
-        if external_api_disabled() or state.get("live_job") or state.get("status") in {"paused", "cancelled", "blocked"}:
+        from react_agent.eeg_research.agentic.llm import external_api_disabled, _remaining_api_calls, _check_api_budget
+        if (external_api_disabled() or not _context_maintenance_boundary(state)
+                or state.get("live_job") or state.get("active_suite") or state.get("unknown_process")
+                or state.get("pending_process_intent") or state.get("pending_candidate_check")
+                or state.get("pause_after_step")):
             return {"status":"deferred", "reason":"not_a_quiescent_authorized_boundary"}
+        from .budget_inheritance import delegated_successor
+        if delegated_successor(camp_dir):
+            return {"status": "deferred", "reason": "budget_delegated"}
+        # Reuse the actual control/remaining-budget/unknown-transport barrier.
+        # This does not reserve a new Planner round or a training phase.
+        _check_api_budget(camp_dir)
         backend = role_backend(camp_dir, "memory_curator")
         context_service = getattr(backend, "context_service", None)
         if context_service is None:
@@ -1346,6 +1479,7 @@ def build_services(camp: Path) -> dict[str, Any]:
         "implement": do_implement,
         "resume_pending_check": resume_pending_check,
         "analyze": analyze,
+        "analyze_diagnostics": analyze_diagnostics,
         "prepare_handoff": prepare_handoff,
         "context_maintenance": maintain_context,
         "revalidate_feedback": revalidate_feedback,
@@ -1380,6 +1514,16 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
         align_interrupt(camp)
     state = load_state(camp)
     if state.get("status") in _TERMINAL:
+        if _context_maintenance_boundary(state):
+            with verification_scope():
+                try:
+                    services = build_services(camp)
+                except (LlmUnavailable, ValueError, OSError) as exc:
+                    event(camp, "context_memory_maintenance_deferred", reason=str(exc))
+                    _sync_ledger(camp, state)
+                    save_state(camp, state)
+                else:
+                    _run_context_maintenance(camp, state, services)
         return state
     try:
         planner = role_backend(camp, "research_planner")
@@ -1402,14 +1546,7 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
         from react_agent.eeg_research.agentic.verification_cache import verification_scope
         with verification_scope():
             state = tick(camp, planner, services=services)
-            upkeep = services.get("context_maintenance")
-            if upkeep and state.get("status") in {"created", "planning"}:
-                try:
-                    result = upkeep(camp, state)
-                    event(camp, "context_memory_maintenance", status=result.get("status", "completed"))
-                    save_state(camp, state)
-                except (LlmUnavailable, ValueError, OSError) as exc:
-                    event(camp, "context_memory_maintenance_deferred", reason=str(exc))
+            _run_context_maintenance(camp, state, services)
         (camp / "worker.json").write_text(
             json.dumps({"pid": os.getpid(), "heartbeat": time.time(), "tick": tick_index,
                         "decision_ticks": decisions, "resumable": bool(state.get("live_job"))}),

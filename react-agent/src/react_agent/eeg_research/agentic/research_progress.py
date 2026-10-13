@@ -537,10 +537,15 @@ def _factual_correction_projection(camp: Path, state: dict[str, Any], report: di
                 'authority': 'No correction payload delivered; inspect original registered artifact.'}
 
 
-def verified_diagnostic_facts(camp: Path, state: dict[str, Any], *, job_ids: set[str] | None = None, target_ids: set[str] | None = None, max_facts: int = 6) -> list[dict[str, Any]]:
+def verified_diagnostic_facts(camp: Path, state: dict[str, Any], *, job_ids: set[str] | None = None, target_ids: set[str] | None = None, suite_ids: set[str] | None = None, max_facts: int = 6) -> list[dict[str, Any]]:
     """Inject compact verified all-query diagnostic facts before history truncation."""
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
-    facts=[];seen=set();limit=max(1,min(int(max_facts),12))
+    from .suite_diagnostics import verified_facts
+    limit=max(1,min(int(max_facts),12))
+    scoped = verified_facts(camp, state, job_ids=job_ids, target_ids=target_ids, suite_ids=suite_ids, max_facts=limit)
+    if scoped:
+        return scoped
+    facts=[];seen=set()
     for row in reversed(state.get('evidence') or []):
         if row.get('kind')!='diagnostic_bundle':continue
         for ref in row.get('artifact_refs') or []:

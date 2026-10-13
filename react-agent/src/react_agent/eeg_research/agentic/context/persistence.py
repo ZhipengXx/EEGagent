@@ -102,6 +102,13 @@ class ContextPersistence:
             campaign = db.execute("SELECT campaign_id FROM context_state WHERE singleton=1").fetchone()[0]
             if campaign != self.campaign_id:
                 raise ValueError("context database belongs to another campaign")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(context_maintenance_jobs)")}
+            for name, definition in (("lease_deadline", "REAL NOT NULL DEFAULT 0"),
+                                     ("in_flight", "INTEGER NOT NULL DEFAULT 0"),
+                                     ("source_family", "TEXT NOT NULL DEFAULT ''")):
+                if name not in columns:
+                    db.execute("ALTER TABLE context_maintenance_jobs ADD COLUMN " + name + " " + definition)
+            db.execute("CREATE INDEX IF NOT EXISTS context_maintenance_family ON context_maintenance_jobs(source_family)")
 
     @contextlib.contextmanager
     def db(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
@@ -159,17 +166,34 @@ class ContextPersistence:
         return receipt
 
     def claim(self, input_digest: str, *, owner: str, turn_id: str, lease_seconds: float,
-              max_attempts: int, input_chars: int, max_concurrent: int = 1) -> str:
+              max_attempts: int, input_chars: int, max_concurrent: int = 1,
+              source_family: str = "", legacy_family_digests: tuple[str, ...] = ()) -> str:
         """Claim one epoch per digest/turn; expired workers can recover next turn."""
         now = self.clock()
         if max_concurrent < 1 or lease_seconds <= 0 or max_attempts < 1:
             raise ValueError("invalid maintenance lease policy")
         with self.db(immediate=True) as db:
+            if source_family:
+                # Link verified historical draft batches without changing any
+                # status, attempt count, response, cost or scientific coverage.
+                for old_digest in legacy_family_digests:
+                    db.execute("UPDATE context_maintenance_jobs SET source_family=? WHERE input_digest=? AND source_family=''",
+                               (source_family, old_digest))
+                siblings = db.execute("SELECT * FROM context_maintenance_jobs WHERE source_family=?", (source_family,)).fetchall()
+                if any(row["status"] == "leased" and (row["lease_until"] > now or
+                       row["in_flight"] and row["lease_deadline"] > now) for row in siblings):
+                    return "leased"
+                if any(row["last_turn_id"] == turn_id for row in siblings):
+                    return "already_attempted_this_turn"
+                if sum(row["retry_count"] for row in siblings) >= max_attempts:
+                    return "attempts_exhausted"
+                if any(row["next_attempt_at"] > now for row in siblings):
+                    return "backoff"
             row = db.execute("SELECT * FROM context_maintenance_jobs WHERE input_digest=?", (input_digest,)).fetchone()
             if row:
                 if row["status"] in {"published", "no_signal", "no_op"}:
                     return "cached_" + row["status"]
-                if row["lease_until"] > now:
+                if row["lease_until"] > now or (row["in_flight"] and row["lease_deadline"] > now):
                     return "leased"
                 if row["last_turn_id"] == turn_id:
                     return "already_attempted_this_turn"
@@ -180,7 +204,7 @@ class ContextPersistence:
                 live = db.execute("SELECT COUNT(*) FROM context_maintenance_jobs WHERE status='leased' AND lease_until>?", (now,)).fetchone()[0]
                 if live >= max_concurrent:
                     return "concurrency_limit"
-                db.execute("UPDATE context_maintenance_jobs SET status='leased',lease_owner=?,lease_until=?,retry_count=retry_count+1,last_turn_id=?,input_chars=? WHERE input_digest=?",
+                db.execute("UPDATE context_maintenance_jobs SET status='leased',lease_owner=?,lease_until=?,retry_count=retry_count+1,last_turn_id=?,input_chars=?,lease_deadline=0,in_flight=0 WHERE input_digest=?",
                            (owner, now + lease_seconds, turn_id, input_chars, input_digest))
             else:
                 live = db.execute("SELECT COUNT(*) FROM context_maintenance_jobs WHERE status='leased' AND lease_until>?", (now,)).fetchone()[0]
@@ -188,7 +212,56 @@ class ContextPersistence:
                     return "concurrency_limit"
                 db.execute("INSERT INTO context_maintenance_jobs(input_digest,status,lease_owner,lease_until,retry_count,last_turn_id,input_chars) VALUES(?,'leased',?,?,1,?,?)",
                            (input_digest, owner, now + lease_seconds, turn_id, input_chars))
+            if source_family:
+                db.execute("UPDATE context_maintenance_jobs SET source_family=? WHERE input_digest=?", (source_family, input_digest))
         return "claimed"
+
+    def legacy_source_family(self, family: str, family_for_draft, *, limit: int = 128) -> tuple[str, ...]:
+        """Bounded compatibility index from immutable drafts of pre-fix jobs."""
+        with self.db() as db:
+            unlinked = {row[0] for row in db.execute("SELECT input_digest FROM context_maintenance_jobs WHERE source_family='' LIMIT ?", (limit,))}
+            if not unlinked:
+                return ()
+            rows = db.execute("SELECT artifact_ref FROM context_proposals ORDER BY created_at DESC LIMIT ?", (limit * 2,)).fetchall()
+        result = set()
+        for row in rows:
+            try:
+                draft = self.read(row[0])
+                operation = draft.get("generation", {}).get("operation_id", "")
+                old_digest = operation.split(":", 1)[0]
+                if old_digest in unlinked and family_for_draft(draft) == family:
+                    result.add(old_digest)
+            except (ValueError, KeyError, OSError, TypeError):
+                # Unverifiable drafts remain unlinked; native intents still
+                # protect unknown/paid response recovery and global call limits.
+                continue
+        return tuple(sorted(result))
+
+    def renew(self, input_digest: str, *, owner: str, lease_seconds: float,
+              epoch_seconds: float, in_flight: bool,
+              authority_revision: str = "", base_revision: int | None = None) -> bool:
+        """Protect one bounded native call while retaining owner and snapshot CAS.
+
+        The epoch deadline is set once. Repeated renewals cannot extend it;
+        crashed callers become reclaimable after this bounded interval. Native
+        API intents still decide whether a request may actually be resent.
+        """
+        if lease_seconds <= 0 or epoch_seconds <= 0:
+            raise ValueError("invalid maintenance renewal deadline")
+        now = self.clock()
+        with self.db(immediate=True) as db:
+            row = db.execute("SELECT * FROM context_maintenance_jobs WHERE input_digest=?", (input_digest,)).fetchone()
+            state = db.execute("SELECT revision,authority_revision FROM context_state WHERE singleton=1").fetchone()
+            if (not row or row["status"] != "leased" or row["lease_owner"] != owner
+                    or (base_revision is not None and state["revision"] != base_revision)
+                    or (authority_revision and state["authority_revision"] != authority_revision)):
+                return False
+            deadline = row["lease_deadline"] or now + epoch_seconds
+            if deadline <= now:
+                return False
+            db.execute("UPDATE context_maintenance_jobs SET lease_until=?,lease_deadline=?,in_flight=? WHERE input_digest=? AND lease_owner=?",
+                       (min(deadline, now + lease_seconds), deadline, int(in_flight), input_digest, owner))
+        return True
 
     def charge(self, *, turn_id: str, max_calls_turn: int, max_calls_campaign: int,
                estimated_cost: float, max_cost_turn: float, max_cost_campaign: float) -> bool:
@@ -213,6 +286,12 @@ class ContextPersistence:
             db.execute("UPDATE context_maintenance_usage SET cost=cost+? WHERE singleton=1", (difference,))
             db.execute("UPDATE context_maintenance_turns SET cost=cost+? WHERE turn_id=?", (difference, turn_id))
 
+    def release_cached_reservation(self, *, turn_id: str, reserved: float) -> None:
+        """A confirmed native cache adoption consumed no new provider call."""
+        with self.db(immediate=True) as db:
+            db.execute("UPDATE context_maintenance_usage SET calls=MAX(0,calls-1),cost=MAX(0,cost-?) WHERE singleton=1", (reserved,))
+            db.execute("UPDATE context_maintenance_turns SET calls=MAX(0,calls-1),cost=MAX(0,cost-?) WHERE turn_id=?", (reserved, turn_id))
+
     def finish_job(self, input_digest: str, *, owner: str, status: str,
                    error: str = "", result_ref: str = "", output_chars: int = 0,
                    backoff_seconds: float = 0) -> bool:
@@ -222,7 +301,7 @@ class ContextPersistence:
             row = db.execute("SELECT lease_owner,status FROM context_maintenance_jobs WHERE input_digest=?", (input_digest,)).fetchone()
             if not row or row["lease_owner"] != owner or row["status"] != "leased":
                 return False
-            db.execute("UPDATE context_maintenance_jobs SET status=?,lease_owner=NULL,lease_until=0,last_error=?,result_ref=?,output_chars=?,next_attempt_at=? WHERE input_digest=?",
+            db.execute("UPDATE context_maintenance_jobs SET status=?,lease_owner=NULL,lease_until=0,in_flight=0,last_error=?,result_ref=?,output_chars=?,next_attempt_at=? WHERE input_digest=?",
                        (status, error[:2_000], result_ref, output_chars,
                         self.clock() + max(0, backoff_seconds), input_digest))
         return True

@@ -74,8 +74,11 @@ an older sampled diagnostic lacks them. Group development results still do
 not measure the untouched subject. Use checkpoint identity and explicit scope.
 
 EXPLICIT AVAILABILITY AND PAIRED ARITHMETIC
-verified_run_coverage gives one seed_record for every actual independent candidate
-seed in matched_run_history. Use its same-seed baseline values and paired mean;
+For ordinary runs, verified_run_coverage gives seed_records. For method research,
+candidate_seed_coverage names the measured phase: seed0 two-fold screening is
+measured even while primary_10fold_coverage is unavailable. Full method primary
+comes only from a complete native ten-fold aggregate; ten folds are one seed,
+not ten independent seeds. Use the matched phase baseline and paired delta;
 name failed exact-seed predictions separately from missing seed coverage.
 Include the observed seed records in observations. A full_query_groups_available
 value of true describes the supplied group coverage for that job; verify the

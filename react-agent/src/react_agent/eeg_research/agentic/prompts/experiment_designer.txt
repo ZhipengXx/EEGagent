@@ -28,6 +28,7 @@ a compound intervention. Do not invent sample counts, subject metadata or
 practical-gain thresholds.
 
 OUTPUT
+Return a compact final JSON promptly; retain executable hook parameters, core implementation promises and source refs without repeating supplied context or policies.
 Return only injected ExperimentDesignResult fields. Put supported prediction
 and disconfirmation content inside experiment_spec/hypothesis, never top-level
 predictions or status_scope_note. Return confounders, required_corrections,

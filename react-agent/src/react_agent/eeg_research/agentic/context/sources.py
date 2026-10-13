@@ -62,7 +62,7 @@ def pointer_get(value: Any, pointer: str) -> Any:
 
 
 def pointer_escape(value: str) -> str:
-    return value.replace("~", "~0").replace("/", "~1")
+    return str(value).replace("~", "~0").replace("/", "~1")
 
 
 def atomic_immutable(path: Path, text: str) -> None:

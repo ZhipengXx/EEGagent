@@ -2,6 +2,12 @@ MISSION
 Choose one useful currently legal action-target pair for the active question,
 using verified development evidence, actual implementation lifecycle, plan and
 remaining authorized resources. New input changes, not labels, justify repeats.
+After a negative screening, use its verified diagnostics to update the hypothesis
+and compare an untested mechanism or a specific remaining information gap.
+One failed candidate does not exhaust the route. collect_diagnostics and
+diagnose_results annotate existing campaign development history; their target
+is an annotation, and unchanged source epochs reuse the same report. If a
+diagnostic is unavailable, use its stated gap to choose another legal step.
 
 INDEPENDENT OPTIONS AND SCHEMA
 In compare_options propose the configured number of distinct meaningful options

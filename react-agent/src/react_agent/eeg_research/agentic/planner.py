@@ -289,9 +289,17 @@ def _seen_without_new_evidence(state: dict[str, Any], action: str) -> bool:
         return False
     if action == "retrieve_memory" and state.get("_has_development_artifacts") and int(state.get("_read_remaining", 0)) > 0:
         return False
+    from .action_epoch import DIAGNOSTIC_ACTIONS, action_input_epoch
     count = evidence_count(state)
     for row in reversed(state.get("decisions") or []):
         if row.get("action") == action and row.get("ok") and row.get("executed") is not False:
+            if action in DIAGNOSTIC_ACTIONS:
+                if row.get("action_input_epoch"):
+                    return row["action_input_epoch"] == action_input_epoch(state, action)
+                # Legacy suite diagnostics had no job resolver. The new
+                # source-bound handler supplies one genuine missing stage.
+                if state.get("evaluation_mode") == "loso_method_search":
+                    return False
             return row.get("evidence_count") == count
     return False
 
@@ -915,7 +923,14 @@ def cost_estimates(state: dict[str, Any], observation: dict[str, Any], *, camp=N
     from react_agent.eeg_research.agentic.execution_protocol import load_protocol, next_unused_training_seed
     if state.get("evaluation_mode") == "loso_method_search":
         from react_agent.eeg_research.agentic.method_suite import suite_cost_estimates
-        return suite_cost_estimates(camp, state, observation)
+        estimates = suite_cost_estimates(camp, state, observation)
+        for key, row in estimates.items():
+            if key.split(":", 1)[0] in {"collect_diagnostics", "diagnose_results"}:
+                row["cost_basis"] = ["runtime:read_existing_campaign_development_exports",
+                    *(basis for basis in row.get("cost_basis") or [] if basis.startswith("manifest:"))]
+                row["diagnostic_scope"] = "campaign_history_annotation; candidate target is an annotation"
+                row["conditional_followup"] = "New verified information may trigger source-bound Analyst/Curator calls; each is charged to the remaining API ledger."
+        return estimates
     estimates = {}
     protocol = load_protocol(camp) if camp else {}
     protocol = protocol or {}

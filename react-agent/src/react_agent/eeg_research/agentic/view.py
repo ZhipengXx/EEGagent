@@ -249,6 +249,8 @@ def campaign_view(camp: Path, *, include_source: bool = True) -> dict[str, Any]:
     contract = _read(camp / "evaluation_contract.json") or {}
     cost = _read(camp / "cost.json") or {}
     state = _read(camp / "campaign_state.json") or {}
+    from react_agent.eeg_research.agentic.decision_receipts import project_decisions
+    project_decisions(camp, state)
     role_calls = {}
     calls_path = camp / "llm_calls.jsonl"
     if calls_path.is_file():
