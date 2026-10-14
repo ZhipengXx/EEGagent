@@ -35,6 +35,7 @@ const state = {
     test_dir: "",
     stop: "chain_early",
     policy: "agentic",
+    execution_version: "single_plan_v1",
     training_strategy: "pooled_subjects",
     generalization_target: "",
     held_out_subjects: "",
@@ -1397,7 +1398,7 @@ function paintWorkspaceShell() {
   const visible = lists.filter((row) => `${row.objective || ""} ${row.campaign_id} ${row.status}`.toLowerCase().includes(query)).sort((a, b) => (b.campaign_id === state.agenticFocus) - (a.campaign_id === state.agenticFocus) || Number(b.updated_at) - Number(a.updated_at));
   listEl.innerHTML = visible.map((row) => `<button type="button" class="run-item${row.campaign_id === state.agenticFocus ? " active" : ""}" data-agentic-select="${esc(row.campaign_id)}" aria-pressed="${row.campaign_id === state.agenticFocus}"><span class="campaign-name"><span class="campaign-dot" aria-hidden="true"></span><span class="run-name" title="${esc(row.objective || row.campaign_id)}">${esc(row.objective || row.campaign_id)}</span></span><span class="campaign-code">${esc(row.campaign_id)}</span><span class="run-meta">${esc(WORKSPACE_STATUS[row.status] || statusLabel(row.status))}${row.campaign_id === state.agenticFocus ? " · current" : ""}</span></button>`).join("") || `<p class="muted">${lists.length ? "No matching campaigns." : "No research campaigns yet."}</p>`;
   if (camp) listEl.innerHTML += `<p class="nav-heading candidate-heading">CANDIDATES</p><div class="candidate-list">${(camp.candidates || []).map((row) => `<button type="button" class="${row.parent_candidate_id ? "tree-child " : ""}${row.candidate_id === state.selectedCandidate ? "active" : ""}" data-candidate="${esc(row.candidate_id)}"><strong>${esc(row.candidate_id)} · ${esc(statusLabel(row.status))}</strong><span class="run-meta">${row.parent_candidate_id ? `From ${esc(row.parent_candidate_id)}` : "Lineage not recorded"}${row.attempt_id ? ` / ${esc(row.attempt_id)}` : ""}</span></button>`).join("")}</div>`;
-  document.getElementById("side-context").innerHTML = camp ? `<strong>${esc(scopeLabel(camp).split(" / ")[0])}</strong><p>${esc(scopeLabel(camp).split(" / ").slice(1).join(" / "))}</p><p>Research metrics follow the recorded evaluation contract.</p>` : "";
+  document.getElementById("side-context").innerHTML = camp ? `<strong>${esc(scopeLabel(camp).split(" / ")[0])}</strong><p>${esc(scopeLabel(camp).split(" / ").slice(1).join(" / "))}</p><p>Execution: ${esc(camp.execution_version || "legacy")}</p><p>Paid memory maintenance: ${esc(camp.paid_maintenance || "legacy")}</p><p>Selected task: ${esc(camp.selected_plan?.plan_id || "None")}${camp.selected_plan?.current_step ? ` · ${esc(camp.selected_plan.current_step)}` : ""}</p><p>Research metrics follow the recorded evaluation contract.</p>` : "";
   document.getElementById("demo-indicator").hidden = !state.demo;
   if (!camp) {
     main.innerHTML = `<section class="workspace"><header class="workspace-head"><div class="workspace-heading"><p class="workspace-kicker">BRAIN DECODING LAB</p><h1>Autonomous research</h1><p class="workspace-protocol">Build, evaluate and understand your next experiment.</p></div></header><section class="panel"><h2>Start a research campaign</h2><p class="muted">Configure your data, protocol and budget in New research.</p><button type="button" class="primary" id="empty-create">+ New research</button></section></section>`;
@@ -1730,7 +1731,7 @@ function paintRetrieval(payload) {
           <option value="legacy_fixed"${state.retrieval.policy === "legacy_fixed" ? " selected" : ""}>固定两试（对照）</option>
         </select></label>
         ${state.retrieval.policy === "agentic"
-          ? `<p class="muted">结束由研究循环决定，不使用两试早停。Pilot 默认 3 个 epoch，只用于探索。完整训练与复现才可能进入确认。代码级协议暂不支持时会明确提示，不会静默改成其它模式。</p>`
+          ? `<label class="choice">任务执行方式<select id="retrieval-execution-version"><option value="single_plan_v1"${state.retrieval.execution_version === "single_plan_v1" ? " selected" : ""}>比较多个方案，每轮执行一个任务（推荐）</option><option value="legacy"${state.retrieval.execution_version === "legacy" ? " selected" : ""}>旧版研究循环</option></select></label><p class="muted">结束由研究循环决定，不使用两试早停。Pilot 默认 3 个 epoch，只用于探索。完整训练与复现才可能进入确认。代码级协议暂不支持时会明确提示，不会静默改成其它模式。</p>`
           : `<label class="choice">结束条件<select id="retrieval-stop">${stopOptions(options)}</select></label>`}
         <details class="advanced-settings" id="advanced-settings"${state.advancedOpen ? " open" : ""}>
         <summary>高级设置</summary>
@@ -1834,12 +1835,13 @@ function bindRetrieval() {
       paintRetrieval(state.shell || {});
     });
   });
-  ["retrieval-epochs", "retrieval-seed", "retrieval-batch", "retrieval-lr", "retrieval-gpu-seconds", "retrieval-stop", "retrieval-policy", "retrieval-strategy", "retrieval-generalization", "retrieval-heldout", "retrieval-root", "retrieval-train", "retrieval-test"].forEach((id) => {
+  ["retrieval-epochs", "retrieval-seed", "retrieval-batch", "retrieval-lr", "retrieval-gpu-seconds", "retrieval-stop", "retrieval-policy", "retrieval-execution-version", "retrieval-strategy", "retrieval-generalization", "retrieval-heldout", "retrieval-root", "retrieval-train", "retrieval-test"].forEach((id) => {
     const node = document.getElementById(id);
     if (!node) return;
     node.addEventListener("change", () => {
       const previous = state.retrieval.data_root;
       readRetrievalFields();
+      if (id === "retrieval-execution-version") agenticRequestId = "";
       if (id === "retrieval-root" && state.retrieval.data_root !== previous) {
         clearDiscovery();
         paintRetrieval(state.shell || {});
@@ -1879,6 +1881,7 @@ function readRetrievalFields() {
     "retrieval-gpu-seconds": "gpu_seconds",
     "retrieval-stop": "stop",
     "retrieval-policy": "policy",
+    "retrieval-execution-version": "execution_version",
     "retrieval-strategy": "training_strategy",
     "retrieval-generalization": "generalization_target",
     "retrieval-heldout": "held_out_subjects",

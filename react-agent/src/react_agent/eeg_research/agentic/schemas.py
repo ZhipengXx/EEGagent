@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
 
 SCHEMA_VERSION = "eeg_research.v1.9"
 ROLE_RESULT_VERSION = "eeg_research.role_result.v1"
@@ -245,7 +245,16 @@ class ResearchPlanProposal(DomainOutput):
         "Use only delivered verified artifact_id or context:// source refs. Use [] when none are required."
         " JSON pointers, hashes, paths and prospective sources are not references."))
     cost_assessment: dict[str, Any] = Field(default_factory=dict)
+    implementation_risk: str | None = Field(default=None, min_length=1, max_length=1000,
+        description="Predicted engineering risk for this task; not execution permission or measured evidence.")
     value_rationale: str = Field(min_length=1, max_length=1500)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_proposal_shape(self, handler):
+        row = handler(self)
+        if "implementation_risk" not in self.model_fields_set:
+            row.pop("implementation_risk", None)
+        return row
 
     @model_validator(mode="after")
     def valid_task_phase(self):

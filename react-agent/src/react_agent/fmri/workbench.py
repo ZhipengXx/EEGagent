@@ -307,6 +307,8 @@ def submit_retrieval(form: dict[str, str]) -> tuple[int, dict[str, Any]]:
         design = parse_design(form)
     except ValueError as exc:
         return 400, {"ok": False, "started": False, "discovered": False, "subjects": [], "gpus": [], "blockers": [str(exc)]}
+    if action == "run" and design.policy == "agentic" and (form.get("execution_version") or "single_plan_v1") not in {"single_plan_v1", "legacy"}:
+        return 400, {"ok": False, "started": False, "blockers": ["invalid_execution_version"]}
     if action == "discover":
         from react_agent.eeg_training.launch import discover_design
         from react_agent.eeg_training.protocol import SplitError
@@ -329,7 +331,8 @@ def submit_retrieval(form: dict[str, str]) -> tuple[int, dict[str, Any]]:
             payload["blockers"] = list(payload.get("blockers") or []) + [reason]
             payload["log"] = list(payload.get("log") or []) + [reason]
         elif not payload.get("blockers"):
-            payload = open_agentic_run(design, payload, request_id=(form.get("request_id") or "").strip(), root=DEFAULT_ROOT)
+            payload = open_agentic_run(design, payload, request_id=(form.get("request_id") or "").strip(),
+                root=DEFAULT_ROOT, execution_version=form.get("execution_version") or "single_plan_v1")
     payload["campaigns"] = _research_campaigns()
     return 200, payload
 

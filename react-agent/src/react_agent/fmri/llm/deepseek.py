@@ -110,6 +110,14 @@ class DeepSeekConfigError(RuntimeError):
     """Raised when DeepSeek is requested without credentials."""
 
 
+class DeepSeekBudgetBoundaryError(DeepSeekConfigError):
+    """An HTTP request hook rejected an owned request before dispatch."""
+
+    def __init__(self, message, *, definitely_not_sent=True):
+        super().__init__(message)
+        self.definitely_not_sent = definitely_not_sent
+
+
 class DeepSeekBackend:
     """Call DeepSeek chat completions with JSON object output."""
 
@@ -131,8 +139,30 @@ class DeepSeekBackend:
             api_key=config.deepseek_api_key,
             base_url=config.deepseek_base_url,
             max_retries=0,
-            http_client=DefaultAsyncHttpxClient(trust_env=config.deepseek_trust_env),
+            http_client=DefaultAsyncHttpxClient(trust_env=config.deepseek_trust_env,
+                event_hooks={"request": [self._budget_http_boundary]}),
         )
+
+    async def _budget_http_boundary(self, request) -> None:
+        from react_agent.eeg_research.agentic import owner_budget as budget
+        camp = self._budget_campaign or budget.current_campaign()
+        if camp is None or not budget.enabled(camp):
+            return
+        permit = budget.current_transport(camp)
+        if permit is None:
+            raise DeepSeekBudgetBoundaryError("provider_http_transport_without_owner_claim")
+        try:
+            body = json.loads(request.content)
+            model = body["model"]
+            if not isinstance(model, str) or not model:
+                raise ValueError("request_model_invalid")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise DeepSeekBudgetBoundaryError("provider_http_request_model_missing") from exc
+        try:
+            budget.mark_http_dispatched(camp, permit[1], provider="deepseek", model=model)
+        except budget.OwnerBudgetError as exc:
+            raise DeepSeekBudgetBoundaryError(str(exc), definitely_not_sent=
+                str(exc) != "provider_http_transport_permit_already_used") from exc
 
     def _profile(self, name: str) -> LmProfile:
         return self.config.reasoning if name == "reasoning" else self.config.fast
@@ -247,7 +277,7 @@ class DeepSeekBackend:
             if permit is None:
                 raise DeepSeekConfigError("provider_transport_without_owner_claim")
             try:
-                budget.mark_transport_dispatched(camp,permit[1])
+                budget.mark_transport_dispatched(camp,permit[1],provider="deepseek",model=kwargs["model"])
             except budget.OwnerBudgetError as exc:
                 raise DeepSeekConfigError(str(exc)) from exc
         started = time.perf_counter()
@@ -261,6 +291,8 @@ class DeepSeekBackend:
             from openai import _base_client
             http_module = getattr(_base_client, "httpx", None) or _base_client.httpx2
             cause = exc.__cause__ or exc
+            if isinstance(cause, DeepSeekBudgetBoundaryError) and cause.definitely_not_sent:
+                raise cause
             not_sent = isinstance(cause, (http_module.ConnectError, http_module.ConnectTimeout, http_module.PoolTimeout))
             unconfirmed = status is None and not not_sent
             kind = "timeout" if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else "cancelled" if isinstance(exc, asyncio.CancelledError) else "authentication_error" if status in {401, 403} else "rate_limited" if status == 429 else "provider_error" if status and status >= 500 else "transport_error"

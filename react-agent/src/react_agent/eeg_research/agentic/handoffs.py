@@ -13,6 +13,7 @@ from react_agent.eeg_research.agentic.run_context import BASELINE_HOOK_SPEC, loa
 
 SOURCE_CHARS = 16000
 _PRIVATE_SCOPES = {"final_test", "final_holdout", "held_out_unused", "secret"}
+_DROP = object()  # Privacy omission is distinct from an authoritative JSON null.
 # Limits apply to provider views, never to the authoritative artifacts or ledger.
 READ_MAX_IDS = 3
 READ_RANGE_CHARS = 4000
@@ -613,23 +614,28 @@ def training_semantics(*, config_only: bool = False) -> list[dict[str, Any]]:
 
 
 def development_view(value: Any) -> Any:
-    """Filter scope recursively before sending data to a provider."""
+    """Filter private objects while preserving business nulls and array positions."""
+    clean = _development_view(value)
+    return None if clean is _DROP else clean
+
+
+def _development_view(value: Any) -> Any:
     if isinstance(value, dict):
         if any(isinstance(value.get(key), str) and value[key] in _PRIVATE_SCOPES
                for key in ("scope", "role", "data_role", "partition")):
-            return None
+            return _DROP
         kept = {}
         for key, item in value.items():
             if key in {"test_result", "final_test_result", "forbidden_contents", "api_key", "DEEPSEEK_API_KEY"} or (
                 str(key).startswith(("test_result", "final_holdout", "final_test_")) and key != "final_test_enabled"
             ):
                 continue
-            clean = development_view(item)
-            if clean is not None or item is None:
+            clean = _development_view(item)
+            if clean is not _DROP:
                 kept[key] = clean
         return kept
     if isinstance(value, list):
-        return [clean for item in value if (clean := development_view(item)) is not None]
+        return [clean for item in value if (clean := _development_view(item)) is not _DROP]
     return value
 
 

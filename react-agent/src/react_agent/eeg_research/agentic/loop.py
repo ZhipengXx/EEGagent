@@ -141,15 +141,37 @@ def create_campaign(
     contract: dict[str, Any],
     request_id: str,
     protocol: dict[str, Any] | None = None,
+    creation_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Idempotent create. The same request id does not open a second campaign."""
     index = root / "request_index.json"
     known = _read(index)
-    if request_id in known:
-        return _read(Path(known[request_id]) / "campaign_state.json")
     camp = root / goal["goal_id"]
+    prepare_path = camp / "campaign_creation.prepare.json"
+    commit_path = camp / "campaign_creation.commit.json"
+    from .action_planning import digest
+    inputs = json.loads(json.dumps({"goal": goal, "contract": contract, "protocol": protocol,
+        "request_id": request_id, "creation_context": creation_context}, ensure_ascii=False))
+    input_digest = digest(inputs)
+    prepared = _read(prepare_path)
+    if prepared:
+        if (prepared.get("inputs") != inputs or prepared.get("input_digest") != input_digest
+                or digest({key: value for key, value in prepared.items() if key != "prepare_digest"}) != prepared.get("prepare_digest")):
+            raise ValueError("campaign_creation_configuration_conflict")
+        if _read(commit_path):
+            if _read(commit_path) != {"schema_version": "eeg_research.campaign_creation_commit.v1",
+                    "prepare_digest": prepared["prepare_digest"], "input_digest": input_digest}:
+                raise ValueError("campaign_creation_commit_changed")
+            if known.get(request_id) not in {None, str(camp)}:
+                raise ValueError("campaign_creation_request_already_bound")
+            if request_id not in known:
+                known[request_id] = str(camp)
+                _write(index, known)
+            return _read(camp / "campaign_state.json")
+    elif request_id in known:
+        return _read(Path(known[request_id]) / "campaign_state.json")
     existing = _read(camp / "campaign_state.json")
-    if existing:
+    if existing and not prepared:
         known[request_id] = str(camp)
         _write(index, known)
         return existing
@@ -214,21 +236,55 @@ def create_campaign(
         raise
     state["training_seeds"] = list(policy.get("training_seeds") or state.get("training_seeds") or [])
     state["confirmation_policy_hash"] = policy.get("policy_hash")
-    _write(camp / "goal.json", goal)
-    _write(camp / "resolved_goal.json", goal)
-    _write(camp / "evaluation_contract.json", contract)
     if protocol is not None:
         if policy.get("seeds_declared") and policy.get("training_seeds"):
             protocol = dict(protocol)
             protocol["training_seeds"] = list(policy["training_seeds"])
-        _write(camp / "execution_protocol.json", protocol)
-    write_confirmation_policy(camp, policy)
-    _write(camp / "campaign_state.json", state)
+    if creation_context:
+        state["gpu"] = creation_context.get("gpu") or []
+    frozen = {"goal.json": goal, "resolved_goal.json": goal, "evaluation_contract.json": contract,
+        "confirmation_policy.json": policy, "campaign_state.json": state}
+    if protocol is not None:
+        frozen["execution_protocol.json"] = protocol
+    if not prepared:
+        prepared = {"schema_version": "eeg_research.campaign_creation_prepare.v1", "inputs": inputs,
+            "input_digest": input_digest, "files": frozen}
+        prepared["prepare_digest"] = digest(prepared)
+        _write(prepare_path, prepared, exclusive=True)
+    elif prepared.get("files") != frozen:
+        raise ValueError("campaign_creation_projection_configuration_changed")
+    context = creation_context or {}
+    inherited = context.get("inheritance")
+    if inherited:
+        from .loso_study import digest as file_digest
+        for dependency in inherited["dependencies"]:
+            if file_digest(Path(dependency["path"])) != dependency["sha256"]:
+                raise ValueError("historical_budget_source_changed")
+    for name, payload in prepared["files"].items():
+        _publish_creation_file(camp / name, payload)
+    init_plan(camp, goal, protocol=protocol)
+    plan = _read(camp / "plan.json")
+    _publish_creation_file(camp / "plan_versions" / "v1.json", plan)
+    if inherited:
+        from .budget_inheritance import claim_successor, validate_inheritance
+        claim_successor(camp, inherited)
+        validate_inheritance(camp, _claim=False)
+    for name, payload in context.get("files", {}).items():
+        _publish_creation_file(camp / name, payload)
+    _write(commit_path, {"schema_version": "eeg_research.campaign_creation_commit.v1",
+        "prepare_digest": prepared["prepare_digest"], "input_digest": input_digest}, exclusive=True)
     known[request_id] = str(camp)
     _write(index, known)
     event(camp, "created", fingerprint=contract["fingerprint"])
-    init_plan(camp, goal, protocol=protocol)
     return state
+
+
+def _publish_creation_file(path: Path, payload: dict) -> None:
+    if path.is_file():
+        if _read(path) != payload:
+            raise ValueError("campaign_creation_frozen_file_changed:" + path.name)
+    else:
+        _write(path, payload, exclusive=True)
 
 
 def load_state(camp: Path) -> dict[str, Any]:

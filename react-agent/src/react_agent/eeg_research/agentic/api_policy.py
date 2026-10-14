@@ -261,7 +261,7 @@ def dispose_unknown_intent(camp: Path, call_id: str, *, reason: str,
         from .owner_budget import settled_provider_usage
         known=settled_provider_usage(camp,call_id)
         if known is not None:
-            row.update({key:known.get(key) for key in ("input_tokens","output_tokens","api_usd","pricing_source","pricing_date")})
+            row.update({key:known.get(key) for key in ("input_tokens","output_tokens","cache_hit_tokens","api_usd","pricing_source","pricing_date")})
             row["charge_usage_source"]="durable_owner_provider_settlement"
         _ledger(camp, row)
     elif call_id not in unresolved_charge_ids(camp):

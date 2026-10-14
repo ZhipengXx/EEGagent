@@ -217,7 +217,10 @@ def system_prompt(role: str, *, memory=None, camp=None) -> str:
             from .runtime_prompts import runtime_mission
             from .context.compiler import render_role_system
             model = domain_model_for(role, memory)
-            if role == "research_planner":
+            if role == "candidate_coder":
+                from .coder import CoderToolRequest
+                model = CoderToolRequest
+            elif role == "research_planner":
                 from .schemas import ResearchRoundDraft
                 model = ResearchRoundDraft
             schema = json.dumps(model.model_json_schema(),ensure_ascii=False) if model is not None else "{}"
@@ -550,7 +553,7 @@ def _ledger(camp: Path, row: dict[str, Any]) -> None:
     from .owner_budget import enabled, settle_request, settled_provider_usage
     if row.get("charge_usage_source")=="durable_owner_provider_settlement":
         proof=settled_provider_usage(camp,str(row.get("call_id") or ""))
-        if proof is None or any(row.get(key)!=proof.get(key) for key in ("input_tokens","output_tokens","api_usd")):
+        if proof is None or any(row.get(key)!=proof.get(key) for key in ("input_tokens","output_tokens","cache_hit_tokens","api_usd")):
             raise LlmUnavailable("owner_charge_usage_proof_mismatch")
     else:
         _price_usage(row,camp=camp)
@@ -639,6 +642,7 @@ def _price_usage(row: dict, *, camp=None, call_id=None) -> None:
             frozen = request_pricing(camp, identifier) if identifier else None
             frozen = frozen or resolve_pricing(camp, provider=row.get("provider") or "deepseek", model=row.get("requested_model"))
             row.setdefault("api_usd", None)
+            row.setdefault("cost_status", "uncertain" if row.get("unconfirmed_charge_possible") else "unpriced")
             amount = estimate_usd(frozen, input_tokens=row.get("input_tokens"), output_tokens=row.get("output_tokens"), cache_hit_tokens=row.get("cache_hit_tokens"))
             if amount is not None:
                 price = frozen["pricing"]

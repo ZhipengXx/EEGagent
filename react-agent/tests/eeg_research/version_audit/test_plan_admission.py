@@ -57,6 +57,21 @@ def test_partial_evaluation_is_incomplete_and_corrected_once():
     assert {row["proposal_id"] for row in repair["valid_proposals"]} == {"A", "B"}
 
 
+def test_correction_clarifies_invalid_inline_pointer_and_extra_null_without_weakening_validation():
+    bad = proposal("A")
+    bad["required_context_refs"] = ["/goal"]
+    extra = {**proposal("B"), "business_value": None}
+    rejected = normalize_research_round(draft([bad, extra]), observation())
+    assert not rejected["ok"] and rejected["round"]["valid_count"] == 0
+    backend = Mock(side_effect=[draft([bad, extra]), draft([proposal("A"), proposal("B")])])
+    corrected = decide_research_plan(observation(), backend)
+    assert corrected["ok"] and backend.call_count == 2
+    contract = backend.call_args_list[1].args[0]["plan_repair_request"]["reference_contract"]
+    assert "required_context_refs=[]" in contract["inline_context"]
+    assert contract["verified_artifact_ids"] == contract["delivered_context_source_refs"] == []
+    assert any("/goal" in form for form in contract["invalid_reference_forms"])
+
+
 def test_every_proposal_evaluated_completes_and_correction_can_complete():
     proposals = [proposal("A"), proposal("B")]
     complete = normalize_research_round(draft(proposals), observation())
@@ -156,6 +171,10 @@ def select_with_budget_filter(tmp_path, monkeypatch, raw, obs, rejected_cost=20)
     """Only replace owner transport; execute the native selection/pool code."""
     from react_agent.eeg_research.agentic import api_policy, owner_budget, experiment_observations, action_planning
     obs = copy.deepcopy(obs)
+    obs.update(_campaign_path=str(tmp_path), contract_fingerprint="synthetic_budget_contract",
+               execution_fingerprint="synthetic_budget_execution")
+    loop._write(tmp_path / "goal.json", obs["goal"])
+    loop._write(tmp_path / "evaluation_contract.json", {"fingerprint": obs["contract_fingerprint"]})
     obs["action_cost_estimates"] = {"by_action_target": {
         "run_full:baseline": {"estimated_cost": {"training_jobs": 1, "gpu_seconds": 10}},
         "run_full:old": {"estimated_cost": {"training_jobs": 1, "gpu_seconds": 20}},
@@ -181,7 +200,9 @@ def select_with_budget_filter(tmp_path, monkeypatch, raw, obs, rejected_cost=20)
     monkeypatch.setattr(loop, "save_state", lambda *_args: None)
     monkeypatch.setattr(loop, "event", lambda *_args, **kwargs: None)
     monkeypatch.setattr(loop, "persist_failure", lambda _camp, state, **kwargs: state.update(failure=kwargs))
-    state = {"goal_id": "synthetic", "evidence": []}
+    state = {"goal_id": "synthetic", "evidence": [], "candidates": copy.deepcopy(obs["candidates"]),
+             "contract_fingerprint": obs["contract_fingerprint"],
+             "execution_fingerprint": obs["execution_fingerprint"]}
     selected_plan._select(tmp_path, state, Mock(return_value=raw))
     stored = next((tmp_path / "research_rounds").glob("*.json"))
     return json.loads(stored.read_text()), allocate, state
@@ -229,3 +250,97 @@ def test_saved_round_with_missing_evaluation_cannot_reauthorize_selection(tmp_pa
     assert latest["shortfall_reason"] == "missing_or_nonunique_proposal_evaluations"
     allocate.assert_not_called()
     backend.assert_not_called()
+
+
+def test_explicit_pilot_only_goal_rejects_full_before_sdk_or_native(tmp_path, monkeypatch):
+    from openai.resources.chat.completions import AsyncCompletions
+    sdk, native, designer, coder = [Mock(side_effect=AssertionError("unauthorized call")) for _ in range(4)]
+    monkeypatch.setattr(AsyncCompletions, "create", sdk)
+    monkeypatch.setattr(loop, "_apply_action", native)
+    value = {"allowed_training_actions": ["run_pilot"],
+        "research_execution": {"version": "single_plan_v1", "target_k": 2}}
+    obs = observation(goal=value)
+    raw = draft([proposal("A"), proposal("B")])
+    backend = Mock(return_value=raw)
+    rejected = decide_research_plan(obs, backend)
+    assert not rejected["ok"] and backend.call_count == 2
+    assert rejected["round"]["valid_count"] == 0
+    assert any("task_training_action_outside_goal:run_full" in row.get("error", "")
+               for row in rejected["validation_records"])
+    pid = "plan_" + "b" * 32
+    loop._write(tmp_path / "goal.json", value)
+    loop._write(tmp_path / "selected_plans" / (pid + ".json"), {
+        "plan_id": pid, "originating_round": "synthetic", "originating_proposal": "A",
+        "proposal": proposal("A"), "scientific_intent_digest": "synthetic",
+        "budget_owner": "synthetic", "recovery_limits": {}, "current_step": "design"})
+    with pytest.raises(ValueError, match="task_training_action_outside_goal:run_full"):
+        selected_plan.tick_selected_plan(tmp_path, {"selected_plan": {"plan_id": pid}}, Mock(),
+            {"designer": designer, "implement": coder})
+    for spy in (sdk, native, designer, coder):
+        spy.assert_not_called()
+
+
+@pytest.mark.parametrize("kind,phase,schedule,actions,expected", [
+    ("new_method", "pilot", "full_only", ["run_pilot"], "run_pilot"),
+    ("diagnosis", "diagnostic", "full_only", [], "collect_diagnostics"),
+    ("validation", "diagnostic", "full_only", [], "collect_diagnostics"),
+    ("new_method", "screening_2fold", "screen_then_confirm", ["run_full"], "run_screening"),
+    ("confirmation", "confirmation_10fold", "screen_then_confirm", ["run_full"], "run_confirmation"),
+])
+def test_explicit_training_scope_uses_native_schedule_aliases(kind, phase, schedule, actions, expected):
+    item = proposal("A", kind, phase, target=None if kind == "new_method" else "old")
+    obs = observation(goal={"allowed_training_actions": actions, "evaluation_schedule": schedule,
+        "research_execution": {"version": "single_plan_v1"}})
+    assert measurement_action(item, obs) == expected
+    assert proposal_cost(item, obs)
+
+
+def test_declared_task_risk_is_preserved_as_prediction_and_unknown_extras_still_reject():
+    a = proposal("A", "diagnosis", "diagnostic", target="old")
+    b = proposal("B", "diagnosis", "diagnostic", target="old")
+    a["implementation_risk"] = "Low: read-only hash comparison; absent files remain unverified."
+    b["implementation_risk"] = "Moderate: bounded native artifact reads may be unavailable."
+    raw = draft([a, b])
+    original = copy.deepcopy(raw)
+    result = normalize_research_round(raw, observation())
+    assert result["ok"] and result["round"]["pool_status"] == "complete"
+    assert raw == original
+    normalized = {row["proposal_id"]: row for row in result["valid_proposals"]}
+    assert normalized["A"]["implementation_risk"] == a["implementation_risk"]
+    prediction = proposal_cost(normalized["A"], observation())
+    assert prediction["predicted"]["implementation_risk"] == {
+        "assessment": a["implementation_risk"], "authority": "model_prediction_not_execution_authority"}
+    assert prediction["known"]["training_jobs"] == prediction["known"]["gpu_seconds"] == 0
+    invalid = copy.deepcopy(raw)
+    invalid["proposals"][0]["invented_authority"] = True
+    rejected = normalize_research_round(invalid, observation())
+    assert not rejected["ok"] and rejected["round"]["valid_count"] == 1
+    assert any("invented_authority" in row.get("error", "") for row in rejected["validation_records"])
+
+
+@pytest.mark.parametrize("risk", [123, "", "X" * 1001])
+def test_task_risk_remains_typed_and_bounded(risk):
+    item = {**proposal("A"), "implementation_risk": risk}
+    with pytest.raises(ValueError):
+        ResearchPlanProposal.model_validate(item)
+
+
+def test_new_optional_risk_preserves_legacy_plan_publication_digest_and_business_null():
+    from react_agent.eeg_research.agentic.action_planning import digest
+    from react_agent.eeg_research.agentic.schemas import SelectedPlan
+    legacy = {**proposal("A"), "cost_assessment": {"usd": None, "parts": [None]}}
+    legacy["evaluation_scope"]["optional"] = None
+    normalized = ResearchPlanProposal.model_validate(legacy).model_dump()
+    assert normalized == legacy and "implementation_risk" not in normalized
+    previous_digest = digest(legacy)
+    plan = SelectedPlan(plan_id="plan_" + "c" * 32, originating_round="legacy",
+        originating_proposal="A", proposal=legacy, scientific_intent_digest="legacy_intent",
+        budget_owner="legacy_owner", recovery_limits={}).model_dump()
+    projected = SelectedPlan.model_validate(plan).model_dump()
+    assert selected_plan._step_binding(plan)["proposal_digest"] == previous_digest
+    assert selected_plan._step_binding(projected) == selected_plan._step_binding(plan)
+    assert projected["proposal"]["target_candidate_ref"] is None
+    assert projected["proposal"]["evaluation_scope"]["optional"] is None
+    assert projected["proposal"]["cost_assessment"] == {"usd": None, "parts": [None]}
+    explicit_null = ResearchPlanProposal.model_validate({**legacy, "implementation_risk": None}).model_dump()
+    assert "implementation_risk" in explicit_null and explicit_null["implementation_risk"] is None

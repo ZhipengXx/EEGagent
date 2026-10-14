@@ -53,6 +53,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--goal", type=Path, default=None, help="GoalSpec YAML. validate-goal prints it and does not start a worker.")
     parser.add_argument("--planner-mode", choices=["single_action", "compare_options"], default=None,
                         help="New campaign controller mode; persisted goals are authoritative on resume.")
+    parser.add_argument("--execution-version", choices=["single_plan_v1", "legacy"], default=None,
+                        help="New campaign protocol; old goal files keep legacy unless explicitly selected.")
     parser.add_argument("--pack", type=Path, default=None, help="Candidate pack directory for evaluate-export")
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
@@ -127,6 +129,11 @@ def goal(campaign: str, design=None) -> dict:
     return {
         "goal_id": campaign,
         "planner_mode": "compare_options",
+        "research_execution": {"version": "single_plan_v1", "budget": {"envelopes": {
+            kind: {"training_jobs": 2, "gpu_seconds": 2 * gpu / 20,
+                "allocation_basis": "authorized_global_gpu_seconds_per_training_job",
+                "authority": "maximum_runtime_allocation_not_cost_estimate"}
+            for kind in ("new_method", "validation", "confirmation")}}},
         "objective": "改进指定数据与协议下的 EEG 到图像检索",
         "task_type": "eeg_image_retrieval",
         "research_scope": scope,
@@ -145,8 +152,83 @@ def goal(campaign: str, design=None) -> dict:
     }
 
 
+def _execution_goal(submitted: dict, execution_version: str | None) -> dict:
+    submitted = dict(submitted)
+    if execution_version == "legacy":
+        submitted.pop("research_execution", None)
+    elif execution_version == "single_plan_v1":
+        submitted["research_execution"] = {**(submitted.get("research_execution") or {}), "version": "single_plan_v1"}
+    elif execution_version is not None:
+        raise ValueError("execution_version_invalid")
+    execution = submitted.get("research_execution") or {}
+    if execution.get("version") == "single_plan_v1" and submitted.get("evaluation_mode", "single_target") == "single_target":
+        from math import isfinite
+        jobs, gpu_seconds = submitted.get("max_training_jobs", 20), submitted.get("max_gpu_seconds", DEFAULT_MAX_GPU_SECONDS)
+        if (type(jobs) is not int or jobs <= 0 or type(gpu_seconds) not in (int, float)
+                or not isfinite(gpu_seconds) or gpu_seconds <= 0):
+            # A zero-training goal can still authorize diagnosis. Missing
+            # measurement bounds remain subject to native admission rejection.
+            return submitted
+        budget = dict(execution.get("budget") or {})
+        envelopes = dict(budget.get("envelopes") or {})
+        for kind in ("new_method", "validation", "confirmation"):
+            envelopes.setdefault(kind, {"training_jobs": 2, "gpu_seconds": 2 * gpu_seconds / jobs,
+                "allocation_basis": "authorized_global_gpu_seconds_per_training_job",
+                "authority": "maximum_runtime_allocation_not_cost_estimate"})
+        budget["envelopes"] = envelopes
+        submitted["research_execution"] = {**execution, "budget": budget}
+    return submitted
+
+
+def _entry_error(camp: Path) -> str | None:
+    path = camp / "campaign_state.json"
+    if path.is_file() and json.loads(path.read_text(encoding="utf-8")).get("status") == "cancelled":
+        return "campaign_cancelled"
+    control = camp / "control.json"
+    if control.is_file() and json.loads(control.read_text(encoding="utf-8")).get("action") == "stop":
+        return "campaign_cancelled"
+    if (camp / "campaign_creation.prepare.json").is_file() and not (camp / "campaign_creation.commit.json").is_file():
+        return "campaign_creation_not_committed"
+    return None
+
+
+def _creation_request_path(root: Path, request_id: str) -> Path:
+    from .action_planning import digest
+    return root / "creation_requests" / (digest({"request_id": request_id}) + ".prepare.json")
+
+
+def _read_creation_request(root: Path, request_id: str, config: dict) -> dict | None:
+    from .action_planning import digest
+    path = _creation_request_path(root, request_id)
+    if not path.is_file():
+        return None
+    prepared = json.loads(path.read_text(encoding="utf-8"))
+    if (digest({key: value for key, value in prepared.items() if key != "prepare_digest"}) != prepared.get("prepare_digest")
+            or prepared.get("request_id") != request_id or prepared.get("request_config") != config):
+        raise ValueError("campaign_creation_configuration_conflict")
+    return prepared
+
+
+def _publish_cli_creation(root: Path, prepared: dict) -> dict:
+    return create_campaign(root, goal=prepared["goal"], contract=prepared["contract"],
+        request_id=prepared["request_id"], protocol=prepared["protocol"], creation_context=prepared["creation_context"])
+
+
+def _create_output(state: dict, camp: Path) -> dict:
+    from .research_execution import paid_maintenance_mode, single_plan_enabled
+    frozen_goal = json.loads((camp / "goal.json").read_text(encoding="utf-8"))
+    return {"status": state["status"], "fingerprint": state["contract_fingerprint"], "spawn_worker": False,
+        "max_training_jobs": state.get("max_training_jobs"), "max_llm_calls": state.get("max_llm_calls"),
+        "max_gpu_seconds": state.get("max_gpu_seconds"),
+        "execution_version": "single_plan_v1" if single_plan_enabled(frozen_goal) else "legacy",
+        "paid_maintenance": paid_maintenance_mode(frozen_goal), "selected_plan": state.get("selected_plan")}
+
+
 def spawn_worker(root: Path, campaign: str, poll_seconds: float, *, max_ticks: int = 200) -> int:
     camp = root / campaign
+    error = _entry_error(camp)
+    if error:
+        raise ValueError(error)
     log = (camp / "worker.log").open("ab")
     proc = subprocess.Popen(  # noqa: S603
         [sys.executable, "-m", "react_agent.eeg_research.agentic.cli", "run", "--campaign", campaign,
@@ -165,6 +247,7 @@ def open_agentic_run(
     request_id: str,
     root: Path,
     spawn=spawn_worker,
+    execution_version: str = "single_plan_v1",
 ) -> dict:
     """Create one new v18 campaign for this click and start its worker. A repeated request id does not start a second one."""
     import hashlib
@@ -180,6 +263,11 @@ def open_agentic_run(
     index = root / "request_index.json"
     known = json.loads(index.read_text(encoding="utf-8")) if index.is_file() else {}
     already = request_id in known
+    existing_camp = Path(known[request_id]) if already else root / campaign
+    if _entry_error(existing_camp) == "campaign_cancelled":
+        result.update(ok=False, started=False, error="campaign_cancelled")
+        result["blockers"] = list(result.get("blockers") or []) + ["campaign_cancelled"]
+        return result
     base = Path(design.data_root) if design.data_root else data_root()
     try:
         protocol = build_execution_protocol(design, base)
@@ -190,7 +278,8 @@ def open_agentic_run(
         return result
     contract = freeze_contract(design, base)
     contract["execution_fingerprint"] = protocol["fingerprint"]
-    state = create_campaign(root, goal=goal(campaign, design), contract=contract, request_id=request_id, protocol=protocol)
+    state = create_campaign(root, goal=_execution_goal(goal(campaign, design), execution_version),
+        contract=contract, request_id=request_id, protocol=protocol)
     camp = root / campaign
     if not already:
         state["gpu"] = [int(item) for item in (design.gpu or (0,))]
@@ -206,7 +295,9 @@ def open_agentic_run(
 
 
 def status_view(camp: Path) -> dict:
+    from .research_execution import paid_maintenance_mode, single_plan_enabled
     state = load_state(camp)
+    frozen_goal = json.loads((camp / "goal.json").read_text(encoding="utf-8"))
     status = state.get("status")
     detail = state.get("detail")
     if status not in {"paused", "finished", "blocked", "cancelled"}:
@@ -219,6 +310,9 @@ def status_view(camp: Path) -> dict:
             status = "interrupted"
             detail = "worker 已退出"
     return {
+        "execution_version": "single_plan_v1" if single_plan_enabled(frozen_goal) else "legacy",
+        "paid_maintenance": paid_maintenance_mode(frozen_goal),
+        "selected_plan": state.get("selected_plan"),
         "status": status,
         "detail": detail,
         "live_job": state.get("live_job"),
@@ -246,6 +340,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if overrides and args.command not in {"create", "role-config-preview", "screening-dry-run"}:
         print(json.dumps({"error": "role_overrides_require_new_campaign_or_preview"}))
+        return 2
+    if args.execution_version is not None and args.command != "create":
+        print(json.dumps({"error": "execution_version_requires_new_campaign"}))
         return 2
     if args.command == "historical-runtime-preview":
         from react_agent.eeg_research.agentic.historical_runtime import checkout_preview
@@ -437,10 +534,33 @@ def main(argv: list[str] | None = None) -> int:
         if args.goal is not None:
             submitted = {**submitted, **load_goal_file(args.goal)}
             submitted["goal_id"] = args.campaign
+        submitted = _execution_goal(submitted, args.execution_version)
         if args.planner_mode is not None:
             submitted["planner_mode"] = args.planner_mode
         if submitted.get("evaluation_mode") == "loso_method_search":
             submitted["allow_shared_gpus"] = args.allow_shared_gpus
+        request_id = args.request_id or args.campaign
+        request_config = {"goal": submitted, "gpu": list(selected_gpus), "base": str(base.resolve()),
+            "execution_version": args.execution_version, "planner_mode": args.planner_mode,
+            "role_overrides": overrides, "fresh_budget_authorization": args.fresh_budget_authorization,
+            "budget_history_source": None if args.budget_history_source is None else str(args.budget_history_source.resolve()),
+            "inherit_study": None if args.inherit_study is None else str(args.inherit_study.resolve()),
+            "additional_authorization": additional}
+        try:
+            index = root / "request_index.json"
+            indexed = json.loads(index.read_text(encoding="utf-8")) if index.is_file() else {}
+            if request_id in indexed and Path(indexed[request_id]).resolve() != camp.resolve():
+                raise ValueError("campaign_creation_request_already_bound")
+            prepared = _read_creation_request(root, request_id, request_config)
+            if prepared:
+                if _entry_error(camp) == "campaign_cancelled":
+                    raise ValueError("campaign_cancelled")
+                state = _publish_cli_creation(root, prepared)
+                print(json.dumps(_create_output(state, camp), ensure_ascii=False))
+                return 0
+        except (OSError, ValueError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
         inherited = None
         estimate_basis = []
         if submitted.get("evaluation_mode") == "loso_method_search":
@@ -491,48 +611,45 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         contract = freeze_contract(design, base)
         contract["execution_fingerprint"] = protocol["fingerprint"]
-        state = create_campaign(
-            root,
-            goal=submitted,
-            contract=contract,
-            request_id=args.request_id or args.campaign,
-            protocol=protocol,
-        )
-        state["gpu"] = list(design.gpu)
-        if overrides:
-            from react_agent.eeg_research.agentic.role_config import role_config_preview
-            role_config_preview(camp, overrides)
-            from react_agent.eeg_research.agentic.loso_study import write_once
-            write_once(camp / "role_config_overrides.json", overrides)
-        if inherited is not None:
-            from react_agent.eeg_research.agentic.budget_inheritance import claim_successor
-            from react_agent.eeg_research.agentic.method_suite import create_manifest, manifest
-            claim_successor(camp, inherited)
-            if not (camp / "method_search_manifest.json").exists():
-                create_manifest(camp, design, allow_shared_gpus=args.allow_shared_gpus,
-                                estimate=submitted["method_suite_gpu_seconds_estimate"], goal=submitted)
-                from react_agent.eeg_research.agentic.loso_study import write_once
-                write_once(camp / "suite_cost_basis.json", {"basis": estimate_basis, "estimate": submitted["method_suite_gpu_seconds_estimate"]})
-            else:
-                manifest(camp)
-        save_state(camp, state)
-        print(
-            json.dumps(
-                {
-                    "status": state["status"],
-                    "fingerprint": state["contract_fingerprint"],
-                    "spawn_worker": False,
-                    "max_training_jobs": state.get("max_training_jobs"),
-                    "max_llm_calls": state.get("max_llm_calls"),
-                    "max_gpu_seconds": state.get("max_gpu_seconds"),
-                },
-                ensure_ascii=False,
-            )
-        )
+        try:
+            context = {"gpu": list(design.gpu), "inheritance": inherited, "files": {}}
+            if overrides:
+                from .role_config import role_config_preview
+                role_config_preview(submitted, overrides)
+                context["files"]["role_config_overrides.json"] = overrides
+            if inherited is not None:
+                from .method_suite import create_manifest
+                from tempfile import TemporaryDirectory
+                # Freeze the entire native manifest before any campaign or
+                # budget claim is published. Restart copies these exact bytes.
+                with TemporaryDirectory(prefix="eeg-campaign-prepare-") as temporary:
+                    frozen_manifest = create_manifest(Path(temporary), design,
+                        allow_shared_gpus=args.allow_shared_gpus,
+                        estimate=submitted["method_suite_gpu_seconds_estimate"], goal=submitted)
+                context["files"]["method_search_manifest.json"] = frozen_manifest
+                context["files"]["suite_cost_basis.json"] = {"basis": estimate_basis,
+                    "estimate": submitted["method_suite_gpu_seconds_estimate"]}
+            from .action_planning import digest
+            from .loop import _write
+            prepared = {"schema_version": "eeg_research.cli_creation_prepare.v1", "request_id": request_id,
+                "request_config": request_config, "goal": submitted, "contract": contract,
+                "protocol": protocol, "creation_context": context}
+            prepared["prepare_digest"] = digest(prepared)
+            _write(_creation_request_path(root, request_id), prepared, exclusive=True)
+            state = _publish_cli_creation(root, prepared)
+        except (OSError, ValueError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
+        print(json.dumps(_create_output(state, camp), ensure_ascii=False))
         return 0
     if not (camp / "campaign_state.json").is_file():
         print(json.dumps({"error": "campaign_missing"}))
         return 2
+    if args.command in {"start", "resume", "run"}:
+        error = _entry_error(camp)
+        if error:
+            print(json.dumps({"error": error}))
+            return 2
     if args.command in {"start", "resume", "run", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents", "authorize-research-recovery"}:
         from react_agent.eeg_research.agentic.budget_inheritance import delegated_successor
         successor = delegated_successor(camp)

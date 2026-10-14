@@ -17,6 +17,8 @@ from .schemas import (ResearchExecutionConfig, ResearchPlanEvaluation,
 from .research_execution import single_plan_enabled
 
 VERSION = "single_plan_v1"
+MEASUREMENT_ACTIONS = {"diagnostic": "collect_diagnostics", "screening_2fold": "run_screening",
+                       "confirmation_10fold": "run_confirmation", "pilot": "run_pilot", "full": "run_full"}
 
 
 def enabled(value: dict) -> bool:
@@ -55,20 +57,20 @@ def _phase(proposal: dict) -> str:
 
 def validate_task(proposal: dict, observation: dict) -> tuple[str, str]:
     kind, phase = proposal["task_kind"], _phase(proposal)
-    schedule = observation.get("evaluation_schedule") or (observation.get("goal") or {}).get("evaluation_schedule") or "full_only"
+    goal = observation.get("goal") or {}
+    schedule = observation.get("evaluation_schedule") or goal.get("evaluation_schedule") or "full_only"
     validate_research_task(kind, phase, proposal.get("target_candidate_ref"), schedule)
+    if phase != "diagnostic" and "allowed_training_actions" in goal:
+        from .planner import training_actions
+        action = MEASUREMENT_ACTIONS[phase]
+        if action not in training_actions({**goal, "evaluation_schedule": schedule}):
+            raise ValueError("task_training_action_outside_goal:" + action)
     return kind, phase
 
 
 def measurement_action(proposal: dict, observation: dict) -> str:
-    kind, phase = validate_task(proposal, observation)
-    if phase == "diagnostic":
-        return "collect_diagnostics"
-    if kind == "confirmation":
-        return "run_confirmation" if phase == "confirmation_10fold" else "run_full"
-    if phase == "screening_2fold":
-        return "run_screening"
-    return "run_pilot" if phase == "pilot" else "run_full"
+    _, phase = validate_task(proposal, observation)
+    return MEASUREMENT_ACTIONS[phase]
 
 
 def scientific_projection(spec: dict | None) -> dict:
@@ -85,10 +87,21 @@ def proposal_cost(proposal: dict, observation: dict) -> dict:
     result = {"known": {"training_jobs": None, "gpu_seconds": None}, "predicted": {
         "llm_calls": None, "input_tokens": None, "output_tokens": None, "wall_seconds": None},
         "basis": [], "confidence": "unknown"}
+    if proposal.get("implementation_risk") is not None:
+        result["predicted"]["implementation_risk"] = {"assessment": proposal["implementation_risk"],
+            "authority": "model_prediction_not_execution_authority"}
     if phase == "diagnostic":
         result.update(known={"training_jobs": 0, "gpu_seconds": 0.0, "feedback_report_count": 1},
                       basis=["Diagnostic task reuses recorded results and needs no training."], confidence="runtime_bound")
         return result
+    execution = observation.get("research_execution") or (observation.get("goal") or {}).get("research_execution") or {}
+    task_budget = execution.get("budget") or {}
+    envelope = (task_budget.get("envelopes") or {}).get(kind) or {}
+    if "training_jobs" in envelope or "gpu_seconds" in envelope:
+        result["runtime_allocation_bound"] = {key: envelope.get(key) for key in ("training_jobs", "gpu_seconds")}
+        result["runtime_allocation_bound"].update(
+            basis=envelope.get("allocation_basis") or "explicit_task_envelope",
+            authority="maximum_runtime_allocation_not_cost_estimate")
     action = measurement_action(proposal, observation)
     costs = observation.get("action_cost_estimates") or {}
     entries = costs.get("by_action_target") or costs
@@ -157,7 +170,11 @@ def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
             if delivered is not None and ref not in delivered:
                 raise ValueError("required_context_ref_not_delivered")
             from .context.sources import ContextSourceRegistry
-            registry = ContextSourceRegistry(Path(observation["_campaign_path"]))
+            if observation.get("_paid_replay_readonly"):
+                from .paid_research_round import readonly_registry
+                registry = readonly_registry(Path(observation["_campaign_path"]))
+            else:
+                registry = ContextSourceRegistry(Path(observation["_campaign_path"]))
             source = registry.get(ref, role="research_planner")
             registry.load(source, role="research_planner")
         if phase != "diagnostic" and observation.get("evaluation_mode") == "loso_method_search":
@@ -274,8 +291,26 @@ def decide_research_plan(observation: dict, backend) -> dict:
             "valid_evaluations": (parsed.get("round") or {}).get("evaluations") or [],
             "missing_evaluation_ids": (parsed.get("round") or {}).get("unevaluated_proposal_ids") or [],
             "rejected": parsed.get("validation_records") or [],
-            "instruction": "Keep valid proposals. Correct failed tasks once and provide explicit evaluations and selection."}}
-        corrected = backend(request)
+            "reference_contract": {
+                "inline_context": "Use required_context_refs=[] when the delivered inline input is sufficient.",
+                "verified_artifact_ids": sorted(row["artifact_id"] for row in observation.get("artifact_index") or []
+                    if row.get("artifact_id") and row.get("verification_status") == "verified"),
+                "delivered_context_source_refs": sorted(observation.get("_delivered_context_refs") or []),
+                "invalid_reference_forms": ["JSON pointers such as /goal or /contract", "local paths", "hashes"]},
+            "instruction": "Keep valid proposals. Correct failed tasks once and provide explicit evaluations and selection. "
+                "Emit only schema properties; remove undeclared fields even when null. Apply the reference_contract exactly."}}
+        from .llm import LlmUnavailable
+        try:
+            corrected = backend(request)
+        except LlmUnavailable as exc:
+            if str(exc) not in {"planner_round_attempt_limit", "api_operation_attempt_limit", "budget_exhausted",
+                                "owner_request_unavailable:llm_calls"}:
+                raise
+            # A refused correction has no new response. Keep the already paid
+            # draft typed and durable, including its native validation shortfall.
+            parsed["proposal_history"] = history
+            parsed["correction_unavailable"] = {"reason": str(exc), "status": "not_sent"}
+            return parsed
         history.append(copy.deepcopy(corrected))
         parsed = normalize_research_round(corrected, observation, existing=parsed.get("valid_proposals"))
         parsed["validation_records"] = first_records + parsed.get("validation_records", [])

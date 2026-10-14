@@ -490,21 +490,50 @@ def _select(camp: Path, state: dict, backend) -> dict:
     from .loop import _read, _sync_ledger, _write, event, observation, persist_failure, save_state
     from .owner_budget import allocate_selected_plan, planner_owner, finish_planner_round
     from .api_policy import planner_api_round
-    full = observation(camp)
+    from .paid_research_round import restore_paid, publish_raw, revalidate_history
+    # Paid recovery must precede observation/compaction: both may capture new
+    # delivery sources even though no provider request is eventually sent.
+    recovered = restore_paid(camp.resolve(), state)
+    full = recovered[0] if recovered else observation(camp)
     cfg = config(full)
     input_digest = state.get("terminal_observation_digest") or digest(round_input(full))
     research_round_id = round_id(full)
-    from .experiment_observations import compact_planner_view
-    delivered = compact_planner_view(camp, full)
+    from .experiment_observations import compact_planner_view, ObservationDeliveryRequired
+    try:
+        delivered = full if recovered else compact_planner_view(camp, full)
+    except ObservationDeliveryRequired as exc:
+        from dataclasses import asdict
+        # Persist the actual typed obligation before planning owner/API admission.
+        # The same observation, round and consumed resources survive resume.
+        state["context_requirement"] = {"schema_version": "eeg_research.planner_context_requirement.v1",
+            "status": "needs_context", "round_id": research_round_id,
+            "input_observation_digest": input_digest, "result": asdict(exc.result)}
+        persist_failure(camp, state, phase="planner", error_type="context_needs_context",
+            detail=exc.result.reason, recoverable=True,
+            diagnostics={"reason": exc.result.reason, "budget_report": exc.result.budget_report})
+        save_state(camp, state)
+        return state
+    requirement = state.get("context_requirement")
+    if isinstance(requirement, dict) and requirement.get("status") == "needs_context":
+        requirement.update(status="resolved", resolved_round_id=research_round_id,
+            resolved_input_observation_digest=input_digest)
+        if (state.get("failure") or {}).get("error_type") == "context_needs_context":
+            state.pop("failure", None)
+            state.pop("detail", None)
+        event(camp, "planner_context_resolved", round_id=research_round_id,
+              input_observation_digest=input_digest)
     context_refs = {row.get("$context_source") for row in delivered.get("history_navigation") or []}
     for card in (delivered.get("experiment_observations") or {}).get("cards") or []:
         context_refs.update(row.get("source_ref") for row in card.get("source_refs") or [])
-    full["_delivered_context_refs"] = {ref for ref in context_refs if ref}
+    full["_delivered_context_refs"] = sorted(set(full.get("_delivered_context_refs") or []) | {ref for ref in context_refs if ref})
     def request(payload):
         bind = getattr(backend, "bind", None)
         if callable(bind):
             bind(operation_id=research_round_id + (":correction" if payload.get("plan_repair_request") else ":generation"))
-        return backend(payload)
+        raw = backend(payload)
+        publish_raw(camp, state, full, planning_owner, raw,
+                    correction=bool(payload.get("plan_repair_request")))
+        return raw
     round_path = camp / "research_rounds" / (research_round_id + ".json")
     draft_path = camp / "research_round_drafts" / (research_round_id + ".json")
     saved = _read(round_path)
@@ -526,7 +555,15 @@ def _select(camp: Path, state: dict, backend) -> dict:
             "detail": "research_pool_" + str(saved.get("pool_status"))}
     else:
         paid_draft = _read(draft_path)
-        if paid_draft:
+        if recovered:
+            _, planning_owner, history, proof = recovered
+            parsed = revalidate_history(full, history)
+            if not paid_draft:
+                _write(draft_path, {"input_observation_digest": digest(round_input(full)),
+                    "planning_owner": planning_owner, "parsed": parsed, "paid_recovery_proof": proof}, exclusive=True)
+            elif paid_draft.get("input_observation_digest") != digest(round_input(full)) or paid_draft.get("planning_owner") != planning_owner:
+                raise ValueError("research_round_draft_identity_conflict")
+        elif paid_draft:
             if paid_draft["input_observation_digest"] != digest(round_input(full)):
                 raise ValueError("research_round_draft_identity_conflict")
             parsed = paid_draft["parsed"]
@@ -541,6 +578,12 @@ def _select(camp: Path, state: dict, backend) -> dict:
             _write(draft_path, {"input_observation_digest": digest(round_input(full)),
                 "planning_owner": planning_owner, "parsed": parsed}, exclusive=True)
         finish_planner_round(camp, planning_owner)
+        if parsed.get("correction_unavailable"):
+            _sync_ledger(camp, state)
+            persist_failure(camp, state, phase="planner", error_type=parsed["detail"],
+                            detail=parsed["correction_unavailable"]["reason"], recoverable=True)
+            save_state(camp, state)
+            return state
         if parsed.get("round"):
             from .owner_budget import preview_selected_plan
             native_round = parsed["round"]

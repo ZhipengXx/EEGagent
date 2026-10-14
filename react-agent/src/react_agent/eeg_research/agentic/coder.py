@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict
 
 _SECRET_NAMES = {".env", "credentials.json", "id_rsa"}
 _BLOCKED_PARTS = {"evaluator", "controller", "protocol.py", "launch.py", "final_test"}
@@ -26,6 +28,14 @@ TOOL_ARGUMENTS = {
     "finish_patch": {"summary": ("string", True)},
     "requires_framework_extension": None,
 }
+
+
+class CoderToolRequest(BaseModel):
+    """The native tool envelope; per-tool arguments use the supplied catalog."""
+
+    model_config = ConfigDict(extra="forbid")
+    tool: Literal[tuple(TOOL_ARGUMENTS)]
+    args: dict[str, Any]
 
 
 def tool_catalog() -> dict[str, Any]:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import sqlite3
 from pathlib import Path
 
 import numpy as np
@@ -270,3 +271,90 @@ def test_local_pinned_minilm_retrieval_and_restart_cache(tmp_path):
     with sm.SidecarStore(camp).connect() as db:
         rows = db.execute("SELECT encoding_metadata FROM embedding_cache WHERE record_type='experiment_observation'").fetchall()
     assert rows and all(json.loads(row[0])["encoded_token_count"] <= backend.metadata["max_sequence_length"] for row in rows)
+
+
+def native_selected_campaign(tmp_path):
+    from react_agent.eeg_research.agentic import loop
+    goal = {"goal_id": "native-context", "max_llm_calls": 100, "max_training_jobs": 10,
+        "max_gpu_seconds": 100, "max_candidates": 4, "allowed_training_actions": ["run_pilot", "run_full"],
+        "research_execution": {"version": "single_plan_v1", "target_k": 2, "paid_maintenance": "off",
+            "budget": {"envelopes": {"new_method": {"role_calls": {"experiment_designer": 2,
+                "candidate_coder": 6, "candidate_reviewer": 2, "result_analyst": 2},
+                "training_jobs": 2, "gpu_seconds": 40}}}}}
+    loop.create_campaign(tmp_path, goal=goal,
+        contract={"fingerprint": "synthetic-context-contract", "task_type": "eeg_image_retrieval"},
+        request_id="native-context")
+    return tmp_path / "native-context"
+
+
+def bind_terminal(camp, saved):
+    from react_agent.eeg_research.agentic import loop
+    state = loop.load_state(camp)
+    state.update(terminal_observation_id=saved["observation_id"], terminal_observation_digest=saved["content_digest"])
+    loop.save_state(camp, state)
+
+
+def test_native_selected_persists_needs_context_reads_before_provider_and_owner(tmp_path):
+    from react_agent.eeg_research.agentic import loop
+    camp = native_selected_campaign(tmp_path)
+    saved = observation(camp)
+    body = {key: value for key, value in saved.items() if key not in {"schema_version", "observation_id", "content_digest"}}
+    body.update(plan_id="native-unclassified-current", new_scientific_gate="EXACT_CURRENT_OBLIGATION" * 3000)
+    saved = cards.ExperimentObservationStore(camp).record(body)
+    bind_terminal(camp, saved)
+    original = (camp / "experiment_observations" / (saved["observation_id"] + ".json")).read_bytes()
+    calls = []
+    state = loop.tick(camp, lambda request: calls.append(request))
+    assert state["status"] == "blocked" and state["failure"]["error_type"] == "context_needs_context"
+    need = loop.load_state(camp)["context_requirement"]
+    assert need["status"] == need["result"]["status"] == "needs_context"
+    assert need["input_observation_digest"] == saved["content_digest"]
+    assert need["result"]["missing"][0]["observation_id"] == saved["observation_id"]
+    assert need["result"]["reads"]
+    reply = cards.ExperimentObservationStore(camp).registry.read(ReadRequest(**need["result"]["reads"][0]), role="research_planner")
+    assert reply.status == "ready" and reply.content.startswith("EXACT_CURRENT_OBLIGATION")
+    assert not calls and not (camp / "llm_calls.jsonl").exists()
+    with sqlite3.connect(camp / "resource_owners.sqlite") as db:
+        assert db.execute("SELECT COUNT(*) FROM owners").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM claims").fetchone()[0] == 0
+    assert not list((camp / "research_rounds").glob("*.json"))
+    loop.tick(camp, lambda request: calls.append(request))
+    assert loop.load_state(camp)["context_requirement"] == need
+    assert (camp / "experiment_observations" / (saved["observation_id"] + ".json")).read_bytes() == original
+
+
+def test_native_selected_resume_after_source_restored_uses_same_feedback(tmp_path, monkeypatch):
+    from react_agent.eeg_research.agentic import cli, loop, selected_plan
+    camp = native_selected_campaign(tmp_path)
+    saved = observation(camp)
+    bind_terminal(camp, saved)
+    store = cards.ExperimentObservationStore(camp)
+    native_ref = saved["source_refs"][0]
+    native = store.registry.get(native_ref["source_ref"], role="research_planner")
+    original_native = store.registry.load(native, role="research_planner")
+    store.registry.capture({"seed": 42}, block_id=native.block_id, kind="scientific")
+    calls = []
+    blocked = loop.tick(camp, lambda request: calls.append(request))
+    assert blocked["context_requirement"]["result"]["reason"] == "current_observation_unreadable" and not calls
+    requirement = copy.deepcopy(blocked["context_requirement"])
+    restored = store.registry.capture(original_native, block_id=native.block_id, kind="scientific")
+    assert restored.source_ref == native.source_ref and restored.source_hash == native.source_hash
+    monkeypatch.setattr(cli, "spawn_worker", lambda *args, **kwargs: 12345)
+    assert cli.main(["resume", "--root", str(tmp_path), "--campaign", camp.name, "--max-ticks", "1"]) == 0
+    def planner(request):
+        calls.append(request)
+        return {"protocol_version": "research_plan_draft.v1", "proposals": [{"proposal_id": pid,
+            "task_kind": "new_method", "question": "Question " + pid, "task_description": "Bounded task " + pid,
+            "scientific_intent": "Independent synthetic mechanism " + pid, "evaluation_scope": {"phase": "full", "seed": 0},
+            "expected_observation": "Native feedback", "completion_condition": "One observation",
+            "required_context_refs": [], "value_rationale": "Resolve uncertainty"} for pid in ("a", "b")],
+            "evaluations": [{"proposal_id": pid, "rank": rank, "value_rationale": "Information", "implementation_risk": "Unknown"}
+                            for rank, pid in enumerate(("a", "b"), 1)],
+            "selected_proposal_id": "a", "selection_rationale": "Compared bounded tasks"}
+    resumed = loop.tick(camp, planner)
+    assert selected_plan.load_plan(camp)["originating_round"] == requirement["round_id"]
+    assert resumed["context_requirement"]["status"] == "resolved"
+    assert canonical(resumed["context_requirement"]["result"]) == canonical(requirement["result"])
+    assert resumed["context_requirement"]["resolved_input_observation_digest"] == saved["content_digest"]
+    assert len(calls) == 1 and calls[0]["experiment_observations"]["cards"][0]["record_id"] == saved["observation_id"]
+    assert not (camp / "llm_calls.jsonl").exists()

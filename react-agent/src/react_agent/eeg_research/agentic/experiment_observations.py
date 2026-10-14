@@ -212,6 +212,111 @@ def _artifact(camp, ref):
     return row, _read(Path(row["path"]))
 
 
+def _single_target_job(camp: Path, entry: dict, protocol: dict) -> tuple[dict, dict, list[dict]]:
+    """Read a completed native job through its original source/spec/protocol gates."""
+    from .artifacts import file_digest
+    from .execution_protocol import command_matches
+    from .handoffs import analysis_experiment_binding
+    from .runner import accept_job
+    directory = Path(str(entry.get("job_dir") or "")).resolve()
+    if directory.parent != (camp / "jobs").resolve() or entry.get("evaluation_valid") is not True:
+        raise ValueError("observation_single_target_job_invalid")
+    job = _read(directory / "job.json")
+    frozen = _read(directory / "frozen_run_spec.json")
+    binding = _read(directory / "source_binding.json")
+    metrics = _read(directory / "metrics.json")
+    seed, fidelity, target = entry.get("seed"), entry.get("fidelity"), entry.get("candidate_id")
+    if (job.get("status") != "finished" or job.get("candidate_id") != target
+            or seed != job.get("seed") or seed != frozen.get("seed")
+            or fidelity != job.get("fidelity") or fidelity != frozen.get("fidelity")
+            or frozen.get("target_id") != target or frozen.get("spec_hash") != entry.get("spec_hash")
+            or frozen.get("evaluation_hash") != protocol["fingerprint"]
+            or entry.get("execution_fingerprint") != protocol["fingerprint"]
+            or job.get("execution_fingerprint") != protocol["fingerprint"]
+            or not command_matches(job.get("command") or [], protocol, fidelity, training_seed=seed)):
+        raise ValueError("observation_single_target_execution_identity_mismatch")
+    source_path = Path(str(binding.get("class_file") or ""))
+    source_path = source_path if source_path.is_absolute() else directory / source_path
+    if (file_digest(source_path) != entry.get("source_hash")
+            or binding.get("file_sha256") != entry.get("source_hash")
+            or job.get("source_hash") != entry.get("source_hash")):
+        raise ValueError("observation_single_target_source_changed")
+    approval = analysis_experiment_binding(camp, entry)
+    if target != "baseline":
+        from .native_patch import enforce_requirement_review
+        workspace = camp / "candidates" / str(target)
+        if approval.get("status") != "verified":
+            raise ValueError("observation_single_target_approval_binding_invalid")
+        if _read(workspace / "source_manifest.json") != job.get("manifest"):
+            raise ValueError("observation_single_target_source_manifest_changed")
+        checks = _read(workspace / "checks.json")
+        review = enforce_requirement_review(workspace, {"experiment": approval["experiment"]},
+            _read(workspace / "review.json"), checks)
+        if checks.get("ok") is not True or review.get("status") != "ready":
+            raise ValueError("observation_single_target_current_check_review_invalid")
+    accepted = accept_job(directory, job.get("manifest"), fidelity, protocol=protocol)
+    if (accepted.get("evaluation_valid") is not True or accepted.get("fixed_bank_top1") != entry.get("fixed_bank_top1")
+            or metrics.get("fixed_bank_top1") != accepted["fixed_bank_top1"]):
+        raise ValueError("observation_single_target_native_result_mismatch")
+    expected_identity = {key: protocol.get(key) for key in ("train_image_ids", "validation_image_ids", "train_query_ids",
+        "validation_query_ids", "gallery_image_ids", "positive_map", "validation_identity", "val_mode", "schema_version")}
+    actual_identity = _read(directory / "evaluation_identity.json")
+    if any(canonical(actual_identity.get(key)) != canonical(value) for key, value in expected_identity.items()):
+        raise ValueError("observation_single_target_evaluation_identity_mismatch")
+    if file_digest(directory / "last.ckpt") != entry.get("checkpoint_id"):
+        raise ValueError("observation_single_target_checkpoint_changed")
+    paths = [directory / name for name in ("metrics.json", "run_record.json", "source_binding.json",
+        "evaluation_identity.json", "frozen_run_spec.json", "hook_config.json", "last.ckpt")]
+    if source_path.resolve().is_relative_to(camp.resolve()):
+        paths.append(source_path)
+    if target != "baseline":
+        paths += [workspace / name for name in ("checks.json", "review.json", "source_manifest.json", "approved_binding.json")]
+    sources = [{"path": str(path), "sha256": file_digest(path), "kind": "native_single_target_job"} for path in paths]
+    if target != "baseline":
+        sources.append({"artifact_id": approval["artifact_ref"], "sha256": approval["artifact_sha256"], "kind": "experiment_spec"})
+    return copy.deepcopy(entry), metrics, sources
+
+
+def _single_target_facts(camp: Path, state: dict, plan: dict, entry: dict) -> tuple[dict, list[dict]]:
+    from .artifacts import file_digest
+    from .comparison import compare_runs, matched_control
+    from .execution_protocol import _fingerprint, load_protocol
+    protocol = load_protocol(camp)
+    if (not protocol or protocol.get("evaluation_mode", "single_target") != "single_target"
+            or _fingerprint({key: value for key, value in protocol.items() if key != "fingerprint"}) != protocol["fingerprint"]):
+        raise ValueError("observation_single_target_protocol_invalid")
+    candidate, metrics, sources = _single_target_job(camp, entry, protocol)
+    if any(plan.get(key) is not None and plan[key] != candidate.get(key) for key in ("candidate_id", "source_hash", "spec_hash")):
+        raise ValueError("observation_frozen_plan_measurement_identity_mismatch")
+    baseline = matched_control(state.get("evidence") or [], candidate, protocol)
+    if baseline is not None:
+        baseline, baseline_metrics, baseline_sources = _single_target_job(camp, baseline, protocol)
+        sources += baseline_sources
+    comparison = compare_runs(candidate=candidate, control=baseline, protocol=protocol)
+    comparison_path = camp / "comparisons" / (candidate["evidence_id"] + ".json")
+    published = _read(comparison_path)
+    if published.get("comparison") != comparison or candidate.get("comparison") != comparison:
+        raise ValueError("observation_single_target_comparison_changed")
+    if candidate.get("promotion") != published.get("promotion"):
+        raise ValueError("observation_single_target_promotion_changed")
+    sources += [{"path": str(path), "sha256": file_digest(path), "kind": "native_single_target_identity"}
+        for path in (camp / "execution_protocol.json", comparison_path)]
+    facts = {key: copy.deepcopy(candidate[key]) for key in ("candidate_id", "source_hash", "spec_hash", "seed", "fidelity",
+        "checkpoint_id", "execution_fingerprint", "job_id") if key in candidate}
+    facts.update(scope="frozen_development", measurement_kind="native_single_target_job", metric_unit="fraction",
+        metrics={key: copy.deepcopy(metrics[key]) for key in ("fixed_bank_top1", "fixed_bank_top5") if key in metrics},
+        coverage=1, required_fold_count=1, subjects=[protocol["subject"]], query_count=metrics.get("query_count"),
+        gallery_size=metrics.get("validation_image_count"), comparison=comparison,
+        paired_delta_pp=comparison.get("delta_pp"), promotion=copy.deepcopy(published.get("promotion")),
+        paired_baseline={"evidence_id": baseline["evidence_id"], "source_hash": baseline["source_hash"],
+            "spec_hash": baseline.get("spec_hash"), "seed": baseline["seed"],
+            "metrics": {key: copy.deepcopy(baseline_metrics[key]) for key in ("fixed_bank_top1", "fixed_bank_top5") if key in baseline_metrics}}
+            if baseline else None,
+        missing=[] if baseline or candidate["candidate_id"] == "baseline" else ["matched_baseline"],
+        independently_replicated=False)
+    return facts, list({ref.get("path") or ref.get("artifact_id"): ref for ref in sources}.values())
+
+
 def _native_facts(camp: Path, state: dict, plan: dict) -> tuple[dict, list]:
     target = plan.get("candidate_id") or plan.get("target_candidate_ref") or (plan.get("proposal") or {}).get("target_candidate_ref")
     evidence_id = plan.get("measurement_evidence_id")
@@ -221,6 +326,11 @@ def _native_facts(camp: Path, state: dict, plan: dict) -> tuple[dict, list]:
         "promotion": None, "missing": ["verified_measurement"]}
     sources = []
     for entry in reversed(evidence):
+        if entry.get("job_dir") and entry.get("evaluation_valid") is True and entry.get("kind") not in {"method_suite", "method_screening"}:
+            try:
+                return _single_target_facts(camp, state, plan, entry)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
         ref = entry.get("artifact_id") or entry.get("artifact") or entry.get("evaluation_ref")
         if not ref and entry.get("artifact_refs"):
             ref = entry["artifact_refs"][0]

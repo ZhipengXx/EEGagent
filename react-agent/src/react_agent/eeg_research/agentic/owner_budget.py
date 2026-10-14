@@ -254,8 +254,11 @@ def _request_resources(camp, input_bound, output_bound, *, frozen_pricing=None):
     amount = resources({"llm_calls": 1, "input_tokens": input_bound, "output_tokens": output_bound, "total_tokens": input_bound + output_bound})
     goal = _read(camp / "goal.json")
     config = ((goal.get("research_execution") or {}).get("budget") or {})
-    from .pricing import resolve_pricing, estimate_usd
-    frozen_pricing = frozen_pricing or resolve_pricing(camp)
+    from .pricing import resolve_pricing, estimate_usd, PricingConflict
+    try:
+        frozen_pricing = frozen_pricing or resolve_pricing(camp)
+    except PricingConflict as exc:
+        raise OwnerBudgetError(str(exc)) from exc
     known_price = estimate_usd(frozen_pricing, input_tokens=input_bound, output_tokens=output_bound, upper_bound=True)
     if known_price is not None:
         amount["api_usd"] = known_price
@@ -311,12 +314,15 @@ def claim_request(camp, *, call_id, operation, role, input_bound, output_bound, 
     camp = Path(camp)
     if not enabled(camp):
         return None
-    from .pricing import resolve_pricing
+    from .pricing import resolve_pricing, PricingConflict
     if model is None:
         from .role_config import ROLES, resolve_role_config
         if role in ROLES:
             model = resolve_role_config(camp, role).model
-    frozen_pricing = resolve_pricing(camp, provider=provider, model=model)
+    try:
+        frozen_pricing = resolve_pricing(camp, provider=provider, model=model)
+    except PricingConflict as exc:
+        raise OwnerBudgetError(str(exc)) from exc
     amount = _request_resources(camp, input_bound, output_bound, frozen_pricing=frozen_pricing)
     with _transaction(camp) as conn:
         existing = _get(conn, "claims", call_id)
@@ -386,6 +392,10 @@ def settle_request(camp, call_id, usage):
         row = _get(conn, "claims", call_id)
         if not row:
             raise OwnerBudgetError("settlement_without_claim")
+        frozen = row.get("frozen_pricing")
+        if frozen and any(usage.get(key) is not None and usage[key] != frozen[field]
+                          for key, field in (("provider", "provider"), ("requested_model", "model"))):
+            raise OwnerBudgetError("settlement_provider_or_model_identity_conflict")
         if row.get("frozen_pricing", {}).get("pricing") is not None:
             from .pricing import estimate_usd
             computed = estimate_usd(row["frozen_pricing"], input_tokens=usage.get("input_tokens"),
@@ -395,6 +405,8 @@ def settle_request(camp, call_id, usage):
                     raise OwnerBudgetError("settlement_pricing_identity_conflict")
                 usage = {**usage, "api_usd": computed}
         identity = {key: usage.get(key) for key in ("input_tokens", "output_tokens", "api_usd", "transport_outcome", "unconfirmed_charge_possible")}
+        if usage.get("cache_hit_tokens") is not None:
+            identity["cache_hit_tokens"] = usage["cache_hit_tokens"]
         identity["unconfirmed_charge_possible"] = bool(identity.get("unconfirmed_charge_possible"))
         signature = _hash(identity)
         if row.get("settlement_digest"):
@@ -408,6 +420,7 @@ def settle_request(camp, call_id, usage):
                 elif (row["status"]=="settled" and usage.get("charge_usage_source")=="durable_owner_provider_settlement"
                       and row.get("settlement_usage",{}).get("input_tokens")==identity["input_tokens"]
                       and row.get("settlement_usage",{}).get("output_tokens")==identity["output_tokens"]
+                      and row.get("settlement_usage",{}).get("cache_hit_tokens")==identity.get("cache_hit_tokens")
                       and row.get("settlement_usage",{}).get("api_usd")==identity["api_usd"]):
                     # A lost outer reply may be explicitly abandoned; exact
                     # persisted provider usage remains a known charge fact.
@@ -475,6 +488,19 @@ def transport_claim(camp, call_id):
         TRANSPORT.reset(token)
 
 
+def _verify_request_pricing(camp, claim, *, provider, model):
+    frozen = claim.get("frozen_pricing")
+    if not frozen:
+        return
+    from .pricing import resolve_pricing, PricingConflict
+    try:
+        current = resolve_pricing(camp, provider=provider, model=frozen.get("model") if model is None else model)
+    except PricingConflict as exc:
+        raise OwnerBudgetError(str(exc)) from exc
+    if current != frozen:
+        raise OwnerBudgetError("provider_pricing_identity_changed")
+
+
 def before_transport(camp, *, call_id, role, input_bound, output_bound, provider="deepseek", model=None):
     camp = Path(camp)
     with _transaction(camp) as conn:
@@ -487,14 +513,7 @@ def before_transport(camp, *, call_id, role, input_bound, output_bound, provider
             raise OwnerBudgetError("provider_transport_claim_not_sendable")
         if row["role"]!=role:
             raise OwnerBudgetError("provider_transport_claim_role_mismatch")
-        if row.get("frozen_pricing"):
-            from .pricing import resolve_pricing, PricingConflict
-            try:
-                current = resolve_pricing(camp, provider=provider, model=model or row["frozen_pricing"].get("model"))
-            except PricingConflict as exc:
-                raise OwnerBudgetError(str(exc)) from exc
-            if current != row["frozen_pricing"]:
-                raise OwnerBudgetError("provider_pricing_identity_changed")
+        _verify_request_pricing(camp, row, provider=provider, model=model)
         if input_bound > row["requested"]["input_tokens"] or output_bound > row["requested"]["output_tokens"]:
             raise OwnerBudgetError("provider_bounds_exceed_claim")
         row.update(status="inflight", transport_started_at=time.time())
@@ -844,16 +863,33 @@ def _check_global_equation(snap):
             raise OwnerBudgetError("global_budget_occupied_exceeds_cap:"+key)
 
 
-def mark_transport_dispatched(camp, call_id):
+def mark_transport_dispatched(camp, call_id, *, provider="deepseek", model=None):
     """The sole HTTP boundary consumes the claim's one transport permit once."""
     with _transaction(Path(camp)) as conn:
         _control(Path(camp),provider=True)
         claim=_get(conn,"claims",call_id)
         if not claim or claim["status"]!="inflight" or claim.get("dispatched_at"):
             raise OwnerBudgetError("provider_transport_permit_already_used_or_missing")
+        _verify_request_pricing(Path(camp), claim, provider=provider, model=model)
         _check_global_equation(_snapshot(conn,Path(camp)))
         claim["dispatched_at"]=time.time()
         _put(conn,"claims",call_id,claim)
+
+
+def mark_http_dispatched(camp, call_id, *, provider, model):
+    """Recheck frozen authority on the SDK's completed HTTP request."""
+    camp = Path(camp)
+    with _transaction(camp) as conn:
+        claim = _get(conn, "claims", call_id)
+        if claim and claim.get("http_dispatched_at"):
+            raise OwnerBudgetError("provider_http_transport_permit_already_used")
+        if not claim or claim["status"] != "inflight" or not claim.get("dispatched_at"):
+            raise OwnerBudgetError("provider_http_transport_permit_missing")
+        _control(camp, provider=True)
+        _verify_request_pricing(camp, claim, provider=provider, model=model)
+        _check_global_equation(_snapshot(conn, camp))
+        claim["http_dispatched_at"] = time.time()
+        _put(conn, "claims", call_id, claim)
 
 
 def admission_available(camp, role):
