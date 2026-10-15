@@ -1287,6 +1287,20 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             payload["hypothesis"] = binding.get("hypothesis")
             payload["experiment"] = binding.get("experiment")
             payload["hypothesis_binding_missing"] = binding.get("status") != "verified"
+        from .stage_contract import has_stage_contract
+        stage_experiment = binding.get("experiment") or bound_experiment or {}
+        if not stage_experiment and (state.get("experiment") or {}).get("spec_hash") == latest.get("spec_hash"):
+            stage_experiment = state["experiment"]
+        measurement_review = None
+        if has_stage_contract(stage_experiment):
+            from .stage_reviews import review_measurement
+            measurement_review = review_measurement(camp_dir, state, latest, stage_experiment,
+                verified_result=suite_result if method_mode else None)
+            if measurement_review["status"] != "completed":
+                persist_failure(camp_dir, state, phase="measurement_review", error_type="measurement_stage_incomplete",
+                    detail="Core measurement requirements lack a verified native receipt.", recoverable=True)
+                _sync_ledger(camp_dir, state)
+                return
         same_revision = [row for row in scientific_rows
             if row.get("evaluation_valid") is True and row.get("candidate_id") == latest["candidate_id"]
             and row.get("fidelity") == latest["fidelity"] and row.get("source_hash") == latest.get("source_hash")
@@ -1411,6 +1425,9 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                     matched_two_fold_baseline_pair=bool(suite_result.get("baseline_suite_hash") and len(suite_result.get("paired_scores") or []) == 2))
                 payload["latest"].update(metric_scope="two_fold_development", phase="screening_2fold",
                                         screening_result=suite_result["screening_result"])
+        if measurement_review is not None:
+            from .stage_reviews import analysis_stage_payload
+            payload = analysis_stage_payload(payload, stage_experiment, measurement_review)
         payload = development_view(payload)
         digest = request_digest(request=payload)
         for row in state.get("evidence") or []:
@@ -1429,10 +1446,13 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                     # Native begin-task reuses this completed Analyst envelope.
                     # Continue its missing curator stage without new transport.
         analysis_inputs = [Path(latest["suite_ref"])] if method_mode else []
+        if measurement_review is not None:
+            analysis_inputs.append(Path(measurement_review["path"]))
         task = begin_role_task(camp_dir, role="result_analyst", inputs=analysis_inputs,
                                candidate_id=latest.get("candidate_id"), request=payload)
         task_payload = {**payload, "task_id": task["task_id"], "attempt_id": task["attempt_id"], "input_digest": task["input_digest"]}
         billed = 0
+        analysis_review = None
         try:
             raw_reply = analyst(task_payload)
             billed += 1
@@ -1444,6 +1464,11 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             role_status = str(raw_reply.get("status") or "completed")
             if role_status not in {"completed", "partial", "failed", "blocked"}:
                 role_status = "partial"
+            if measurement_review is not None:
+                from .stage_reviews import check_analysis_coverage
+                analysis_review = check_analysis_coverage(reply, stage_experiment, measurement_review)
+                if analysis_review["status"] != "completed" and role_status == "completed":
+                    role_status = "blocked"
         except LlmUnavailable as exc:
             if method_mode and str(exc) in _METHOD_ROLE_HARD_BLOCKS:
                 _sync_ledger(camp_dir, state)
@@ -1463,6 +1488,12 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         envelope = finish_role_task(camp_dir, task, {**reply, "status": role_status,
             "prompt_hash": raw_reply.get("prompt_hash", "") if "raw_reply" in locals() else "", **benchmark_origin},
             kind="analysis", path=target, candidate_id=latest.get("candidate_id"))
+        if measurement_review is not None:
+            from .stage_reviews import check_analysis_coverage, save_analysis_review
+            analysis_review = analysis_review or check_analysis_coverage(reply, stage_experiment, measurement_review)
+            if role_status != "completed":
+                analysis_review["status"] = "blocked"
+            analysis_review = save_analysis_review(camp_dir, analysis_review, artifact_id=envelope["artifact_refs"][-1])
         analysis_row = {
                 "evidence_id": f"ev_analysis_{task['task_id']}",
                 "kind": "analysis",
@@ -1473,14 +1504,17 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 "status": role_status,
                 "summary": {key: reply.get(key) for key in ("hypothesis_assessment", "summary_zh", "suggested_next_actions")},
             }
+        if measurement_review is not None:
+            analysis_row.update(measurement_review_ref=measurement_review["artifact_id"],
+                analysis_stage_review_ref=analysis_review["artifact_id"], analysis_stage_status=analysis_review["status"])
         previous_analysis = next((index for index, item in enumerate(state["evidence"])
                                   if item.get("evidence_id") == analysis_row["evidence_id"]), None)
         if previous_analysis is None:
             state["evidence"].append(analysis_row)
         else:
             state["evidence"][previous_analysis] = analysis_row
-        if method_mode and role_status != "completed":
-            # An incomplete Analyst cannot authorize a method-level lesson.
+        if (method_mode or measurement_review is not None) and role_status != "completed":
+            # An incomplete staged Analyst cannot authorize a lesson.
             # Recovery retries that role with its actual feedback before curation.
             _sync_ledger(camp_dir, state)
             return

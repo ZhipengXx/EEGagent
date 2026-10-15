@@ -120,6 +120,10 @@ def materialize_design_brief(brief: dict[str, Any] | DesignerBrief,
         },
         "status": "draft",
     }
+    from .stage_contract import STAGE_REQUIREMENT_FIELDS
+    for field in STAGE_REQUIREMENT_FIELDS:
+        if field in parsed.model_fields_set:
+            result[field] = [requirement.model_dump() for requirement in getattr(parsed, field)]
     # This policy is owned by the frozen task/parent, never invented by Designer.
     policy = task.get("negative_sampling_policy") or parent.get("negative_sampling_policy")
     if policy:
@@ -156,4 +160,6 @@ def scientific_design_projection(spec: dict[str, Any] | None) -> dict[str, Any]:
             scientific.append(row)
     result["requirement_roster"] = sorted(roster, key=lambda row: row["requirement_id"] or "")
     result["scientific_requirements"] = sorted(scientific, key=lambda row: row["requirement_id"] or "")
+    from .stage_contract import stage_requirements_projection
+    result.update(stage_requirements_projection(spec))
     return result

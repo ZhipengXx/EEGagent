@@ -61,3 +61,9 @@ shorthand in saved replies. Every referenced method must exist and be within
 the supplied source range, including disjoint runtime excerpts; missing members
 or another file cannot expand delivery. The Reviewer prompt examples are checked
 in the actual Prepared Request while preserving its compact mission budget.
+
+The `test_stage_*` fixtures cover explicit v2 Implementation / native Measurement /
+Analysis contracts, immutable phase acceptance identity, final SDK input isolation,
+optional hook applicability, source/spec/receipt binding, idempotent measurement,
+analysis completion for negative results, and exact legacy Analyst schema recovery.
+They use synthetic receipts or native CPU jobs and SDK MockTransport only.

@@ -582,7 +582,7 @@ def add_role_examples(
     if design_contract_version == "v2":
         if role == "experiment_designer":
             selectors[role] = _designer_brief
-        elif role in {"candidate_coder", "candidate_reviewer"}:
+        elif role in {"candidate_coder", "candidate_reviewer"} or role == "result_analyst" and payload.get("review_stage") == "analysis":
             # The current tools, caller and diagnostics replace unrelated toy patches.
             return payload
     if (
@@ -632,5 +632,10 @@ def _designer_brief(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "transform": {"mode": "replace", "config": {"offset": 0.125}}},
             "implementation_requirements": [{"requirement_id": "train_only_offset", "scope": "scientific",
                 "expected_behavior": "Apply the configured offset to training EEG; leave evaluation EEG unchanged.",
-                "verification": "source_review"}]}, "summary_zh": "仅修改训练变换，继承父候选模型和损失。"},
-        "Declare behavior; Coder supplies actual source locations. The runtime materializes inherited configs.")]
+                "verification": "source_review"}],
+            "measurement_requirements": [{"requirement_id": "paired_receipts", "verification": "paired_coverage",
+                "expected_behavior": "Complete the frozen matched measurement coverage."}],
+            "analysis_requirements": [{"requirement_id": "interpret_offset", "verification": "hypothesis_assessment",
+                "expected_behavior": "Interpret whether the measured result supports the offset hypothesis."}]},
+            "summary_zh": "实现、测量、解释分别验收；仅修改训练变换，继承父候选模型和损失。"},
+        "Coder binds source, native Measurement verifies receipts, Analyst interprets measured evidence. Runtime materializes inherited configs.")]

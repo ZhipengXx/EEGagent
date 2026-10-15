@@ -64,6 +64,10 @@ def persist_approved_binding(
         binding["design_brief"] = spec.get("design_brief")
         for key in ("principal_intervention", "scientific_intent", "evaluation_scope", "initial_fidelity", "hook_modes"):
             binding[key] = spec.get(key)
+        from .stage_contract import STAGE_REQUIREMENT_FIELDS
+        for key in STAGE_REQUIREMENT_FIELDS:
+            if key in spec:
+                binding[key] = spec[key]
         previous = dest / "approved_binding.json"
         if previous.is_file() and json.loads(previous.read_text(encoding="utf-8")) != binding:
             from .artifacts import file_digest, register
@@ -195,6 +199,12 @@ def build_frozen_run_spec(
             frozen["target_revision"] = protocol["method_revision"]
             frozen["run_config_hash"] = run_config_hash(hook, seed=seed, fidelity=fidelity,
                 extra={"method_revision": protocol["method_revision"], "fold_protocol": protocol["fingerprint"]})
+    from .stage_contract import STAGE_REQUIREMENT_FIELDS, has_stage_contract
+    if has_stage_contract(binding):
+        frozen["design_contract_version"] = "v2"
+    for key in STAGE_REQUIREMENT_FIELDS:
+        if key in binding:
+            frozen[key] = binding[key]
     return frozen
 
 

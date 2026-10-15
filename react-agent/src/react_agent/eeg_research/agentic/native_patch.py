@@ -485,6 +485,8 @@ def implement(
                 "missing_inputs": ["needed source range"] if not current or current.get("truncated") else [],
             }
             request["runtime_note"] = "The last edit wrote nothing. Use current_file's hash and exact source; request a missing range or make a unique edit. Do not repeat the rejected fragment."
+        from .stage_context import implementation_stage_payload
+        request = implementation_stage_payload(request, reviewer=False)
         reply = backend(request)
         tool, args, request_error = validate_tool_request(reply)
         started = time.time()
@@ -1053,6 +1055,8 @@ def review(
         text = parent.read_text(encoding="utf-8")
         payload["parent_source"] = {"source_ref": str(parent), "source_hash": file_digest(parent),
                                     "source": text[:16000], "source_truncated": len(text) > 16000}
+    from .stage_context import implementation_stage_payload
+    payload = implementation_stage_payload(payload)
     reply = backend(payload)
     repaired = False
     if not _review_valid(reply) and getattr(backend, "role_config", None) is None:
@@ -1095,6 +1099,8 @@ def review(
     # Native transport supplies the actual delivered wire; the model cannot
     # widen the source-reference scope by returning its own request fields.
     result["review_evidence_request"] = getattr(backend, "review_evidence_request", None) or payload
+    if payload.get("review_stage") == "implementation":
+        result["review_stage"] = "implementation"
     experiment = spec.get("experiment") or {}
     if (experiment.get("principal_intervention") or experiment.get("intervention")) and not result.get("intervention_coverage"):
         result["status"] = "needs_fix"

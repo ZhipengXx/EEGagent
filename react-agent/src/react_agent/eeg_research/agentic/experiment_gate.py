@@ -145,6 +145,11 @@ def canonicalize_experiment_spec(spec: dict[str, Any] | None, *, allow_legacy: b
         ids = [item["requirement_id"] for item in copied["implementation_requirements"]]
         if len(ids) != len(set(ids)):
             raise CanonicalizationError("duplicate_implementation_requirement_id")
+    from .stage_contract import normalize_stage_requirements
+    try:
+        copied.update(normalize_stage_requirements(copied))
+    except ValueError as exc:
+        raise CanonicalizationError(str(exc)) from exc
     copied["schema_version"] = copied.get("schema_version") or SPEC_SCHEMA
     return copied
 
@@ -169,6 +174,10 @@ def _execution_hash(spec: dict[str, Any]) -> str:
     }
     if "implementation_requirements" in spec:
         body["implementation_requirements"] = spec["implementation_requirements"]
+    from .stage_contract import STAGE_REQUIREMENT_FIELDS
+    for field in STAGE_REQUIREMENT_FIELDS:
+        if field in spec:
+            body[field] = spec[field]
     return _digest(body)
 
 

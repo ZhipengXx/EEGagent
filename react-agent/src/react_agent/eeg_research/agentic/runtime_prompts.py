@@ -11,9 +11,10 @@ ROOT = Path(__file__).with_name("prompts") / "runtime_v1"
 PROMPT_VERSION = "eeg_research.runtime_mission.single_plan.v1"
 
 
-def runtime_mission(role: str, *, design_contract_version: str = "v1") -> str:
+def runtime_mission(role: str, *, design_contract_version: str = "v1", review_stage: str | None = None) -> str:
     root = ROOT
-    if design_contract_version == "v2" and role in {"experiment_designer", "candidate_coder", "candidate_reviewer"}:
+    if design_contract_version == "v2" and (role in {"experiment_designer", "candidate_coder", "candidate_reviewer"}
+            or role == "result_analyst" and review_stage == "analysis"):
         root = ROOT.parent / "runtime_v2"
     return (root / "shared_contract.txt").read_text(encoding="utf-8") + "\n\n" + (root / (role + ".txt")).read_text(encoding="utf-8")
 

@@ -436,6 +436,39 @@ class DesignRequirement(ImplementationRequirement):
     binding_stage: Literal["design"] = "design"
 
 
+class MeasurementRequirement(DomainOutput):
+    """A supported native measurement predicate under the frozen protocol."""
+
+    requirement_id: str = Field(min_length=1)
+    expected_behavior: str = Field(min_length=1)
+    core: bool = True
+    verification: Literal["run_identity", "paired_coverage", "metric_integrity"]
+
+
+class AnalysisRequirement(DomainOutput):
+    """A result interpretation requirement, verified after measurement."""
+
+    requirement_id: str = Field(min_length=1)
+    expected_behavior: str = Field(min_length=1)
+    core: bool = True
+    verification: Literal["evidence_grounding", "paired_comparison", "scope_limits", "hypothesis_assessment"]
+
+
+class StageRequirementCoverage(DomainOutput):
+    requirement_id: str = Field(min_length=1)
+    status: Literal["implemented", "contradicted", "unverified"]
+    detail: str = Field(min_length=1)
+    evidence_refs: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def verified_stage_has_evidence(self):
+        if any(not reference.strip() for reference in self.evidence_refs):
+            raise ValueError("stage_requirement_evidence_ref_empty")
+        if self.status in {"implemented", "contradicted"} and not self.evidence_refs:
+            raise ValueError("verified_stage_requirement_needs_evidence_refs")
+        return self
+
+
 class DesignerExperimentSpec(BaseModel):
     """The executable fields required by the deterministic experiment gate."""
 
@@ -491,17 +524,31 @@ class DesignerBrief(DomainOutput):
     scientific_parameters: dict[str, Any] = Field(default_factory=dict)
     hook_changes: DesignHookChanges
     implementation_requirements: list[DesignRequirement] = Field(default_factory=list)
+    measurement_requirements: list[MeasurementRequirement] = Field(default_factory=list)
+    analysis_requirements: list[AnalysisRequirement] = Field(default_factory=list)
     required_capability_ids: list[str] = Field(default_factory=list)
     method_evidence_refs: list[str] = Field(default_factory=list)
     applicability: str = ""
     expected_observation: str = ""
     completion_condition: str = ""
 
+    @model_serializer(mode="wrap")
+    def preserve_legacy_brief_shape(self, handler):
+        row = handler(self)
+        for name in ("measurement_requirements", "analysis_requirements"):
+            if name not in self.model_fields_set:
+                row.pop(name, None)
+        return row
+
     @model_validator(mode="after")
     def unique_requirements(self):
         ids = [requirement.requirement_id for requirement in self.implementation_requirements]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate_implementation_requirement_id")
+        ids += [requirement.requirement_id for requirement in self.measurement_requirements]
+        ids += [requirement.requirement_id for requirement in self.analysis_requirements]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate_stage_requirement_id")
         return self
 
 
@@ -616,7 +663,9 @@ class ImplementationReview(DomainOutput):
         return self
 
 
-class ResultAnalysis(DomainOutput):
+class LegacyResultAnalysis(DomainOutput):
+    model_config = ConfigDict(title="ResultAnalysis")
+
     execution_assessment: Any = None
     hypothesis_assessment: Literal["supported", "weakened", "inconclusive", "not_tested"] | None = None
     observations: list[dict[str, Any]] = Field(default_factory=list)
@@ -628,6 +677,35 @@ class ResultAnalysis(DomainOutput):
     scope_limits: list[str] = Field(default_factory=list)
     evidence_refs: list[str] = Field(default_factory=list)
     summary_zh: str = ""
+
+
+class ResultAnalysis(DomainOutput):
+    execution_assessment: Any = None
+    hypothesis_assessment: Literal["supported", "weakened", "inconclusive", "not_tested"] | None = None
+    observations: list[dict[str, Any]] = Field(default_factory=list)
+    prediction_checks: list[dict[str, Any]] = Field(default_factory=list)
+    interpretations: list[Any] = Field(default_factory=list)
+    competing_explanations: list[Any] = Field(default_factory=list)
+    evidence_gaps: list[Any] = Field(default_factory=list)
+    suggested_next_actions: list[Any] = Field(default_factory=list)
+    scope_limits: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    analysis_requirement_coverage: list[StageRequirementCoverage] = Field(default_factory=list)
+    summary_zh: str = ""
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_analysis_shape(self, handler):
+        row = handler(self)
+        if "analysis_requirement_coverage" not in self.model_fields_set:
+            row.pop("analysis_requirement_coverage", None)
+        return row
+
+    @model_validator(mode="after")
+    def unique_analysis_requirement_coverage(self):
+        ids = [item.requirement_id for item in self.analysis_requirement_coverage]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate_analysis_requirement_coverage_id")
+        return self
 
 
 class LessonProposal(DomainOutput):

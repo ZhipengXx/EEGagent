@@ -196,7 +196,7 @@ def project_correction_context(payload: dict[str, Any], role: str, *, system_cha
     return view
 
 
-def domain_model_for(role: str, memory=None, *, camp=None):
+def domain_model_for(role: str, memory=None, *, camp=None, review_stage: str | None = None):
     from react_agent.eeg_research.agentic.schemas import DOMAIN_OUTPUT_MODELS
 
     if role == "experiment_designer":
@@ -208,13 +208,17 @@ def domain_model_for(role: str, memory=None, *, camp=None):
         from react_agent.eeg_research.agentic.schemas import PlannerProposal
         return PlannerProposal
 
+    if role == "result_analyst" and review_stage != "analysis":
+        from .schemas import LegacyResultAnalysis
+        return LegacyResultAnalysis
+
     if role == "memory_curator" and memory is not None and memory.enabled and memory.skills_enabled:
         from react_agent.eeg_research.agentic.skill_memory import SkillLessonProposal
         return SkillLessonProposal
     return DOMAIN_OUTPUT_MODELS.get(role)
 
 
-def system_prompt(role: str, *, memory=None, camp=None) -> str:
+def system_prompt(role: str, *, memory=None, camp=None, review_stage: str | None = None) -> str:
     from react_agent.eeg_research.agentic.schemas import role_output_schema
 
     if camp is not None:
@@ -222,7 +226,7 @@ def system_prompt(role: str, *, memory=None, camp=None) -> str:
         if single_plan_enabled(camp):
             from .runtime_prompts import runtime_mission
             from .context.compiler import render_role_system
-            model = domain_model_for(role, memory, camp=camp)
+            model = domain_model_for(role, memory, camp=camp, review_stage=review_stage)
             if role == "candidate_coder":
                 from .coder import CoderToolRequest
                 model = CoderToolRequest
@@ -234,7 +238,8 @@ def system_prompt(role: str, *, memory=None, camp=None) -> str:
             from .research_execution import independent_critic_enabled
             mission_role = "research_proposer" if role == "research_planner" and independent_critic_enabled(camp) else role
             from .design_contract import design_contract_version
-            mission = runtime_mission(mission_role, design_contract_version=design_contract_version(camp))
+            mission = runtime_mission(mission_role, design_contract_version=design_contract_version(camp),
+                                      review_stage=review_stage)
             if role == "candidate_reviewer":
                 from .research_execution import research_goal
                 if (research_goal(camp).get("research_execution") or {}).get("implementation_review_mode") == "single_pass":
@@ -244,6 +249,10 @@ def system_prompt(role: str, *, memory=None, camp=None) -> str:
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
     mission = (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
     schema = role_output_schema(role)
+    if role == "result_analyst":
+        if review_stage == "analysis":
+            mission = (PROMPTS / "runtime_v2" / "result_analyst.txt").read_text(encoding="utf-8")
+        schema = json.dumps(domain_model_for(role, memory, camp=camp, review_stage=review_stage).model_json_schema(), ensure_ascii=False)
     if role == "research_planner":
         from react_agent.eeg_research.agentic.schemas import PlannerOption
         schema = json.dumps(domain_model_for(role, memory).model_json_schema(), ensure_ascii=False, separators=(",", ":"))
@@ -1017,6 +1026,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                         context_service.owned_calls.add(row["call_id"])
     context_service.callback = maintenance_callback
     bound: dict[str, Any] = {}
+    active_review_stage: str | None = None
 
     def configure(changes: dict) -> None:
         nonlocal resolved
@@ -1050,19 +1060,21 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             from .schemas import ResearchRoundDraft, ResearchProposalDraft
             from .research_execution import independent_critic_enabled
             return ResearchProposalDraft if independent_critic_enabled(camp) else ResearchRoundDraft
-        return domain_model_for(role,memory,camp=camp)
+        return domain_model_for(role,memory,camp=camp,review_stage=active_review_stage)
 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
-        nonlocal resolved
+        nonlocal resolved, system, prompt_hash, active_review_stage
+        active_review_stage = payload.get("review_stage")
+        if role == "result_analyst":
+            system = system_prompt(role, memory=memory, camp=camp, review_stage=payload.get("review_stage"))
+            prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
         from .research_execution import single_plan_enabled
         if single_plan_enabled(camp) and role in {"experiment_designer","candidate_coder","candidate_reviewer","result_analyst"}:
             from .selected_plan import load_plan
             selected = load_plan(camp)
             if selected:
-                proposal = selected.get("proposal") or {}
-                payload = {**payload,"selected_research_task":{key:proposal[key] for key in (
-                    "question","task_description","scientific_intent","evaluation_scope","expected_observation","completion_condition") if key in proposal},
-                    "origin_plan_id":selected["plan_id"]}
+                from .stage_context import with_selected_task
+                payload = with_selected_task(payload, role, selected)
 
         task = None
         if role in ENVELOPE_ROLES:
