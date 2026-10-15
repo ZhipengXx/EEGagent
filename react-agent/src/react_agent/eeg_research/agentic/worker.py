@@ -314,8 +314,10 @@ def _attach(backend: Any, **fields: Any) -> None:
 
 
 def _stored_review(workspace: Path, *, candidate_id: str, attempt_id: str, input_hash: str,
-                   role_config_hash: str | None = None) -> dict[str, Any] | None:
-    """Return a review only when it belongs to this attempt and this source hash."""
+                   role_config_hash: str | None = None, approved_spec_hash: str | None = None,
+                   intervention_config_hash: str | None = None,
+                   implementation_map_hash: str | None = None) -> dict[str, Any] | None:
+    """Reuse current attempt/source and, for v2, the exact design/config/map."""
     path = workspace / "review.json"
     if not path.is_file():
         return None
@@ -335,6 +337,12 @@ def _stored_review(workspace: Path, *, candidate_id: str, attempt_id: str, input
         return None
     if role_config_hash is not None and payload.get("role_config_hash") != role_config_hash:
         return None
+    if approved_spec_hash is not None and payload.get("approved_spec_hash") != approved_spec_hash:
+        return None
+    if intervention_config_hash is not None and payload.get("intervention_config_hash") != intervention_config_hash:
+        return None
+    if implementation_map_hash is not None and payload.get("implementation_map_hash") != implementation_map_hash:
+        return None
     from react_agent.eeg_research.agentic.native_patch import apply_review_filter, satisfied_invariants
     return apply_review_filter(payload, satisfied=satisfied_invariants(workspace))
 
@@ -348,12 +356,24 @@ def _review_or_reuse(
     state: dict[str, Any],
     *,
     revalidation_reason: str | None = None,
+    revalidation_operation: str | None = None,
 ) -> dict[str, Any] | None:
     """Use a stored review, or call the reviewer once. None means the campaign is already blocked."""
     attempt = ensure_attempt(workspace, str(workspace.name))
     digest = source_hash(workspace)
     reviewer_config = getattr(reviewer, "role_config", None)
     config_hash = getattr(reviewer_config, "role_config_hash", None)
+    experiment = spec.get("experiment") or {}
+    design_v2 = experiment.get("design_contract_version") == "v2"
+    if design_v2:
+        from .run_context import intervention_config_hash
+        from .binding import file_sha256
+        mapping = workspace / "implementation_map.json"
+        review_binding = {"approved_spec_hash": experiment.get("spec_hash"),
+                          "intervention_config_hash": intervention_config_hash(experiment),
+                          "implementation_map_hash": file_sha256(mapping) if mapping.is_file() else ""}
+    else:
+        review_binding = {}
     try:
         stored = _stored_review(
             workspace,
@@ -361,6 +381,7 @@ def _review_or_reuse(
             attempt_id=str(attempt["attempt_id"]),
             input_hash=digest,
             role_config_hash=config_hash,
+            **review_binding,
         )
     except RecoveryBlocked as exc:
         _block_phase(
@@ -372,25 +393,44 @@ def _review_or_reuse(
             recoverable=False,
         )
         return None
+    if stored is None and config_hash and revalidation_reason is None:
+        from .review_revalidation import authorized_config
+        authorized = authorized_config(camp_dir, workspace, state, config_hash)
+        if authorized:
+            stored = _stored_review(workspace, candidate_id=str(workspace.name),
+                attempt_id=str(attempt["attempt_id"]), input_hash=digest,
+                role_config_hash=authorized["role_config"]["role_config_hash"], **review_binding)
+            if stored and stored.get("operation_id") != authorized["operation_id"]:
+                raise ValueError("review_revalidation_completed_operation_changed")
     if stored is not None and revalidation_reason is None:
         from react_agent.eeg_research.agentic.native_patch import enforce_requirement_review
         return enforce_requirement_review(workspace, spec, stored)
     if revalidation_reason is not None:
         from react_agent.eeg_research.agentic.binding import file_sha256
         previous = workspace / "review.json"
-        if not revalidation_reason.strip() or stored is None:
+        if not revalidation_reason.strip() or (stored is None and not revalidation_operation):
             raise ValueError("review_revalidation_requires_matching_prior_receipt_and_reason")
-        archive = workspace / "review_history" / (file_sha256(previous) + ".json")
-        archive.parent.mkdir(exist_ok=True)
-        data = previous.read_bytes()
-        if archive.exists():
-            if archive.read_bytes() != data:
-                raise ValueError("review_history_identity_conflict")
+        if stored and stored.get("operation_id") == revalidation_operation:
+            from .native_patch import enforce_requirement_review
+            return enforce_requirement_review(workspace, spec, stored)
+        archive = None
+        if previous.is_file():
+            archive = workspace / "review_history" / (file_sha256(previous) + ".json")
+            archive.parent.mkdir(exist_ok=True)
+            data = previous.read_bytes()
+            if archive.exists():
+                if archive.read_bytes() != data:
+                    raise ValueError("review_history_identity_conflict")
+            else:
+                with archive.open("xb") as target:
+                    target.write(data)
+        if revalidation_operation:
+            event(camp_dir, "review_output_revalidation_requested", candidate_id=workspace.name,
+                  operation_id=revalidation_operation, prior_review_ref=str(archive) if archive else None,
+                  reason=revalidation_reason)
         else:
-            with archive.open("xb") as target:
-                target.write(data)
-        event(camp_dir, "review_revalidation_requested", candidate_id=workspace.name,
-              prior_review_ref=str(archive), reason=revalidation_reason)
+            event(camp_dir, "review_revalidation_requested", candidate_id=workspace.name,
+                  prior_review_ref=str(archive), reason=revalidation_reason)
     cost_path = camp_dir / "cost.json"
     used = json.loads(cost_path.read_text(encoding="utf-8")).get("llm_calls", 0) if cost_path.is_file() else 0
     if int(state.get("max_llm_calls", 100)) - int(used) <= 0:
@@ -407,9 +447,10 @@ def _review_or_reuse(
         "candidate_id": workspace.name,
         "attempt_id": attempt["attempt_id"],
         "phase": "review_candidate",
-        "operation_id": operation_id(workspace, workspace.name, "review_candidate"),
+        "operation_id": revalidation_operation or operation_id(workspace, workspace.name, "review_candidate"),
         "input_hash": digest,
         **({"role_config_hash": config_hash} if config_hash else {}),
+        **review_binding,
     }
     _attach(reviewer, **identity)
     try:
@@ -429,16 +470,87 @@ def _review_or_reuse(
         return None
 
 
-def build_services(camp: Path) -> dict[str, Any]:
+def _route_v2_repairs(camp: Path, state: dict[str, Any], candidate_id: str,
+                      verdict: dict[str, Any], repair: dict[str, Any] | None = None) -> str:
+    """Route concrete findings to the role that can change their cause."""
+    issues = [dict(issue) for issue in verdict.get("issues") or []
+              if isinstance(issue, dict) and issue.get("severity") == "blocking"]
+    for issue in issues:
+        kind = issue.get("kind")
+        if kind == "core_implementation_contradicted" and issue.get("expected") and issue.get("check_ref"):
+            actual = issue.get("actual") if isinstance(issue.get("actual"), dict) else {}
+            issue.setdefault("evidence_refs", [*(actual.get("source_refs") or []), issue["check_ref"]])
+            issue.setdefault("smallest_correction", "Implement approved requirement " + str(issue.get("requirement_id")) + ": " + str(issue["expected"]))
+            issue.setdefault("validation_expectation", "The current requirement check and independent review verify " + str(issue["expected"]))
+        if kind not in {"code_error", "design_conflict", "framework_issue", "scientific_replan"}:
+            if kind in {"core_implementation_contradicted", "intervention_coverage_missing"} or issue.get("category") == "candidate_defect":
+                issue["kind"] = "code_error"
+            else:
+                issue["kind"] = "framework_issue"
+        if issue["kind"] in {"code_error", "design_conflict", "scientific_replan"} and not all(
+                issue.get(field) for field in ("evidence_refs", "smallest_correction", "validation_expectation")):
+            issue["kind"] = "framework_issue"
+            issue["detail"] = "Blocking finding needs evidence, a concrete correction and its verification."
+    if not issues:
+        issues = [{"kind": "framework_issue", "severity": "blocking",
+                   "detail": verdict.get("summary_zh") or "Review has no executable blocking finding."}]
+    kinds = {issue["kind"] for issue in issues}
+    owner = ("planner" if "scientific_replan" in kinds else "native" if "framework_issue" in kinds
+             else "designer" if "design_conflict" in kinds else "coder")
+    state["candidate_ready"] = False
+    state["repair_task"] = None
+    if owner == "planner":
+        state["needs_replan"] = {"candidate_id": candidate_id, "issues": issues}
+        state["experiment_failed"] = False
+        return owner
+    if owner == "native":
+        state["framework_issue_task"] = {"candidate_id": candidate_id, "issues": issues}
+        state["experiment_failed"] = False
+        persist_failure(camp, state, phase="review_candidate", error_type="framework_issue",
+                        detail="framework_issue:" + str(issues[0].get("detail") or issues[0].get("reason") or issues[0].get("kind")),
+                        recoverable=True)
+        return owner
+    used = int((repair or {}).get("used") or 0)
+    if used >= int(state.get("max_repairs_per_candidate", 2)):
+        state["experiment_failed"] = True
+        return owner
+    task = {"candidate_id": candidate_id, "remaining": 1, "used": used + 1,
+            "issues": issues, "intervention_coverage": verdict.get("intervention_coverage"),
+            "unverified_invariants": verdict.get("unverified_invariants") or [],
+            "previous_review": {key: verdict.get(key) for key in (
+                "status", "input_hash", "approved_spec_hash", "requirement_coverage", "summary_zh")},
+            "review_focus": {"previous_issue_ids": [issue.get("issue_id") for issue in issues if issue.get("issue_id")],
+                             "issues": issues}}
+    if owner == "designer":
+        task["prior_spec_hash"] = (state.get("experiment") or {}).get("spec_hash")
+        task["prior_experiment_ref"] = state.get("experiment_ref")
+        state["design_revision_task"] = task
+    else:
+        state["repair_task"] = task
+    state["experiment_failed"] = False
+    return owner
+
+
+def build_services(camp: Path, *, role_overrides: dict | None = None,
+                   current_user_instruction: dict | None = None) -> dict[str, Any]:
+    from .review_revalidation import validate_override
+    review_overrides = validate_override(role_overrides)
     # Launch/settlement remain usable without constructing a paid role client.
     # Each role is resolved only when its service actually invokes it.
     def lazy_backend(role: str):
         client = None
+        fields = {}
+        def bind(**identity):
+            fields.clear()
+            fields.update(identity)
         def call(payload: dict[str, Any]) -> dict[str, Any]:
             nonlocal client
             if client is None:
                 client = role_backend(camp, role)
+            if fields:
+                client.bind(**fields)
             return client(payload)
+        call.bind = bind
         return call
 
     analyst = lazy_backend("result_analyst")
@@ -468,12 +580,15 @@ def build_services(camp: Path) -> dict[str, Any]:
 
     def do_implement(camp_dir: Path, state: dict[str, Any], *,
                      review_candidate_id: str | None = None,
-                     review_reason: str | None = None) -> None:
+                     review_reason: str | None = None,
+                     review_operation: str | None = None) -> None:
         if state.get("status") in {"paused", "cancelled"}:
             return
         from react_agent.eeg_research.agentic.coding_recovery import policy as coding_policy
         modern_recovery = coding_policy(camp_dir / "candidates" / "_policy_probe") is not None
-        if state.get("evaluation_mode") == "loso_method_search" and not modern_recovery:
+        from .design_contract import design_contract_version
+        native_v2 = design_contract_version(json.loads((camp_dir / "goal.json").read_text())) == "v2"
+        if state.get("evaluation_mode") == "loso_method_search" and not modern_recovery and not native_v2:
             from react_agent.eeg_research.agentic.resource_guard import require_idle_gpus
             try:
                 require_idle_gpus(camp_dir, state)
@@ -482,7 +597,7 @@ def build_services(camp: Path) -> dict[str, Any]:
                                 detail=str(exc), recoverable=True)
                 return
         repair = state.get("repair_task") if isinstance(state.get("repair_task"), dict) else None
-        repairing = bool(repair and int(repair.get("remaining") or 0) > 0 and repair.get("candidate_id"))
+        repairing = bool(review_operation is None and repair and int(repair.get("remaining") or 0) > 0 and repair.get("candidate_id"))
         candidate_id = review_candidate_id or candidate_implementation_target(camp_dir, state)
         selected_target = state.get("active_implementation_target_id")
         if selected_target and selected_target != candidate_id:
@@ -504,9 +619,14 @@ def build_services(camp: Path) -> dict[str, Any]:
             _block_phase(camp_dir, state, phase="implement_candidate",
                          error_type=exc.reason, detail=exc.reason, recoverable=True)
             return
-        coder = role_backend(camp, "candidate_coder")
+        coder = role_backend(camp, "candidate_coder") if review_operation is None else None
         reviewer = role_backend(camp, "candidate_reviewer")
         spec = {"hypothesis": assigned.get("hypothesis"), "experiment": assigned}
+        design_v2 = assigned.get("design_contract_version") == "v2"
+        if design_v2:
+            spec["design_contract_version"] = "v2"
+        if current_user_instruction:
+            spec["current_user_instruction"] = current_user_instruction
         from react_agent.eeg_research.agentic.semantic_memory import read_json
         previous_spec = read_json(workspace / "spec.json")
         previous_attempt_id = read_json(workspace / "attempt.json").get("attempt_id")
@@ -515,24 +635,38 @@ def build_services(camp: Path) -> dict[str, Any]:
         spec["audit_issues"] = [row for row in audit_feedback(camp_dir, state)["issues"]
                                 if row["issue_id"] in (state.get("active_issue_ids") or [])]
         spec["artifact_reads"] = selected_read_context(camp_dir, state)
+        if review_operation is not None:
+            # An explicit independent review consumes the existing checked
+            # implementation; it cannot rematerialize or rewrite its inputs.
+            spec = previous_spec
         if repairing:
             spec["repair_issues"] = repair.get("issues") or []
             spec["repair_intervention_coverage"] = repair.get("intervention_coverage")
             spec["repair_unverified_invariants"] = repair.get("unverified_invariants") or []
+            if design_v2:
+                spec["review_mode"] = "targeted"
+                spec["review_focus"] = repair.get("review_focus") or {"issues": repair.get("issues") or []}
+                spec["review_focus"]["previous_review"] = repair.get("previous_review")
         workspace.mkdir(parents=True, exist_ok=True)
         from react_agent.eeg_research.agentic.run_context import load_approved_binding, persist_approved_binding
         from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
         if load_approved_binding(camp_dir, candidate_id) is None and experiment_is_approved(assigned):
             persist_approved_binding(camp_dir, candidate_id, assigned,
                 spec_ref=assigned.get("experiment_ref") or state.get("experiment_ref"))
-        (workspace / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+        if review_operation is None:
+            (workspace / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
         protocol = load_protocol(camp_dir)
-        (workspace / "input_spec.json").write_text(
-            json.dumps(candidate_interface(protocol), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        interface = candidate_interface(protocol)
+        if design_v2:
+            interface["design_contract_version"] = "v2"
+        if review_operation is None:
+            (workspace / "input_spec.json").write_text(
+                json.dumps(interface, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         try:
-            materialize(camp_dir, workspace, assigned)
+            if review_operation is None:
+                materialize(camp_dir, workspace, assigned)
         except LineageError as exc:
             _block_phase(
                 camp_dir,
@@ -584,8 +718,9 @@ def build_services(camp: Path) -> dict[str, Any]:
             attempt = ensure_attempt(workspace, candidate_id)
         from react_agent.eeg_research.agentic.semantic_memory import coder_delivery
         try:
-            memory = coder_delivery(camp_dir, workspace, attempt["attempt_id"], spec, state=state,
+            memory = (coder_delivery(camp_dir, workspace, attempt["attempt_id"], spec, state=state,
                                     previous_spec=previous_spec, previous_attempt_id=previous_attempt_id)
+                      if review_operation is None else None)
         except (OSError, ValueError, sqlite3.Error) as exc:
             _block_phase(camp_dir, state, phase="implement_candidate", error_type="MemorySnapshotError",
                          detail=f"{type(exc).__name__}: {exc}", recoverable=True)
@@ -594,16 +729,18 @@ def build_services(camp: Path) -> dict[str, Any]:
             spec["retrieved_memory"] = memory
             (workspace / "spec.json").write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
         from react_agent.eeg_research.agentic.artifacts import request_digest
-        _attach(
-            coder,
-            candidate_id=candidate_id,
-            attempt_id=attempt["attempt_id"],
-            phase="implement_candidate",
-            operation_id=operation_id(workspace, candidate_id, "implement_candidate"),
-            input_hash=source_hash(workspace),
-            **({"input_digest": request_digest(request=spec)}
-               if spec.get("artifact_reads") or spec.get("audit_issues") or spec.get("retrieved_memory") else {}),
-        )
+        if review_operation is None:
+            _attach(
+                coder,
+                candidate_id=candidate_id,
+                attempt_id=attempt["attempt_id"],
+                phase="implement_candidate",
+                operation_id=operation_id(workspace, candidate_id, "implement_candidate"),
+                input_hash=source_hash(workspace),
+                **({"input_digest": request_digest(request=spec)}
+                   if spec.get("artifact_reads") or spec.get("audit_issues") or spec.get("retrieved_memory")
+                   or spec.get("current_user_instruction") else {}),
+            )
         outcome: dict[str, Any] | None = None
         if impl_path.is_file() and not repairing:
             outcome = json.loads(impl_path.read_text(encoding="utf-8"))
@@ -690,7 +827,12 @@ def build_services(camp: Path) -> dict[str, Any]:
             state.pop("detail", None)
         if row["status"] == "implementation_failed":
             state["detail"] = row["detail"]
-        if outcome["status"] == "implementation_failed":
+        if design_v2 and outcome["status"] == "needs_design_revision":
+            issue = dict(outcome.get("detail") or outcome.get("revision_request") or {})
+            issue.setdefault("kind", "design_conflict")
+            issue["severity"] = "blocking"
+            _route_v2_repairs(camp_dir, state, candidate_id, {"issues": [issue]}, repair)
+        elif outcome["status"] == "implementation_failed":
             used = int((repair or {}).get("used") or 0)
             limit = int(state.get("max_repairs_per_candidate", 2))
             # A failed preflight is concrete engineering feedback, even before
@@ -704,16 +846,32 @@ def build_services(camp: Path) -> dict[str, Any]:
                 still_open = [dict(issue, status="still_open_from_previous_review")
                               for issue in (repair or {}).get("issues") or []
                               if issue.get("category") != "candidate_check_failure"]
+                check_issue = {"category": "candidate_check_failure", **row["check"],
+                               "correction_scope": "Repair the exact failing hook and approved config; preserve the scientific intervention"
+                                                   + (" and still resolve the open review issues." if still_open else ".")}
                 state["repair_task"] = {"candidate_id": candidate_id, "remaining": 1, "used": used + 1,
-                    "issues": [{"category": "candidate_check_failure", **row["check"],
-                                "correction_scope": "Repair the exact failing hook and approved config; preserve the scientific intervention"
-                                                    + (" and still resolve the open review issues." if still_open else ".")},
+                    "issues": [check_issue,
                                *still_open],
                     "intervention_coverage": (repair or {}).get("intervention_coverage") if still_open else None,
                     "unverified_invariants": ((repair or {}).get("unverified_invariants") or []) if still_open else []}
-                state["experiment_failed"] = False
+                if design_v2:
+                    from .coding_recovery import classify_check
+                    check_issue.update(kind="framework_issue" if classify_check(check) in {
+                        "environment_error", "format_error", "resource_pending"} else "code_error",
+                        severity="blocking", evidence_refs=[str(workspace / "checks.json")],
+                        smallest_correction=check_issue["correction_scope"],
+                        validation_expectation="The failing native check passes for the approved current config.")
+                    _route_v2_repairs(camp_dir, state, candidate_id, {
+                        "issues": [check_issue, *still_open],
+                        "intervention_coverage": (repair or {}).get("intervention_coverage"),
+                        "unverified_invariants": (repair or {}).get("unverified_invariants") or []}, repair)
+                if not design_v2:
+                    state["experiment_failed"] = False
             else:
                 state["repair_task"] = None
+                if design_v2:
+                    state.pop("framework_issue_task", None)
+                    state.pop("design_revision_task", None)
                 state["experiment_failed"] = True
         elif repairing and outcome["status"] not in {"ready_for_review", "check_pending"}:
             state["repair_task"] = None
@@ -722,7 +880,7 @@ def build_services(camp: Path) -> dict[str, Any]:
             if (state.get("pending_candidate_check") or {}).get("candidate_id") == candidate_id:
                 state.pop("pending_candidate_check", None)
             verdict = (_review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state,
-                        revalidation_reason=review_reason) if review_reason is not None
+                        revalidation_reason=review_reason, revalidation_operation=review_operation) if review_reason is not None
                        else _review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state))
             if verdict is None:
                 if modern_recovery:
@@ -736,10 +894,14 @@ def build_services(camp: Path) -> dict[str, Any]:
                 return
             row["review"] = verdict["status"]
             row["review_format_failed"] = verdict.get("format_failed")
+            row["review_operation_id"] = verdict.get("operation_id")
             if verdict["status"] == "ready":
                 state["candidate_ready"] = True
                 state["candidate_id"] = candidate_id
                 state["repair_task"] = None
+                if design_v2:
+                    state.pop("framework_issue_task", None)
+                    state.pop("design_revision_task", None)
                 row["status"] = "ready"
                 bound = assigned
                 if isinstance(bound, dict):
@@ -753,6 +915,10 @@ def build_services(camp: Path) -> dict[str, Any]:
                         attempt_id=attempt.get("attempt_id"),
                         source_hash=source_hash(workspace),
                     )
+            elif design_v2:
+                owner = _route_v2_repairs(camp_dir, state, candidate_id, verdict, repair)
+                row["status"] = "review_" + verdict["status"]
+                row["repair_owner"] = owner
             elif verdict["status"] == "needs_fix" or (
                 verdict["status"] == "blocked"
                 and (blocking := [issue for issue in verdict.get("issues") or [] if issue.get("severity") == "blocking"])
@@ -785,6 +951,9 @@ def build_services(camp: Path) -> dict[str, Any]:
                 isinstance(state.get("repair_task"), dict)
                 and int((state.get("repair_task") or {}).get("remaining") or 0) > 0
             )
+            if design_v2:
+                repairing_now = repairing_now or bool(state.get("design_revision_task") or
+                                                     state.get("framework_issue_task") or state.get("needs_replan"))
             if not repairing_now:
                 state["experiment_failed"] = True
         existing = next(
@@ -848,7 +1017,7 @@ def build_services(camp: Path) -> dict[str, Any]:
         from react_agent.eeg_research.agentic.native_patch import _check_fingerprint
         from react_agent.eeg_research.agentic.review_context import review_reference_errors
         if (state.get("evaluation_mode") != "loso_method_search" or state.get("live_job")
-                or state.get("active_suite") or state.get("repair_task")
+                or state.get("active_suite")
                 or state.get("status") == "cancelled" or not reason.strip()
                 or not re.fullmatch(r"c[1-9][0-9]*", candidate_id)):
             raise ValueError("review_revalidation_requires_quiescent_checked_candidate_and_reason")
@@ -858,13 +1027,130 @@ def build_services(camp: Path) -> dict[str, Any]:
         check_path = workspace / "checks.json"
         spec = json.loads((workspace / "spec.json").read_text())
         checks = json.loads(check_path.read_text())
-        prior = json.loads((workspace / "review.json").read_text())
+        prior_path = workspace / "review.json"
+        prior = json.loads(prior_path.read_text()) if prior_path.is_file() else None
         impl = json.loads((workspace / "implementation.json").read_text())
-        if (not row or row.get("status") != "review_blocked" or prior.get("status") != "blocked"
+        if review_overrides:
+            from .review_revalidation import truncated_proof, authorize, authorized_config, paid_review_proof, record_paid_review
+            from .role_config import resolve_role_config
+            from .owner_budget import budget_owner
+            pinned = {path: file_sha256(path) for path in (source, check_path, workspace / "spec.json",
+                workspace / "attempt.json", camp_dir / "goal.json")}
+            authorization = authorized_config(camp_dir, workspace, state,
+                resolve_role_config(camp_dir, "candidate_reviewer").role_config_hash)
+            stored = _stored_review(workspace, candidate_id=candidate_id, attempt_id=impl["attempt_id"],
+                input_hash=file_sha256(source), role_config_hash=authorization["role_config"]["role_config_hash"]) if authorization else None
+            recovered = None
+            if stored is not None:
+                if stored.get("operation_id") != authorization["operation_id"]:
+                    raise ValueError("review_revalidation_completed_operation_changed")
+                proof = authorization
+                from .native_patch import enforce_requirement_review
+                verdict = enforce_requirement_review(workspace, spec, stored)
+            elif (recovered := paid_review_proof(camp_dir, state, candidate_id)) is not None:
+                proof, authorization = recovered["proof"], recovered["authorization"]
+                record_paid_review(camp_dir, recovered)
+                class PaidReviewer:
+                    role_config = resolve_role_config(camp_dir, "candidate_reviewer", {"max_tokens": 32768})
+                    model = role_config.model
+                    review_evidence_request = recovered["request"]
+                    def __call__(self, payload):
+                        return recovered["reply"]
+                identity = {"candidate_id": candidate_id, "attempt_id": proof["attempt_id"],
+                    "phase": "review_candidate", "operation_id": authorization["operation_id"],
+                    "input_hash": proof["source_hash"], "role_config_hash": authorization["role_config"]["role_config_hash"]}
+                verdict = review(workspace, spec, summary, PaidReviewer(), PaidReviewer.model, identity=identity)
+            else:
+                proof = truncated_proof(camp_dir, state, candidate_id)
+                authorization = authorize(camp_dir, proof, reason)
+                reviewer = role_backend(camp, "candidate_reviewer", overrides=review_overrides["candidate_reviewer"])
+                if reviewer.role_config.semantics() != authorization["role_config"]:
+                    raise ValueError("review_revalidation_resolved_profile_changed")
+                with budget_owner(camp_dir, proof["budget_owner"].removesuffix(":role:candidate_reviewer"), purpose="mainline"):
+                    verdict = _review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state,
+                        revalidation_reason=reason, revalidation_operation=authorization["operation_id"])
+            if any(file_sha256(path) != sha for path, sha in pinned.items()):
+                raise ValueError("review_revalidation_changed_frozen_inputs")
+            _sync_ledger(camp_dir, state)
+            if verdict is None:
+                raise LlmUnavailable(str(state.get("detail") or "review_revalidation_unavailable"))
+            row.update(review=verdict["status"], review_format_failed=verdict.get("format_failed"),
+                       status="ready" if verdict["status"] == "ready" else "review_" + verdict["status"])
+            if verdict["status"] == "ready":
+                from .run_context import persist_approved_binding
+                state.update(candidate_ready=True, candidate_id=candidate_id, repair_task=None, experiment_failed=False)
+                persist_approved_binding(camp_dir, candidate_id, spec["experiment"],
+                    spec_ref=state.get("experiment_ref"), attempt_id=proof["attempt_id"], source_hash=proof["source_hash"])
+            else:
+                # The native Reviewer can still reject the checked implementation.
+                # Preserve its judgment; a retry does not grant scientific approval.
+                state["candidate_ready"] = False
+                blocking = [issue for issue in verdict.get("issues") or [] if issue.get("severity") == "blocking"]
+                repairable = verdict["status"] == "needs_fix" or (bool(blocking) and all(
+                    issue.get("category") == "candidate_defect" and issue.get("smallest_correction") for issue in blocking))
+                used = int((state.get("repair_task") or {}).get("used") or 0)
+                if repairable and used < int(state.get("max_repairs_per_candidate", 2)):
+                    state["repair_task"] = {"candidate_id": candidate_id, "issues": verdict.get("issues") or [],
+                        "intervention_coverage": verdict.get("intervention_coverage"),
+                        "unverified_invariants": verdict.get("unverified_invariants") or [], "remaining": 1, "used": used + 1}
+                    state["experiment_failed"] = False
+                else:
+                    state["repair_task"] = None
+                    state["experiment_failed"] = True
+            evidence = {"evidence_id": "ev_impl_" + candidate_id, "kind": "implementation",
+                "candidate_id": candidate_id, "summary": row}
+            old = next((i for i, item in enumerate(state.get("evidence") or []) if item.get("evidence_id") == evidence["evidence_id"]), None)
+            if old is None:
+                state.setdefault("evidence", []).append(evidence)
+            else:
+                state["evidence"][old] = evidence
+            state.pop("failure", None)
+            state.pop("detail", None)
+            if state.get("status") == "blocked":
+                state["status"] = "created"
+            return {"status": row["status"], "candidate_id": candidate_id, "reason": reason,
+                "source_hash": proof["source_hash"], "candidate_source_rewritten": False,
+                **({"recovered_paid_call_id": recovered["receipt"]["call_id"], "api_calls_added": 0} if recovered else {}),
+                "authorization_id": authorization["authorization_id"], "operation_id": authorization["operation_id"]}
+        if (not row or not prior
                 or checks.get("ok") is not True or checks.get("source_sha256") != file_sha256(source)
                 or checks.get("check_fingerprint") != _check_fingerprint(workspace, None)
                 or impl.get("status") != "ready_for_review" or impl.get("input_hash") != source_hash(workspace)
                 or (spec.get("experiment") or {}).get("spec_hash") != (state.get("experiment") or {}).get("spec_hash")):
+            raise ValueError("review_revalidation_requires_current_source_checks_and_same_approved_spec")
+        review_operation = None
+        completed_v2 = ((spec.get("experiment") or {}).get("design_contract_version") == "v2"
+                        and not prior.get("format_failed")
+                        and prior.get("model_status", prior.get("status")) in {"needs_fix", "blocked", "ready"})
+        if completed_v2:
+            import hashlib
+            from .action_planning import digest
+            from .embedding import memory_config
+            from .llm import system_prompt
+            from .selected_plan import load_plan
+            plan = load_plan(camp_dir, state)
+            if not plan or plan.get("candidate_id") != candidate_id or plan.get("spec_hash") != (spec.get("experiment") or {}).get("spec_hash"):
+                raise ValueError("review_revalidation_requires_current_selected_plan")
+            prompt_sha = hashlib.sha256(system_prompt("candidate_reviewer", camp=camp_dir,
+                memory=memory_config(camp_dir)).encode()).hexdigest()
+            def scope(prior_sha):
+                return "review_revalidation_" + digest({"prior_review_sha256": prior_sha,
+                    "prompt_sha256": prompt_sha})[:32]
+            # The archived original plus this prompt names the same request on
+            # repeated CLI calls, including when its new verdict still blocks.
+            for archive in (workspace / "review_history").glob("*.json"):
+                if prior.get("operation_id") == scope(file_sha256(archive)):
+                    review_operation = prior["operation_id"]
+                    if row.get("review_operation_id") == review_operation:
+                        return {"status": row["status"], "candidate_id": candidate_id, "reason": reason,
+                            "source_hash": file_sha256(source), "candidate_source_rewritten": False,
+                            "operation_id": review_operation, "api_calls_added": 0}
+                    break
+            if review_operation is None:
+                if prior.get("status") not in {"needs_fix", "blocked"}:
+                    raise ValueError("review_revalidation_requires_completed_unsuccessful_review")
+                review_operation = scope(file_sha256(prior_path))
+        elif (state.get("repair_task") or row.get("status") != "review_blocked" or prior.get("status") != "blocked"):
             raise ValueError("review_revalidation_requires_current_source_checks_and_same_approved_spec")
         metadata = {"candidate_source": source.read_text(), "requirement_evidence_identity": {
             "source_ref": str(source), "source_hash": file_sha256(source),
@@ -873,15 +1159,21 @@ def build_services(camp: Path) -> dict[str, Any]:
         # A review blocked only because core evidence was unavailable (not an
         # observed defect) may be re-run once that evidence is supplied.
         evidence_only = bool(blocking) and all(issue.get("kind") == "core_implementation_unverified" for issue in blocking)
-        if not review_reference_errors(prior, metadata) and not evidence_only:
+        if not completed_v2 and not review_reference_errors(prior, metadata) and not evidence_only:
             raise ValueError("review_revalidation_requires_recorded_reference_contract_failure")
         pinned_source = file_sha256(source)
         pinned_check = file_sha256(check_path)
         was_paused = state.get("status") == "paused"
-        if was_paused:
+        if was_paused or (completed_v2 and state.get("status") == "blocked"):
             state["status"] = "planning"
         try:
-            do_implement(camp_dir, state, review_candidate_id=candidate_id, review_reason=reason)
+            if completed_v2:
+                from .owner_budget import budget_owner
+                with budget_owner(camp_dir, plan["budget_owner"], purpose="mainline"):
+                    do_implement(camp_dir, state, review_candidate_id=candidate_id, review_reason=reason,
+                                 review_operation=review_operation)
+            else:
+                do_implement(camp_dir, state, review_candidate_id=candidate_id, review_reason=reason)
             if file_sha256(source) != pinned_source or file_sha256(check_path) != pinned_check:
                 raise ValueError("review_revalidation_changed_candidate_source_or_checks")
             if state.get("candidate_ready") or state.get("repair_task"):
@@ -892,7 +1184,8 @@ def build_services(camp: Path) -> dict[str, Any]:
             _sync_ledger(camp_dir, state)
         return {"status": next(item["status"] for item in state["candidates"] if item["candidate_id"] == candidate_id),
                 "candidate_id": candidate_id, "reason": reason,
-                "source_hash": file_sha256(source), "candidate_source_rewritten": False}
+                "source_hash": file_sha256(source), "candidate_source_rewritten": False,
+                **({"operation_id": review_operation} if review_operation else {})}
 
     def _analyze_run(camp_dir: Path, state: dict[str, Any], latest: dict[str, Any], *,
                      trigger: dict[str, Any], prepare_only: bool = False,
@@ -1504,6 +1797,7 @@ def build_services(camp: Path) -> dict[str, Any]:
 
     return {
         "launch": launch,
+        "critic": lazy_backend("research_critic"),
         "settle": settle,
         "implement": do_implement,
         "resume_pending_check": resume_pending_check,

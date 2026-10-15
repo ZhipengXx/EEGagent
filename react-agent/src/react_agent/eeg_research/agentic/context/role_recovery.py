@@ -150,6 +150,13 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
             raise _error("role_recovery_transport_config_mismatch")
         if digest({"system": traced["system"], "user": traced["user"], "transport_fields": fields}) != call.get("context_request_digest"):
             raise _error("role_recovery_prepared_digest_mismatch")
+        if role == "candidate_coder" and response.get("validation") == "coder_tool_request_invalid":
+            reply = response.get("reply")
+            if not isinstance(reply, dict) or digest(reply) != call.get("response_reply_sha256"):
+                raise _error("role_recovery_response_hash_missing_or_changed")
+            # Known invalid tool arguments executed nothing. Preserve their spend
+            # and let the existing operation allowance govern the next attempt.
+            return None
         if response.get("validation") not in {"pending", "valid"} or not isinstance(response.get("reply"), dict):
             raise _error("role_recovery_reply_invalid")
         reply = response["reply"]

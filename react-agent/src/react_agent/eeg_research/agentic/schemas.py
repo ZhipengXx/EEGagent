@@ -12,6 +12,7 @@ ROLE_RESULT_VERSION = "eeg_research.role_result.v1"
 
 ROLE_OUTPUT_SCHEMAS = {
     "research_planner": "PlannerDecision: action, target_id, question_id, evidence_refs, decision_rationale, expected_information, required_artifact_refs, hypothesis_draft, plan_update, action_depends_on_plan_update, stop_reason, summary_zh",
+    "research_critic": "ResearchPlanCritique: protocol_version, proposal_pool_digest, evaluations, selected_proposal_id, selection_rationale",
     "research_librarian": "MethodEvidencePacket: question, search_scope, sources, method_cards, competing_hypotheses, applicability_limits, knowledge_gaps, local_only, summary_zh",
     "experiment_designer": "ExperimentDesignResult: status, experiment_spec, missing_inputs, required_capability_ids, confounders, required_corrections, evidence_refs, summary_zh",
     "candidate_coder": "One tool request: tool, args. The runtime builds PatchResult.",
@@ -193,9 +194,23 @@ class ResearchExecutionConfig(DomainOutput):
     allow_degraded_singleton: bool = False
     proposal_correction_calls: int = Field(default=1, ge=0, le=1)
     max_planner_api_attempts: int = Field(default=2, ge=1, le=6)
+    planning_mode: Literal["combined", "propose_then_critic"] = "combined"
+    implementation_review_mode: Literal["legacy", "single_pass"] = "legacy"
+    design_contract_version: Literal["v1", "v2"] = "v1"
+    max_critic_api_attempts: int = Field(default=2, ge=1, le=2)
     max_engineering_repairs: int = Field(default=2, ge=0, le=2)
+    max_completed_rounds: int | None = Field(default=None, ge=1,
+        description="Stop after this many selected tasks have durable terminal observations; repairs and polling do not count.")
     paid_maintenance: Literal["off", "emergency", "batch"] | None = None
     budget: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_execution_shape(self, handler):
+        row = handler(self)
+        for name in ("planning_mode", "implementation_review_mode", "max_critic_api_attempts", "design_contract_version"):
+            if name not in self.model_fields_set:
+                row.pop(name, None)
+        return row
 
 
 RESEARCH_TASK_PHASES = {
@@ -278,6 +293,22 @@ class ResearchRoundDraft(DomainOutput):
     selection_rationale: str = Field(min_length=1, max_length=1800)
 
 
+class ResearchProposalDraft(DomainOutput):
+    """Proposal generation has no ranking or execution authority."""
+    protocol_version: Literal["research_proposals.v1"]
+    proposals: list[Any] = Field(min_length=2, max_length=4,
+        json_schema_extra={"items": ResearchPlanProposal.model_json_schema()})
+
+
+class ResearchPlanCritique(DomainOutput):
+    """Independent comparison is bound to one native feasible proposal pool."""
+    protocol_version: Literal["research_plan_critique.v1"]
+    proposal_pool_digest: str = Field(min_length=1)
+    evaluations: list[ResearchPlanEvaluation] = Field(min_length=2, max_length=4)
+    selected_proposal_id: str = Field(min_length=1)
+    selection_rationale: str = Field(min_length=1, max_length=1800)
+
+
 class ResearchRound(DomainOutput):
     round_id: str
     input_observation_ids: list[str]
@@ -341,8 +372,8 @@ class MethodEvidencePacket(DomainOutput):
 class OrderedWindowProbe(DomainOutput):
     """Observe slots at the real representation consumer, after temporal pooling."""
 
-    input_module_path: str = Field(min_length=1, description="Named module whose input is the temporal pool input.")
-    representation_module_path: str = Field(min_length=1, description="Named downstream module whose input must still contain all ordered window slots.")
+    input_module_path: str = Field(default="", description="Named module whose input is the temporal pool input; bound by Coder for v2 declarations.")
+    representation_module_path: str = Field(default="", description="Named downstream module whose input must still contain all ordered window slots; bound by Coder for v2 declarations.")
     slot_count: int = Field(ge=2, le=32)
     window_axis: Literal[-1, 2] = -1
     layout: Literal["flatten_channel_major", "flatten_window_major", "channel_window", "window_channel"] = "flatten_channel_major"
@@ -358,14 +389,26 @@ class ImplementationRequirement(DomainOutput):
     code_locations: list[str] = Field(default_factory=list)
     verification: Literal["source_review", "ordered_window_slots"] = "source_review"
     probe: OrderedWindowProbe | None = None
+    binding_stage: Literal["bound", "design"] = "bound"
+    scope: Literal["scientific", "engineering"] = "scientific"
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_requirement_shape(self, handler):
+        row = handler(self)
+        for name in ("binding_stage", "scope"):
+            if name not in self.model_fields_set:
+                row.pop(name, None)
+        return row
 
     @model_validator(mode="after")
     def explicit_verification(self):
-        if self.kind == "implementation" and not self.code_locations:
+        if self.kind == "implementation" and not self.code_locations and self.binding_stage != "design":
             raise ValueError("implementation_requirement_needs_code_locations")
         if self.verification == "ordered_window_slots":
             if self.kind != "implementation" or self.probe is None:
                 raise ValueError("ordered_window_requirement_needs_typed_probe")
+            if self.binding_stage != "design" and not all((self.probe.input_module_path, self.probe.representation_module_path)):
+                raise ValueError("ordered_window_requirement_needs_bound_modules")
         elif self.probe is not None:
             raise ValueError("source_review_requirement_cannot_have_window_probe")
         return self
@@ -385,6 +428,12 @@ class RequirementCoverage(DomainOutput):
         if self.status in {"implemented", "contradicted"} and not all((self.source_hash, self.source_refs, self.check_ref, self.check_sha256)):
             raise ValueError("verified_requirement_status_needs_source_and_check_refs")
         return self
+
+
+class DesignRequirement(ImplementationRequirement):
+    """Behavior is fixed during design; source locations are supplied by Coder."""
+
+    binding_stage: Literal["design"] = "design"
 
 
 class DesignerExperimentSpec(BaseModel):
@@ -416,7 +465,76 @@ class DesignerExperimentSpec(BaseModel):
         return self
 
 
+class DesignHookChange(DomainOutput):
+    mode: Literal["inherit", "replace"]
+    config: dict[str, Any] | None = None
+
+    @model_validator(mode="after")
+    def explicit_config_mode(self):
+        if self.mode == "replace" and self.config is None:
+            raise ValueError("replace_hook_requires_config")
+        if self.mode == "inherit" and self.config is not None:
+            raise ValueError("inherit_hook_cannot_override_config")
+        return self
+
+
+class DesignHookChanges(DomainOutput):
+    model: DesignHookChange
+    objective: DesignHookChange
+    transform: DesignHookChange
+
+
+class DesignerBrief(DomainOutput):
+    schema_version: Literal["eeg_research.design_brief.v2"] = "eeg_research.design_brief.v2"
+    hypothesis: str = Field(min_length=1)
+    principal_intervention: str = Field(min_length=1)
+    scientific_parameters: dict[str, Any] = Field(default_factory=dict)
+    hook_changes: DesignHookChanges
+    implementation_requirements: list[DesignRequirement] = Field(default_factory=list)
+    required_capability_ids: list[str] = Field(default_factory=list)
+    method_evidence_refs: list[str] = Field(default_factory=list)
+    applicability: str = ""
+    expected_observation: str = ""
+    completion_condition: str = ""
+
+    @model_validator(mode="after")
+    def unique_requirements(self):
+        ids = [requirement.requirement_id for requirement in self.implementation_requirements]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate_implementation_requirement_id")
+        return self
+
+
 class ExperimentDesignResult(DomainOutput):
+    status: Literal["completed", "partial", "failed", "blocked", "requires_framework_extension"]
+    experiment_spec: DesignerExperimentSpec | None = None
+    design_brief: DesignerBrief | None = None
+    missing_inputs: list[str] = Field(default_factory=list)
+    required_capability_ids: list[str] = Field(default_factory=list)
+    confounders: list[Any] = Field(default_factory=list)
+    required_corrections: list[Any] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    summary_zh: str = ""
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_design_shape(self, handler):
+        row = handler(self)
+        if "design_brief" not in self.model_fields_set:
+            row.pop("design_brief", None)
+        return row
+
+    @model_validator(mode="after")
+    def completed_design_has_spec(self):
+        if self.experiment_spec is not None and self.design_brief is not None:
+            raise ValueError("design_result_requires_one_contract")
+        if self.status == "completed" and self.experiment_spec is None and self.design_brief is None:
+            raise ValueError("completed_design_requires_executable_spec")
+        return self
+
+
+class LegacyExperimentDesignResult(DomainOutput):
+    """The original Designer wire contract; v1 never receives the v2 brief schema."""
+
     status: Literal["completed", "partial", "failed", "blocked", "requires_framework_extension"]
     experiment_spec: DesignerExperimentSpec | None = None
     missing_inputs: list[str] = Field(default_factory=list)
@@ -427,9 +545,26 @@ class ExperimentDesignResult(DomainOutput):
     summary_zh: str = ""
 
     @model_validator(mode="after")
-    def completed_design_has_spec(self):
+    def completed_has_spec(self):
         if self.status == "completed" and self.experiment_spec is None:
             raise ValueError("completed_design_requires_executable_spec")
+        return self
+
+
+class ExperimentDesignBriefResult(DomainOutput):
+    status: Literal["completed", "partial", "failed", "blocked", "requires_framework_extension"]
+    design_brief: DesignerBrief | None = None
+    missing_inputs: list[str] = Field(default_factory=list)
+    required_capability_ids: list[str] = Field(default_factory=list)
+    confounders: list[Any] = Field(default_factory=list)
+    required_corrections: list[Any] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    summary_zh: str = ""
+
+    @model_validator(mode="after")
+    def completed_has_brief(self):
+        if self.status == "completed" and self.design_brief is None:
+            raise ValueError("completed_design_requires_brief")
         return self
 
 
@@ -438,6 +573,18 @@ class ImplementationIssue(BaseModel):
     severity: Literal["blocking", "non_blocking"]
     category: str = ""
     blocking: bool | None = None
+    kind: str = ""
+    evidence_refs: list[str] = Field(default_factory=list)
+    smallest_correction: str = ""
+    validation_expectation: str = ""
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_issue_shape(self, handler):
+        row = handler(self)
+        for name in ("kind", "evidence_refs", "smallest_correction", "validation_expectation"):
+            if name not in self.model_fields_set:
+                row.pop(name, None)
+        return row
 
     @model_validator(mode="after")
     def consistent_blocking_flag(self):
@@ -521,6 +668,7 @@ class AuditReport(DomainOutput):
 
 DOMAIN_OUTPUT_MODELS = {
     "research_planner": PlannerProposal,
+    "research_critic": ResearchPlanCritique,
     "research_librarian": MethodEvidencePacket,
     "experiment_designer": ExperimentDesignResult,
     "candidate_reviewer": ImplementationReview,

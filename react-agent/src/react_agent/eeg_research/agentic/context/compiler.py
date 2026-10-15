@@ -19,7 +19,7 @@ from .types import (Blocked, CompileRequest, CompileResult, NeedsContext, Prepar
 _IN_MAINTENANCE = contextvars.ContextVar("eeg_context_in_maintenance", default=False)
 MAINTENANCE_MODES = frozenset({"summary", "extraction", "consolidation"})
 WRAPPERS = frozenset({"observation", "input", "research_context", "context", "payload"})
-OPTIONAL_FIELDS = frozenset({"analyses", "memory", "lessons", "retrieved_memory", "recent_decisions",
+OPTIONAL_FIELDS = frozenset({"analyses", "memory", "lessons", "retrieved_memory", "retrieved_knowledge", "recent_decisions",
     "artifact_index", "evidence_index", "memory_index", "context_limits", "planner_context_projection",
     "role_context_projection", "planner_budget_reductions", "optional_context_delivery", "report_draft"})
 CLOSED_COLLECTIONS = frozenset({"analyses", "evidence", "method_screenings", "method_suites", "run_artifacts"})
@@ -61,9 +61,9 @@ def _compact_system_schema(system: str) -> str:
     return system
 
 
-def render_role_system(role: str, system: str, *, instructions: Any = None, schema: Any = None, execution_version: str | None = None) -> str:
+def render_role_system(role: str, system: str, *, instructions: Any = None, schema: Any = None, execution_version: str | None = None, planning_mode: str | None = None) -> str:
     """Freeze policy/schema text before native task and cache identity binding."""
-    policy = role_policy(role, execution_version=execution_version)
+    policy = role_policy(role, execution_version=execution_version, planning_mode=planning_mode)
     system = _compact_system_schema(system)
     if instructions is not None:
         system += "\nCURRENT_INSTRUCTIONS\n" + canonical(instructions)
@@ -325,7 +325,7 @@ class ContextCompiler:
                     # Selected rows are literal FULL records; their unfamiliar
                     # fields are delivered, not removed by a partial adapter.
                     unknown = []
-                cap = (request.budget.retrieval_chars if key in {"retrieved_memory", "retrieved_context", "memory", "lessons", "skills"}
+                cap = (request.budget.retrieval_chars if key in {"retrieved_memory", "retrieved_knowledge", "retrieved_context", "memory", "lessons", "skills"}
                        else request.budget.snapshot_max_chars if key == "working_snapshot"
                        else request.budget.recent_chars if key == "recent_decisions" else None)
                 bounded = _bounded_optional(block, payload, cap) if cap else None

@@ -24,6 +24,7 @@ LONG_JSON_ROLES = {
     "candidate_reviewer",
     "result_analyst",
     "research_planner",
+    "research_critic",
     "research_librarian",
     "experiment_designer",
     "memory_curator",
@@ -195,8 +196,13 @@ def project_correction_context(payload: dict[str, Any], role: str, *, system_cha
     return view
 
 
-def domain_model_for(role: str, memory=None):
+def domain_model_for(role: str, memory=None, *, camp=None):
     from react_agent.eeg_research.agentic.schemas import DOMAIN_OUTPUT_MODELS
+
+    if role == "experiment_designer":
+        from .design_contract import design_contract_version
+        from .schemas import ExperimentDesignBriefResult, LegacyExperimentDesignResult
+        return ExperimentDesignBriefResult if design_contract_version(camp) == "v2" else LegacyExperimentDesignResult
 
     if role == "research_planner":
         from react_agent.eeg_research.agentic.schemas import PlannerProposal
@@ -216,15 +222,25 @@ def system_prompt(role: str, *, memory=None, camp=None) -> str:
         if single_plan_enabled(camp):
             from .runtime_prompts import runtime_mission
             from .context.compiler import render_role_system
-            model = domain_model_for(role, memory)
+            model = domain_model_for(role, memory, camp=camp)
             if role == "candidate_coder":
                 from .coder import CoderToolRequest
                 model = CoderToolRequest
             elif role == "research_planner":
-                from .schemas import ResearchRoundDraft
-                model = ResearchRoundDraft
+                from .schemas import ResearchRoundDraft, ResearchProposalDraft
+                from .research_execution import independent_critic_enabled
+                model = ResearchProposalDraft if independent_critic_enabled(camp) else ResearchRoundDraft
             schema = json.dumps(model.model_json_schema(),ensure_ascii=False) if model is not None else "{}"
-            return render_role_system(role, runtime_mission(role) + "\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object.\n",execution_version="single_plan_v1")
+            from .research_execution import independent_critic_enabled
+            mission_role = "research_proposer" if role == "research_planner" and independent_critic_enabled(camp) else role
+            from .design_contract import design_contract_version
+            mission = runtime_mission(mission_role, design_contract_version=design_contract_version(camp))
+            if role == "candidate_reviewer":
+                from .research_execution import research_goal
+                if (research_goal(camp).get("research_execution") or {}).get("implementation_review_mode") == "single_pass":
+                    mission += "\nKeep one short sentence per coverage item and cite its source/check. Do not repeat full contracts, source or check reports."
+            return render_role_system(role, mission + "\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object.\n",execution_version="single_plan_v1",
+                planning_mode="propose_then_critic" if independent_critic_enabled(camp) else None)
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
     mission = (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
     schema = role_output_schema(role)
@@ -1031,9 +1047,10 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
     def active_domain_model():
         from .research_execution import single_plan_enabled
         if role == "research_planner" and single_plan_enabled(camp):
-            from .schemas import ResearchRoundDraft
-            return ResearchRoundDraft
-        return domain_model_for(role,memory)
+            from .schemas import ResearchRoundDraft, ResearchProposalDraft
+            from .research_execution import independent_critic_enabled
+            return ResearchProposalDraft if independent_critic_enabled(camp) else ResearchRoundDraft
+        return domain_model_for(role,memory,camp=camp)
 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
         nonlocal resolved
@@ -1139,6 +1156,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     from .review_context import review_reference_errors
                     if review_reference_errors(body, frozen_payload):
                         raise RoleResultError("recovered_review_evidence_reference_invalid")
+                    call.review_evidence_request = json.loads(json.dumps(frozen_payload))
             if role in ENVELOPE_ROLES:
                 from .roles import bind_role_output
                 return bind_role_output(parsed, task=task, prompt_hash=frozen_prompt_hash)
@@ -1180,7 +1198,12 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         previous_domain = None
         schema_feedback = None
         logical_operation = operation_id(role, payload, bound, resolved.role_config_hash)
-        for _attempt in range(PARSE_ATTEMPTS):
+        from .research_execution import research_goal
+        execution = research_goal(camp).get("research_execution") or {}
+        attempt_limit = (1 if role == "candidate_reviewer"
+                         and execution.get("implementation_review_mode") == "single_pass"
+                         else PARSE_ATTEMPTS)
+        for _attempt in range(attempt_limit):
             request_mode = "repair" if external_repair or last is not None or schema_error is not None else "normal"
             call_payload = payload
             if last is not None:
@@ -1214,7 +1237,9 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 hints = conditional_hints(role, call_payload)
                 if hints:
                     call_payload = {**call_payload,"relevant_implementation_hints":hints}
-                call_payload = add_role_examples(call_payload, role, memory, max_count=1, execution_version="single_plan_v1")
+                from .design_contract import design_contract_version
+                call_payload = add_role_examples(call_payload, role, memory, max_count=1, execution_version="single_plan_v1",
+                    design_contract_version=design_contract_version(camp))
             else:
                 call_payload = add_role_examples(call_payload, role, memory)
             if transport_retry_prepared is not None:
@@ -1295,7 +1320,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             row.update(owner_input_token_bound=input_token_bound(prepared.messages, prepared.transport_fields, prepared.budget_report),
                        owner_output_token_bound=int(config.fast.max_tokens))
             row.update(reserve_operation_attempt(camp, operation=logical_operation, call_id=row["call_id"],
-                       reserve_usd=_unknown_reserve(camp), metadata=row))
+                       max_attempts=attempt_limit, reserve_usd=_unknown_reserve(camp), metadata=row))
             _reserve_api_intent(camp, row)
             try:
                 reply, usage = loop.run_until_complete(
@@ -1316,7 +1341,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 )
                 kind = getattr(exc.usage, "failure_kind", None)
                 if kind == "output_truncated":
-                    if (_attempt + 1 >= PARSE_ATTEMPTS or exc.usage.unconfirmed_charge_possible
+                    if (_attempt + 1 >= attempt_limit or exc.usage.unconfirmed_charge_possible
                             or getattr(exc.usage, "transport_outcome", None) != "confirmed_response"):
                         raise LlmUnavailable("output_truncated") from exc
                     if _adjust_output_budget(camp, config, row):
@@ -1339,7 +1364,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     error=type(exc).__name__,
                 )
                 usage = getattr(exc, "usage", None)
-                if usage is not None and getattr(usage, "http_status", None) in {429, 500, 502, 503, 504} and _attempt + 1 < PARSE_ATTEMPTS:
+                if usage is not None and getattr(usage, "http_status", None) in {429, 500, 502, 503, 504} and _attempt + 1 < attempt_limit:
                     from react_agent.eeg_research.agentic.api_policy import api_request_policy
                     transport_retry_prepared = prepared
                     loop.run_until_complete(asyncio.sleep(api_request_policy(camp).transport_backoff_s))
@@ -1443,6 +1468,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                             last = None
                             continue
             _response_trace(camp, row, reply, validation="valid", normalization=normalization)
+            if role == "candidate_reviewer":
+                call.review_evidence_request = json.loads(prepared.user)
             append_ui_event(camp, "llm_call_finished", role=role, call_id=row.get("call_id"),
                             candidate_id=bound.get("candidate_id"), status="completed")
             if bound_reply is not None:

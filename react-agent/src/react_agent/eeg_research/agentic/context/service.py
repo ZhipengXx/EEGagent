@@ -441,7 +441,7 @@ class ContextService:
 
     def _upkeep_api_allowance(self, request) -> int | None:
         remaining = request.remaining_api_calls
-        if request.role != "research_planner":
+        if request.role not in {"research_planner", "research_critic"}:
             return remaining
         from react_agent.eeg_research.agentic.api_policy import ATTEMPTS, ROUND, api_request_policy
         round_ = ROUND.get()
@@ -501,7 +501,7 @@ class ContextService:
         payload = copy.deepcopy(request.payload)
         authority = native_authority(self.camp)
         from ..research_execution import single_plan_enabled
-        if single_plan_enabled(self.camp) and request.role == "research_planner":
+        if single_plan_enabled(self.camp) and request.role in {"research_planner", "research_critic"}:
             from ..experiment_observations import _admission_view
             controls = authority.get("controls") or {}
             admissions = controls.get("candidate_admissions")

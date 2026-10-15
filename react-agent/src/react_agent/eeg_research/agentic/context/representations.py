@@ -29,7 +29,7 @@ def source_kind(key: str, payload: Any) -> str:
         return "log"
     if key in {"analyses", "analysis", "controller_state", "research_progress"}:
         return "analysis"
-    if "memory" in key or key in {"lessons", "skills", "snapshot"}:
+    if "memory" in key or key in {"lessons", "skills", "snapshot", "retrieved_knowledge"}:
         return "memory"
     return "unclassified"
 
@@ -146,6 +146,12 @@ def representations_for(block: SourceBlock, payload: Any, *, role: str, string_c
     full = Representation(digest({"source": block.source_hash, "kind": "FULL"}), block.block_id,
                           "FULL", copy.deepcopy(payload), (block.source_ref,), (block.source_hash,),
                           digest(payload), budget_chars=len(canonical(payload)), applicability=block.task_applicability)
+    if role == "research_critic" and block.metadata.get("top_key") in {
+            "proposal_pool", "feasible_pool", "proposals", "native_cost_by_id"}:
+        # Critic must compare every feasible proposal's complete wording and
+        # native cost. If this pool exceeds capacity, require more context
+        # instead of changing the competitors through prose compression.
+        return [full], []
     content = visit(payload, "")
     card = Representation(digest({"source": block.source_hash, "kind": "FACT_CARD", "content": content}),
                           block.block_id, "FACT_CARD", content, (block.source_ref,), (block.source_hash,),
@@ -168,6 +174,22 @@ def representations_for(block: SourceBlock, payload: Any, *, role: str, string_c
     if ref.budget_chars < choices[-1].budget_chars:
         choices.append(ref)
     return choices, unknown
+
+
+def delivered_source_refs(payload: Any) -> set[str]:
+    """Include registered read handles inside exact cards, not only outer lists."""
+    refs: set[str] = set()
+    def visit(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"source_ref", "$context_source"} and isinstance(child, str) and child.startswith("context://"):
+                    refs.add(child)
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+    visit(payload)
+    return refs
 
 
 def deduplicate(payload: Any, *, minimum_chars: int = 300) -> Any:

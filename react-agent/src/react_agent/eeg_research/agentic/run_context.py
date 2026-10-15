@@ -58,7 +58,24 @@ def persist_approved_binding(
         "hypothesis": spec.get("hypothesis"),
         "implementation_requirements": spec.get("implementation_requirements") or [],
     }
-    (dest / "approved_binding.json").write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
+    if spec.get("design_contract_version") == "v2":
+        binding["design_contract_version"] = "v2"
+        binding["scientific_parameters"] = spec.get("scientific_parameters") or {}
+        binding["design_brief"] = spec.get("design_brief")
+        for key in ("principal_intervention", "scientific_intent", "evaluation_scope", "initial_fidelity", "hook_modes"):
+            binding[key] = spec.get(key)
+        previous = dest / "approved_binding.json"
+        if previous.is_file() and json.loads(previous.read_text(encoding="utf-8")) != binding:
+            from .artifacts import file_digest, register
+            history = dest / "approved_binding_history" / (file_digest(previous) + ".json")
+            history.parent.mkdir(exist_ok=True)
+            if not history.exists():
+                with history.open("xb") as handle:
+                    handle.write(previous.read_bytes())
+                register(camp, history, kind="approved_binding_history", candidate_id=target)
+    tmp = dest / "approved_binding.json.tmp"
+    tmp.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(dest / "approved_binding.json")
     return binding
 
 

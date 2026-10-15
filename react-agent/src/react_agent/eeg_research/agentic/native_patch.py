@@ -37,7 +37,12 @@ def _read_key(tool: str, args: dict[str, Any], revision: str) -> tuple[Any, ...]
             int(args.get("start") or 1), int(args.get("end") or 200), revision)
 
 
-def _check_fingerprint(workspace: Path, python: str | None) -> str:
+def _design_v2(spec: dict[str, Any], input_spec: dict[str, Any] | None = None) -> bool:
+    experiment = spec.get("experiment") or spec
+    return experiment.get("design_contract_version") == "v2" or (input_spec or {}).get("design_contract_version") == "v2"
+
+
+def _check_fingerprint(workspace: Path, python: str | None, *, cpu_only: bool = False) -> str:
     from react_agent.eeg_research.agentic.binding import file_sha256
     from react_agent.eeg_training.protocol import torch_python
 
@@ -49,7 +54,7 @@ def _check_fingerprint(workspace: Path, python: str | None) -> str:
     # receipts do not change the computation checked by this fingerprint.
     hook_config = {key: config.get(key) or {} for key in ("model", "objective", "transform")}
     payload = {
-        "fingerprint_version": 4,
+        "fingerprint_version": 5,
         "source": file_sha256(workspace / "extension" / "eeg_candidate.py"),
         "input_spec": json.loads(spec.read_text(encoding="utf-8")) if spec.is_file() else "eeg",
         "approved_hook_config": hook_config,
@@ -61,11 +66,74 @@ def _check_fingerprint(workspace: Path, python: str | None) -> str:
         "implementation_semantic_probe": file_sha256(Path(__file__).with_name("implementation_semantics.py")),
         "baseline_loss_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "model.py"),
         "objective_dispatch_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "hooks.py"),
+        "training_entry_reference": file_sha256(Path(__file__).resolve().parents[2] / "eeg_training" / "train_entry.py"),
     }
-    if isinstance(payload["input_spec"], dict) and (payload["input_spec"].get("multigpu_check") or {}).get("enabled"):
+    if _design_v2(assigned, payload["input_spec"] if isinstance(payload["input_spec"], dict) else None):
+        payload["check_scope"] = "cpu" if cpu_only else "complete"
+        mapping = workspace / "implementation_map.json"
+        binding = json.loads(mapping.read_text(encoding="utf-8")) if mapping.is_file() else {}
+        payload["implementation_probe_bindings"] = {
+            key: row["probe"] for key, row in (binding.get("requirements") or {}).items() if row.get("probe")
+        } if binding.get("source_sha256") == payload["source"] and binding.get("approved_spec_hash") == config.get("spec_hash") else {}
+    if not cpu_only and isinstance(payload["input_spec"], dict) and (payload["input_spec"].get("multigpu_check") or {}).get("enabled"):
         payload["multigpu_checker"] = file_sha256(Path(__file__).with_name("multigpu_check.py"))
         payload["multigpu_probe"] = file_sha256(Path(__file__).with_name("multigpu_probe.py"))
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+def _store_implementation_map(workspace: Path, spec: dict[str, Any], mapping: dict[str, Any]) -> dict[str, Any]:
+    from .binding import file_sha256
+    from .coder import bound_implementation_requirements
+    from .review_context import valid_source_reference
+    experiment = spec.get("experiment") or spec
+    source = workspace / "extension/eeg_candidate.py"
+    declarations = experiment.get("implementation_requirements") or []
+    declared_ids = {row["requirement_id"] for row in declarations}
+    if set(mapping) - declared_ids:
+        return {"ok": False, "error": "implementation_map_unknown_requirement"}
+    text = source.read_text(encoding="utf-8")
+    for row in mapping.values():
+        if not isinstance(row, dict) or set(row) - {"source_refs", "probe"}:
+            return {"ok": False, "error": "implementation_map_invalid_row"}
+        refs = row.get("source_refs") or []
+        if not isinstance(refs, list) or not all(valid_source_reference(ref, {str(source), "extension/eeg_candidate.py"}, text) for ref in refs):
+            return {"ok": False, "error": "implementation_map_invalid_source_reference"}
+        if row.get("probe") is not None and not isinstance(row["probe"], dict):
+            return {"ok": False, "error": "implementation_map_invalid_probe"}
+    binding = {"schema_version": "eeg_research.implementation_map.v1", "approved_spec_hash": experiment.get("spec_hash"),
+               "source_sha256": file_sha256(source), "requirements": mapping}
+    try:
+        bound_implementation_requirements(declarations, binding, source_sha256=binding["source_sha256"], spec_hash=binding["approved_spec_hash"])
+    except (ValueError, TypeError) as exc:
+        return {"ok": False, "error": str(exc)}
+    (workspace / "implementation_map.json").write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"ok": True, "implementation_map": binding}
+
+
+def _run_v2_check(workspace: Path, python: str | None, *, complete: bool) -> dict[str, Any]:
+    """Keep the CPU receipt separate; only final checks can authorize review."""
+    from .binding import file_sha256
+    cpu_fingerprint = _check_fingerprint(workspace, python, cpu_only=True)
+    cpu_path = workspace / "cpu_checks.json"
+    cpu = json.loads(cpu_path.read_text(encoding="utf-8")) if cpu_path.is_file() else {}
+    if cpu.get("check_fingerprint") == cpu_fingerprint and not (complete and cpu.get("probe_bindings_pending")):
+        cpu = {**cpu, "cached": True}
+    else:
+        cpu = {**run_candidate_check(workspace, python=python, cpu_only=True, allow_unbound_probes=not complete), "source_sha256": file_sha256(workspace / "extension/eeg_candidate.py"),
+               "check_fingerprint": cpu_fingerprint, "check_scope": "cpu"}
+        cpu_path.write_text(json.dumps(cpu, ensure_ascii=False, indent=2), encoding="utf-8")
+    if not complete:
+        return cpu
+    full_fingerprint = _check_fingerprint(workspace, python)
+    check_path = workspace / "checks.json"
+    stored = json.loads(check_path.read_text(encoding="utf-8")) if check_path.is_file() else {}
+    if stored.get("check_fingerprint") == full_fingerprint and stored.get("error") != "gpu_check_pending":
+        return {**stored, "cached": True}
+    payload = (run_candidate_check(workspace, python=python, cpu_result=cpu) if cpu.get("ok") else cpu)
+    result = {**payload, "source_sha256": cpu["source_sha256"], "check_fingerprint": full_fingerprint, "check_scope": "complete"}
+    result.pop("cached", None)  # A cached CPU result does not mean the final GPU check was cached.
+    check_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    return result
 
 
 class RecoveryBlocked(RuntimeError):
@@ -268,22 +336,35 @@ def implement(
         input_spec = json.loads(spec_path.read_text(encoding="utf-8"))
     else:
         input_spec = candidate_interface(None)
+    design_v2 = _design_v2(spec, input_spec)
+    if design_v2 and (workspace / "cpu_checks.json").is_file():
+        cpu = json.loads((workspace / "cpu_checks.json").read_text(encoding="utf-8"))
+        if cpu.get("check_fingerprint") == _check_fingerprint(workspace, python, cpu_only=True) and (
+                not last_check or last_check.get("check_fingerprint") != _check_fingerprint(workspace, python)):
+            last_check = cpu
+            last_check_fingerprint = str(cpu.get("check_fingerprint") or "")
     pages = {name: source_page(path.read_text(encoding="utf-8").splitlines(), 1, 100000, char_limit=12000)
-             for name, path in _REFERENCES.items() if name not in {"reference/hooks.py", "reference/hook_config.py"}}
+             for name, path in _REFERENCES.items() if name not in {"reference/hooks.py", "reference/hook_config.py", "reference/check_entry.py"}
+             and (not design_v2 or name != "reference/train_entry.py")}
     parent = workspace / "reference" / "parent.py"
     if parent.is_file():
         pages["reference/parent.py"] = source_page(parent.read_text(encoding="utf-8").splitlines(), 1, 100000, char_limit=12000)
     references = {name: page["text"] for name, page in pages.items()}
     reference_ranges = {name: {key: value for key, value in page.items() if key != "text"} for name, page in pages.items()}
+    caller_context = None
+    if design_v2:
+        from .handoffs import training_semantics
+        caller_context = training_semantics(config_only=True)
     entry = workspace / "extension" / "eeg_candidate.py"
-    if recovery is not None and (last_check or {}).get("error") == "gpu_check_pending":
-        last_check = {**run_candidate_check(workspace, python=python),
-                      "source_sha256": file_sha256(entry), "check_fingerprint": _check_fingerprint(workspace, python)}
+    if (recovery is not None or design_v2) and (last_check or {}).get("error") == "gpu_check_pending":
+        last_check = (_run_v2_check(workspace, python, complete=True) if design_v2 else
+                      {**run_candidate_check(workspace, python=python),
+                       "source_sha256": file_sha256(entry), "check_fingerprint": _check_fingerprint(workspace, python)})
         last_check_fingerprint = last_check["check_fingerprint"]
         (workspace / "checks.json").write_text(json.dumps(last_check, ensure_ascii=False, indent=2), encoding="utf-8")
         if last_check.get("error") == "gpu_check_pending":
             return {"status": "check_pending", "detail": "gpu_check_pending", "check": last_check,
-                    "steps": recovery["steps_used"]}
+                    "steps": recovery["steps_used"] if recovery is not None else next_step - 1}
         if last_check.get("ok"):
             # Complete the previously requested automatic check, then finalize
             # existing source through the same native tool and current identity.
@@ -294,13 +375,16 @@ def implement(
                 stream.write(json.dumps({"call_id": uuid.uuid4().hex[:12], "step": next_step - 1,
                     "tool": "finish_patch", "args": {"summary": "Native completion after deferred GPU preflight."},
                     "result": result, "model_invoked": False, "trigger": "deferred_gpu_check_completed"}) + "\n")
-            coding_recovery.observe_check(recovery, last_check)
+            if recovery is not None:
+                coding_recovery.observe_check(recovery, last_check)
             from react_agent.eeg_research.agentic.engineering_memory import record_engineering_repair
             try:
                 record_engineering_repair(workspace, last_check, spec, python=python)
             except (ValueError, OSError) as exc:
-                recovery["engineering_memory_pending"] = {"reason": str(exc), "check_fingerprint": last_check.get("check_fingerprint")}
-            coding_recovery.save(workspace, recovery)
+                if recovery is not None:
+                    recovery["engineering_memory_pending"] = {"reason": str(exc), "check_fingerprint": last_check.get("check_fingerprint")}
+            if recovery is not None:
+                coding_recovery.save(workspace, recovery)
             return {"status": "ready_for_review", "manifest": result["manifest"], "check": last_check, "steps": next_step - 1}
     extension_answered = bool(restored["extension_answered"])
     if recovery is not None and (recovery["steps_used"] >= step_limit or recovery["failed_checks_used"] >= recovery["failed_check_limit"]):
@@ -324,6 +408,9 @@ def implement(
             "repairs_used": max(0, failed_checks - failed_at_start - 1),
             "max_repairs": max_repairs,
             "current_file": current,
+            "candidate_source_presence": "present" if current is not None else "missing",
+            "current_file_delivery": ("complete" if current is not None and not current["truncated"]
+                                      else "partial" if current is not None else "absent"),
             "references": references,
             "reference_ranges": reference_ranges,
             "tools": tool_catalog(),
@@ -331,6 +418,14 @@ def implement(
             "last_check": last_check,
             "history": history[-8:],
         }
+        if design_v2:
+            experiment = spec.get("experiment") or spec
+            request["hook_config_runtime_source"] = caller_context
+            request["effective_hook_config"] = {key: experiment.get(key) or {} for key in ("model", "objective", "transform")}
+            request["available_references"] = list(_REFERENCES) + (["reference/parent.py"] if parent.is_file() else [])
+            request["check_policy"] = {"automatic_after_patch": "cpu", "finish_patch": "complete CPU/GPU preflight in this native tool",
+                                       "explicit_recheck": "reuse checks for unchanged source, config and caller"}
+            request["implementation_map"] = json.loads((workspace / "implementation_map.json").read_text(encoding="utf-8")) if (workspace / "implementation_map.json").is_file() else None
         if recovery is not None:
             request["coding_recovery"] = {k: recovery[k] for k in ("tool_step_limit", "failed_check_limit", "steps_used",
                                         "failed_checks_used", "model_escalations_used", "consecutive_error_count")}
@@ -346,10 +441,10 @@ def implement(
             if no_progress and no_progress != "escalated":
                 return {"status": "implementation_failed", "detail": no_progress, "check": last_check,
                         "steps": recovery["steps_used"], "coding_recovery": recovery}
-        if last_check and not last_check.get("ok") and "config" in json.dumps(last_check, default=str).lower():
+        if not design_v2 and last_check and not last_check.get("ok") and "config" in json.dumps(last_check, default=str).lower():
             from react_agent.eeg_research.agentic.handoffs import training_semantics
             request["hook_config_runtime_source"] = training_semantics(config_only=True)
-        current_fingerprint = _check_fingerprint(workspace, python) if entry.is_file() else ""
+        current_fingerprint = _check_fingerprint(workspace, python, cpu_only=design_v2 and (last_check or {}).get("check_scope") == "cpu") if entry.is_file() else ""
         check_fresh = bool(current and last_hash == current["sha256"] and last_check_fingerprint == current_fingerprint)
         request["check_status"] = {
             "passed": bool(last_check and last_check.get("ok")),
@@ -358,13 +453,16 @@ def implement(
             "checked_fingerprint": last_check_fingerprint,
             "next_tool": "run_candidate_check" if last_check and not check_fresh else None,
         }
+        if design_v2:
+            request["check_status"]["scope"] = (last_check or {}).get("check_scope")
+            request["check_status"]["ready_for_review"] = bool(check_fresh and (last_check or {}).get("ok") and last_check.get("check_scope") == "complete")
         location = (last_check or {}).get("location") or {}
         if entry.is_file() and isinstance(location.get("line"), int):
             line = location["line"]
             page = read_code(workspace, "extension/eeg_candidate.py", max(1, line - 5), line + 10)
             if page.get("ok"):
                 request["failure_source"] = {**page, "numbered_text": "\n".join(f"{page['start'] + i}: {text}" for i, text in enumerate(page["text"].splitlines()))}
-        if step >= 3 and writes == 0:
+        if not design_v2 and step >= 3 and writes == 0:
             request["runtime_note"] = "References and the current file are already supplied. Call apply_candidate_patch now."
         elif last_check is not None and not last_check.get("ok"):
             request["runtime_note"] = "The last check failed. Prefer edit_candidate_code for a local correction, or apply_candidate_patch for a full replacement; new source is automatically checked."
@@ -374,7 +472,9 @@ def implement(
         elif last_check is not None and last_check.get("ok") and not check_fresh:
             request["runtime_note"] = "The stored check passed for an older fingerprint. Call run_candidate_check before finish_patch; rereading source or repeating finish cannot refresh the check."
         elif last_check is not None and last_check.get("ok"):
-            request["runtime_note"] = "The current check passed. Call finish_patch unless a required source change is missing."
+            request["runtime_note"] = ("CPU checks passed. Finish the implementation with finish_patch; its native tool performs the final preflight."
+                                       if design_v2 and last_check.get("check_scope") == "cpu" else
+                                       "The current check passed. Call finish_patch unless a required source change is missing.")
         latest_result = (history[-1].get("result") or {}) if history else {}
         if latest_result.get("error") in {"edit_not_found", "edit_not_unique", "base_hash_mismatch"}:
             request["recovery_context"] = {
@@ -390,16 +490,40 @@ def implement(
         started = time.time()
         key = None
         cached_check = False
+        tool_for_check = None
         if request_error is not None:
             result = request_error
-        elif tool == "finish_patch":
-            fresh = entry.is_file() and file_sha256(entry) == last_hash
-            if fresh and last_check_fingerprint:
-                fresh = _check_fingerprint(workspace, python) == last_check_fingerprint
-            if not (fresh and last_check and last_check.get("ok")):
-                result = {"ok": False, "error": "check_not_passed", "detail": "The current source and executable config must have a fresh passing check. Call run_candidate_check before finish_patch.", "next_tool": "run_candidate_check", "check_fresh": fresh}
+        elif tool == "request_design_revision":
+            if design_v2:
+                experiment = spec.get("experiment") or spec
+                issue = {**args, "kind": args.get("kind", "design_conflict"), "candidate_id": workspace.name,
+                         "approved_spec_hash": experiment.get("spec_hash"), "source_sha256": file_sha256(entry) if entry.is_file() else ""}
+                result = {"ok": True, "revision_request": issue}
             else:
-                result = _execute(workspace, tool, args, last_check, python)
+                result = {"ok": False, "error": "design_revision_requires_v2"}
+        elif tool == "finish_patch":
+            if design_v2 and entry.is_file() and file_sha256(entry) == last_hash:
+                mapping_result = (_store_implementation_map(workspace, spec, args["implementation_map"])
+                                  if "implementation_map" in args else {"ok": True})
+                if mapping_result.get("ok"):
+                    tool_for_check = _run_v2_check(workspace, python, complete=True)
+                    result = (_execute(workspace, tool, args, tool_for_check, python) if tool_for_check.get("ok") else
+                              {"ok": False, "error": tool_for_check.get("error") or "check_not_passed"})
+                    result["auto_check"] = tool_for_check
+                else:
+                    result = mapping_result
+            else:
+                fresh = entry.is_file() and file_sha256(entry) == last_hash
+                if fresh and last_check_fingerprint:
+                    fresh = _check_fingerprint(workspace, python) == last_check_fingerprint
+                if not (fresh and last_check and last_check.get("ok")):
+                    result = {"ok": False, "error": "check_not_passed", "detail": "The current source and executable config must have a fresh passing check. Call run_candidate_check before finish_patch.", "next_tool": "run_candidate_check", "check_fresh": fresh}
+                else:
+                    result = _execute(workspace, tool, args, last_check, python)
+        elif tool == "run_candidate_check" and design_v2 and entry.is_file():
+            result = _run_v2_check(workspace, python, complete=True)
+            tool_for_check = result
+            cached_check = bool(result.get("cached"))
         elif tool == "run_candidate_check" and entry.is_file() and last_check is not None and _check_fingerprint(workspace, python) == last_check_fingerprint:
             result = {**last_check, "cached": True}
             cached_check = True
@@ -457,24 +581,24 @@ def implement(
         if tool in _WRITE_TOOLS and result.get("ok"):
             last_hash = str(result.get("sha256"))
             writes += 1
-            fingerprint = _check_fingerprint(workspace, python)
+            fingerprint = _check_fingerprint(workspace, python, cpu_only=design_v2)
             if last_check is not None and fingerprint == last_check_fingerprint:
                 check = {**last_check, "cached": True}
                 cached_check = True
             else:
-                check = {**run_candidate_check(workspace, python=python), "source_sha256": last_hash, "check_fingerprint": fingerprint}
+                check = (_run_v2_check(workspace, python, complete=False) if design_v2 else
+                         {**run_candidate_check(workspace, python=python), "source_sha256": last_hash, "check_fingerprint": fingerprint})
             result = {**result, "auto_check": check}
             tool_for_check = check
-        else:
-            tool_for_check = None
         if tool_for_check is not None:
             last_check = tool_for_check
             last_check_fingerprint = str(tool_for_check.get("check_fingerprint") or "")
-            (workspace / "checks.json").write_text(json.dumps(tool_for_check, ensure_ascii=False, indent=2), encoding="utf-8")
-            if not tool_for_check.get("ok") and last_check_fingerprint not in failed_revisions:
+            receipt_path = workspace / ("cpu_checks.json" if design_v2 and tool_for_check.get("check_scope") == "cpu" else "checks.json")
+            receipt_path.write_text(json.dumps(tool_for_check, ensure_ascii=False, indent=2), encoding="utf-8")
+            if not tool_for_check.get("ok") and tool_for_check.get("error") != "gpu_check_pending" and last_check_fingerprint not in failed_revisions:
                 failed_checks += 1
                 failed_revisions.add(last_check_fingerprint)
-        if tool == "run_candidate_check" and request_error is None and _is_check_receipt(result) and not cached_check:
+        if tool == "run_candidate_check" and not design_v2 and request_error is None and _is_check_receipt(result) and not cached_check:
             if entry.is_file():
                 result = {**result, "source_sha256": file_sha256(entry), "check_fingerprint": _check_fingerprint(workspace, python)}
             last_check = result
@@ -502,16 +626,19 @@ def implement(
                 row["engineering_progress"] = coding_recovery.observe_check(recovery, observed)
                 from react_agent.eeg_research.agentic.engineering_memory import capture_failed_check, record_engineering_repair
                 try:
-                    if observed.get("ok"):
+                    if observed.get("ok") and observed.get("check_scope") != "cpu":
                         record_engineering_repair(workspace, observed, spec, python=python)
-                    else:
+                    elif not observed.get("ok"):
                         capture_failed_check(workspace, observed, spec, python=python)
                 except (ValueError, OSError) as exc:
                     recovery["engineering_memory_pending"] = {"reason": str(exc), "check_fingerprint": observed.get("check_fingerprint")}
             coding_recovery.save(workspace, recovery)
-            if (last_check or {}).get("error") == "gpu_check_pending":
-                return {"status": "check_pending", "detail": "gpu_check_pending", "check": last_check, "steps": step}
+        if (recovery is not None or design_v2) and (last_check or {}).get("error") == "gpu_check_pending":
+            return {"status": "check_pending", "detail": "gpu_check_pending", "check": last_check, "steps": step}
         history.append({"tool": tool, "result": result if tool in _READ_TOOLS else _short(result)})
+        if tool == "request_design_revision" and result.get("ok"):
+            return {"status": "needs_design_revision", "detail": result["revision_request"],
+                    "revision_request": result["revision_request"], "steps": step}
         if tool == "requires_framework_extension":
             return {"status": "requires_framework_extension", "detail": args, "steps": step}
         if tool == "finish_patch" and result.get("ok"):
@@ -617,7 +744,7 @@ def _short(value: Any, *, limit: int = _SHORT_LIMIT) -> Any:
                 shortened[key] = field[:400] + "…"
         if len(json.dumps(shortened, ensure_ascii=False, default=str)) <= limit:
             return shortened
-        compact = {key: shortened[key] for key in ("ok", "error", "path", "sha256", "source_sha256", "check_fingerprint", "cached", "stage") if key in shortened}
+        compact = {key: shortened[key] for key in ("ok", "error", "path", "sha256", "source_sha256", "check_fingerprint", "check_scope", "cached", "stage") if key in shortened}
         if isinstance(shortened.get("auto_check"), dict):
             compact["auto_check"] = _short(shortened["auto_check"], limit=2000)
         compact["truncated"] = True
@@ -757,8 +884,15 @@ def enforce_requirement_review(workspace: Path, spec: dict[str, Any], result: di
     evidence_current = bool(receipt_current and checks.get("ok"))
     source_refs = {str(entry), "extension/eeg_candidate.py"}
     current_text = entry.read_text(encoding="utf-8") if entry.is_file() else None
+    delivered = updated.get("review_evidence_request")
     def valid_source_ref(reference: str) -> bool:
-        from react_agent.eeg_research.agentic.review_context import valid_source_reference
+        from react_agent.eeg_research.agentic.review_context import valid_review_reference, valid_source_reference
+        if isinstance(delivered, dict):
+            from react_agent.eeg_research.agentic.context.representations import resolve_request_pointer
+            identity = resolve_request_pointer(delivered, "/requirement_evidence_identity")
+            if identity.get("source_hash") != current_source or identity.get("check_sha256") != current_check:
+                return False
+            return valid_review_reference(reference, delivered)
         return valid_source_reference(reference, source_refs, current_text)
     requirements = []
     invalid_declaration = False
@@ -809,12 +943,24 @@ def enforce_requirement_review(workspace: Path, spec: dict[str, Any], result: di
         if reason:
             contradictory = contradictory or observed_contradiction
             unverifiable = unverifiable or not observed_contradiction
-            issues.append({"severity": "blocking", "kind": "core_implementation_contradicted" if observed_contradiction else "core_implementation_unverified",
+            design_owned = (_design_v2(spec) and getattr(requirement, "scope", "scientific") == "engineering"
+                            and any(issue.get("kind") == "design_conflict" and (
+                                issue.get("requirement_id") == requirement.requirement_id or
+                                requirement.requirement_id in (issue.get("requirement_ids") or [])) for issue in issues))
+            if design_owned:
+                continue
+            issue = {"severity": "blocking", "kind": "core_implementation_contradicted" if observed_contradiction else "core_implementation_unverified",
                            "requirement_id": requirement.requirement_id, "error_class": "semantic_requirement_mismatch" if observed_contradiction else "semantic_evidence_missing_or_stale",
                            "stage": "review_candidate", "location": requirement.code_locations,
                            "expected": requirement.expected_behavior, "actual": row,
                            "source_hash": current_source, "check_ref": str(check_path), "check_sha256": current_check,
-                           "probe": probe_rows.get(requirement.requirement_id), "detail": reason})
+                           "probe": probe_rows.get(requirement.requirement_id), "detail": reason}
+            if _design_v2(spec) and observed_contradiction:
+                issue.update(kind="code_error", category="core_implementation_contradicted",
+                    evidence_refs=[*((row or {}).get("source_refs") or [str(entry)]), str(check_path)],
+                    smallest_correction=f"Repair {requirement.requirement_id} at its bound implementation so that {requirement.expected_behavior}; preserve the approved intervention.",
+                    validation_expectation=f"Rerun the {requirement.verification} verification for {requirement.requirement_id} on the corrected source and obtain implemented coverage.")
+            issues.append(issue)
     updated["issues"] = issues
     updated["requirements_hash"] = requirements_hash(declarations)
     updated["requirement_evidence_current"] = evidence_current
@@ -883,6 +1029,15 @@ def review(
         "reviewer_model": model,
         "executor_model": model,
     }
+    if _design_v2(spec, interface):
+        payload["review_mode"] = spec.get("review_mode", "full")
+        payload["review_focus"] = spec.get("review_focus") or {}
+        mapping = workspace / "implementation_map.json"
+        if mapping.is_file():
+            bound = json.loads(mapping.read_text(encoding="utf-8"))
+            from .binding import file_sha256 as source_digest
+            if bound.get("source_sha256") == source_digest(entry) and bound.get("approved_spec_hash") == (spec.get("experiment") or spec).get("spec_hash"):
+                payload["implementation_map"] = bound
     from react_agent.eeg_research.agentic.binding import file_sha256
     check_path = workspace / "checks.json"
     payload["requirement_evidence_identity"] = {
@@ -930,13 +1085,16 @@ def review(
         satisfied=satisfied_invariants(workspace, contract_summary),
     )
     if identity:
-        for key in ("candidate_id", "attempt_id", "phase", "operation_id"):
+        for key in ("candidate_id", "attempt_id", "phase", "operation_id", "approved_spec_hash", "intervention_config_hash", "implementation_map_hash"):
             if identity.get(key):
                 result[key] = identity[key]
     configuration = getattr(backend, "role_config", None)
     if configuration is not None:
         result["role_config_hash"] = configuration.role_config_hash
         result["role_configuration"] = configuration.semantics()
+    # Native transport supplies the actual delivered wire; the model cannot
+    # widen the source-reference scope by returning its own request fields.
+    result["review_evidence_request"] = getattr(backend, "review_evidence_request", None) or payload
     experiment = spec.get("experiment") or {}
     if (experiment.get("principal_intervention") or experiment.get("intervention")) and not result.get("intervention_coverage"):
         result["status"] = "needs_fix"

@@ -31,6 +31,11 @@ every internal decision publication window, current observation delivery and
 readback, finite continuation, owner/native GPU accounting without a GPU
 process, frozen pricing through the real SDK/HTTP boundary, paid-off publication
 adoption, CLI creation/restart/cancellation, and UI protocol propagation.
+`test_planner_knowledge.py` additionally verifies sourced lesson/method-card
+text in actual Prepared Planner JSON, independent knowledge allocation,
+explicit embedding failure before owner/provider admission, healthy cold start,
+source revocation/readback and a real pinned MiniLM cosine/cache case. Its
+synthetic vector cases identify their backend explicitly.
 Paid Planner recovery fixtures cover original settled replies, crash boundaries,
 the same frozen round and continuation, and identity/tamper refusal before any
 new context capture, API claim or request.
@@ -40,3 +45,19 @@ Real provider validation is a separate explicit invocation of
 started by pytest. Its root must be new and empty, its API cap is at most 18,
 and its dataset remains synthetic. It preserves the native design, source,
 review, training, metric and terminal-observation gates.
+
+## Independent planning and shorter implementation review
+
+The staged planning configuration, protocol, owner, paid recovery and dispatch
+fixtures cover separate Pro thinking proposal and Pro thinking Critic SDK requests,
+as well as an explicitly configured Flash proposal role, complete
+pool delivery, winner-only publication and crash recovery without duplicate
+paid calls. `test_single_pass_review.py` covers the one-request Reviewer policy
+and native Coder source-presence delivery. These use isolated local campaigns
+and SDK MockTransport; they do not claim live Pro or EEG/GPU performance.
+
+`test_review_source_references.py` additionally covers shared-scope method
+shorthand in saved replies. Every referenced method must exist and be within
+the supplied source range, including disjoint runtime excerpts; missing members
+or another file cannot expand delivery. The Reviewer prompt examples are checked
+in the actual Prepared Request while preserving its compact mission budget.

@@ -25,7 +25,12 @@ TOOL_ARGUMENTS = {
     },
     "run_candidate_check": {},
     "inspect_check_result": {},
-    "finish_patch": {"summary": ("string", True)},
+    "finish_patch": {"summary": ("string", True), "implementation_map": ("object", False)},
+    "request_design_revision": {
+        "kind": ("string", False), "reason": ("string", True),
+        "requirement_ids": ("array", True), "evidence_refs": ("array", True),
+        "smallest_correction": ("string", True), "validation_expectation": ("string", True),
+    },
     "requires_framework_extension": None,
 }
 
@@ -65,7 +70,7 @@ def validate_tool_request(reply: Any) -> tuple[str, dict[str, Any], dict[str, An
     if not isinstance(args, dict):
         return tool, {}, {"ok": False, "error": "invalid_tool_args", "detail": "args must be an object"}
     fields = TOOL_ARGUMENTS[tool]
-    argument_types = {"string": str, "integer": int, "array": list}
+    argument_types = {"string": str, "integer": int, "array": list, "object": dict}
     issues = []
     if fields is not None:
         issues.extend("unknown argument: " + str(key) for key in args if key not in fields)
@@ -91,6 +96,12 @@ def validate_tool_request(reply: Any) -> tuple[str, dict[str, Any], dict[str, An
                            1 <= edit["start"] <= edit["end"] and isinstance(edit.get("new"), str))
             if not (valid_text or valid_lines):
                 issues.append(f"edits[{index}] must use nonempty old/new strings or integer 1 <= start <= end and new string")
+    if tool == "request_design_revision" and not issues:
+        if args.get("kind", "design_conflict") not in {"design_conflict", "scientific_replan"}:
+            issues.append("kind must be design_conflict or scientific_replan")
+        for field in ("requirement_ids", "evidence_refs"):
+            if not all(isinstance(item, str) and item for item in args[field]):
+                issues.append(field + " must contain nonempty strings")
     error = {"ok": False, "error": "invalid_tool_args", "detail": "; ".join(issues)} if issues else None
     return tool, args, error
 
@@ -143,6 +154,7 @@ _REFERENCES = {
     "reference/train_entry.py": Path(__file__).resolve().parents[2] / "eeg_training" / "train_entry.py",
     "reference/hooks.py": Path(__file__).resolve().parents[2] / "eeg_training" / "hooks.py",
     "reference/hook_config.py": Path(__file__).resolve().parent / "hook_config.py",
+    "reference/check_entry.py": Path(__file__).resolve().parent / "check_entry.py",
 }
 
 
@@ -166,12 +178,16 @@ def read_code(workspace: Path, relative: str, start: int = 1, end: int = 200) ->
 
 def search_code(workspace: Path, query: str) -> dict[str, Any]:
     hits = []
-    for path in (workspace / "extension").rglob("*.py"):
-        if not _allowed(workspace, path):
-            continue
+    sources = [(str(path.relative_to(workspace)), path) for path in (workspace / "extension").rglob("*.py")
+               if _allowed(workspace, path)]
+    sources.extend(_REFERENCES.items())
+    parent = workspace / "reference" / "parent.py"
+    if parent.is_file():
+        sources.append(("reference/parent.py", parent))
+    for relative, path in sources:
         for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             if query and query in line:
-                hits.append({"path": str(path.relative_to(workspace)), "line": index, "text": line[:180]})
+                hits.append({"path": relative, "line": index, "text": line[:180]})
             if len(hits) >= 20:
                 return {"ok": True, "hits": hits}
     return {"ok": True, "hits": hits}
@@ -231,7 +247,9 @@ def edit_candidate_code(workspace: Path, relative: str, edits: list[Any], expect
     return {**apply_candidate_patch(workspace, relative, content, expected_base_hash), "edit_count": len(edits)}
 
 
-def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: float = 300.0) -> dict[str, Any]:
+def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: float = 300.0,
+                        *, cpu_only: bool = False, cpu_result: dict[str, Any] | None = None,
+                        allow_unbound_probes: bool = False) -> dict[str, Any]:
     """Run check_entry in the training interpreter. The child gets no API key and no shell."""
     import subprocess
 
@@ -253,6 +271,22 @@ def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: f
     approved_spec = workspace / "spec.json"
     if approved_spec.is_file():
         command.append(str(approved_spec.resolve()))
+        implementation_map = workspace / "implementation_map.json"
+        if implementation_map.is_file():
+            command.append(str(implementation_map.resolve()))
+    if allow_unbound_probes:
+        command.append("--allow-unbound-probes")
+    if cpu_result is not None:
+        payload = dict(cpu_result)
+    else:
+        payload = _run_cpu_check(command, extension, env, timeout_s)
+    if cpu_only or not payload.get("ok"):
+        return payload
+    return _complete_multigpu_check(workspace, interpreter, spec_path, payload, timeout_s)
+
+
+def _run_cpu_check(command: list[str], extension: Path, env: dict[str, str], timeout_s: float) -> dict[str, Any]:
+    import subprocess
     try:
         completed = subprocess.run(  # noqa: S603
             command,
@@ -283,6 +317,11 @@ def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: f
     if completed.returncode != 0:
         payload["ok"] = False
         payload.setdefault("error", "check_nonzero_returncode")
+    return payload
+
+
+def _complete_multigpu_check(workspace: Path, interpreter: str, spec_path: Path,
+                            payload: dict[str, Any], timeout_s: float) -> dict[str, Any]:
     input_spec = json.loads(spec_path.read_text()) if spec_path.is_file() else {}
     if payload.get("ok") and (input_spec.get("multigpu_check") or {}).get("enabled"):
         from react_agent.eeg_research.agentic.execution_protocol import load_protocol
@@ -319,6 +358,13 @@ def run_candidate_check(workspace: Path, python: str | None = None, timeout_s: f
             payload["error"] = receipt.get("error") or "multigpu_runtime_check_failed"
             payload["detail"] = (receipt.get("result") or {}).get("detail") or receipt.get("stderr_tail") or str(receipt)
     return payload
+
+
+def bound_implementation_requirements(requirements: list[dict[str, Any]], binding: dict[str, Any],
+                                      *, source_sha256: str, spec_hash: str | None) -> list[dict[str, Any]]:
+    """Apply implementation locations without changing approved scientific properties."""
+    from .check_entry import bound_implementation_requirements as bind_requirements
+    return bind_requirements(requirements, binding, source_sha256=source_sha256, spec_hash=spec_hash)
 
 
 def inspect_check_result(payload: dict[str, Any]) -> dict[str, Any]:

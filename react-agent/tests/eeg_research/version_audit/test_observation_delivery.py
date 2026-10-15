@@ -196,7 +196,7 @@ def test_recent_semantic_compact_share_conditions_and_never_match_different_scop
         "source_hash": "c" * 64, "spec_hash": "d" * 64, "method_revision": "r2"}
     recent = cards.recall_observations(camp, "temporal alignment", recent=1, relevant=0, context=current)["cards"][0]
     bundle = sm.retrieve(camp, "temporal alignment", context=current, require_embedding=True)
-    assert bundle["backend"] == "minilm"  # backend label, synthetic vectors identified above
+    assert bundle["backend"] == "synthetic_embedding"  # Unit vectors are not the real MiniLM model.
     semantic = next(row for row in bundle["items"] if row["record_id"] == saved["observation_id"])
     view = cards.compact_planner_view(camp, {"current_task_context": current})
     compact = view["experiment_observations"]["cards"][0]

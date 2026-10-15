@@ -36,6 +36,26 @@ def test_raw_invalid_sibling_survives_outer_parse_for_independent_validation():
     assert parsed.proposals == raw["proposals"]
 
 
+def test_new_method_candidate_identity_contract_survives_actual_prepared_schema_compaction(tmp_path):
+    from react_agent.eeg_research.agentic.context.service import ContextService
+    from react_agent.eeg_research.agentic.context.types import CompileRequest, Ready
+    goal = {"research_execution": {"version": "single_plan_v1"}, "memory": {"enabled": False}}
+    (tmp_path / "goal.json").write_text(json.dumps(goal))
+    (tmp_path / "campaign_state.json").write_text('{"status":"planning"}')
+    (tmp_path / "evaluation_contract.json").write_text('{"task_type":"eeg_image_retrieval"}')
+    result = ContextService(tmp_path).compile(CompileRequest(tmp_path.name, "research_planner",
+        {"goal": goal, "candidates": [], "eligible_targets": {"collect_diagnostics": ["baseline"]}},
+        system=system_prompt("research_planner", camp=tmp_path)))
+    assert isinstance(result, Ready), result
+    assert result.prepared.verify() and result.prepared.budget_report["ready_budget_ok"]
+    assert "For new_method set target_candidate_ref=null" in result.prepared.system
+    assert "runtime assigns the selected new candidate ID" in result.prepared.system
+    assert "copy an existing delivered candidate ID" in result.prepared.system
+    encoded = result.prepared.system.split("\nOUTPUT_SCHEMA\n", 1)[1].split("\nReturn one JSON object.", 1)[0]
+    target = json.loads(encoded)["properties"]["proposals"]["items"]["properties"]["target_candidate_ref"]
+    assert "description" not in target
+
+
 def test_single_plan_coder_real_prepared_request_has_native_tool_schema(tmp_path, monkeypatch):
     from react_agent.eeg_research.agentic.coder import CoderToolRequest, TOOL_ARGUMENTS, tool_catalog
     from react_agent.eeg_research.agentic.context.service import ContextService
@@ -150,6 +170,61 @@ def test_designer_coder_config_contract_survives_actual_prepared_schema_compacti
         assert block.source_hash == registered["source_hash"] == digest(spec)
         assert registry.load(block, role=role) == spec
         assert len(runtime_mission(role)) < (3500 if role == "candidate_coder" else 2500)
+    assert canonical(payload) == original
+    assert not (camp / "llm_calls.jsonl").exists()
+
+
+def test_designer_reviewer_phase_contract_reaches_real_prepared_request(tmp_path, monkeypatch):
+    from react_agent.eeg_research.agentic.context.service import ContextService
+    from react_agent.eeg_research.agentic.context.types import CompileRequest, Ready, canonical
+    from react_agent.eeg_research.agentic.schemas import ImplementationRequirement
+    from react_agent.eeg_research.agentic.runtime_prompts import runtime_mission
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *args, **kwargs: False)
+    camp = tmp_path / "phase_contract"
+    camp.mkdir()
+    (camp / "goal.json").write_text(json.dumps({"research_execution": {"version": "single_plan_v1"},
+                                               "memory": {"enabled": False}}))
+    requirements = [
+        {"requirement_id": "current_binding", "kind": "implementation", "core": True,
+         "expected_behavior": "Current code preserves frozen recipe and source/config identity.",
+         "code_locations": ["EEGCandidate.build_encoder"], "verification": "source_review"},
+        {"requirement_id": "future_report", "kind": "implementation", "core": False,
+         "expected_behavior": "After native measurement, report paired fold scores and trained module hashes.",
+         "code_locations": ["native trainer report"], "verification": "source_review"},
+        {"requirement_id": "gain_prediction", "kind": "scientific_hypothesis", "core": False,
+         "expected_behavior": "A paired screening gain remains unmeasured."},
+    ]
+    for item in requirements:
+        ImplementationRequirement.model_validate(item)
+    task = {"expected_observation": "Matched baseline/candidate fold scores and current trained module hashes.",
+            "completion_condition": "Native paired measurements and final parameter counts are recorded."}
+    payload = {"selected_research_task": task, "experiment_spec": {"implementation_requirements": requirements},
+               "training_jobs": 0, "live_job": None, "native_measurements": None}
+    original = canonical(payload)
+    for role in ("experiment_designer", "candidate_reviewer"):
+        outcome = ContextService(camp).compile(CompileRequest(camp.name, role, payload,
+            system=system_prompt(role, camp=camp), max_output_tokens=16384, allow_semantic_compaction=False))
+        assert isinstance(outcome, Ready)
+        assert outcome.prepared.verify()
+        system = outcome.prepared.system.split("\nOUTPUT_SCHEMA\n", 1)[0]
+        assert "current code behavior" in system and "before training" in system.lower()
+        assert "source/config binding" in system and "evaluation boundaries" in system
+        assert "expected_observation/completion_condition" in system
+        assert "implementation and scientific_hypothesis" in system
+        if role == "experiment_designer":
+            assert "core=true" in system and "auxiliary requirements use core=false" in system
+            assert "do not invent measurement/reporting kinds" in system
+        else:
+            assert "do not waive that core requirement" in system
+            assert "phase-contract mismatch requiring replanning" in system
+            assert "without inventing receipts or claiming performance" in system
+            assert "path::TemporalAttentionEncoder.__init__ and path::TemporalAttentionEncoder.forward" in system
+            assert "Each entry cites one real location within delivered source" in system
+        delivered = json.loads(outcome.prepared.user)
+        assert delivered["selected_research_task"] == task
+        assert delivered["experiment_spec"]["implementation_requirements"] == requirements
+        assert delivered["training_jobs"] == 0 and delivered["native_measurements"] is None
+        assert len(runtime_mission(role)) < 2500
     assert canonical(payload) == original
     assert not (camp / "llm_calls.jsonl").exists()
 

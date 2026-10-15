@@ -134,6 +134,10 @@ def canonicalize_experiment_spec(spec: dict[str, Any] | None, *, allow_legacy: b
         value = copied["implementation_requirements"]
         if not isinstance(value, list):
             raise CanonicalizationError("implementation_requirements_not_list")
+        if copied.get("design_contract_version") != "v2" and any(
+            isinstance(item, dict) and item.get("binding_stage") == "design" for item in value
+        ):
+            raise CanonicalizationError("design_declaration_requires_v2_contract")
         try:
             copied["implementation_requirements"] = [ImplementationRequirement.model_validate(item).model_dump() for item in value]
         except ValidationError as exc:
@@ -170,6 +174,9 @@ def _execution_hash(spec: dict[str, Any]) -> str:
 
 def scientific_identity(spec: dict[str, Any] | None) -> dict[str, Any]:
     spec = spec if isinstance(spec, dict) else {}
+    if spec.get("design_contract_version") == "v2":
+        from .design_contract import scientific_design_projection
+        return scientific_design_projection(spec)
     identity = {
         "intervention": spec.get("principal_intervention") or spec.get("intervention"),
         "hypothesis": spec.get("hypothesis"),

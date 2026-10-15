@@ -129,12 +129,20 @@ def goal(campaign: str, design=None) -> dict:
     return {
         "goal_id": campaign,
         "planner_mode": "compare_options",
-        "research_execution": {"version": "single_plan_v1", "budget": {"envelopes": {
+        "research_execution": {"version": "single_plan_v1", "planning_mode": "propose_then_critic",
+            "implementation_review_mode": "single_pass", "design_contract_version": "v2", "budget": {"envelopes": {
             kind: {"training_jobs": 2, "gpu_seconds": 2 * gpu / 20,
                 "allocation_basis": "authorized_global_gpu_seconds_per_training_job",
                 "authority": "maximum_runtime_allocation_not_cost_estimate"}
             for kind in ("new_method", "validation", "confirmation")}}},
         "objective": "改进指定数据与协议下的 EEG 到图像检索",
+        "role_models": {
+            "research_planner": {"model": "deepseek-v4-pro", "thinking": True,
+                "reasoning_effort": "high", "max_tokens": 32768, "timeout_s": 240},
+            "research_critic": {"model": "deepseek-v4-pro", "thinking": True,
+                "reasoning_effort": "high", "max_tokens": 16384, "timeout_s": 240},
+            "candidate_reviewer": {"model": "deepseek-flash", "thinking": False,
+                "reasoning_effort": None, "max_tokens": 8192, "timeout_s": 120}},
         "task_type": "eeg_image_retrieval",
         "research_scope": scope,
         "primary_metric": "validation.fixed_gallery_top1",
@@ -338,7 +346,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(json.dumps({"error": str(exc)}))
         return 2
-    if overrides and args.command not in {"create", "role-config-preview", "screening-dry-run"}:
+    if overrides and args.command == "revalidate-review":
+        from .review_revalidation import validate_override
+        try:
+            validate_override(overrides)
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
+    elif overrides and args.command not in {"create", "role-config-preview", "screening-dry-run"}:
         print(json.dumps({"error": "role_overrides_require_new_campaign_or_preview"}))
         return 2
     if args.execution_version is not None and args.command != "create":
@@ -775,7 +790,7 @@ def main(argv: list[str] | None = None) -> int:
                 state = load_state(camp)
                 with verification_scope():
                     validate_inheritance(camp)
-                    services = build_services(camp)
+                    services = build_services(camp, role_overrides=overrides) if overrides else build_services(camp)
                     if retry_design:
                         result = services["retry_design"](camp, state, reason=args.retry_reason)
                     elif revalidate_review:

@@ -22,6 +22,20 @@ def single_plan_enabled(value: Mapping | Path | str) -> bool:
     return isinstance(config, Mapping) and config.get("version") == SINGLE_PLAN_VERSION
 
 
+def independent_critic_enabled(value: Mapping | Path | str) -> bool:
+    config = research_goal(value).get("research_execution") or {}
+    return single_plan_enabled(value) and config.get("planning_mode") == "propose_then_critic"
+
+
+def planning_call_budget(value: Mapping | Path | str) -> int:
+    """The two planning stages share one finite native round allocation."""
+    goal = research_goal(value)
+    config = goal.get("research_execution") or {}
+    if not independent_critic_enabled(goal):
+        return 2
+    return min(2, int(config.get("max_planner_api_attempts", 2))) + int(config.get("max_critic_api_attempts", 2))
+
+
 def paid_maintenance_mode(value: Mapping | Path | str) -> str:
     goal = research_goal(value)
     mode = goal.get("paid_maintenance")
