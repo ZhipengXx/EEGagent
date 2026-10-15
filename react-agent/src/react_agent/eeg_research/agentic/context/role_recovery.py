@@ -157,7 +157,10 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
             # Known invalid tool arguments executed nothing. Preserve their spend
             # and let the existing operation allowance govern the next attempt.
             return None
-        if response.get("validation") not in {"pending", "valid"} or not isinstance(response.get("reply"), dict):
+        revalidate_review_schema = (role == "candidate_reviewer"
+                                    and response.get("validation") == "domain_schema_invalid")
+        if (response.get("validation") not in {"pending", "valid"} and not revalidate_review_schema
+                or not isinstance(response.get("reply"), dict)):
             raise _error("role_recovery_reply_invalid")
         reply = response["reply"]
         if digest(reply) != call.get("response_reply_sha256"):
@@ -200,6 +203,9 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
         "prompt_hash": system_hash[:16], "context_request_digest": call["context_request_digest"],
         "source_dependency_digest": manifest["source_dependency_digest"],
         "api_calls_added": 0, "cost_preserved": True, "recorded_at": time.time()}
+    if revalidate_review_schema:
+        receipt["original_validation"] = response["validation"]
+        receipt["revalidated_by"] = "current_review_schema_and_source_references"
     existing = _rows(camp / "role_response_recovery.jsonl")
     if not any(row.get("call_id") == call_id and row.get("task_id") == receipt["task_id"] for row in existing):
         with (camp / "role_response_recovery.jsonl").open("a", encoding="utf-8") as stream:

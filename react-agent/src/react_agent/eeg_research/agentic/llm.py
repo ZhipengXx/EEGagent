@@ -32,6 +32,18 @@ LONG_JSON_ROLES = {
 }
 RAW_EXCERPT_LIMIT = 2048
 API_INTENTS = "llm_api_intents.jsonl"
+CODER_FORMAT_FEEDBACK_REVISION = "eeg_research.coder_json_feedback.v2"
+
+
+def coder_format_feedback(raw: str, *, finish_reason: str | None = None) -> dict:
+    """Repair a confirmed malformed tool reply without interpreting its action."""
+    return {
+        "kind": "invalid_json", "finish_reason": finish_reason,
+        "format_protocol_revision": CODER_FORMAT_FEEDBACK_REVISION,
+        "tool_executed": False, "rejected_format": str(raw)[:RAW_EXCERPT_LIMIT],
+        "example": {"tool": "read_code", "args": {"path": "reference/parent.py", "start": 1, "end": 120}},
+        "instruction": "No tool executed. Return exactly one ordinary JSON object with keys tool and args, using a tool from the supplied catalog. The example illustrates the envelope only; choose the action and arguments needed for the current task. Do not emit DSML tags, invoke/parameter markup or multiple tool calls. Escape code newlines and quotes inside JSON strings.",
+    }
 
 
 class LlmUnavailable(RuntimeError):
@@ -631,6 +643,9 @@ def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
     user_sha = hashlib.sha256(user.encode("utf-8")).hexdigest()
     identity = {key: row.get(key) for key in
                 ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash", "requested_model")}
+    for key in ("coder_format_feedback_revision", "coder_format_recovery"):
+        if key in row:
+            identity[key] = row[key]
     if row.get("operation"):
         identity["operation"] = row["operation"]
     record = {**identity, "system": system, "user": user,
@@ -716,6 +731,9 @@ def _response_trace(camp: Path, row: dict[str, Any], reply: Any, *, validation: 
     identity = {key: row.get(key) for key in
                 ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash",
                  "request_trace_ref", "request_system_sha256", "request_user_sha256")}
+    for key in ("coder_format_feedback_revision", "coder_format_recovery"):
+        if key in row:
+            identity[key] = row[key]
     if row.get("operation"):
         identity["operation"] = row["operation"]
     record = {**identity, "reply": reply, "validation": validation,
@@ -1145,6 +1163,13 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         logical_operation = operation_id(role, payload, bound, resolved.role_config_hash)
         request_semantics = operation_id(role, payload,
             {key: value for key, value in bound.items() if key != "operation_id"}, "")
+        format_recovery = None
+        if role == "candidate_coder":
+            from .coder_format_recovery import coder_format_recovery
+            format_recovery = coder_format_recovery(camp, logical_operation, payload=payload,
+                bound=bound, revision=CODER_FORMAT_FEEDBACK_REVISION)
+            if format_recovery is not None:
+                logical_operation = format_recovery["operation_id"]
 
         def validate_recovered(reply, frozen_payload, frozen_prompt_hash):
             parsed = dict(reply)
@@ -1209,15 +1234,19 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         schema_error_kind = "domain_schema_invalid"
         previous_domain = None
         schema_feedback = None
-        logical_operation = operation_id(role, payload, bound, resolved.role_config_hash)
         from .research_execution import research_goal
         execution = research_goal(camp).get("research_execution") or {}
         attempt_limit = (1 if role == "candidate_reviewer"
                          and execution.get("implementation_review_mode") == "single_pass"
                          else PARSE_ATTEMPTS)
         for _attempt in range(attempt_limit):
-            request_mode = "repair" if external_repair or last is not None or schema_error is not None else "normal"
+            request_mode = "repair" if external_repair or last is not None or schema_error is not None or format_recovery is not None else "normal"
             call_payload = payload
+            if format_recovery is not None:
+                call_payload = {**payload,
+                    "previous_response_error": {**coder_format_feedback(format_recovery["rejected_format"]),
+                        "recovery": {key: value for key, value in format_recovery.items()
+                                     if key != "rejected_format"}}}
             if last is not None:
                 failure = getattr(last.usage, "failure_kind", None)
                 error_feedback = {
@@ -1231,6 +1260,9 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                         parent_task_ref=row.get("task_id"), invalid_response_digest=response_digest(last.raw),
                         max_output_tokens=int(config.fast.max_tokens),
                         instruction="The previous final JSON was truncated. Return a concise complete OUTPUT_SCHEMA object within the current output cap. Preserve required executable hooks, parameter values, core implementation requirements and source references; omit repeated input context, policies and optional narrative. Finish the final JSON promptly.")
+                elif role == "candidate_coder":
+                    error_feedback = coder_format_feedback(last.raw,
+                        finish_reason=getattr(last.usage, "finish_reason", None))
                 call_payload = {
                     **payload,
                     "previous_response_error": error_feedback,
@@ -1309,6 +1341,11 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                        role_context_original_user_chars=projection["original_user_chars"],
                        role_context_projected_total_chars=projection["projected_total_chars"],
                        role_context_budget_chars=projection["budget_chars"])
+            if role == "candidate_coder":
+                row["coder_format_feedback_revision"] = CODER_FORMAT_FEEDBACK_REVISION
+                if format_recovery is not None:
+                    row["coder_format_recovery"] = {key: value for key, value in format_recovery.items()
+                                                   if key != "rejected_format"}
             append_ui_event(
                 camp,
                 "llm_call_started",

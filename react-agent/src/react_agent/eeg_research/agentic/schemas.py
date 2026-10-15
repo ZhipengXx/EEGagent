@@ -649,6 +649,9 @@ class ImplementationReview(DomainOutput):
     unverified_invariants: list[Any] = Field(default_factory=list)
     review_limits: Any = None
     summary_zh: str = ""
+    # Some reviewers annotate the supplied runtime census. Native measurements
+    # remain authoritative; this optional diagnostic is not a verdict field.
+    parameter_census: dict[str, Any] | None = Field(default=None, exclude=True)
 
     @model_validator(mode="after")
     def status_matches_unresolved_issues(self):
