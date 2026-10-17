@@ -913,7 +913,7 @@ def observation(camp: Path) -> dict[str, Any]:
         "blocked_actions": blocked_actions(state),
         "trainable_ids": trainable,
         "budget": budget_snapshot(camp, state),
-        "capabilities": capability_manifest(),
+        "capabilities": capability_manifest(protocol) if (goal.get("research_execution") or {}).get("design_contract_version") == "v2" else capability_manifest(),
         "research_plan": consume_for_planner(camp, state),
         "memory": retrieve(
             state.get("memory") or [],
@@ -1414,6 +1414,14 @@ def _apply_action(
         # report that went stale looks freshly audited here and audit_result is refused.
         refresh_audit_freshness(scope)
         live["available_actions"] = available_actions(scope)
+        revision = (raw.get("experiment_draft") or {}).get("design_revision") if isinstance(raw.get("experiment_draft"), dict) else None
+        if (internal_plan is not None and internal_plan.get("current_step") == "design_revision"
+                and action == "design_experiment" and isinstance(revision, dict)
+                and revision.get("candidate_id") == internal_plan.get("candidate_id")
+                and revision.get("prior_spec_hash") == internal_plan.get("spec_hash")
+                and (state.get("experiment") or {}).get("design_contract_version") == "v2"):
+            # This edits the admitted design; it does not allocate another method.
+            live["available_actions"].append("design_experiment")
         from react_agent.eeg_research.agentic.planner import eligible_targets
         live["eligible_targets"] = eligible_targets(scope)
         candidate = {**raw, "action": action}
@@ -1821,6 +1829,11 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
             context["selected_research_task"] = {"plan_id": selected["plan_id"],
                 **{key: selected["proposal"][key] for key in ("question", "task_description", "scientific_intent",
                     "evaluation_scope", "expected_observation", "completion_condition")}}
+            # Separate key: selected_research_task is compared verbatim in review revalidation.
+            from .planning_context import selection_basis
+            basis = selection_basis(camp, selected)
+            if basis is not None:
+                context["selection_basis"] = basis
     return context
 
 
@@ -1828,8 +1841,12 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     from react_agent.eeg_research.agentic.experiment_gate import approve_experiment, experiment_is_approved
     from react_agent.eeg_research.agentic.llm import LlmUnavailable
     from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
+    from .design_contract import design_contract_version, materialize_design_brief, DesignContractError
 
-    spec = raw.get("experiment_draft") or state.get("experiment") or {"initial_fidelity": "pilot"}
+    design_v2 = design_contract_version(_read(camp / "goal.json")) == "v2"
+    draft = raw.get("experiment_draft")
+    revision = draft.get("design_revision") if design_v2 and isinstance(draft, dict) else None
+    spec = (state.get("experiment") if revision else draft) or state.get("experiment") or {"initial_fidelity": "pilot"}
     if not isinstance(spec, dict):
         spec = {"initial_fidelity": "pilot"}
     spec = dict(spec)
@@ -1843,11 +1860,38 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     if (camp / "evaluation_contract.json").is_file():
         inputs.append(camp / "evaluation_contract.json")
     context = _design_context(camp, state, spec)
+    revision = revision if isinstance(revision, dict) else None
+    previous_spec = dict(state.get("experiment") or {}) if revision else None
+    if design_v2:
+        from .run_context import BASELINE_HOOK_SPEC, load_approved_binding
+        parent_id = str(spec.get("parent_candidate_id") or "baseline")
+        parent_config = ({"target_id": "baseline", **BASELINE_HOOK_SPEC} if parent_id == "baseline"
+                         else load_approved_binding(camp, parent_id) or {})
+        context["design_contract_version"] = "v2"
+        context["parent_hook_config"] = parent_config
+        if parent_id != "baseline":
+            inputs.append(camp / "candidates" / parent_id / "approved_binding.json")
+        if revision:
+            context["design_revision"] = revision
+            context["prior_design_brief"] = previous_spec.get("design_brief")
+            if (revision.get("candidate_id") != candidate_implementation_target(camp, state)
+                    or revision.get("prior_spec_hash") != previous_spec.get("spec_hash")):
+                raise ValueError("design_revision_identity_changed")
+            if (state.get("live_job") or state.get("active_suite") or state.get("queued") or any(
+                    row.get("candidate_id") == revision["candidate_id"] and row.get("fidelity")
+                    for row in state.get("evidence") or [])):
+                raise ValueError("design_revision_requires_unmeasured_candidate")
+        design_input = {key: spec[key] for key in ("hypothesis", "intervention", "principal_intervention",
+            "parent_candidate_id", "control_candidate_id", "initial_fidelity") if key in spec}
+    else:
+        design_input = spec
+    if services.get("current_user_instruction"):
+        context["current_user_instruction"] = services["current_user_instruction"]
     task = begin_role_task(
         camp,
         role="experiment_designer",
         inputs=inputs,
-        request={"draft": spec, **context},
+        request={"draft": design_input, **context},
         artifacts=[{"artifact_id": row["artifact_id"], "kind": "selected_development_read", "sha256": row.get("sha256")}
                    for row in context.get("artifact_reads") or [] if row.get("status") == "read"],
     )
@@ -1865,7 +1909,7 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
                     "task_id": task["task_id"],
                     "attempt_id": task["attempt_id"],
                     "input_digest": task["input_digest"],
-                    "draft": spec,
+                    "draft": design_input,
                     **context,
                 }
             )
@@ -1875,6 +1919,17 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
                 inner = reply.get("payload")
                 if spec_reply is None and isinstance(inner, dict):
                     spec_reply = inner.get("experiment_spec")
+                if design_v2:
+                    brief = reply.get("design_brief")
+                    if brief is None and isinstance(inner, dict):
+                        brief = inner.get("design_brief")
+                    if brief is not None:
+                        selected_task = {**(context.get("selected_research_task") or {}),
+                            **{key: spec[key] for key in ("parent_candidate_id", "control_candidate_id",
+                                  "initial_fidelity", "negative_sampling_policy") if key in spec}}
+                        spec_reply = materialize_design_brief(brief, selected_task, parent_config)
+                    elif str(reply.get("status") or "") == "completed":
+                        raise DesignContractError("completed_design_requires_brief")
                 payload["summary_zh"] = str(reply.get("summary_zh") or payload["summary_zh"])
                 status = str(reply.get("status") or "")
                 if status in {"partial", "failed", "requires_framework_extension", "blocked"} or reply.get("requires_framework_extension"):
@@ -1889,6 +1944,26 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
                     spec_reply["status"] = "draft"
                 spec_reply.pop("approval_record", None)
                 spec = {**spec, **spec_reply}
+                if revision:
+                    from .plan_protocol import scientific_projection
+                    if scientific_projection(spec) != scientific_projection(previous_spec):
+                        state["needs_replan"] = {"reason": "design_revision_changes_scientific_intent",
+                                                 "candidate_id": revision["candidate_id"]}
+                        blocked = True
+                        design_failed = True
+                        spec["role_status"] = "blocked"
+                        spec["status"] = "blocked"
+                        spec["blocked_reason"] = "design_revision_changes_scientific_intent"
+        except DesignContractError as exc:
+            design_failure = {"error_type": exc.reason, "task_id": task["task_id"], "recoverable": False}
+            payload["design_failure"] = design_failure
+            payload["status"] = "blocked"
+            payload["summary_zh"] = "设计交接无法装配：" + exc.reason
+            spec["role_status"] = "blocked"
+            spec["status"] = "blocked"
+            spec["blocked_reason"] = exc.reason
+            design_failed = True
+            blocked = True
         except LlmUnavailable as exc:
             design_failure = {"error_type": str(exc), "diagnostics": getattr(exc, "diagnostics", {}),
                 "task_id": task["task_id"], "input_digest": task["input_digest"],
@@ -1898,6 +1973,9 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
             payload["summary_zh"] = "设计调用未完成：" + str(exc) + "；草稿未批准"
             spec["role_status"] = "partial"
             spec["status"] = "draft"
+            if str(exc) == "design_contract_invalid":
+                spec.update(status="blocked", role_status="blocked", blocked_reason=str(exc))
+                blocked = True
             design_failed = True
     if design_failed or blocked:
         spec["status"] = "blocked" if blocked and spec.get("role_status") in {"requires_framework_extension", "blocked"} else "draft"
@@ -1909,6 +1987,11 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
         spec = approve_experiment(spec, camp=camp, context=context, producer=task)
         blocked = not experiment_is_approved(spec)
     payload["experiment_spec"] = spec
+    if revision:
+        payload["design_revision"] = {"candidate_id": revision["candidate_id"],
+            "prior_spec_hash": previous_spec.get("spec_hash"), "new_spec_hash": spec.get("spec_hash"),
+            "prior_experiment_ref": revision.get("prior_experiment_ref"),
+            "issues": revision.get("issues") or []}
     payload["status"] = "blocked" if blocked else payload["status"]
     path = camp / "experiments" / f"spec_{task['task_id']}.json"
     envelope = finish_role_task(camp, task, payload, kind="experiment_spec", path=path)
@@ -1916,6 +1999,13 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     if not isinstance(stored, dict):
         inner = envelope.get("payload")
         stored = inner.get("experiment_spec") if isinstance(inner, dict) else spec
+    if revision and blocked:
+        state["design_revision_failure"] = {"artifact_ref": (envelope.get("artifact_refs") or [None])[-1],
+            "error_type": (design_failure or {}).get("error_type") or spec.get("blocked_reason") or "design_revision_not_approved",
+            "candidate_id": revision["candidate_id"]}
+        state["candidate_ready"] = False
+        state["experiment_failed"] = False
+        return
     state.pop("execution_spec", None)
     state["experiment"] = stored
     state["experiment_ref"] = (
@@ -1927,8 +2017,23 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
     state["candidate_ready"] = False
     state["experiment_failed"] = blocked
     if not blocked:
-        from react_agent.eeg_research.agentic.candidate_lifecycle import admit
-        admit(camp, state, candidate_implementation_target(camp, state), stored)
+        if revision:
+            from .identity import rotate_attempt
+            from .run_context import persist_approved_binding
+            candidate_id = revision["candidate_id"]
+            workspace = camp / "candidates" / candidate_id
+            attempt = rotate_attempt(workspace, candidate_id)
+            persist_approved_binding(camp, candidate_id, stored, spec_ref=state["experiment_ref"],
+                                     attempt_id=attempt["attempt_id"])
+            state["repair_task"] = {**revision, "attempt_id": attempt["attempt_id"], "remaining": 1}
+            state["repair_task"]["review_focus"] = {**(revision.get("review_focus") or {}),
+                "design_revision": payload["design_revision"]}
+            state.pop("design_revision_task", None)
+            state.pop("design_revision_failure", None)
+            state.pop("pending_candidate_check", None)
+        else:
+            from react_agent.eeg_research.agentic.candidate_lifecycle import admit
+            admit(camp, state, candidate_implementation_target(camp, state), stored)
     if design_failure:
         scientific_epoch = [row.get("evidence_id") for row in state.get("evidence") or []
                             if row.get("evaluation_valid") is True and row.get("fidelity") in {"pilot", "full"}]

@@ -17,6 +17,7 @@ LONG_JSON_ROLES = {
     "candidate_reviewer",
     "result_analyst",
     "research_planner",
+    "research_critic",
     "research_librarian",
     "experiment_designer",
     "memory_curator",
@@ -328,8 +329,8 @@ def role_recovery_identity(camp: Path, role: str, target: str | None, request: d
     memory = memory_config(camp)
     from react_agent.eeg_research.agentic.role_config import resolve_role_config
     resolved = resolve_role_config(camp, role)
-    system = system_prompt(role, memory=memory,camp=camp)
-    model = domain_model_for(role, memory)
+    system = system_prompt(role, memory=memory,camp=camp, review_stage=request.get("review_stage"))
+    model = domain_model_for(role, memory, camp=camp, review_stage=request.get("review_stage"))
     schema = model.model_json_schema() if model else {"envelope": ROLE_RESULT_VERSION}
     binding = load_approved_binding(camp, str(target)) if target else None
     source = camp / "candidates" / str(target) / "extension" / "eeg_candidate.py"

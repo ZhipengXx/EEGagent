@@ -76,6 +76,9 @@ def measurement_action(proposal: dict, observation: dict) -> str:
 def scientific_projection(spec: dict | None) -> dict:
     """Engineering attempts may change source bytes; approved science may not."""
     spec = spec or {}
+    if spec.get("design_contract_version") == "v2":
+        from .design_contract import scientific_design_projection
+        return scientific_design_projection(spec)
     return {key: spec.get(key) for key in ("intervention", "principal_intervention", "hypothesis", "model", "objective", "transform",
         "parent_candidate_id", "control_candidate_id", "initial_fidelity", "implementation_requirements",
         "required_capability_ids", "evaluation_scope")}
@@ -141,6 +144,15 @@ def proposal_cost(proposal: dict, observation: dict) -> dict:
     return result
 
 
+def _check_basis(ids: list[str], observation: dict) -> None:
+    """Basis IDs name delivered observations only; absent delivery sets (legacy replay) are not guessed."""
+    if len(set(ids)) != len(ids):
+        raise ValueError("basis_observation_ids_duplicate")
+    delivered = observation.get("_delivered_observation_ids")
+    if delivered is not None and any(item not in delivered for item in ids):
+        raise ValueError("basis_observation_id_not_delivered")
+
+
 def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
     try:
         item = ResearchPlanProposal.model_validate(raw).model_dump()
@@ -177,6 +189,7 @@ def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
                 registry = ContextSourceRegistry(Path(observation["_campaign_path"]))
             source = registry.get(ref, role="research_planner")
             registry.load(source, role="research_planner")
+        _check_basis(item.get("basis_observation_ids") or [], observation)
         if phase != "diagnostic" and observation.get("evaluation_mode") == "loso_method_search":
             folds = item["evaluation_scope"].get("folds")
             expected = 2 if phase == "screening_2fold" else 10
@@ -318,3 +331,134 @@ def decide_research_plan(observation: dict, backend) -> dict:
             parsed["round"]["validation_records"] = parsed["validation_records"]
     parsed["proposal_history"] = history
     return parsed
+
+
+def proposal_pool_digest(pool: dict) -> str:
+    """Bind the exact alternatives and native costs shown to the Critic."""
+    return digest({"round_id": pool["round_id"], "proposals": pool["proposals"],
+                   "native_cost": pool["native_cost_by_id"]})
+
+
+def freeze_proposal_pool(proposals: list[dict], observation: dict, *,
+                         validation_records: list[dict] | None = None) -> dict:
+    """Validate and freeze a proposal-only pool, including pre-Critic admission.
+
+    This function creates no candidate, owner or implementation work. Callers
+    may pass only the alternatives that survived complete-task budget preview.
+    """
+    cfg = config(observation)
+    accepted, records, ids, signatures, costs = [], copy.deepcopy(validation_records or []), set(), set(), {}
+    for raw in proposals:
+        proposal, trace = _validate_proposal(raw, observation)
+        if proposal is not None:
+            keys = ("task_kind", "target_candidate_ref", "scientific_intent", "evaluation_scope")
+            if proposal["task_kind"] != "new_method":
+                keys += ("question",)
+            signature = digest({key: proposal.get(key) for key in keys})
+            if proposal["proposal_id"] in ids or signature in signatures:
+                trace.update(status="rejected", error="duplicate_research_task")
+            elif len(accepted) >= 4:
+                trace.update(status="rejected", error="research_pool_at_maximum")
+            else:
+                accepted.append(proposal)
+                ids.add(proposal["proposal_id"])
+                signatures.add(signature)
+                costs[proposal["proposal_id"]] = copy.deepcopy(trace["native_cost"])
+        records.append(trace)
+    count = len(accepted)
+    status = "complete" if 2 <= count <= 4 else "no_feasible_plan" if not count else "incomplete"
+    pool = {"round_id": round_id(observation), "input_observation_digest": digest(round_input(observation)),
+        "target_k": cfg.target_k, "proposals": accepted, "native_cost_by_id": costs,
+        "validation_records": records, "rejected": [row for row in records if row.get("status") == "rejected"],
+        "pool_status": status, "valid_count": count,
+        "shortfall_reason": None if count >= cfg.target_k else "independent_rejections_or_insufficient_distinct_tasks"}
+    pool["pool_digest"] = proposal_pool_digest(pool)
+    return pool
+
+
+def normalize_proposal_pool(raw: Any, observation: dict, *, existing: list[dict] | None = None) -> dict:
+    """Planner supplies competing tasks; it cannot rank or select its own work."""
+    from .schemas import ResearchProposalDraft
+    try:
+        draft = ResearchProposalDraft.model_validate(raw)
+    except ValidationError as exc:
+        return {"ok": False, "detail": "research_proposal_schema_invalid", "raw": copy.deepcopy(raw),
+            "valid_proposals": [], "validation_records": [{"status": "rejected", "error": str(exc)}]}
+    pool = freeze_proposal_pool([*copy.deepcopy(existing or []), *draft.proposals], observation)
+    ok = pool["pool_status"] == "complete"
+    return {"ok": ok, "detail": None if ok else "research_pool_" + pool["pool_status"],
+        "raw": copy.deepcopy(raw), "pool": pool, "valid_proposals": copy.deepcopy(pool["proposals"]),
+        "validation_records": copy.deepcopy(pool["validation_records"])}
+
+
+def normalize_critique(raw: Any, frozen_pool: dict, observation: dict) -> dict:
+    """Accept only a complete Critic ranking bound to the delivered pool.
+
+    Neither missing evaluations nor an invalid preferred alternative can cause
+    native substitution. The Critic must select its rank-one alternative and
+    provide the rationale for that exact selection.
+    """
+    from .schemas import ResearchPlanCritique
+
+    def rejected(detail, reason):
+        return {"ok": False, "detail": detail, "raw": copy.deepcopy(raw),
+            "valid_proposals": copy.deepcopy(frozen_pool.get("proposals") or []),
+            "selected_proposal": None,
+            "validation_records": [{"status": "rejected", "error": reason}]}
+
+    try:
+        if (frozen_pool["round_id"] != round_id(observation)
+                or frozen_pool["input_observation_digest"] != digest(round_input(observation))
+                or frozen_pool["pool_digest"] != proposal_pool_digest(frozen_pool)):
+            raise ValueError("frozen_proposal_pool_identity_mismatch")
+        current = freeze_proposal_pool(frozen_pool["proposals"], observation)
+        if (current["pool_status"] != "complete" or current["pool_digest"] != frozen_pool["pool_digest"]
+                or frozen_pool.get("pool_status") != "complete"
+                or frozen_pool.get("valid_count") != current["valid_count"]):
+            raise ValueError("frozen_proposal_pool_no_longer_valid")
+    except (KeyError, ValueError, TypeError) as exc:
+        return rejected("research_proposal_pool_identity_invalid", str(exc))
+    try:
+        critique = ResearchPlanCritique.model_validate(raw)
+    except ValidationError as exc:
+        return rejected("research_critique_schema_invalid", str(exc))
+    if critique.proposal_pool_digest != frozen_pool["pool_digest"]:
+        return rejected("research_critique_pool_digest_mismatch", "critic_must_compare_exact_frozen_pool")
+    proposals = copy.deepcopy(frozen_pool["proposals"])
+    by_id = {proposal["proposal_id"]: proposal for proposal in proposals}
+    evaluations = [ResearchPlanEvaluation.model_validate(row).model_dump() for row in critique.evaluations]
+    ids = [row["proposal_id"] for row in evaluations]
+    ranks = [row["rank"] for row in evaluations]
+    if len(ids) != len(by_id) or len(set(ids)) != len(ids) or set(ids) != set(by_id):
+        return rejected("research_critique_evaluation_coverage_invalid", "every_frozen_proposal_requires_one_evaluation")
+    if set(ranks) != set(range(1, len(by_id) + 1)) or len(set(ranks)) != len(ranks):
+        return rejected("research_critique_rank_invalid", "critic_ranks_must_be_unique_and_complete")
+    winner = next(row["proposal_id"] for row in evaluations if row["rank"] == 1)
+    if critique.selected_proposal_id != winner:
+        return rejected("research_critique_selection_invalid", "critic_selected_proposal_must_match_rank_one")
+    try:
+        _check_basis(critique.selected_basis_observation_ids, observation)
+    except ValueError as exc:
+        return rejected("research_critique_basis_invalid", str(exc))
+    cards = observation.get("experiment_observations") or []
+    if isinstance(cards, dict):
+        cards = [row.get("body") or row for row in cards.get("cards") or []]
+    observation_ids = [row["observation_id"] for row in cards if row.get("observation_id")]
+    terminal = observation.get("terminal_observation_id")
+    if terminal and terminal not in observation_ids:
+        observation_ids.append(terminal)
+    cfg = config(observation)
+    records = copy.deepcopy(frozen_pool["validation_records"])
+    record = {"round_id": frozen_pool["round_id"], "input_observation_ids": observation_ids,
+        "input_observation_digest": frozen_pool["input_observation_digest"], "target_k": cfg.target_k,
+        "proposals": proposals, "evaluations": evaluations, "selected_proposal_id": winner,
+        **pool_summary(proposals, evaluations, cfg), "shortfall_reason": frozen_pool["shortfall_reason"],
+        "selection_rationale": critique.selection_rationale, "selection_source": "independent_critic_selection",
+        "planning_mode": "propose_then_critic", "proposal_pool_digest": frozen_pool["pool_digest"],
+        "native_cost_by_id": copy.deepcopy(frozen_pool["native_cost_by_id"]),
+        "validation_records": records, "raw_digest": digest(raw)}
+    if "selected_basis_observation_ids" in critique.model_fields_set:
+        record["selected_basis_observation_ids"] = list(critique.selected_basis_observation_ids)
+    return {"ok": True, "detail": None, "raw": copy.deepcopy(raw), "round": record,
+        "valid_proposals": copy.deepcopy(proposals), "selected_proposal": copy.deepcopy(by_id[winner]),
+        "validation_records": records}

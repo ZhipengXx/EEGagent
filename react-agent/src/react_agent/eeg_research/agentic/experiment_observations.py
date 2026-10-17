@@ -423,6 +423,76 @@ def _native_facts(camp: Path, state: dict, plan: dict) -> tuple[dict, list]:
     return facts, sources
 
 
+def _current_review_failure(camp: Path, state: dict, plan: dict) -> tuple[dict, list[dict]]:
+    """Carry source-bound native blocking issues into terminal failure feedback."""
+    from .artifacts import file_digest
+    from .identity import result_matches
+    from .native_patch import _check_fingerprint
+    from .implementation_semantics import requirements_hash
+    from .plan_protocol import scientific_projection
+    from .context.types import digest
+    target = plan.get("candidate_id")
+    if not target or target == "baseline" or plan.get("current_step") not in {"implement", "repair", "check"}:
+        return {}, []
+    workspace = camp / "candidates" / str(target)
+    paths = {name: workspace / name for name in ("review.json", "checks.json", "spec.json", "attempt.json", "implementation.json")}
+    entry = workspace / "extension/eeg_candidate.py"
+    if not entry.is_file() or not all(path.is_file() for path in paths.values()):
+        return {}, []  # Legacy/environment failures need not have a review.
+    review, checks, spec, attempt, implementation = (_read(paths[name]) for name in paths)
+    source_hash, check_hash = file_digest(entry), file_digest(paths["checks.json"])
+    experiment = spec.get("experiment") or {}
+    if (not result_matches(review, candidate_id=str(target), attempt_id=attempt.get("attempt_id"),
+            phase="review_candidate", input_hash=source_hash)
+            or review.get("status") not in {"blocked", "needs_fix"}
+            or checks.get("source_sha256") != source_hash or checks.get("check_fingerprint") != _check_fingerprint(workspace, None)
+            or (checks.get("implementation_semantics") or {}).get("requirements_hash")
+                != requirements_hash(experiment.get("implementation_requirements") or [])
+            or implementation.get("attempt_id") != attempt.get("attempt_id") or implementation.get("input_hash") != source_hash
+            or experiment.get("spec_hash") != plan.get("spec_hash")
+            or experiment.get("spec_hash") != (state.get("experiment") or {}).get("spec_hash")
+            or digest(scientific_projection(experiment)) != plan.get("approved_scientific_digest")
+            or (plan.get("source_hash") and plan["source_hash"] != source_hash)):
+        return {"failure_feedback_status": "current_review_identity_mismatch"}, []
+    blocking = [copy.deepcopy(issue) for issue in review.get("issues") or []
+                if isinstance(issue, dict) and issue.get("severity") == "blocking"]
+    if not blocking:
+        return {}, []
+    identity = {"candidate_id": target, "attempt_id": attempt["attempt_id"], "source_hash": source_hash,
+        "spec_hash": experiment["spec_hash"], "check_sha256": check_hash,
+        "review_sha256": file_digest(paths["review.json"])}
+    # Retain only the original blocking rows behind a real bounded read; never
+    # copy unrelated model context or treat a failed review as measurement.
+    block = ContextSourceRegistry(camp).capture({"identity": identity, "blocking_issues": blocking},
+        block_id="selected-review-failure:" + plan["plan_id"], kind="checks", role="research_planner", identity=identity)
+    record = {"source_refs": [{"source_ref": block.source_ref, "source_hash": block.source_hash}]}
+    projected = []
+    for index, issue in enumerate(blocking[:4]):
+        pointer = "/blocking_issues/" + str(index)
+        row = {}
+        for key in ("requirement_id", "kind", "error_class", "stage", "detail", "expected"):
+            if key in issue:
+                value = issue[key]
+                row[key] = copy.deepcopy(value) if len(canonical(value)) <= 1200 else _feedback_handle(record, pointer + "/" + key)
+        actual = issue.get("actual") or {}
+        if isinstance(actual, dict):
+            if "status" in actual:
+                row["coverage_status"] = actual["status"]
+            if "detail" in actual:
+                value = actual["detail"]
+                row["coverage_detail"] = value if len(canonical(value)) <= 1200 else _feedback_handle(record, pointer + "/actual/detail", unit="chars", size=len(value))
+        row["source_hash"] = source_hash
+        row["original_issue"] = _feedback_handle(record, pointer)
+        projected.append(row)
+    sources = [{"path": str(path.resolve()), "sha256": file_digest(path), "kind": "implementation_failure_input"}
+               for path in [entry, *paths.values()]]
+    sources.append({"source_ref": block.source_ref, "source_hash": block.source_hash, "kind": "blocking_review_issues"})
+    return {"failure_stage": "review_candidate", "verified_failure_source": identity,
+        "blocking_issues": projected, "blocking_issue_count": len(blocking),
+        "omitted_blocking_issue_count": max(0, len(blocking) - len(projected)),
+        "blocking_issues_read_ref": _feedback_handle(record, "/blocking_issues", unit="items", size=len(blocking))}, sources
+
+
 def record_experiment_observation(camp: Path, state: dict, plan: dict, execution_status: str,
                                   analysis_ref: str | None = None) -> dict:
     camp = Path(camp)
@@ -460,6 +530,9 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
                 if key in explanation and len(canonical(explanation[key])) > 1200]}
         sources.append({"artifact_id": analysis_ref, "sha256": row["sha256"], "kind": row["kind"]})
     if engineering:
+        feedback, failure_sources = _current_review_failure(camp, state, plan)
+        failure.update(feedback)
+        sources.extend(failure_sources)
         failure.setdefault("error", plan.get("error") or plan.get("block_reason") or "implementation_failed")
         failure.setdefault("error_fingerprint", content_hash({"error": failure["error"], "source_hash": plan.get("source_hash"), "spec_hash": plan.get("spec_hash")}))
         failure.setdefault("repairs_used", plan.get("repair_count", 0))
@@ -603,9 +676,9 @@ def minimum_observation_card(record: dict, *, current: bool = False, context: di
 
 
 def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
-                        context: dict | None = None) -> dict:
+                        context: dict | None = None, retrieval_out: dict | None = None) -> dict:
     """Current terminal feedback is mandatory; optional history uses remaining space."""
-    from .semantic_memory import retrieve
+    from .semantic_memory import retrieve, embedding_health
     from .context.retrieval import prepare_query
     store = ExperimentObservationStore(camp)
     records = store.records(context=context)
@@ -617,13 +690,38 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
     choices = current + records[:min(max(recent, 0), 2)]
     config = memory_config(camp)
     backend = "recent_only"
+    health = {"backend": "recent_only", "degraded": False, "reason": "similarity_not_requested" if config.enabled else "disabled",
+              "model": config.model_id, "revision": config.model_revision, "fingerprint": None,
+              "query": question, "query_status": "not_encoded", "indexing": {"status": "not_requested"}}
     if config.enabled and relevant > 0:
         query = prepare_query(question=question, identities=[(context or {}).get("candidate_id")])["text"]
         bundle = retrieve(camp, query, config=config, role="research_planner", context=context)
+        health = embedding_health(bundle)
+        if bundle.get("degraded") and single_plan_enabled(camp):
+            raise ObservationDeliveryRequired(NeedsContext(({
+                "status": "embedding_retrieval_unavailable", "embedding_health": health,
+                "required_action": "Restore the frozen embedding backend and resume the same campaign."},), (),
+                "embedding_retrieval_unavailable", {}, {"paid_maintenance_calls": 0}))
+        if retrieval_out is not None:
+            # Current/recent observations and related priors have independent
+            # top-k allocations; five recent experiment hits cannot crowd every
+            # useful older lesson out of the Planner's knowledge channel.
+            knowledge = retrieve(camp, query, config=config, role="research_planner", context=context,
+                                 record_types=frozenset({"lesson", "knowledge"}))
+            if knowledge.get("degraded"):
+                raise ObservationDeliveryRequired(NeedsContext(({
+                    "status": "embedding_retrieval_unavailable", "embedding_health": embedding_health(knowledge)},), (),
+                    "embedding_retrieval_unavailable", {}, {"paid_maintenance_calls": 0}))
+            retrieval_out.update(knowledge)
+            health["knowledge_indexing"] = knowledge.get("indexing")
+            health["knowledge_candidate_count"] = knowledge.get("candidate_count")
+            health["knowledge_query_status"] = knowledge.get("query_status")
+            health["knowledge_query_sha256"] = knowledge.get("query_sha256")
         backend = bundle.get("backend", backend)
         choices += [item for item in bundle.get("items", []) if item["record_type"] == "experiment_observation"][:min(relevant, 5)]
     result = {"status": "ready", "cards": [], "budget_chars": char_cap, "budget_tokens": token_cap,
         "backend": backend, "max_recent": min(max(recent, 0), 2), "max_relevant": min(max(relevant, 0), 5),
+        "retrieval_health": health,
         "full_records_readable": True, "current_observation_id": current[0]["record_id"] if current else None,
         "omitted_history_count": 0, "delivered_chars": 0}
     def fits(candidate):
@@ -718,18 +816,39 @@ def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap
                          context: dict | None = None) -> dict:
     if not single_plan_enabled(camp):
         return copy.deepcopy(fullobs)
+    from .semantic_memory import planner_query, planner_knowledge_delivery
+    conditions = {**planner_applicability_context(camp, fullobs), **(context or {})}
+    question = planner_query(camp, fullobs)
+    def attach_retrieval(result):
+        bundle = {}
+        recalled = recall_observations(camp, question, context=conditions,
+            char_cap=char_cap, token_cap=token_cap, retrieval_out=bundle)
+        result["memory_retrieval_health"] = recalled.pop("retrieval_health")
+        result["experiment_observations"] = recalled
+        if bundle:
+            result["retrieved_knowledge"] = planner_knowledge_delivery(camp, bundle, context=conditions)
+        else:
+            result["retrieved_knowledge"] = {"status": "disabled", "items": [],
+                "scientific_evidence": False, "execution_authority": False}
+        navigation = [row for row in result.get("history_navigation") or []
+                      if not str(row.get("field", "")).startswith("retrieved_knowledge/")]
+        for card in result["retrieved_knowledge"]["items"]:
+            original = card["full_record"]
+            navigation.append({"field": "retrieved_knowledge/" + card["record_id"],
+                "$context_source": original["$context_source"], "source_hash": original["source_hash"],
+                "fidelity": "REF_ONLY", "read_capability": "registered_bounded_delivery_read",
+                "satisfies_development_read_receipt": False})
+        result["history_navigation"] = navigation
+        return result
     if fullobs.get("context_delivery_version") == "observation_card_first.v1":
         # Recheck the actual request's budget without recapturing projections
         # as new authoritative heads for their original history sources.
         result = copy.deepcopy(fullobs)
-        goal = fullobs.get("goal") or _read(Path(camp) / "goal.json")
-        question = str(fullobs.get("current_question") or goal.get("objective") or "")
-        result["experiment_observations"] = recall_observations(camp, question,
-            context={**planner_applicability_context(camp, fullobs), **(context or {})},
-            char_cap=char_cap, token_cap=token_cap)
-        return result
+        return attach_retrieval(result)
     registry = ContextSourceRegistry(camp)
     result, navigation = {}, []
+    from .design_contract import design_contract_version
+    design_v2 = design_contract_version(camp) == "v2"
     def register(key, value):
         block = registry.capture(value, block_id="planner-history:" + key, kind="scientific" if key in {"evidence", "method_screenings", "method_suites"} else "analysis", role="research_planner")
         navigation.append({"field": key, "$context_source": block.source_ref, "source_hash": block.source_hash,
@@ -737,6 +856,13 @@ def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap
     for key, value in fullobs.items():
         if key in HISTORY_FIELDS:
             register(key, value)
+            if (design_v2 and key in {"parent_source", "control_source"}
+                    and isinstance(value, dict) and value.get("candidate_id") == "baseline"
+                    and "baseline_source" not in result):
+                # A new scientific proposal needs the actual baseline method.
+                # Parent/control are often identical; carry its wrapper and
+                # encoder excerpt once to both staged planning roles.
+                result["baseline_source"] = copy.deepcopy(value)
         elif key in {"candidate_admissions", "inherited_candidate_admissions"}:
             result[key], projection = _admission_view(value)
             if projection:
@@ -758,11 +884,7 @@ def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap
                     result[key][field] = copy.deepcopy(item)
         else:
             result[key] = copy.deepcopy(value)
-    goal = fullobs.get("goal") or _read(Path(camp) / "goal.json")
-    question = str(fullobs.get("current_question") or goal.get("objective") or "")
-    result["experiment_observations"] = recall_observations(camp, question,
-        context={**planner_applicability_context(camp, fullobs), **(context or {})},
-        char_cap=char_cap, token_cap=token_cap)
     result["history_navigation"] = navigation
+    attach_retrieval(result)
     result["context_delivery_version"] = "observation_card_first.v1"
     return result

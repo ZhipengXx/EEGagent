@@ -26,6 +26,20 @@
     "research_planner": {
       "model": "deepseek-flash",
       "max_tokens": 16384
+    },
+    "candidate_coder": {
+      "model": "deepseek-flash",
+      "thinking": true,
+      "reasoning_effort": "high",
+      "max_tokens": 262144,
+      "timeout_s": 2400
+    },
+    "candidate_reviewer": {
+      "model": "deepseek-flash",
+      "thinking": true,
+      "reasoning_effort": "high",
+      "max_tokens": 262144,
+      "timeout_s": 2400
     }
   },
   "benchmark_feedback_enabled": true,

@@ -22,8 +22,33 @@ def _spec(dataset_or_path: str) -> dict[str, object]:
     return geometry(dataset_or_path)
 
 
+def bound_implementation_requirements(requirements: list[dict], binding: dict,
+                                      *, source_sha256: str, spec_hash: str | None) -> list[dict]:
+    """Bind code locations using only stdlib in the training interpreter."""
+    import copy
+    derived = copy.deepcopy(requirements)
+    if binding.get("source_sha256") != source_sha256 or binding.get("approved_spec_hash") != spec_hash:
+        return derived
+    rows = binding.get("requirements") or {}
+    for requirement in derived:
+        row = rows.get(requirement.get("requirement_id")) or {}
+        if row.get("source_refs"):
+            requirement["code_locations"] = list(row["source_refs"])
+        probe = row.get("probe") or {}
+        if probe:
+            declared = requirement.get("probe") or {}
+            for key, value in probe.items():
+                if key not in {"input_module_path", "representation_module_path"}:
+                    if declared.get(key) != value:
+                        raise ValueError("implementation_map_cannot_change_probe_semantics:" + key)
+                elif declared.get(key) and declared[key] != value:
+                    raise ValueError("implementation_map_cannot_change_declared_probe_location:" + key)
+            requirement["probe"] = {**declared, **probe}
+    return derived
+
+
 def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_config: dict | None = None,
-        implementation_requirements: list[dict] | None = None) -> dict[str, object]:
+        implementation_requirements: list[dict] | None = None, allow_unbound_probes: bool = False) -> dict[str, object]:
     import torch
 
     context = context if context is not None else {}
@@ -179,8 +204,20 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_
         second = rebuilt(batch)
     round_trip = bool(torch.allclose(first, second))
     context["stage"] = "declared_implementation_semantics"
-    from react_agent.eeg_research.agentic.implementation_semantics import probe_requirements
-    implementation_semantics = probe_requirements(encoder, geom, implementation_requirements or [])
+    from react_agent.eeg_research.agentic.implementation_semantics import probe_requirements, requirements_hash
+    requirements = implementation_requirements or []
+    pending = [row for row in requirements if allow_unbound_probes and row.get("binding_stage") == "design"
+               and row.get("verification") == "ordered_window_slots"
+               and not all(((row.get("probe") or {}).get("input_module_path"),
+                            (row.get("probe") or {}).get("representation_module_path")))]
+    pending_ids = {row["requirement_id"] for row in pending}
+    implementation_semantics = probe_requirements(encoder, geom, [row for row in requirements if row["requirement_id"] not in pending_ids])
+    if pending:
+        implementation_semantics["requirements_hash"] = requirements_hash(requirements)
+        implementation_semantics["requirements"].extend({
+            "requirement_id": row["requirement_id"], "kind": row.get("kind", "implementation"), "core": row.get("core", True),
+            "verification": row["verification"], "status": "binding_pending",
+            "detail": "Coder must bind the actual modules before final preflight."} for row in pending)
     loaded = str(Path(inspect.getfile(type(candidate))).resolve())
     failures = []
     if not finite:
@@ -228,6 +265,7 @@ def run(dataset: str = "eeg", *, context: dict[str, object] | None = None, hook_
         "torch": torch.__version__,
         "stage": "complete",
         "approved_hook_config": config,
+        "probe_bindings_pending": sorted(pending_ids),
         "training_objective_finite": objective_finite,
         "duplicate_image_objective_finite": duplicate_objective_finite,
         "objective_ablation_probe": ablation_probe,
@@ -247,9 +285,24 @@ def main() -> int:
     try:
         assigned = json.loads(Path(sys.argv[2]).read_text()) if len(sys.argv) > 2 else {}
         hook_config = assigned.get("experiment") or assigned
+        requirements = hook_config.get("implementation_requirements") or []
+        bound_requirements = requirements
+        extra = sys.argv[3:]
+        mapping_path = next((arg for arg in extra if not arg.startswith("--")), None)
+        design_v2 = hook_config.get("design_contract_version") == "v2"
+        if mapping_path and design_v2:
+            from react_agent.eeg_research.agentic.binding import file_sha256
+            bound_requirements = bound_implementation_requirements(
+                requirements, json.loads(Path(mapping_path).read_text()),
+                source_sha256=file_sha256(Path.cwd() / "eeg_candidate.py"), spec_hash=hook_config.get("spec_hash"))
         payload = run(sys.argv[1] if len(sys.argv) > 1 else "eeg", context=context,
                       hook_config={key: hook_config.get(key) or {} for key in ("model", "objective", "transform")},
-                      implementation_requirements=hook_config.get("implementation_requirements") or [])
+                      implementation_requirements=bound_requirements,
+                      allow_unbound_probes=design_v2 and "--allow-unbound-probes" in extra)
+        if bound_requirements != requirements:
+            from react_agent.eeg_research.agentic.implementation_semantics import requirements_hash
+            payload["implementation_semantics"]["binding_hash"] = requirements_hash(bound_requirements)
+            payload["implementation_semantics"]["requirements_hash"] = requirements_hash(requirements)
     except Exception as exc:  # noqa: BLE001
         payload = {**context, "ok": False, "error": type(exc).__name__, "detail": traceback.format_exc()[-1500:]}
         if isinstance(exc, SyntaxError):

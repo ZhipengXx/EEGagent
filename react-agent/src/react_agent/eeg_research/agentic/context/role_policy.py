@@ -46,6 +46,7 @@ FACT_FIELDS = frozenset({"evidence", "method_screenings", "method_suites", "meth
 
 MISSIONS = {
     "research_planner": "Choose only current legal actions using active frontier identities, costs, scope and comparisons.",
+    "research_critic": "Compare the complete native feasible proposal pool against observation cards and conditional memory; select one task before implementation.",
     "candidate_coder": "Modify the actual requested interface using applicable source regions and exact failure evidence.",
     "candidate_reviewer": "Review implementation, native checks, applicable scope and actual read obligations.",
     "result_analyst": "Explain exact evaluated results and limitations without upgrading coverage or execution state.",
@@ -64,6 +65,7 @@ SHARED_REQUIRED = frozenset({"goal", "contract", "budget", "permissions", "resou
     "screening_evidence_scope", "full_required_fold_count", "benchmark_permission", "selected_research_task", "origin_plan_id"})
 ROLE_REQUIRED = {
     "research_planner": CONTROL_FIELDS | frozenset({"evidence", "method_screenings", "method_suites", "latest_comparison", "checks", "research_progress", "controller_state"}),
+    "research_critic": CONTROL_FIELDS | frozenset({"experiment_observations", "history_navigation", "context_delivery_version", "proposal_pool", "proposal_pool_digest", "retrieved_knowledge", "retrieved_memory", "native_cost_by_id"}),
     "candidate_coder": frozenset({"candidate_interface", "implementation_source", "source", "code", "approved_spec", "experiment", "repair_task", "checks", "candidate_checks", "implementation_lifecycle"}),
     "candidate_reviewer": frozenset({"candidate_interface", "implementation_source", "approved_spec", "experiment", "checks", "candidate_checks", "development_metrics", "evidence"}),
     "result_analyst": frozenset({"evidence", "run", "method_suite", "method_screenings", "method_suites", "metrics", "diagnostics", "verified_training_diagnostics", "comparison", "latest_comparison", "scores", "results"}),
@@ -77,12 +79,12 @@ ROLE_REQUIRED = {
 }
 
 
-def role_policy(role: str, *, execution_version: str | None = None) -> RolePolicy:
+def role_policy(role: str, *, execution_version: str | None = None, planning_mode: str | None = None) -> RolePolicy:
     if role not in MISSIONS:
         raise KeyError("policy_missing:" + role)
     full = frozenset({"implementation_source", "code", "source"}) if role == "candidate_coder" else frozenset()
     required = SHARED_REQUIRED | ROLE_REQUIRED[role]
-    if execution_version == "single_plan_v1" and role == "research_planner":
+    if execution_version == "single_plan_v1" and role in {"research_planner", "research_critic"}:
         from ..experiment_observations import HISTORY_FIELDS
         # Present current facts via exact native cards; full historical trees
         # remain registered/readable rather than compulsory literal payloads.
@@ -90,6 +92,8 @@ def role_policy(role: str, *, execution_version: str | None = None) -> RolePolic
     mission = MISSIONS[role]
     if execution_version == "single_plan_v1" and role == "research_planner":
         mission = "Compare 2–4 bounded research tasks against current observation cards, costs and permissions; select one task to feedback."
+        if planning_mode == "propose_then_critic":
+            mission = "Propose 2–4 competing research tasks from current observation cards and conditional memory; leave comparison and selection to the independent Critic."
     return RolePolicy(role, mission, required, full,
         version=POLICY_VERSION + (".single_plan_v1" if execution_version == "single_plan_v1" else ""))
 

@@ -60,8 +60,9 @@ from failure_source or read_code, with the current hash. For multiple line edits
 work from the bottom upwards to preserve earlier line numbers. The replacement
 contains only Python source, without the displayed line-number prefixes.
 read_code takes path and optional 1-based inclusive integer start/end. If a
-source page is truncated, continue at its supplied next_range; do not reread
-the same delivered range. Request only information needed for the exact task.
+source page is truncated, continue at its supplied next_range. Prefer the
+same-revision pages and edit feedback in the current request; read relevant
+ranges when source is missing, has changed, or dependencies need inspection.
 requires_framework_extension reports an actual missing capability outside the
 declared interface, not permission to define a custom torch.nn.Module.
 
@@ -78,7 +79,8 @@ EFFICIENT IMPLEMENTATION AND REPAIR
    For syntax errors, repair the actual line in failure_source, not a similarly
    worded comment elsewhere. Prefer a line edit when exact old-string copying
    is uncertain; never add corrected characters to an old-match string.
-   Read an additional range only if the needed source is explicitly truncated.
+   Read additional relevant source when needed to establish the cause or inspect
+   a dependency that the current request does not cover.
    Do not submit an unchanged file or repeat a failed check without a code repair.
 4. When the check passes, self-review the source against ALL task requirements,
    including optional hooks actually requested. If covered, call finish_patch

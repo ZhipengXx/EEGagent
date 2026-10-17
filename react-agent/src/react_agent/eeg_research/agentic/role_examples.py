@@ -568,6 +568,7 @@ def add_role_examples(
     *,
     max_chars: int = EXAMPLE_CHARS,
     execution_version: str | None = None,
+    design_contract_version: str = "v1",
     max_count: int | None = None,
 ) -> dict[str, Any]:
     """Add complete deterministic examples within an independent field budget."""
@@ -578,6 +579,12 @@ def add_role_examples(
         "candidate_reviewer": _reviewer,
         "result_analyst": _analyst,
     }
+    if design_contract_version == "v2":
+        if role == "experiment_designer":
+            selectors[role] = _designer_brief
+        elif role in {"candidate_coder", "candidate_reviewer"} or role == "result_analyst" and payload.get("review_stage") == "analysis":
+            # The current tools, caller and diagnostics replace unrelated toy patches.
+            return payload
     if (
         role == "memory_curator"
         and memory is not None
@@ -610,3 +617,25 @@ def add_role_examples(
         if len(field["examples"]) == max_count:
             break
     return {**payload, "illustrative_examples": field} if field["examples"] else payload
+
+
+def _designer_brief(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [_example("inherit_parent_hooks",
+        {"selected_intervention": "Train-only EEG offset", "parent_hook_config": {
+            "model": {}, "objective": {}, "transform": {}}},
+        {"training_protocol": "Supplied by the runtime"},
+        {"status": "completed", "design_brief": {
+            "schema_version": "eeg_research.design_brief.v2",
+            "hypothesis": "A train-only offset may improve robustness; evaluate against the matched parent.",
+            "principal_intervention": "Add an EEG offset during training only.",
+            "hook_changes": {"model": {"mode": "inherit"}, "objective": {"mode": "inherit"},
+                "transform": {"mode": "replace", "config": {"offset": 0.125}}},
+            "implementation_requirements": [{"requirement_id": "train_only_offset", "scope": "scientific",
+                "expected_behavior": "Apply the configured offset to training EEG; leave evaluation EEG unchanged.",
+                "verification": "source_review"}],
+            "measurement_requirements": [{"requirement_id": "paired_receipts", "verification": "paired_coverage",
+                "expected_behavior": "Complete the frozen matched measurement coverage."}],
+            "analysis_requirements": [{"requirement_id": "interpret_offset", "verification": "hypothesis_assessment",
+                "expected_behavior": "Interpret whether the measured result supports the offset hypothesis."}]},
+            "summary_zh": "实现、测量、解释分别验收；仅修改训练变换，继承父候选模型和损失。"},
+        "Coder binds source, native Measurement verifies receipts, Analyst interprets measured evidence. Runtime materializes inherited configs.")]
