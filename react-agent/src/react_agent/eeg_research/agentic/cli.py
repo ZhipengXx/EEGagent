@@ -30,9 +30,9 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m react_agent.eeg_research.agentic.cli")
     parser.add_argument(
         "command",
-        choices=["create", "start", "run", "status", "pause", "resume", "stop", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents", "validate-goal", "evaluate-export", "evaluate-pack",
+        choices=["create", "start", "run", "status", "pause", "resume", "stop", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "retry-coder", "authorize-gpu-sharing", "recover-api-intents", "validate-goal", "evaluate-export", "evaluate-pack",
                  "study-create", "study-status", "study-run", "study-freeze", "study-evaluate", "study-aggregate",
-                 "suite-retry-fold", "role-config-preview", "screening-dry-run", "dispose-unknown-intent", "detach-candidate", "historical-runtime-preview", "authorize-research-recovery"],
+                 "suite-retry-fold", "role-config-preview", "configure-roles", "screening-dry-run", "dispose-unknown-intent", "detach-candidate", "cancel-selected-plan", "historical-runtime-preview", "authorize-research-recovery"],
     )
     parser.add_argument("--campaign", default="eeg_retrieval_research_v1")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
@@ -77,8 +77,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--suite", default=None, help="Frozen method suite ID for an engineering retry")
     parser.add_argument("--fold", default=None, help="Fold ID for an engineering retry")
     parser.add_argument("--candidate", default=None, help="Existing checked candidate for review revalidation")
+    parser.add_argument("--plan-id", default=None, help="Exact selected plan for an explicit pre-measurement cancellation")
     parser.add_argument("--role-override", action="append", default=[], metavar="ROLE.FIELD=VALUE",
-                        help="Explicit new-campaign role settings; preview shows resolved request configuration")
+                        help="Explicit role settings for create/configure-roles; preview shows resolved request configuration")
     parser.add_argument("--call-id", default=None, help="Unknown API intent for explicit response abandonment")
     parser.add_argument("--runtime-checkout", type=Path, help="Pinned historical Git repository checkout; read-only compatibility preview")
     parser.add_argument("--original-project-root", type=Path, default=Path(__file__).resolve().parents[5],
@@ -129,12 +130,22 @@ def goal(campaign: str, design=None) -> dict:
     return {
         "goal_id": campaign,
         "planner_mode": "compare_options",
-        "research_execution": {"version": "single_plan_v1", "budget": {"envelopes": {
+        "research_execution": {"version": "single_plan_v1", "planning_mode": "propose_then_critic",
+            "implementation_review_mode": "single_pass", "design_contract_version": "v2", "budget": {"envelopes": {
             kind: {"training_jobs": 2, "gpu_seconds": 2 * gpu / 20,
                 "allocation_basis": "authorized_global_gpu_seconds_per_training_job",
                 "authority": "maximum_runtime_allocation_not_cost_estimate"}
             for kind in ("new_method", "validation", "confirmation")}}},
         "objective": "改进指定数据与协议下的 EEG 到图像检索",
+        "role_models": {
+            "research_planner": {"model": "deepseek-v4-pro", "thinking": True,
+                "reasoning_effort": "high", "max_tokens": 32768, "timeout_s": 240},
+            "research_critic": {"model": "deepseek-v4-pro", "thinking": True,
+                "reasoning_effort": "high", "max_tokens": 16384, "timeout_s": 240},
+            "candidate_coder": {"model": "deepseek-flash", "thinking": True,
+                "reasoning_effort": "high", "max_tokens": 262144, "timeout_s": 2400},
+            "candidate_reviewer": {"model": "deepseek-flash", "thinking": True,
+                "reasoning_effort": "high", "max_tokens": 262144, "timeout_s": 2400}},
         "task_type": "eeg_image_retrieval",
         "research_scope": scope,
         "primary_metric": "validation.fixed_gallery_top1",
@@ -338,7 +349,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(json.dumps({"error": str(exc)}))
         return 2
-    if overrides and args.command not in {"create", "role-config-preview", "screening-dry-run"}:
+    if overrides and args.command == "revalidate-review":
+        from .review_revalidation import validate_override
+        try:
+            validate_override(overrides)
+        except ValueError as exc:
+            print(json.dumps({"error": str(exc)}))
+            return 2
+    elif overrides and args.command not in {"create", "configure-roles", "role-config-preview", "screening-dry-run"}:
         print(json.dumps({"error": "role_overrides_require_new_campaign_or_preview"}))
         return 2
     if args.execution_version is not None and args.command != "create":
@@ -650,7 +668,7 @@ def main(argv: list[str] | None = None) -> int:
         if error:
             print(json.dumps({"error": error}))
             return 2
-    if args.command in {"start", "resume", "run", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "authorize-gpu-sharing", "recover-api-intents", "authorize-research-recovery"}:
+    if args.command in {"start", "resume", "run", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "retry-coder", "configure-roles", "authorize-gpu-sharing", "recover-api-intents", "authorize-research-recovery", "cancel-selected-plan"}:
         from react_agent.eeg_research.agentic.budget_inheritance import delegated_successor
         successor = delegated_successor(camp)
         if successor:
@@ -688,6 +706,35 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "research_recovery_authorized", "authorization": receipt}, ensure_ascii=False))
         return 0
     state = load_state(camp)
+    if args.command == "cancel-selected-plan":
+        import fcntl
+        from .selected_plan_control import cancel_selected_plan
+        try:
+            if not args.plan_id or not args.retry_reason.strip():
+                raise ValueError("selected_plan_cancellation_requires_plan_id_and_reason")
+            with (camp / "worker.lock").open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = cancel_selected_plan(camp, load_state(camp), args.retry_reason,
+                                              expected_plan_id=args.plan_id)
+            print(json.dumps({"status": result.get("status"), "selected_plan": result.get("selected_plan"),
+                              "next_stage": "planner"}, ensure_ascii=False))
+            return 0
+        except (OSError, ValueError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
+    if args.command == "configure-roles":
+        import fcntl
+        from .role_configuration import apply_role_configuration
+        try:
+            with (camp / "worker.lock").open("a") as handle:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = apply_role_configuration(camp, load_state(camp), overrides,
+                    reason=args.retry_reason)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        except (OSError, ValueError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
     if args.command == "detach-candidate":
         from react_agent.eeg_research.agentic.candidate_lifecycle import detach_failed_candidate, enabled
         import fcntl
@@ -753,7 +800,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "recovered", "llm_calls": cost["llm_calls"],
                           "unknown_outcome_call_ids": cost["api_abandoned_call_ids"]}))
         return 0
-    if args.command in {"prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design"}:
+    if args.command in {"prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "retry-coder"}:
         import fcntl
         from react_agent.eeg_research.agentic.worker import build_services
         from react_agent.eeg_research.agentic.llm import LlmUnavailable
@@ -761,8 +808,9 @@ def main(argv: list[str] | None = None) -> int:
         from react_agent.eeg_research.agentic.verification_cache import verification_scope
         revalidate = args.command == "revalidate-feedback"
         retry_design = args.command == "retry-design"
+        retry_coder = args.command == "retry-coder"
         revalidate_review = args.command == "revalidate-review"
-        if (revalidate or retry_design or revalidate_review) and not args.retry_reason.strip():
+        if (revalidate or retry_design or retry_coder or revalidate_review) and not args.retry_reason.strip():
             print(json.dumps({"error": "feedback_revalidation_reason_required"}))
             return 2
         with (camp / "worker.lock").open("a") as handle:
@@ -775,8 +823,10 @@ def main(argv: list[str] | None = None) -> int:
                 state = load_state(camp)
                 with verification_scope():
                     validate_inheritance(camp)
-                    services = build_services(camp)
-                    if retry_design:
+                    services = build_services(camp, role_overrides=overrides) if overrides else build_services(camp)
+                    if retry_coder:
+                        result = services["retry_coder"](camp, state, reason=args.retry_reason)
+                    elif retry_design:
                         result = services["retry_design"](camp, state, reason=args.retry_reason)
                     elif revalidate_review:
                         result = services["revalidate_review"](camp, state,
@@ -785,10 +835,10 @@ def main(argv: list[str] | None = None) -> int:
                         result = (services["revalidate_feedback"](camp, state, reason=args.retry_reason)
                                   if revalidate else services["prepare_handoff"](camp, state))
                 save_state(camp, state)
-                event(camp, "review_revalidated" if revalidate_review else "designer_retried" if retry_design else "feedback_revalidated" if revalidate else "handoff_prepared", **result)
+                event(camp, "coder_retried" if retry_coder else "review_revalidated" if revalidate_review else "designer_retried" if retry_design else "feedback_revalidated" if revalidate else "handoff_prepared", **result)
             except (LlmUnavailable, OSError, ValueError, KeyError) as exc:
                 save_state(camp, state)
-                event(camp, "review_revalidation_failed" if revalidate_review else "designer_retry_failed" if retry_design else "feedback_revalidation_failed" if revalidate else "handoff_preparation_failed", detail=str(exc))
+                event(camp, "coder_retry_failed" if retry_coder else "review_revalidation_failed" if revalidate_review else "designer_retry_failed" if retry_design else "feedback_revalidation_failed" if revalidate else "handoff_preparation_failed", detail=str(exc))
                 print(json.dumps({"error": str(exc)}, ensure_ascii=False))
                 return 2
         print(json.dumps(result, ensure_ascii=False))

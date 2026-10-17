@@ -290,10 +290,22 @@ class DeepSeekBackend:
             # outcome is unknown. Only known pre-send local errors are uncharged.
             from openai import _base_client
             http_module = getattr(_base_client, "httpx", None) or _base_client.httpx2
+            # SDK versions may propagate the hook error itself or wrap it in
+            # multiple transport exceptions. Only this native marker proves a
+            # refusal before HTTP; unrelated causes retain their normal cost.
+            native_refusal = None
+            current, seen = exc, set()
+            while current is not None and id(current) not in seen:
+                seen.add(id(current))
+                if isinstance(current, DeepSeekBudgetBoundaryError):
+                    native_refusal = current
+                    break
+                current = current.__cause__
+            if native_refusal is not None and native_refusal.definitely_not_sent:
+                raise native_refusal
             cause = exc.__cause__ or exc
-            if isinstance(cause, DeepSeekBudgetBoundaryError) and cause.definitely_not_sent:
-                raise cause
-            not_sent = isinstance(cause, (http_module.ConnectError, http_module.ConnectTimeout, http_module.PoolTimeout))
+            not_sent = native_refusal is None and isinstance(cause,
+                (http_module.ConnectError, http_module.ConnectTimeout, http_module.PoolTimeout))
             unconfirmed = status is None and not not_sent
             kind = "timeout" if isinstance(exc, (TimeoutError, asyncio.TimeoutError)) else "cancelled" if isinstance(exc, asyncio.CancelledError) else "authentication_error" if status in {401, 403} else "rate_limited" if status == 429 else "provider_error" if status and status >= 500 else "transport_error"
             usage = LMUsage(
@@ -336,7 +348,7 @@ class DeepSeekBackend:
             failure = "output_truncated" if reason == "length" else "non_stop_finish_reason" if reason != "stop" else "unexpected_tool_calls" if getattr(choice.message, "tool_calls", None) else "missing_final_content" if not content.strip() else None
             if failure:
                 usage.success, usage.status, usage.failure_kind, usage.error = False, "failed", failure, failure
-                raise DeepSeekOutputError(raw_excerpt(content), usage)
+                raise DeepSeekOutputError(content, usage)
         return content, usage
 
     def enable_context_protocol(self) -> None:

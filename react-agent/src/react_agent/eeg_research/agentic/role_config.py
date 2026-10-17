@@ -10,9 +10,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 ROLES = ("research_planner", "experiment_designer", "candidate_coder", "candidate_reviewer",
-         "result_analyst", "result_auditor", "research_librarian", "memory_curator")
+         "result_analyst", "result_auditor", "research_librarian", "memory_curator", "research_critic")
 FIELDS = ("model", "thinking", "reasoning_effort", "max_tokens", "timeout_s")
-ALIASES = dict(zip(("planner", "designer", "coder", "reviewer", "analyst", "auditor", "librarian", "curator"), ROLES))
+ALIASES = dict(zip(("planner", "designer", "coder", "reviewer", "analyst", "auditor", "librarian", "curator", "critic"), ROLES))
 
 
 class RoleModelConfig(BaseModel):
@@ -20,7 +20,9 @@ class RoleModelConfig(BaseModel):
     model: str = Field(min_length=1)
     thinking: bool
     reasoning_effort: Literal["low", "high", "max"] | None = None
-    max_tokens: int = Field(gt=0, le=131072)
+    # Configuration accepts the provider's largest documented output size;
+    # actual model/context compatibility is resolved before each request.
+    max_tokens: int = Field(gt=0, le=393216)
     timeout_s: float = Field(gt=0, le=3600)
 
     @model_validator(mode="after")
@@ -52,10 +54,16 @@ class ResolvedRoleConfig(RoleModelConfig):
 def defaults(role: str) -> dict:
     if role not in ROLES:
         raise ValueError("unknown_research_role:" + role)
+    if role == "research_critic":
+        return {"model": "deepseek-v4-pro", "thinking": True, "reasoning_effort": "high",
+                "max_tokens": 16384, "timeout_s": 240}
+    if role in {"candidate_coder", "candidate_reviewer"}:
+        return {"model": "deepseek-flash", "thinking": True, "reasoning_effort": "high",
+                "max_tokens": 262144, "timeout_s": 2400}
     return {"model": "deepseek-flash", "thinking": role != "research_librarian",
             "reasoning_effort": None if role == "research_librarian" else "low" if role == "memory_curator" else "high",
-            "max_tokens": 32768 if role == "candidate_coder" else 4096 if role == "research_librarian" else 8192 if role == "memory_curator" else 16384,
-            "timeout_s": 240 if role == "candidate_coder" else 120 if role == "research_librarian" else 180}
+            "max_tokens": 4096 if role == "research_librarian" else 8192 if role == "memory_curator" else 16384,
+            "timeout_s": 120 if role == "research_librarian" else 180}
 
 
 def _parse_env(field: str, value: str):
@@ -87,6 +95,10 @@ def resolve_role_config(camp: Path | dict | None, role: str, overrides: dict | N
         goal = json.loads(path.read_text()) if path.is_file() else {}
         path = camp / "role_config_overrides.json"
         cli = json.loads(path.read_text()) if path.is_file() else {}
+    if role == "research_planner" and (goal.get("research_execution") or {}).get("planning_mode") == "propose_then_critic":
+        value.update(model="deepseek-v4-pro", thinking=True, reasoning_effort="high",
+                     max_tokens=32768, timeout_s=240)
+        sources.update({name: "staged_planner_default" for name in FIELDS})
     def merge(data, label):
         if not isinstance(data, dict) or set(data).difference(FIELDS):
             raise ValueError("invalid_role_config_fields")

@@ -137,29 +137,78 @@ def save(workspace: Path, state: dict) -> None:
 
 
 def initialize(workspace: Path, config: CodingRecoveryConfig, *, max_steps: int,
-               max_repairs: int, restored: dict) -> dict:
+               max_repairs: int, restored: dict, operation_binding: dict | None = None,
+               resume_repair: bool = False) -> dict:
     state = load(workspace)
+    binding = dict(operation_binding or {})
     if state:
         if state.get("candidate_id") != workspace.name:
             raise ValueError("coding_recovery_candidate_identity_changed")
         state["steps_used"] = max(state["steps_used"], int(restored.get("next_step", 1)) - 1)
-        for check in _logged_checks(workspace):
-            observe_check(state, check)
-        save(workspace, state)
-        return state
-    state = {"schema_version": "eeg_research.coding_recovery.v1",
-             "candidate_id": workspace.name,
-             "tool_step_limit": config.max_tool_steps or max_steps,
-             "failed_check_limit": config.max_failed_checks or max_repairs + 1,
-             "steps_used": int(restored.get("next_step", 1)) - 1,
-             "failed_checks_used": 0,
-             "model_escalations_used": 0, "consecutive_error_count": 0,
-             "latest_error_fingerprint": None, "checks": [], "escalations": []}
+        previous = state.get("operation_binding") or {}
+        migrating = not state.get("tool_sessions")
+        if migrating:
+            state["tool_sessions"] = [{"kind": "initial", "first_step": 1,
+                "last_step": state["tool_step_limit"], "binding": dict(previous)}]
+        new_repair = (resume_repair and binding.get("operation_id") and binding.get("attempt_id")
+            and binding.get("operation_id") != previous.get("operation_id")
+            and binding.get("attempt_id") != previous.get("attempt_id")
+            and not _is_escalation_attempt(workspace, state, binding["attempt_id"]))
+        if new_repair:
+            first_step = int(restored.get("next_step", 1))
+            # Old recovery files have no session boundary. A completed patch
+            # identifies the Reviewer repair's start, including tools already
+            # executed before this bookkeeping fix was installed.
+            if migrating and restored.get("last_finish_step"):
+                first_step = int(restored["last_finish_step"]) + 1
+            _start_tool_session(state, config, binding, "review_repair", first_step, max_steps)
+        elif not previous and binding:
+            state["operation_binding"] = binding
+            state["tool_sessions"][-1]["binding"] = dict(binding)
+        if config.max_tool_steps is not None:
+            state["tool_step_limit"] = config.max_tool_steps
+    else:
+        state = {"schema_version": "eeg_research.coding_recovery.v1",
+                 "candidate_id": workspace.name,
+                 "tool_step_limit": config.max_tool_steps or max_steps,
+                 "failed_check_limit": config.max_failed_checks or max_repairs + 1,
+                 "steps_used": int(restored.get("next_step", 1)) - 1,
+                 "failed_checks_used": 0,
+                 "model_escalations_used": 0, "consecutive_error_count": 0,
+                 "latest_error_fingerprint": None, "checks": [], "escalations": [], "tool_sessions": []}
+        first_step = (int(restored.get("last_finish_step") or 0) + 1
+                      if resume_repair and binding.get("operation_id") and binding.get("attempt_id") else 1)
+        _start_tool_session(state, config, binding, "review_repair" if resume_repair else "initial",
+                            first_step, max_steps)
     # A logged check remains consumed after migration; it must not look new.
     for row in _logged_checks(workspace):
         observe_check(state, row)
     save(workspace, state)
     return state
+
+
+def _start_tool_session(state: dict, config: CodingRecoveryConfig, binding: dict,
+                        kind: str, first_step: int, max_steps: int) -> None:
+    # An explicit cap remains candidate-wide. Otherwise max_steps is the native
+    # implementation/Reviewer-repair window already reserved by the plan owner.
+    last_step = config.max_tool_steps if config.max_tool_steps is not None else first_step + max_steps - 1
+    state["tool_step_limit"] = last_step
+    state["operation_binding"] = dict(binding)
+    state["tool_sessions"].append({"kind": kind, "first_step": first_step,
+        "last_step": last_step, "binding": dict(binding)})
+
+
+def _is_escalation_attempt(workspace: Path, state: dict, attempt_id: str) -> bool:
+    for upgrade in state.get("escalations") or []:
+        if upgrade.get("attempt_id") == attempt_id:
+            return True
+        if not upgrade.get("attempt_id"):
+            path = workspace / "attempt.json"
+            current = json.loads(path.read_text()) if path.is_file() else {}
+            if (current.get("attempt_id") == attempt_id
+                    and current.get("supersedes_attempt_id") == upgrade.get("parent_attempt_id")):
+                return True
+    return False
 
 
 def _logged_checks(workspace: Path):

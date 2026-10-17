@@ -12,6 +12,7 @@ from .action_planning import digest
 
 ADMISSIONS = "candidate_admissions.jsonl"
 DETACHMENTS = "candidate_detachments.jsonl"
+FRAMEWORK_CORRECTIONS = "candidate_framework_corrections.jsonl"
 
 
 def enabled(goal: dict) -> bool:
@@ -74,7 +75,14 @@ def sync(camp: Path, state: dict) -> None:
         raise ValueError("scientific_admission_inheritance_receipt_missing")
     state["inherited_candidate_admissions"] = inherited
     detachments = _rows(camp / DETACHMENTS)
-    state["detached_candidates"] = {row["candidate_id"]: row for row in detachments}
+    corrections = _rows(camp / FRAMEWORK_CORRECTIONS)
+    known = {(row["candidate_id"], row["receipt_hash"]) for row in detachments}
+    covered = {(row["candidate_id"], row["detach_receipt"]) for row in corrections}
+    if not covered.issubset(known):
+        raise ValueError("candidate_framework_correction_detachment_missing")
+    state["candidate_framework_corrections"] = corrections
+    state["detached_candidates"] = {row["candidate_id"]: row for row in detachments
+        if (row["candidate_id"], row["receipt_hash"]) not in covered}
 
 
 def admit(camp: Path, state: dict, candidate_id: str, spec: dict) -> dict | None:

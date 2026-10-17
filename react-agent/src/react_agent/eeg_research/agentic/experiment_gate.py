@@ -134,6 +134,10 @@ def canonicalize_experiment_spec(spec: dict[str, Any] | None, *, allow_legacy: b
         value = copied["implementation_requirements"]
         if not isinstance(value, list):
             raise CanonicalizationError("implementation_requirements_not_list")
+        if copied.get("design_contract_version") != "v2" and any(
+            isinstance(item, dict) and item.get("binding_stage") == "design" for item in value
+        ):
+            raise CanonicalizationError("design_declaration_requires_v2_contract")
         try:
             copied["implementation_requirements"] = [ImplementationRequirement.model_validate(item).model_dump() for item in value]
         except ValidationError as exc:
@@ -141,6 +145,11 @@ def canonicalize_experiment_spec(spec: dict[str, Any] | None, *, allow_legacy: b
         ids = [item["requirement_id"] for item in copied["implementation_requirements"]]
         if len(ids) != len(set(ids)):
             raise CanonicalizationError("duplicate_implementation_requirement_id")
+    from .stage_contract import normalize_stage_requirements
+    try:
+        copied.update(normalize_stage_requirements(copied))
+    except ValueError as exc:
+        raise CanonicalizationError(str(exc)) from exc
     copied["schema_version"] = copied.get("schema_version") or SPEC_SCHEMA
     return copied
 
@@ -165,11 +174,18 @@ def _execution_hash(spec: dict[str, Any]) -> str:
     }
     if "implementation_requirements" in spec:
         body["implementation_requirements"] = spec["implementation_requirements"]
+    from .stage_contract import STAGE_REQUIREMENT_FIELDS
+    for field in STAGE_REQUIREMENT_FIELDS:
+        if field in spec:
+            body[field] = spec[field]
     return _digest(body)
 
 
 def scientific_identity(spec: dict[str, Any] | None) -> dict[str, Any]:
     spec = spec if isinstance(spec, dict) else {}
+    if spec.get("design_contract_version") == "v2":
+        from .design_contract import scientific_design_projection
+        return scientific_design_projection(spec)
     identity = {
         "intervention": spec.get("principal_intervention") or spec.get("intervention"),
         "hypothesis": spec.get("hypothesis"),
@@ -329,6 +345,11 @@ def approve_experiment(
         return _stamp(failed, status="blocked", context=context, producer=producer, allowed=[])
     copied.pop("approval_record", None)
     copied.pop("experiment_ref", None)
+    # A failed brief was never assembled into an executable draft. Preserve its
+    # actual failure instead of diagnosing fields absent from that old draft.
+    if copied.get("status") == "blocked" and copied.get("blocked_reason"):
+        copied["allowed_actions"] = []
+        return _stamp(copied, status="blocked", context=context, producer=producer, allowed=[])
     draft_problem = executable_draft_problem(copied)
     evaluation = (context or {}).get("evaluation_contract") or {}
     mode = (context or {}).get("evaluation_mode") or evaluation.get("evaluation_mode")

@@ -58,7 +58,28 @@ def persist_approved_binding(
         "hypothesis": spec.get("hypothesis"),
         "implementation_requirements": spec.get("implementation_requirements") or [],
     }
-    (dest / "approved_binding.json").write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
+    if spec.get("design_contract_version") == "v2":
+        binding["design_contract_version"] = "v2"
+        binding["scientific_parameters"] = spec.get("scientific_parameters") or {}
+        binding["design_brief"] = spec.get("design_brief")
+        for key in ("principal_intervention", "scientific_intent", "evaluation_scope", "initial_fidelity", "hook_modes"):
+            binding[key] = spec.get(key)
+        from .stage_contract import STAGE_REQUIREMENT_FIELDS
+        for key in STAGE_REQUIREMENT_FIELDS:
+            if key in spec:
+                binding[key] = spec[key]
+        previous = dest / "approved_binding.json"
+        if previous.is_file() and json.loads(previous.read_text(encoding="utf-8")) != binding:
+            from .artifacts import file_digest, register
+            history = dest / "approved_binding_history" / (file_digest(previous) + ".json")
+            history.parent.mkdir(exist_ok=True)
+            if not history.exists():
+                with history.open("xb") as handle:
+                    handle.write(previous.read_bytes())
+                register(camp, history, kind="approved_binding_history", candidate_id=target)
+    tmp = dest / "approved_binding.json.tmp"
+    tmp.write_text(json.dumps(binding, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(dest / "approved_binding.json")
     return binding
 
 
@@ -178,6 +199,12 @@ def build_frozen_run_spec(
             frozen["target_revision"] = protocol["method_revision"]
             frozen["run_config_hash"] = run_config_hash(hook, seed=seed, fidelity=fidelity,
                 extra={"method_revision": protocol["method_revision"], "fold_protocol": protocol["fingerprint"]})
+    from .stage_contract import STAGE_REQUIREMENT_FIELDS, has_stage_contract
+    if has_stage_contract(binding):
+        frozen["design_contract_version"] = "v2"
+    for key in STAGE_REQUIREMENT_FIELDS:
+        if key in binding:
+            frozen[key] = binding[key]
     return frozen
 
 

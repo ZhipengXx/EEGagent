@@ -24,6 +24,7 @@ LONG_JSON_ROLES = {
     "candidate_reviewer",
     "result_analyst",
     "research_planner",
+    "research_critic",
     "research_librarian",
     "experiment_designer",
     "memory_curator",
@@ -31,6 +32,24 @@ LONG_JSON_ROLES = {
 }
 RAW_EXCERPT_LIMIT = 2048
 API_INTENTS = "llm_api_intents.jsonl"
+CODER_FORMAT_FEEDBACK_REVISION = "eeg_research.coder_json_feedback.v2"
+
+
+def coder_format_feedback(raw: str, *, finish_reason: str | None = None) -> dict:
+    """Repair a confirmed malformed tool reply without interpreting its action."""
+    return {
+        "kind": "invalid_json", "finish_reason": finish_reason,
+        "format_protocol_revision": CODER_FORMAT_FEEDBACK_REVISION,
+        "tool_executed": False, "rejected_format": str(raw)[:RAW_EXCERPT_LIMIT],
+        "example": {"tool": "read_code", "args": {"path": "reference/parent.py", "start": 1, "end": 120}},
+        "instruction": "No tool executed. Return exactly one ordinary JSON object with keys tool and args, using a tool from the supplied catalog. The example illustrates the envelope only; choose the action and arguments needed for the current task. Do not emit DSML tags, invoke/parameter markup or multiple tool calls. Escape code newlines and quotes inside JSON strings.",
+    }
+
+
+def review_format_feedback(raw: str, *, finish_reason: str | None = None) -> dict:
+    return {"kind": "invalid_json", "finish_reason": finish_reason,
+        "rejected_format": str(raw)[:RAW_EXCERPT_LIMIT], "review_verdict_accepted": False,
+        "instruction": "No review verdict was accepted. Return one ordinary JSON object matching OUTPUT_SCHEMA, without DSML tags or surrounding text. Correct only the output format while retaining your substantive findings and any blocking issues. Use the supplied current source/check identities; do not repeat the input reports."}
 
 
 class LlmUnavailable(RuntimeError):
@@ -195,12 +214,37 @@ def project_correction_context(payload: dict[str, Any], role: str, *, system_cha
     return view
 
 
-def domain_model_for(role: str, memory=None):
+def designer_contract_errors(body: dict, payload: dict) -> list[dict]:
+    """Check executable brief assembly inside the existing format correction loop."""
+    if body.get("status") != "completed" or not isinstance(body.get("design_brief"), dict):
+        return []
+    from .design_contract import DesignContractError, materialize_design_brief
+    draft = payload.get("draft") or {}
+    selected = {**(payload.get("selected_research_task") or {}),
+        **{key: draft[key] for key in ("parent_candidate_id", "control_candidate_id",
+              "initial_fidelity", "negative_sampling_policy") if key in draft}}
+    try:
+        materialize_design_brief(body["design_brief"], selected, payload.get("parent_hook_config") or {})
+    except DesignContractError as exc:
+        return [{"type": "design_contract_invalid", "loc": ["design_brief"], "msg": exc.reason}]
+    return []
+
+
+def domain_model_for(role: str, memory=None, *, camp=None, review_stage: str | None = None):
     from react_agent.eeg_research.agentic.schemas import DOMAIN_OUTPUT_MODELS
+
+    if role == "experiment_designer":
+        from .design_contract import design_contract_version
+        from .schemas import ExperimentDesignBriefResult, LegacyExperimentDesignResult
+        return ExperimentDesignBriefResult if design_contract_version(camp) == "v2" else LegacyExperimentDesignResult
 
     if role == "research_planner":
         from react_agent.eeg_research.agentic.schemas import PlannerProposal
         return PlannerProposal
+
+    if role == "result_analyst" and review_stage != "analysis":
+        from .schemas import LegacyResultAnalysis
+        return LegacyResultAnalysis
 
     if role == "memory_curator" and memory is not None and memory.enabled and memory.skills_enabled:
         from react_agent.eeg_research.agentic.skill_memory import SkillLessonProposal
@@ -208,7 +252,25 @@ def domain_model_for(role: str, memory=None):
     return DOMAIN_OUTPUT_MODELS.get(role)
 
 
-def system_prompt(role: str, *, memory=None, camp=None) -> str:
+def _coder_prompt_fields(mission: str, payload: dict) -> tuple[str, str]:
+    """Render the same per-task contract that validates the tool request."""
+    from .coder_contract import coder_contract
+    contract = coder_contract(payload)
+    # Keep the static mission callable for legacy prompt inspection/recovery;
+    # actual requests replace its generic example with this task's real keys.
+    mission = mission.split("\nimplementation_map shape:", 1)[0]
+    mission += ("\nUse candidate_identity for the current candidate metadata. "
+                "Fill source_refs and optional probe in finish_patch_template using the current source. "
+                "Use existing single-line refs (extension/eeg_candidate.py:1) or AST symbols "
+                "(extension/eeg_candidate.py::EEGCandidate.build_encoder). "
+                "Runtime supplies artifact/hash metadata; return only tool and args."
+                "\nFINISH_PATCH_TEMPLATE\n" + json.dumps(contract["finish_patch_template"],
+                    ensure_ascii=False, separators=(",", ":")))
+    return mission, json.dumps(contract["output_schema"], ensure_ascii=False, separators=(",", ":"))
+
+
+def system_prompt(role: str, *, memory=None, camp=None, review_stage: str | None = None,
+                  coder_payload: dict | None = None) -> str:
     from react_agent.eeg_research.agentic.schemas import role_output_schema
 
     if camp is not None:
@@ -216,18 +278,42 @@ def system_prompt(role: str, *, memory=None, camp=None) -> str:
         if single_plan_enabled(camp):
             from .runtime_prompts import runtime_mission
             from .context.compiler import render_role_system
-            model = domain_model_for(role, memory)
+            model = domain_model_for(role, memory, camp=camp, review_stage=review_stage)
             if role == "candidate_coder":
                 from .coder import CoderToolRequest
                 model = CoderToolRequest
             elif role == "research_planner":
-                from .schemas import ResearchRoundDraft
-                model = ResearchRoundDraft
+                from .schemas import ResearchRoundDraft, ResearchProposalDraft
+                from .research_execution import independent_critic_enabled
+                model = ResearchProposalDraft if independent_critic_enabled(camp) else ResearchRoundDraft
             schema = json.dumps(model.model_json_schema(),ensure_ascii=False) if model is not None else "{}"
-            return render_role_system(role, runtime_mission(role) + "\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object.\n",execution_version="single_plan_v1")
+            from .research_execution import independent_critic_enabled
+            mission_role = "research_proposer" if role == "research_planner" and independent_critic_enabled(camp) else role
+            from .design_contract import design_contract_version
+            mission = runtime_mission(mission_role, design_contract_version=design_contract_version(camp),
+                                      review_stage=review_stage)
+            if role in {"research_planner", "research_critic"} and independent_critic_enabled(camp):
+                # These roles propose/compare science, with no source-read or
+                # implementation protocol. Their explicit mission and schema
+                # are the complete provider-facing system contract.
+                mission = (PROMPTS / "runtime_v1" / (mission_role + ".txt")).read_text(encoding="utf-8")
+            if role == "candidate_coder" and coder_payload is not None:
+                mission, schema = _coder_prompt_fields(mission, coder_payload)
+            if role == "candidate_reviewer":
+                from .research_execution import research_goal
+                if (research_goal(camp).get("research_execution") or {}).get("implementation_review_mode") == "single_pass":
+                    mission += "\nKeep one short sentence per coverage item and cite its source/check. Do not repeat full contracts, source or check reports."
+            return render_role_system(role, mission + "\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object.\n",execution_version="single_plan_v1",
+                planning_mode="propose_then_critic" if independent_critic_enabled(camp) else None)
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
     mission = (PROMPTS / f"{role}.txt").read_text(encoding="utf-8")
     schema = role_output_schema(role)
+    if role == "candidate_coder" and coder_payload is not None:
+        mission, schema = _coder_prompt_fields(mission, coder_payload)
+    if role == "result_analyst":
+        if review_stage == "analysis":
+            mission = (PROMPTS / "runtime_v2" / "result_analyst.txt").read_text(encoding="utf-8")
+        schema = json.dumps(domain_model_for(role, memory, camp=camp, review_stage=review_stage).model_json_schema(), ensure_ascii=False)
     if role == "research_planner":
         from react_agent.eeg_research.agentic.schemas import PlannerOption
         schema = json.dumps(domain_model_for(role, memory).model_json_schema(), ensure_ascii=False, separators=(",", ":"))
@@ -606,6 +692,9 @@ def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
     user_sha = hashlib.sha256(user.encode("utf-8")).hexdigest()
     identity = {key: row.get(key) for key in
                 ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash", "requested_model")}
+    for key in ("coder_format_feedback_revision", "coder_format_recovery", "review_format_recovery"):
+        if key in row:
+            identity[key] = row[key]
     if row.get("operation"):
         identity["operation"] = row["operation"]
     record = {**identity, "system": system, "user": user,
@@ -691,6 +780,9 @@ def _response_trace(camp: Path, row: dict[str, Any], reply: Any, *, validation: 
     identity = {key: row.get(key) for key in
                 ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash",
                  "request_trace_ref", "request_system_sha256", "request_user_sha256")}
+    for key in ("coder_format_feedback_revision", "coder_format_recovery", "review_format_recovery"):
+        if key in row:
+            identity[key] = row[key]
     if row.get("operation"):
         identity["operation"] = row["operation"]
     record = {**identity, "reply": reply, "validation": validation,
@@ -1001,6 +1093,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                         context_service.owned_calls.add(row["call_id"])
     context_service.callback = maintenance_callback
     bound: dict[str, Any] = {}
+    active_review_stage: str | None = None
 
     def configure(changes: dict) -> None:
         nonlocal resolved
@@ -1031,21 +1124,40 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
     def active_domain_model():
         from .research_execution import single_plan_enabled
         if role == "research_planner" and single_plan_enabled(camp):
-            from .schemas import ResearchRoundDraft
-            return ResearchRoundDraft
-        return domain_model_for(role,memory)
+            from .schemas import ResearchRoundDraft, ResearchProposalDraft
+            from .research_execution import independent_critic_enabled
+            return ResearchProposalDraft if independent_critic_enabled(camp) else ResearchRoundDraft
+        return domain_model_for(role,memory,camp=camp,review_stage=active_review_stage)
 
     def call(payload: dict[str, Any]) -> dict[str, Any]:
-        nonlocal resolved
+        nonlocal resolved, system, prompt_hash, active_review_stage
+        from .context.compiler import is_research_planning_input
+        scientific_planning = is_research_planning_input(role, payload)
+        if role == "candidate_coder":
+            # Per-call delivery evidence, never a promise about the preceding
+            # call or the uncompiled input. Recovery below uses its frozen view.
+            call.coder_source_request = None
+        active_review_stage = payload.get("review_stage")
+        if role == "result_analyst":
+            system = system_prompt(role, memory=memory, camp=camp, review_stage=payload.get("review_stage"))
+            prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
         from .research_execution import single_plan_enabled
         if single_plan_enabled(camp) and role in {"experiment_designer","candidate_coder","candidate_reviewer","result_analyst"}:
             from .selected_plan import load_plan
             selected = load_plan(camp)
             if selected:
-                proposal = selected.get("proposal") or {}
-                payload = {**payload,"selected_research_task":{key:proposal[key] for key in (
-                    "question","task_description","scientific_intent","evaluation_scope","expected_observation","completion_condition") if key in proposal},
-                    "origin_plan_id":selected["plan_id"]}
+                from .stage_context import with_selected_task
+                payload = with_selected_task(payload, role, selected)
+
+        if role == "candidate_coder":
+            identity = dict(payload.get("candidate_identity") or {})
+            for name in ("candidate_id", "attempt_id"):
+                if bound.get(name) is not None:
+                    identity.setdefault(name, bound[name])
+            if identity:
+                payload = {**payload, "candidate_identity": identity}
+            system = system_prompt(role, memory=memory, camp=camp, coder_payload=payload)
+            prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
 
         task = None
         if role in ENVELOPE_ROLES:
@@ -1116,6 +1228,23 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         logical_operation = operation_id(role, payload, bound, resolved.role_config_hash)
         request_semantics = operation_id(role, payload,
             {key: value for key, value in bound.items() if key != "operation_id"}, "")
+        from .research_execution import research_goal
+        execution = research_goal(camp).get("research_execution") or {}
+        single_pass_review = role == "candidate_reviewer" and execution.get("implementation_review_mode") == "single_pass"
+        format_recovery = None
+        review_recovery = None
+        if role == "candidate_coder":
+            from .coder_format_recovery import coder_format_recovery
+            format_recovery = coder_format_recovery(camp, logical_operation, payload=payload,
+                bound=bound, revision=CODER_FORMAT_FEEDBACK_REVISION)
+            if format_recovery is not None:
+                logical_operation = format_recovery["operation_id"]
+        elif single_pass_review:
+            from .review_format_recovery import review_format_recovery
+            review_recovery = review_format_recovery(camp, logical_operation, payload=payload,
+                bound=bound, config_hash=resolved.role_config_hash)
+            if review_recovery is not None:
+                logical_operation = review_recovery["operation_id"]
 
         def validate_recovered(reply, frozen_payload, frozen_prompt_hash):
             parsed = dict(reply)
@@ -1123,10 +1252,11 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 from .planner_context import normalize_input_echoes
                 parsed, _ = normalize_input_echoes(parsed, frozen_payload)
             if role == "candidate_coder":
-                from .coder import validate_tool_request
-                _, _, error = validate_tool_request(parsed)
+                from .coder_contract import validate_coder_request
+                _, _, error = validate_coder_request(parsed, frozen_payload)
                 if error:
                     raise RoleResultError("recovered_coder_tool_request_invalid")
+                call.coder_source_request = frozen_payload
             else:
                 model = active_domain_model()
                 body = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else parsed
@@ -1135,10 +1265,17 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     body = {key: value for key, value in body.items() if key not in identities
                             and (key != "status" or "status" in model.model_fields)}
                     model.model_validate(body)
+                if role == "experiment_designer" and designer_contract_errors(body, frozen_payload):
+                    raise RoleResultError("recovered_designer_contract_invalid")
+                if role == "result_analyst":
+                    from .stage_reviews import analysis_reply_errors
+                    if analysis_reply_errors(body, frozen_payload):
+                        raise RoleResultError("recovered_analysis_reply_invalid")
                 if role == "candidate_reviewer":
                     from .review_context import review_reference_errors
                     if review_reference_errors(body, frozen_payload):
                         raise RoleResultError("recovered_review_evidence_reference_invalid")
+                    call.review_evidence_request = json.loads(json.dumps(frozen_payload))
             if role in ENVELOPE_ROLES:
                 from .roles import bind_role_output
                 return bind_role_output(parsed, task=task, prompt_hash=frozen_prompt_hash)
@@ -1179,10 +1316,22 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         schema_error_kind = "domain_schema_invalid"
         previous_domain = None
         schema_feedback = None
-        logical_operation = operation_id(role, payload, bound, resolved.role_config_hash)
-        for _attempt in range(PARSE_ATTEMPTS):
-            request_mode = "repair" if external_repair or last is not None or schema_error is not None else "normal"
+        attempt_limit = PARSE_ATTEMPTS
+        if single_pass_review:
+            from .review_format_recovery import operation_attempt_limit
+            attempt_limit = operation_attempt_limit(camp, logical_operation, attempt_limit)
+        for _attempt in range(attempt_limit):
+            request_mode = "repair" if external_repair or last is not None or schema_error is not None or format_recovery is not None or review_recovery is not None else "normal"
             call_payload = payload
+            if review_recovery is not None:
+                call_payload = {**payload,
+                    "previous_response_error": {**review_format_feedback(review_recovery["rejected_format"]),
+                        "recovery": {key: value for key, value in review_recovery.items() if key != "rejected_format"}}}
+            if format_recovery is not None:
+                call_payload = {**payload,
+                    "previous_response_error": {**coder_format_feedback(format_recovery["rejected_format"]),
+                        "recovery": {key: value for key, value in format_recovery.items()
+                                     if key != "rejected_format"}}}
             if last is not None:
                 failure = getattr(last.usage, "failure_kind", None)
                 error_feedback = {
@@ -1196,14 +1345,34 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                         parent_task_ref=row.get("task_id"), invalid_response_digest=response_digest(last.raw),
                         max_output_tokens=int(config.fast.max_tokens),
                         instruction="The previous final JSON was truncated. Return a concise complete OUTPUT_SCHEMA object within the current output cap. Preserve required executable hooks, parameter values, core implementation requirements and source references; omit repeated input context, policies and optional narrative. Finish the final JSON promptly.")
+                elif role == "candidate_coder":
+                    error_feedback = coder_format_feedback(last.raw,
+                        finish_reason=getattr(last.usage, "finish_reason", None))
+                elif single_pass_review:
+                    error_feedback = review_format_feedback(last.raw,
+                        finish_reason=getattr(last.usage, "finish_reason", None))
+                if scientific_planning:
+                    error_feedback = {key: error_feedback[key] for key in ("kind", "finish_reason")
+                                      if key in error_feedback}
+                    error_feedback["instruction"] = "Return one complete JSON object matching OUTPUT_SCHEMA. Keep the scientific task and candidate pool unchanged."
                 call_payload = {
                     **payload,
                     "previous_response_error": error_feedback,
                 }
             if schema_error is not None:
-                call_payload = {**call_payload, "schema_error": schema_error, "previous": previous_domain,
-                                "schema_repair_context": schema_feedback,
-                                "correction_instruction": "Return a complete corrected JSON object using only OUTPUT_SCHEMA fields. Input metadata is read-only, not output. Remove every reported forbidden field; correct every reported missing/invalid field. Keep the task, legal actions, evidence identities and business context unchanged."}
+                if scientific_planning:
+                    # Errors are feedback for this response, not a replay of
+                    # previous drafts, audit records or validation history.
+                    errors = (schema_feedback or {}).get("validation_errors") or []
+                    call_payload = {**call_payload, "previous_response_error": {
+                        "kind": "schema_invalid",
+                        "errors": [{key: error[key] for key in ("loc", "type", "msg") if key in error}
+                                   for error in errors],
+                        "instruction": "Return a complete corrected JSON object matching OUTPUT_SCHEMA. Correct the listed fields while keeping the scientific task and candidate pool unchanged."}}
+                else:
+                    call_payload = {**call_payload, "schema_error": schema_error, "previous": previous_domain,
+                                    "schema_repair_context": schema_feedback,
+                                    "correction_instruction": "Return a complete corrected JSON object using only OUTPUT_SCHEMA fields. Input metadata is read-only, not output. Remove every reported forbidden field; correct every reported missing/invalid field. Keep the task, legal actions, evidence identities and business context unchanged."}
             from react_agent.eeg_research.agentic.role_examples import add_role_examples
             from react_agent.eeg_research.agentic.context.types import CompileRequest, Ready
             from react_agent.eeg_research.agentic.context.service import budget_for_role
@@ -1214,7 +1383,9 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 hints = conditional_hints(role, call_payload)
                 if hints:
                     call_payload = {**call_payload,"relevant_implementation_hints":hints}
-                call_payload = add_role_examples(call_payload, role, memory, max_count=1, execution_version="single_plan_v1")
+                from .design_contract import design_contract_version
+                call_payload = add_role_examples(call_payload, role, memory, max_count=1, execution_version="single_plan_v1",
+                    design_contract_version=design_contract_version(camp))
             else:
                 call_payload = add_role_examples(call_payload, role, memory)
             if transport_retry_prepared is not None:
@@ -1243,6 +1414,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                                      "context_result":str(outcome)[:2000]})
                 prepared = outcome.prepared
             call_payload = prepared.payload
+            if role == "candidate_coder":
+                call.coder_source_request = prepared.payload
             projection = {"revision":prepared.policy_version,
                           "original_user_chars":len(json.dumps(payload,ensure_ascii=False,default=str)),
                           "projected_total_chars":prepared.budget_report["chars"],
@@ -1267,11 +1440,20 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                        reasoning_effort=resolved.reasoning_effort,
                        application_retry_kind=("domain_schema" if schema_error is not None else
                                                "output_truncated" if last is not None and getattr(last.usage, "failure_kind", None) == "output_truncated" else
-                                               "invalid_json" if last is not None else "native_planner_repair" if external_repair else None),
+                                               "invalid_json" if last is not None else "review_format_recovery" if review_recovery is not None else
+                                               "native_planner_repair" if external_repair else None),
                        role_context_revision=projection["revision"],
                        role_context_original_user_chars=projection["original_user_chars"],
                        role_context_projected_total_chars=projection["projected_total_chars"],
                        role_context_budget_chars=projection["budget_chars"])
+            if role == "candidate_coder":
+                row["coder_format_feedback_revision"] = CODER_FORMAT_FEEDBACK_REVISION
+                if format_recovery is not None:
+                    row["coder_format_recovery"] = {key: value for key, value in format_recovery.items()
+                                                   if key != "rejected_format"}
+            if review_recovery is not None:
+                row["review_format_recovery"] = {key: value for key, value in review_recovery.items()
+                                                if key != "rejected_format"}
             append_ui_event(
                 camp,
                 "llm_call_started",
@@ -1295,7 +1477,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             row.update(owner_input_token_bound=input_token_bound(prepared.messages, prepared.transport_fields, prepared.budget_report),
                        owner_output_token_bound=int(config.fast.max_tokens))
             row.update(reserve_operation_attempt(camp, operation=logical_operation, call_id=row["call_id"],
-                       reserve_usd=_unknown_reserve(camp), metadata=row))
+                       max_attempts=attempt_limit, reserve_usd=_unknown_reserve(camp), metadata=row))
             _reserve_api_intent(camp, row)
             try:
                 reply, usage = loop.run_until_complete(
@@ -1316,7 +1498,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 )
                 kind = getattr(exc.usage, "failure_kind", None)
                 if kind == "output_truncated":
-                    if (_attempt + 1 >= PARSE_ATTEMPTS or exc.usage.unconfirmed_charge_possible
+                    if (single_pass_review or _attempt + 1 >= attempt_limit or exc.usage.unconfirmed_charge_possible
                             or getattr(exc.usage, "transport_outcome", None) != "confirmed_response"):
                         raise LlmUnavailable("output_truncated") from exc
                     if _adjust_output_budget(camp, config, row):
@@ -1339,7 +1521,9 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     error=type(exc).__name__,
                 )
                 usage = getattr(exc, "usage", None)
-                if usage is not None and getattr(usage, "http_status", None) in {429, 500, 502, 503, 504} and _attempt + 1 < PARSE_ATTEMPTS:
+                if (not single_pass_review and usage is not None
+                        and getattr(usage, "http_status", None) in {429, 500, 502, 503, 504}
+                        and _attempt + 1 < attempt_limit):
                     from react_agent.eeg_research.agentic.api_policy import api_request_policy
                     transport_retry_prepared = prepared
                     loop.run_until_complete(asyncio.sleep(api_request_policy(camp).transport_backoff_s))
@@ -1365,8 +1549,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             parsed = reply if isinstance(reply, dict) else {"_not_object": reply}
             normalization = None
             if role == "candidate_coder":
-                from react_agent.eeg_research.agentic.coder import validate_tool_request, tool_catalog
-                _, _, request_error = validate_tool_request(parsed)
+                from .coder_contract import coder_contract, validate_coder_request
+                _, _, request_error = validate_coder_request(parsed, payload)
                 if request_error is not None:
                     # A malformed tool call has executed no step. Repair its
                     # envelope/args inside this same persistent operation rather
@@ -1375,7 +1559,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     schema_error_kind = "coder_tool_request_invalid"
                     previous_domain = parsed
                     schema_feedback = {"failure_kind": "format_error", "validation_error": request_error,
-                        "allowed_tool_arguments": tool_catalog(),
+                        "allowed_tool_arguments": coder_contract(payload)["tools"],
                         "instruction": "Correct only the tool envelope and parameter format against this catalog. Return one tool/args object for the same current step; no tool executed or source changed."}
                     last = None
                     _response_trace(camp, row, reply, validation=schema_error_kind, schema_errors=request_error)
@@ -1410,6 +1594,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     try:
                         domain_model.model_validate(body)
                     except ValidationError as exc:
+                        schema_error_kind = "domain_schema_invalid"
                         schema_error = json.dumps(exc.errors(include_input=False), ensure_ascii=False, default=str)[:3000]
                         _response_trace(camp, row, reply, validation="domain_schema_invalid",
                                         schema_errors=exc.errors(include_input=False))
@@ -1425,6 +1610,35 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                         append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
                                         status="failed", error="domain_schema_invalid")
                         continue
+                    if role == "experiment_designer":
+                        errors = designer_contract_errors(body, payload)
+                        if errors:
+                            schema_error_kind = "design_contract_invalid"
+                            schema_error = json.dumps(errors, ensure_ascii=False)
+                            previous_domain = body
+                            schema_feedback = {"validation_errors": errors,
+                                "instruction": "Correct the reported brief/config inconsistency while preserving the selected scientific method. Keep descriptive annotations distinct from executable configuration values."}
+                            _response_trace(camp, row, reply, validation=schema_error_kind, schema_errors=errors)
+                            append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
+                                            status="failed", error=schema_error_kind)
+                            last = None
+                            continue
+                    if role == "result_analyst":
+                        from .stage_reviews import analysis_reply_errors
+                        errors = analysis_reply_errors(body, payload)
+                        if errors:
+                            # Without in-call feedback the native stage check blocks (or an empty
+                            # summary reaches the Observation) and a retry resends the identical input.
+                            schema_error_kind = "analysis_reply_invalid"
+                            schema_error = json.dumps(errors, ensure_ascii=False)
+                            previous_domain = body
+                            schema_feedback = {"validation_errors": errors,
+                                "instruction": "Correct only the reported fields (coverage IDs, evidence_refs, summary_zh); keep the scientific assessment unchanged. Identities such as hashes are not evidence references."}
+                            _response_trace(camp, row, reply, validation=schema_error_kind, schema_errors=errors)
+                            append_ui_event(camp, "llm_call_failed", role=role, call_id=row.get("call_id"),
+                                            status="failed", error=schema_error_kind)
+                            last = None
+                            continue
                     if role == "candidate_reviewer":
                         from react_agent.eeg_research.agentic.review_context import review_reference_errors
                         errors = review_reference_errors(body, payload)
@@ -1443,6 +1657,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                             last = None
                             continue
             _response_trace(camp, row, reply, validation="valid", normalization=normalization)
+            if role == "candidate_reviewer":
+                call.review_evidence_request = json.loads(prepared.user)
             append_ui_event(camp, "llm_call_finished", role=role, call_id=row.get("call_id"),
                             candidate_id=bound.get("candidate_id"), status="completed")
             if bound_reply is not None:
@@ -1459,4 +1675,6 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
     call.configure = configure  # type: ignore[attr-defined]
     call.role_config = resolved  # type: ignore[attr-defined]
     call.identity = dict(bound)  # type: ignore[attr-defined]
+    if role == "candidate_coder":
+        call.coder_source_request = None  # type: ignore[attr-defined]
     return call

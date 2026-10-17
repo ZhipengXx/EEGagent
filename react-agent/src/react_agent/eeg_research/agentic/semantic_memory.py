@@ -14,7 +14,7 @@ from typing import Any
 
 from react_agent.eeg_research.agentic.embedding import (
     DIMENSION, TEXT_BUILDER_VERSION, EmbeddingUnavailable, MemoryConfig,
-    backend_for, cached_vector, canonical, content_hash, memory_config, vector_blob,
+    MiniLMBackend, backend_for, cached_vector, canonical, content_hash, memory_config, vector_blob,
 )
 from react_agent.eeg_research.agentic.context.retrieval import (
     MAX_CANDIDATES, MAX_DELIVERY_CHARS, deduplicate_hits, prepare_query,
@@ -337,10 +337,54 @@ def build_query(camp: Path, *, state: dict | None = None, experiment: dict | Non
         identities=[experiment.get("candidate_id"), state.get("active_question_id")])["text"]
 
 
+def planner_query(camp: Path, observation: dict) -> str:
+    """Prioritize the current question, mechanism and latest native feedback."""
+    from .context.retrieval import prepare_query
+    from .experiment_observations import ExperimentObservationStore
+
+    selected = observation.get("selected_research_task") or (observation.get("selected_plan") or {}).get("proposal") or {}
+    experiment = observation.get("experiment") or {}
+    hypothesis = experiment.get("hypothesis") or observation.get("hypothesis") or {}
+    terminal = observation.get("terminal_observation_id") or (observation.get("selected_plan") or {}).get("terminal_observation_id")
+    original = {}
+    if terminal:
+        # Use the same verified native source as observation delivery, rather
+        # than letting a generic objective displace the just-completed question.
+        records = ExperimentObservationStore(Path(camp)).records(observation_id=str(terminal), limit=1)
+        original = records[0]["body"] if records else {}
+    question = (observation.get("current_question") or selected.get("question")
+                or original.get("question")
+                or (hypothesis.get("question") if isinstance(hypothesis, dict) else None)
+                or build_query(camp, state=observation, experiment=experiment))
+    mechanism = (hypothesis.get("mechanism") or hypothesis.get("intended_intervention")
+                 if isinstance(hypothesis, dict) else hypothesis) or selected.get("scientific_intent") or experiment.get("intervention") or original.get("intervention")
+    feedback = ""
+    if original:
+        failure = original.get("engineering_failure") or {}
+        facts = original.get("native_facts") or {}
+        parts = ["status=" + str(original.get("execution_status"))]
+        if failure.get("error_category"):
+            parts.append("category=" + str(failure["error_category"])[:60])
+        issue = next((row for row in failure.get("blocking_issues") or [] if isinstance(row, dict)), {})
+        parts.extend(key + "=" + str(issue[key])[:80]
+                     for key in ("requirement_id", "error_class", "kind") if issue.get(key))
+        if facts.get("metrics"):
+            parts.append(canonical({key: facts[key] for key in ("metrics", "paired_delta_pp", "seed", "coverage") if key in facts})[:180])
+        feedback = " ".join(parts)
+    # retrieve() subsequently applies a 600-character encoding view. Allocate
+    # that view here so feedback and mechanism survive even a huge question.
+    sections = [("Feedback", feedback, 220), ("Question", question, 180), ("Mechanism", mechanism, 140)]
+    text = "\n".join(label + ": " + value.strip()[:limit]
+                     for label, value, limit in sections if isinstance(value, str) and value.strip())
+    return prepare_query(question=text, max_chars=600)["text"]
+
+
 def _search_text(kind: str, body: dict) -> str:
     if kind == "experiment_observation":
         from .experiment_observations import observation_search_text
         return observation_search_text(body)
+    if kind == "knowledge":
+        return "\n".join(str(body[key]) for key in ("title", "name", "method", "statement", "mechanism", "description", "summary", "summary_zh", "idea") if body.get(key))
     scope = body.get("conditions") if kind == "lesson" else body.get("preconditions")
     scope = scope or {}
     # The old goal_id is an applicability identity, not semantic text.
@@ -348,6 +392,60 @@ def _search_text(kind: str, body: dict) -> str:
                                     "scope", "screening_subjects", "selection_manifest_hash", "method_revision", "seed") if scope.get(k) not in (None, "")}
     description = str(body.get("statement") or "") if kind == "lesson" else str(body["description_en"]) + "\n" + str(body["trigger_en"])
     return description + ("\nApplicable scope: " + canonical(readable) if readable else "")
+
+
+def registered_knowledge(camp: Path, context: dict) -> list[dict]:
+    """Index existing native librarian artifacts; never invent a lesson or paper."""
+    from .artifacts import REGISTRY, resolve_verified_artifact
+    from .context.sources import ContextSourceRegistry
+    from .experiment_observations import observation_applicability
+    path = Path(camp) / REGISTRY
+    if not path.is_file():
+        return []
+    registry = ContextSourceRegistry(camp)
+    rows, seen = [], set()
+    for line in reversed(path.read_text(encoding="utf-8").splitlines()):
+        if len(rows) >= MAX_CANDIDATES:
+            break
+        try:
+            item = json.loads(line)
+            if item.get("kind") not in {"method_hits", "method_evidence_packet"} or item.get("artifact_id") in seen:
+                continue
+            seen.add(item["artifact_id"])
+            native = resolve_verified_artifact(camp, item["artifact_id"])
+            original = read_json(Path(native["path"]))
+            if original.get("status") != "completed" or unsafe_source(original):
+                continue
+            payload = original.get("payload") if isinstance(original.get("payload"), dict) else original
+            cards = payload.get("method_cards") or original.get("method_cards") or []
+            for index, body in enumerate(cards[:MAX_CANDIDATES - len(rows)]):
+                if not isinstance(body, dict) or unsafe_source(body) or not _search_text("knowledge", body).strip():
+                    continue
+                rid = "knowledge:" + item["artifact_id"] + ":" + str(body.get("id") or index)
+                source = registry.capture(body, block_id="semantic-knowledge:" + rid,
+                    kind="memory", role="research_planner", identity={"record_id": rid, "record_type": "knowledge"})
+                label, differences = observation_applicability(body.get("conditions") or body.get("preconditions") or {}, context)
+                rows.append({"record_type": "knowledge", "record_id": rid, "version": content_hash(body),
+                    "content_hash": content_hash(body), "body": copy.deepcopy(body),
+                    "source_refs": [{"artifact_id": native["artifact_id"], "path": native["path"], "sha256": native["sha256"]}],
+                    "record_source_ref": source.source_ref, "record_source_hash": source.source_hash,
+                    "applicability": label, "condition_differences": differences,
+                    "source_retrieval": "native_registered_local_method_card"})
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return rows
+
+
+def embedding_health(bundle: dict) -> dict:
+    """Keep actual encoding diagnostics separate from optional hit packing."""
+    keys = ("backend", "degraded", "reason", "model", "revision", "fingerprint", "runtime_class",
+            "dimension", "query", "query_sha256", "query_representation", "query_encoding", "query_status",
+            "indexing", "candidate_count", "matched_count", "hit_count", "language_limit")
+    return {key: copy.deepcopy(bundle.get(key)) for key in keys if key in bundle}
+
+
+def _embedding_ready(bundle: dict) -> bool:
+    return not bundle.get("degraded") and bool(bundle.get("fingerprint"))
 
 
 def candidates(camp: Path, config: MemoryConfig, context: dict | None = None, *, query: str = "") -> list[dict]:
@@ -407,6 +505,9 @@ def candidates(camp: Path, config: MemoryConfig, context: dict | None = None, *,
         for body in lessons:
             original = next(item for item in valid if item["lesson_id"] == body["lesson_id"])
             digest = content_hash(original)
+            from .context.sources import ContextSourceRegistry
+            source = ContextSourceRegistry(camp).capture(original, block_id="semantic-lesson:" + body["lesson_id"],
+                kind="memory", role="research_planner", identity={"record_id": body["lesson_id"], "record_type": "lesson"})
             evidence_updates = [update for ref in body.get("supporting_episode_ids", []) for update in updates.get(ref, [])]
             if evidence_updates:
                 # Delivery-only relationship; retain the original lesson/episode
@@ -414,8 +515,10 @@ def candidates(camp: Path, config: MemoryConfig, context: dict | None = None, *,
                 body = {**body, "evidence_updates": evidence_updates}
             rows.append({"record_type": "lesson", "record_id": body["lesson_id"], "version": digest,
                          "content_hash": digest, "source_refs": sources[body["lesson_id"]] + [item["source"] for item in evidence_updates],
+                         "record_source_ref": source.source_ref, "record_source_hash": source.source_hash,
                          "applicability": label, "condition_differences": {k: body[k] for k in ("mismatch", "missing_conditions") if k in body},
                          "body": body})
+    rows += registered_knowledge(camp, context)
     if config.skills_enabled:
         from react_agent.eeg_research.agentic.skill_memory import current_skills, skill_applicability
         for skill in current_skills(camp, limit=MAX_CANDIDATES):
@@ -486,7 +589,7 @@ def _delivery_fields(bundle: dict, *, standalone: bool) -> dict:
         metadata.pop("query", None)
         metadata.update(query_identity)
     fields = {"retrieved_memory": metadata}
-    if bundle["backend"] == "minilm":
+    if _embedding_ready(bundle):
         if standalone:
             for item in metadata["items"]:
                 if item["record_type"] == "lesson":
@@ -508,7 +611,7 @@ def _fit_delivery(bundle: dict, *, standalone: bool = False) -> tuple[dict | Non
     budget = min(bundle["context_chars_budget"], MAX_DELIVERY_CHARS)
     if budget <= 0 or bundle.get("delivery_available") is False or bundle.get("reason") == "disabled":
         return None, {}
-    source_items = bundle["items"] if bundle["backend"] == "minilm" else []
+    source_items = bundle["items"] if _embedding_ready(bundle) else []
     selected = copy.deepcopy(bundle)
     selected.update(items=[], lessons={key: [] for key in GROUPS}, hit_count=0)
     omitted = int(bundle.get("omitted_count", 0))
@@ -581,11 +684,14 @@ def _finalize_bundle(bundle: dict) -> dict:
 def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
              experiment: dict | None = None, config: MemoryConfig | None = None,
              require_embedding: bool = False, rebuild: bool = False,
-             role: str = "research_planner", context: dict | None = None) -> dict:
+             role: str = "research_planner", context: dict | None = None,
+             record_types: frozenset[str] | None = None) -> dict:
     config = config or memory_config(camp)
     query = build_query(camp, state=state, experiment=experiment) if query is None else prepare_query(question=query)["text"]
-    bundle = {"backend": "legacy", "degraded": False, "reason": "disabled", "query": query[:800],
+    bundle = {"backend": "disabled", "degraded": False, "reason": "disabled", "query": query,
               "items": [], "lessons": {k: [] for k in GROUPS}, "candidate_count": 0, "hit_count": 0,
+              "model": config.model_id, "revision": config.model_revision, "fingerprint": None,
+              "indexing": {"indexed": 0, "reused": 0, "pending": 0, "failed": 0}, "query_status": "not_encoded",
               "context_chars_budget": min(config.context_chars_budget, MAX_DELIVERY_CHARS), "truncated": False}
     if not config.enabled:
         if require_embedding:
@@ -595,37 +701,49 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
         require_eeg_campaign(camp)
         context = {**build_context(camp, state=state, experiment=experiment), **(context or {})}
         records = candidates(camp, config, context, query=query)
+        if record_types is not None:
+            records = [row for row in records if row["record_type"] in record_types]
         from .research_execution import single_plan_enabled
         if single_plan_enabled(camp) and role == "research_planner":
             # Engineering procedures belong to Coder/Reviewer, not every round.
             records = [row for row in records if row["record_type"] != "skill"]
         bundle.update(candidate_count=len(records), indexing={"indexed": 0, "reused": 0, "pending": len(records), "failed": 0})
         backend = backend_for(config)
+        bundle.update(backend="minilm" if isinstance(backend, MiniLMBackend) else "synthetic_embedding",
+                      runtime_class=type(backend).__module__ + "." + type(backend).__qualname__,
+                      model=backend.metadata["model_id"], revision=backend.metadata["model_revision"],
+                      fingerprint=backend.fingerprint, dimension=DIMENSION)
         store = SidecarStore(camp)
         stats = index_records(store, records, backend, rebuild=rebuild)
         bundle["indexing"] = stats
         if stats["failed"]:
             raise EmbeddingUnavailable(stats["reason"])
-        bundle.update(backend="minilm", degraded=False, reason=None, model=backend.metadata["model_id"],
+        bundle.update(degraded=False, reason=None, model=backend.metadata["model_id"],
                       revision=backend.metadata["model_revision"], fingerprint=backend.fingerprint,
                       text_builder_version=TEXT_BUILDER_VERSION, indexing=stats,
                       candidate_count=len(records), language_limit="Original lesson language; no translation. MiniLM is English-focused.")
-        if not query.strip() or config.top_k <= 0 or not records:
+        if not query.strip():
+            bundle["query_status"] = "empty_index_only"
             return _finalize_bundle(bundle)
         query_card = backend.prepare_query(query) if hasattr(backend, "prepare_query") else prepare_query(question=query)
         query = query_card["text"]
+        bundle["query"] = query
+        bundle["query_sha256"] = hashlib.sha256(query.encode()).hexdigest()
         bundle["query_representation"] = query_card["metadata"]
         query_hash = hashlib.sha256(query.encode()).hexdigest()
         query_record = {"record_type": "query", "record_id": "query_" + query_hash[:24], "version": TEXT_BUILDER_VERSION,
                         "content_hash": query_hash, "text_hash": query_hash, "search_text": query}
         query_vector = store.cached(query_record, backend.fingerprint, backend.metadata)
         query_encoding = store.cached_encoding(query_record, backend.fingerprint) if query_vector is not None else None
+        bundle["query_status"] = "cache_reused"
         if query_vector is None or query_encoding is None:
+            bundle["query_status"] = "encoding"
             query_vectors, query_metadata = backend.encode([query])
             query_vector = query_vectors[0]; query_encoding = query_metadata[0]
             if query_encoding.get("truncated"):
                 raise EmbeddingUnavailable("implicit_query_truncation_forbidden")
             store.save_vectors([query_record], query_vectors, query_metadata, backend)
+            bundle["query_status"] = "encoded"
         vector_blob(query_vector)
         bundle["query_encoding"] = {k: v for k, v in query_encoding.items() if k != "encoded_text"}
         ranked = []
@@ -646,7 +764,7 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
         for _, _, _, row, score in ranked[:max(0, min(config.top_k, 32))]:
             item = {k: copy.deepcopy(v) for k, v in row.items() if k not in {"search_text", "text_hash", "body", "embedding_chunks"}}
             item["cosine_score"] = score
-            if row["record_type"] in {"skill", "experiment_observation"}:
+            if row["record_type"] in {"skill", "experiment_observation", "knowledge"}:
                 item["body"] = copy.deepcopy(row["body"])
             bundle["items"].append(item)
             if row["record_type"] == "lesson":
@@ -660,12 +778,67 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
         bundle["hit_count"] = len(bundle["items"])
         return _finalize_bundle(bundle)
     except Exception as exc:
+        bundle.update(backend="unavailable", degraded=True,
+                      reason=str(exc) if isinstance(exc, EmbeddingUnavailable) else type(exc).__name__,
+                      items=[], lessons={key: [] for key in GROUPS}, hit_count=0, query_status="failed")
         if require_embedding:
-            raise EmbeddingUnavailable(str(exc)) from exc
+            failure = EmbeddingUnavailable(str(exc))
+            failure.retrieval_health = embedding_health(bundle)
+            raise failure from exc
         # Do not pretend structured applicability is a lexical/embedding hit.
-        bundle.update(backend="legacy", degraded=True, reason=str(exc) if isinstance(exc, EmbeddingUnavailable) else type(exc).__name__,
-                      items=[], lessons={key: [] for key in GROUPS}, hit_count=0)
         return _finalize_bundle(bundle)
+
+
+def planner_knowledge_delivery(camp: Path, bundle: dict, *, context: dict | None = None) -> dict:
+    """Small prior/analogy cards backed by original registered record bodies."""
+    from .context.sources import ContextSourceRegistry
+    from .context.representations import handle
+    from .experiment_observations import observation_applicability
+    result = {"status": "no_related_knowledge", "items": [], "omitted": [], "omitted_count": 0,
+              "scientific_evidence": False, "execution_authority": False,
+              "budget_chars": min(int(bundle.get("context_chars_budget") or 0), MAX_DELIVERY_CHARS)}
+    if not _embedding_ready(bundle):
+        result["status"] = "embedding_unavailable" if bundle.get("degraded") else "disabled"
+        return result
+    registry = ContextSourceRegistry(camp)
+    items = [item for item in bundle.get("items") or [] if item.get("record_type") in {"lesson", "knowledge"}]
+    for item in items[:32]:
+        try:
+            source = registry.get(item["record_source_ref"], role="research_planner")
+            original = registry.load(source, role="research_planner")
+            if source.source_hash != item["record_source_hash"] or content_hash(original) != item["content_hash"]:
+                raise ValueError("knowledge_original_identity_changed")
+            text = original.get("statement") if item["record_type"] == "lesson" else _search_text("knowledge", original)
+            if not isinstance(text, str) or not text.strip():
+                raise ValueError("knowledge_body_missing")
+            conditions = original.get("conditions") or original.get("preconditions") or {}
+            label, differences = observation_applicability(conditions, context)
+            original_refs = copy.deepcopy(item.get("source_refs") or [])
+            full = handle(source)
+            full["next_read"] = {"source_ref": source.source_ref, "source_hash": source.source_hash,
+                                 "json_pointer": "", "max_chars": 2000}
+            card = {key: copy.deepcopy(item[key]) for key in ("record_type", "record_id", "version", "content_hash", "cosine_score")}
+            card.update(body={"statement": text[:800]}, conditions=copy.deepcopy(conditions),
+                applicability=label, condition_differences=differences, source_refs=original_refs,
+                similarity_method="MiniLM_normalized_cosine" if bundle["backend"] == "minilm" else "synthetic_embedding_cosine",
+                source_retrieval=item.get("source_retrieval", "native_validated_lesson"),
+                knowledge_role="prior_or_analogy", scientific_evidence=False, execution_authority=False,
+                full_record=full, omissions=([{"path": "/statement" if item["record_type"] == "lesson" else "derived_known_text_fields",
+                    "selected_char_range": [0, 800], "full_chars": len(text), "complete": False}] if len(text) > 800 else []))
+            trial = {**result, "status": "ready", "items": result["items"] + [card]}
+            if len(canonical(trial)) <= result["budget_chars"]:
+                result = trial
+            else:
+                result["omitted_count"] += 1
+                result["omitted"].append({"record_id": item["record_id"], "reason": "knowledge_delivery_budget"})
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            result["omitted_count"] += 1
+            result["omitted"].append({"record_id": item.get("record_id"), "reason": "knowledge_source_unreadable", "detail": str(exc)[:120]})
+    # Omission metadata is bounded too; never let optional knowledge steal the
+    # mandatory current observation's minimum allocation.
+    while result["omitted"] and len(canonical(result)) > result["budget_chars"]:
+        result["omitted"].pop()
+    return result
 
 
 def apply_memory(request: dict, bundle: dict) -> dict:
@@ -745,7 +918,8 @@ def main(argv=None) -> int:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (EmbeddingUnavailable, ValueError) as exc:
-        print(json.dumps({"backend": "unavailable", "error": str(exc), "require_embedding": args.require_embedding}))
+        print(json.dumps({"backend": "unavailable", "error": str(exc), "require_embedding": args.require_embedding,
+                          "embedding_health": getattr(exc, "retrieval_health", {})}))
         return 1
 
 

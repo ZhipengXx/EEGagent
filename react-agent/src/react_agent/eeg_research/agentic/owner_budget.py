@@ -273,6 +273,43 @@ def _request_resources(camp, input_bound, output_bound, *, frozen_pricing=None):
     return amount
 
 
+def _planning_resources(camp, input_bound, output_bound, calls):
+    """Reserve both planning stages against their actual routing and finite caps."""
+    camp = Path(camp)
+    from .research_execution import independent_critic_enabled
+    if not independent_critic_enabled(camp):
+        return resources({key: calls * value for key, value in
+                          _request_resources(camp, input_bound, output_bound).items()})
+    goal = _read(camp / "goal.json")
+    execution = goal.get("research_execution") or {}
+    limits = {"research_planner": min(2, int(execution.get("max_planner_api_attempts", 2))),
+              "research_critic": int(execution.get("max_critic_api_attempts", 2))}
+    if (any(not 1 <= count <= 2 for count in limits.values())
+            or type(calls) is not int or not 2 <= calls <= sum(limits.values())):
+        raise OwnerBudgetError("staged_planning_requires_both_finite_roles")
+    counts = {role: 1 for role in limits}
+    remaining = calls - 2
+    for role, limit in limits.items():
+        extra = min(remaining, limit - 1)
+        counts[role] += extra
+        remaining -= extra
+    from .role_config import resolve_role_config
+    from .pricing import resolve_pricing, PricingConflict
+    total = resources()
+    for role, count in counts.items():
+        resolved = resolve_role_config(camp, role)
+        if resolved.max_tokens > output_bound:
+            raise OwnerBudgetError("planning_role_output_bound_exceeds_envelope:" + role)
+        try:
+            price = resolve_pricing(camp, model=resolved.model)
+        except PricingConflict as exc:
+            raise OwnerBudgetError(str(exc)) from exc
+        amount = _request_resources(camp, input_bound, resolved.max_tokens, frozen_pricing=price)
+        for key, value in amount.items():
+            total[key] += count * value
+    return total
+
+
 def _role_owner(conn, camp, role):
     scope = OWNER.get()
     if scope and scope[0] != str(camp.resolve()):
@@ -297,7 +334,9 @@ def _role_owner(conn, camp, role):
         if row["kind"] == "role_preparation" and role not in {"memory_curator","context_summary","memory_extraction","memory_consolidation"}:
             raise OwnerBudgetError("owner_preparation_scope_violation")
         if row["kind"] == "continuation":
-            if role != "research_planner" or not row.get("round_id"):
+            from .research_execution import independent_critic_enabled
+            planning_roles = {"research_planner", "research_critic"} if independent_critic_enabled(camp) else {"research_planner"}
+            if role not in planning_roles or not row.get("round_id"):
                 raise OwnerBudgetError("continuation_scope_violation")
         if row["kind"] == "selected_plan":
             if role.startswith("memory_") or role in {"context_summary", "memory_curator"}:
@@ -545,7 +584,13 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
     configured = (config.get("envelopes") or {}).get(task_kind) or {}
     repairs = int(recovery_limits.get("max_repairs", recovery_limits.get("max_engineering_repairs", goal.get("max_repairs_per_candidate", 2))))
     steps = int(recovery_limits.get("coder_steps", 8))
-    defaults = {"experiment_designer": 2, "candidate_coder": 2 * steps * (repairs + 1), "candidate_reviewer": 2 * (repairs + 1), "result_analyst": 2}
+    from .api_policy import api_request_policy
+    # A single accepted verdict may need the existing JSON/schema correction
+    # slot. Reserve the actual transport allowance for each review session.
+    reviewer_calls = api_request_policy(Path(camp)).max_attempts_per_operation
+    defaults = {"experiment_designer": 2, "candidate_coder": 2 * steps * (repairs + 1), "candidate_reviewer": reviewer_calls * (repairs + 1), "result_analyst": 2}
+    if (goal.get("research_execution") or {}).get("design_contract_version") == "v2":
+        defaults["experiment_designer"] = 2 * (repairs + 1)
     if task_kind in {"diagnosis", "validation", "confirmation"}:
         defaults = {"result_analyst": 2}
     feedback_reports = known_cost.get("feedback_report_count",1)
@@ -561,7 +606,16 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
         raise OwnerBudgetError("selected_chain_required_stage_missing")
     input_per = int(configured.get("input_tokens_per_call", config.get("input_tokens_per_call", 128000)))
     output_per = int(configured.get("output_tokens_per_call", config.get("output_tokens_per_call", 32768)))
-    role_resources = {role: resources({key: value * count for key, value in _request_resources(Path(camp), input_per, output_per).items()}) for role, count in roles.items()}
+    from .role_config import resolve_role_config
+    role_resources = {}
+    for role, count in roles.items():
+        role_output = output_per
+        if role in {"candidate_coder", "candidate_reviewer"}:
+            # The common allocation estimate used to be32k. A larger coding
+            # profile must fit its complete output bound before transport.
+            role_output = max(role_output, resolve_role_config(Path(camp), role).max_tokens)
+        role_resources[role] = resources({key: value * count for key, value in
+            _request_resources(Path(camp), input_per, role_output).items()})
     for row in role_resources.values():
         row["training_jobs"] = row["gpu_seconds"] = 0
     known = known_cost.get("resources", known_cost)
@@ -589,10 +643,12 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
                 raise OwnerBudgetError("engineering_gpu_envelope_unknown")
     engineering=resources({"gpu_seconds":engineering_gpu})
     total.update(training_jobs=jobs, gpu_seconds=gpu+engineering["gpu_seconds"])
-    continuation_calls = int(configured.get("continuation_calls", 2))
-    if not 1 <= continuation_calls <= 2:
+    from .research_execution import planning_call_budget
+    planning_calls = planning_call_budget(goal)
+    continuation_calls = int(configured.get("continuation_calls", planning_calls))
+    if not 1 <= continuation_calls <= planning_calls:
         raise OwnerBudgetError("continuation_must_be_finite")
-    continuation = resources({key: value * continuation_calls for key, value in _request_resources(Path(camp), input_per, output_per).items()})
+    continuation = _planning_resources(camp, input_per, output_per, continuation_calls)
     return total, role_resources, continuation, preparation, engineering
 
 
@@ -675,9 +731,11 @@ def planner_owner(camp, *, observation_digest, round_id):
                 raise OwnerBudgetError("continuation_observation_not_found")
             config=((_read(camp/"goal.json").get("research_execution") or {}).get("budget") or {})
             planning=(config.get("envelopes") or {}).get("planning") or {}
-            amount = _request_resources(camp,int(planning.get("input_tokens_per_call",config.get("input_tokens_per_call",128000))),
-                int(planning.get("output_tokens_per_call",config.get("output_tokens_per_call",32768))))
-            amount = {key: 2 * value for key, value in amount.items()}
+            from .research_execution import planning_call_budget
+            amount = _planning_resources(camp,
+                int(planning.get("input_tokens_per_call", config.get("input_tokens_per_call", 128000))),
+                int(planning.get("output_tokens_per_call", config.get("output_tokens_per_call", 32768))),
+                planning_call_budget(camp))
             owner = _allocate(conn, camp, "bootstrap:initial_planner", amount, kind="continuation", binding={"observation_digest": observation_digest})
             if owner["status"] == "released":
                 raise OwnerBudgetError("bootstrap_round_already_finished")

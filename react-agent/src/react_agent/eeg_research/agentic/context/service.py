@@ -15,7 +15,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .compiler import ContextCompiler
+from .compiler import ContextCompiler, is_research_planning_input
 from .maintenance import MaintenanceBudget, MaintenanceCoordinator
 from .long_memory import LongMemoryPipeline, valid_source_ref
 from .recovery import incorporate_partial_reads, recover_context
@@ -441,7 +441,7 @@ class ContextService:
 
     def _upkeep_api_allowance(self, request) -> int | None:
         remaining = request.remaining_api_calls
-        if request.role != "research_planner":
+        if request.role not in {"research_planner", "research_critic"}:
             return remaining
         from react_agent.eeg_research.agentic.api_policy import ATTEMPTS, ROUND, api_request_policy
         round_ = ROUND.get()
@@ -498,10 +498,16 @@ class ContextService:
             _ACTIVE.reset(token)
 
     def _current_kernel(self, request: CompileRequest, *, callbacks: bool) -> CompileRequest:
+        if is_research_planning_input(request.role, request.payload):
+            # The native planning snapshot binds full state separately. Keep
+            # control revisions in the local manifest, not the model's science.
+            return replace(request, authority_revision=authoritative_revision(self.camp, self.owned_calls),
+                maintenance_callback=None, allow_semantic_compaction=False,
+                allow_sync_memory_maintenance=False)
         payload = copy.deepcopy(request.payload)
         authority = native_authority(self.camp)
         from ..research_execution import single_plan_enabled
-        if single_plan_enabled(self.camp) and request.role == "research_planner":
+        if single_plan_enabled(self.camp) and request.role in {"research_planner", "research_critic"}:
             from ..experiment_observations import _admission_view
             controls = authority.get("controls") or {}
             admissions = controls.get("candidate_admissions")
@@ -609,7 +615,8 @@ class ContextService:
             return Blocked("unreadable_source", {"reason":"private or unavailable source"})
         request = replace(request, payload=filtered)
         maintenance = request.mode in MAINTENANCE_MODES
-        if not maintenance:
+        scientific_planning = is_research_planning_input(request.role, request.payload)
+        if not maintenance and not scientific_planning:
             try:
                 self.snapshot.invalidate_stale_sources(role=request.role)
                 self.capture_closed(request.payload)
@@ -618,7 +625,7 @@ class ContextService:
                 return Blocked("context_source_unavailable", {"reason": str(exc)},
                                recoverable_when=("valid applicable source or native classification",))
         from ..research_execution import single_plan_enabled, paid_maintenance_mode
-        if single_plan_enabled(self.camp) and request.role == "research_planner" and not maintenance:
+        if single_plan_enabled(self.camp) and request.role == "research_planner" and not maintenance and not scientific_planning:
             from ..experiment_observations import compact_planner_view, planner_applicability_context, ObservationDeliveryRequired
             payload = copy.deepcopy(request.payload)
             try:
@@ -634,7 +641,7 @@ class ContextService:
                 return exc.result
             request = replace(request, payload=payload)
         revision_before, calls_before = self.snapshot.revision, set(self.owned_calls)
-        callbacks = not maintenance and paid_maintenance_mode(self.camp) in {"legacy", "emergency"}
+        callbacks = not maintenance and not scientific_planning and paid_maintenance_mode(self.camp) in {"legacy", "emergency"}
         current = self._current_kernel(request, callbacks=callbacks)
         result = self.compiler.compile(current)
         if not maintenance and (self.snapshot.revision != revision_before or self.owned_calls != calls_before):

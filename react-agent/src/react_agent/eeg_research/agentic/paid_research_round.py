@@ -97,7 +97,7 @@ def _verify_current(camp, state, full):
                 raise ValueError("paid_round_candidate_source_changed")
 
 
-def _wire_observation(camp, wire):
+def _wire_observation(camp, wire, *, role="research_planner"):
     """Expand original delivered history references, never capture new sources."""
     from .context.representations import resolve_request_pointer, validate_pointer_closure
     from .context.sources import pointer_escape
@@ -107,7 +107,7 @@ def _wire_observation(camp, wire):
     def expand(value, path=""):
         if isinstance(value, dict):
             if "$context_pointer" in value:
-                return copy.deepcopy(resolve_request_pointer(wire, path))
+                return expand(resolve_request_pointer(wire, path), value["$context_pointer"])
             return {key: expand(child, path + "/" + pointer_escape(key)) for key, child in value.items()}
         if isinstance(value, list):
             return [expand(child, path + "/" + str(index)) for index, child in enumerate(value)]
@@ -121,10 +121,10 @@ def _wire_observation(camp, wire):
         references.add(ref)
         if field and "/" not in field:
             registry = readonly_registry(camp)
-            source = registry.get(ref, role="research_planner")
+            source = registry.get(ref, role=role)
             if source.block_id != "planner-history:" + field or source.source_hash != row.get("source_hash"):
                 raise ValueError("paid_round_history_identity_changed")
-            full[field] = registry.load(source, role="research_planner")
+            full[field] = registry.load(source, role=role)
     for card in (wire.get("experiment_observations") or {}).get("cards") or []:
         references.update(row.get("source_ref") for row in card.get("source_refs") or [] if row.get("source_ref"))
     # compact_planner_view adds delivery cards after the native round was bound.
@@ -141,7 +141,7 @@ def _one(rows, call_id, name):
     return found[0]
 
 
-def _verify_call(camp, row, owner, claims, journals):
+def _verify_call(camp, row, owner, claims, journals, *, allowed_roles=None, operations=None, state=None):
     from .context.types import digest as wire_digest
     call_id = row["call_id"]
     intent = _one(journals["llm_api_intents.jsonl"], call_id, "intent")
@@ -149,9 +149,11 @@ def _verify_call(camp, row, owner, claims, journals):
     request = _read(camp / "llm_requests" / (call_id + ".json"))
     response = _read(camp / "llm_responses" / (call_id + ".json"))
     rid = owner["round_id"]
+    allowed_roles = {"research_planner"} if allowed_roles is None else set(allowed_roles)
+    operations = {rid + ":generation", rid + ":correction"} if operations is None else set(operations)
     if (row.get("success") is not True or row.get("transport_outcome") != "confirmed_response"
             or response.get("validation") != "valid" or row.get("planner_round_id") != rid
-            or row.get("operation_id") not in {rid + ":generation", rid + ":correction"}):
+            or row.get("role") not in allowed_roles or row.get("operation_id") not in operations):
         raise ValueError("paid_round_response_not_confirmed")
     for source in (intent, attempt):
         for key in ("role", "operation_id", "planner_round_id", "budget_owner", "resource_claim_id",
@@ -185,7 +187,7 @@ def _verify_call(camp, row, owner, claims, journals):
     claim = claims.get(call_id) or {}
     usage = claim.get("settlement_usage") or {}
     if (claim.get("call_id") != call_id or claim.get("status") != "settled"
-            or claim.get("owner_id") != owner["owner_id"] or claim.get("role") != "research_planner"
+            or claim.get("owner_id") != owner["owner_id"] or claim.get("role") != row["role"]
             or claim.get("operation_id") != row["operation_id"]
             or usage.get("transport_outcome") != "confirmed_response" or usage.get("unconfirmed_charge_possible") is not False
             or claim.get("settlement_digest") != wire_digest(usage)):
@@ -195,7 +197,12 @@ def _verify_call(camp, row, owner, claims, journals):
             raise ValueError("paid_round_settlement_usage_changed")
     if (claim.get("actual") or {}).get("llm_calls") != 1:
         raise ValueError("paid_round_settlement_call_count_changed")
-    full = _wire_observation(camp, json.loads(request["user"]))
+    wire = json.loads(request["user"])
+    from .staged_planning_recovery import PLANNING_CONTEXT_VERSION, _input_snapshot
+    if wire.get("planning_context_version") == PLANNING_CONTEXT_VERSION:
+        full, _ = _input_snapshot(camp, wire, row, owner, state=state)
+    else:
+        full = _wire_observation(camp, wire, role=row["role"])
     if round_id(full) != rid:
         raise ValueError("paid_round_original_input_changed")
     raw = copy.deepcopy(response["reply"])

@@ -68,7 +68,8 @@ def require_idle_gpus(camp: Path, state: dict) -> None:
     from react_agent.eeg_research.agentic.loso_study import read, gpu_inventory
     goal = read(camp / "goal.json")
     authorization = sharing_authorization(camp, state)
-    inventory = gpu_inventory(tuple(state["gpu"]),
+    cards = state.get("gpu") or read(camp / "execution_protocol.json").get("gpu") or []
+    inventory = gpu_inventory(tuple(cards),
         allow_shared=bool(authorization) or goal.get("allow_shared_gpus") is True)
     if authorization:
         if [row["uuid"] for row in inventory] != authorization["physical_gpu_uuids"]:

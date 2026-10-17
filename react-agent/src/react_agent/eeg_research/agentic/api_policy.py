@@ -23,7 +23,7 @@ class ApiRequestPolicy(BaseModel):
     max_attempts_per_planner_round: int = Field(default=6, ge=1, le=100)
     unknown_usd_reserve: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     allow_output_budget_adjustment: bool = False
-    max_output_tokens: int = Field(default=65536, ge=1, le=131072)
+    max_output_tokens: int = Field(default=65536, ge=1, le=393216)
     output_retry_timeout_s: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
     transport_backoff_s: float = Field(default=.25, ge=0, le=60, allow_inf_nan=False)
 
@@ -187,6 +187,14 @@ def reserve_operation_attempt(camp: Path, *, operation: str, call_id: str,
             raise LlmUnavailable("api_operation_attempt_limit", diagnostics={"operation_id": operation, "actual_attempts": used})
         if round_ and sum(row.get("planner_round_id") == round_[1] for row in rows) >= round_[2]:
             raise LlmUnavailable("planner_round_attempt_limit", diagnostics={"planner_round_id": round_[1]})
+        if round_:
+            from .research_execution import independent_critic_enabled, research_goal
+            role = (metadata or {}).get("role")
+            if independent_critic_enabled(camp) and role in {"research_planner", "research_critic"}:
+                config = research_goal(camp)["research_execution"]
+                limit = min(2, int(config.get("max_planner_api_attempts", 2))) if role == "research_planner" else int(config.get("max_critic_api_attempts", 2))
+                if sum(row.get("planner_round_id") == round_[1] and row.get("role") == role for row in rows) >= limit:
+                    raise LlmUnavailable("planning_stage_attempt_limit", diagnostics={"planner_round_id": round_[1], "role": role})
         safe_metadata = {key: (metadata or {}).get(key) for key in ("role", "task_id", "attempt_id", "input_digest",
             "prompt_hash", "requested_model", "role_config_hash", "role_model_config", "request_trace_ref",
             "request_system_sha256", "request_user_sha256", "research_authorization_ref", "parent_planner_round_id",

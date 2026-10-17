@@ -10,9 +10,36 @@ of the frozen evaluator, so it may change without invalidating suites.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any
+
+
+def _capacity_comparison(trainable_scalars: int, scientific_parameters: Any) -> dict[str, Any] | None:
+    """Compare the measured count with an explicit declared band, without changing it."""
+    if not isinstance(scientific_parameters, dict):
+        return None
+    baseline = scientific_parameters.get("matched_baseline_trainable_params")
+    band = scientific_parameters.get("target_parameter_band")
+    def finite_number(value: Any) -> bool:
+        return type(value) in (int, float) and math.isfinite(value)
+    if (not finite_number(baseline) or baseline <= 0 or not isinstance(band, (list, tuple))
+            or len(band) != 2 or not all(finite_number(value) for value in band)
+            or not 0 <= band[0] <= band[1]):
+        return None
+    delta = trainable_scalars - baseline
+    relative = delta / baseline
+    return {
+        "encoder_trainable_scalars": trainable_scalars,
+        "declared_baseline_trainable_scalars": baseline,
+        "declared_band": list(band),
+        "delta_scalars": delta,
+        "relative_deviation": relative,
+        "relative_deviation_percent": relative * 100,
+        "within_declared_band": band[0] <= trainable_scalars <= band[1],
+        "scope": "Arithmetic on native measured encoder scalars and the approved declared band; no scientific performance claim.",
+    }
 
 
 def _count(dataset: str, approved_spec: str | None) -> dict[str, Any]:
@@ -32,14 +59,19 @@ def _count(dataset: str, approved_spec: str | None) -> dict[str, Any]:
                  if hasattr(candidate, "build_training_objective") else None)
     extra = objective_parameters(objective)
     trainable = [p for p in encoder.parameters() if p.requires_grad]
-    return {
+    result = {
         "status": "measured",
+        "candidate_id": Path.cwd().parent.name,
         "parameter_counts": {"encoder": sum(int(p.numel()) for p in encoder.parameters()),
                              "objective": sum(int(p.numel()) for p in extra)},
         "encoder_trainable_scalars": sum(int(p.numel()) for p in trainable),
         "encoder_frozen_scalars": sum(int(p.numel()) for p in encoder.parameters() if not p.requires_grad),
         "basis": "Same hooks and numel sum as train_entry parameter_counts (capabilities_used.json).",
     }
+    comparison = _capacity_comparison(result["encoder_trainable_scalars"], config.get("scientific_parameters"))
+    if comparison is not None:
+        result["capacity_comparison"] = comparison
+    return result
 
 
 def measure(workspace: Path, timeout_s: float = 120.0) -> dict[str, Any]:

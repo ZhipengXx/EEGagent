@@ -1,0 +1,1 @@
+Complete the selected task using its scientific design, effective config, actual source and native check results. Keep implementation evidence separate from unmeasured scientific predictions. Read referenced content when needed; cite the delivered source locations. Return the requested JSON.

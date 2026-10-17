@@ -8,6 +8,14 @@ from .types import BudgetConfig, CompileRequest, RENDER_VERSION, canonical
 
 TOKENIZER_VERSION = "unicode_utf8_conservative_estimate.v1"
 
+# DeepSeek V4's documented 1M window includes thinking and final output. Keep
+# unrecognized model names on the existing provider fallback instead of assuming
+# that every model served by DeepSeek has the same context capacity.
+MODEL_CONTEXT_TOKENS = {
+    ("deepseek", "deepseek-flash"): 1_000_000,
+    ("deepseek", "deepseek-v4-pro"): 1_000_000,
+}
+
 
 def token_count(text: str, tokenizer=None) -> tuple[int, str, str]:
     if tokenizer is not None:
@@ -26,9 +34,9 @@ def token_count(text: str, tokenizer=None) -> tuple[int, str, str]:
 
 def provider_window(request: CompileRequest) -> tuple[int, int]:
     configured = request.budget.provider_context_tokens
-    # Explicitly versioned conservative model policy, overridden for small models.
     defaults = {"deepseek": 128_000, "openai": 128_000, "anthropic": 200_000}
-    window = configured or defaults.get(request.provider, 32_768)
+    window = configured or MODEL_CONTEXT_TOKENS.get(
+        (request.provider, request.model), defaults.get(request.provider, 32_768))
     input_limit = request.budget.provider_input_tokens or window
     return window, input_limit
 
@@ -47,7 +55,11 @@ def measure(system: str, user: str, request: CompileRequest,
     overhead = 16
     safety = math.ceil((tokens + structured_tokens + overhead) * request.budget.token_safety_factor)
     window, input_limit = provider_window(request)
-    reserve = request.max_output_tokens + request.budget.reasoning_reserve_tokens
+    # DeepSeek max_tokens already bounds reasoning + final output together.
+    # Reserving thinking a second time can incorrectly reject a valid request.
+    shared_output_budget = (request.provider, request.model) in MODEL_CONTEXT_TOKENS
+    reasoning_reserve = 0 if shared_output_budget else request.budget.reasoning_reserve_tokens
+    reserve = request.max_output_tokens + reasoning_reserve
     ceiling = request.budget.hard_chars if request.mode == "repair" else request.budget.fallback_chars
     application_ok = len(effective) < ceiling if request.mode == "repair" else len(effective) <= ceiling
     return {
@@ -61,7 +73,8 @@ def measure(system: str, user: str, request: CompileRequest,
         "usage_calibration": getattr(request.tokenizer, "calibration_metadata", None),
         "token_safety_factor": request.budget.token_safety_factor,
         "safe_input_tokens": safety, "max_output_tokens": request.max_output_tokens,
-        "reasoning_reserve_tokens": request.budget.reasoning_reserve_tokens,
+        "reasoning_reserve_tokens": reasoning_reserve,
+        "configured_reasoning_reserve_tokens": request.budget.reasoning_reserve_tokens,
         "provider_context_tokens": window, "provider_input_tokens": input_limit,
         "provider_budget_ok": safety <= input_limit and safety + reserve <= window,
         "target_chars": request.budget.target_chars, "high_chars": request.budget.high_chars,

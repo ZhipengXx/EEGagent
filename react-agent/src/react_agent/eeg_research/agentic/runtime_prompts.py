@@ -11,15 +11,19 @@ ROOT = Path(__file__).with_name("prompts") / "runtime_v1"
 PROMPT_VERSION = "eeg_research.runtime_mission.single_plan.v1"
 
 
-def runtime_mission(role: str) -> str:
-    return (ROOT / "shared_contract.txt").read_text(encoding="utf-8") + "\n\n" + (ROOT / (role + ".txt")).read_text(encoding="utf-8")
+def runtime_mission(role: str, *, design_contract_version: str = "v1", review_stage: str | None = None) -> str:
+    root = ROOT
+    if design_contract_version == "v2" and (role in {"experiment_designer", "candidate_coder", "candidate_reviewer"}
+            or role == "result_analyst" and review_stage == "analysis"):
+        root = ROOT.parent / "runtime_v2"
+    return (root / "shared_contract.txt").read_text(encoding="utf-8") + "\n\n" + (root / (role + ".txt")).read_text(encoding="utf-8")
 
 
 def conditional_hints(role: str, payload: dict) -> dict | None:
     if role not in {"candidate_coder", "candidate_reviewer", "experiment_designer", "result_analyst"}:
         return None
     # Examine the current task/config/check, not unrelated history or RAG.
-    current = {key: payload[key] for key in ("approved_spec", "experiment", "hypothesis", "task", "selected_research_task", "repair_task", "last_check", "check", "recovery_context", "current_feedback", "objective_semantics_probe", "objective_semantic_findings", "probe") if key in payload}
+    current = {key: payload[key] for key in ("approved_spec", "experiment", "experiment_spec", "design_brief", "hypothesis", "task", "selected_research_task", "repair_task", "last_check", "check", "recovery_context", "current_feedback", "objective_semantics_probe", "objective_semantic_findings", "probe") if key in payload}
     text = json.dumps(current, ensure_ascii=False, default=str).lower()
     matchers = {
         "positive_mass_infonce": ("positive-mass", "positive_mass", "multi_positive", "logsumexp"),
