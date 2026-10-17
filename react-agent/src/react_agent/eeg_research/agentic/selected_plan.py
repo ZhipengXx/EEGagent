@@ -635,12 +635,26 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
     else:
         recovered = restore_paid(camp.resolve(), state)
     full = recovered[0] if recovered else observation(camp)
+    if staged_mode and not recovered and (camp / "method_search_manifest.json").is_file():
+        # Supply actual frozen fold identifiers even on the first round, when
+        # neither a previous experiment nor an observation card exists yet.
+        from .method_suite import manifest
+        common = manifest(camp)
+        phase = "confirmation_10fold" if common.get("evaluation_schedule") == "screen_then_confirm" else "full"
+        scopes = {phase: {"phase": phase, "folds": [row["fold_id"] for row in common["folds"]],
+                          "seed": common["seed"], "controls": ["baseline"]}}
+        if phase == "confirmation_10fold":
+            scopes["screening_2fold"] = {"phase": "screening_2fold",
+                "folds": common["selection_manifest"]["screening_fold_ids"],
+                "seed": common["seed"], "controls": ["baseline"]}
+        full["frozen_evaluation_scopes"] = {"phases": scopes,
+            **{key: common[key] for key in ("metric", "metric_unit", "aggregation") if key in common}}
     cfg = config(full)
     input_digest = state.get("terminal_observation_digest") or digest(round_input(full))
     research_round_id = round_id(full)
     from .experiment_observations import compact_planner_view, ObservationDeliveryRequired
     try:
-        if recovered and staged_mode and "critic" not in recovered[2]:
+        if recovered and staged_mode:
             delivered = recovered[3].get("planner_delivery") or compact_planner_view(camp, full)
         else:
             delivered = full if recovered else compact_planner_view(camp, full)
@@ -665,6 +679,9 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
             state.pop("detail", None)
         event(camp, "planner_context_resolved", round_id=research_round_id,
               input_observation_digest=input_digest)
+    if staged_mode and not recovered:
+        from .planning_context import build_proposer_input
+        delivered = build_proposer_input(full, delivered)
     from .context.representations import delivered_source_refs
     context_refs = delivered_source_refs(delivered)
     full["_delivered_context_refs"] = sorted(set(full.get("_delivered_context_refs") or []) | {ref for ref in context_refs if ref})
@@ -925,11 +942,10 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
             bounded = finish_bounded_engineering_failure(camp, state, state.get("detail"))
             if bounded is not None:
                 return bounded
-            # Engineering failure with a native finite repair remains this plan;
-            # environmental/unknown blocks keep the same owner and current step.
-            if not state.get("repair_task"):
-                reflect_control(camp, state)
-                return state
+            # The native step has not completed. An existing repair task does
+            # not turn a recoverable API/resource wait into a consumed repair.
+            reflect_control(camp, state)
+            return state
         if repair:
             plan["repair_count"] += 1
         plan["attempt"] += 1

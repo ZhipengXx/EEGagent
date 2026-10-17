@@ -141,7 +141,7 @@ def _one(rows, call_id, name):
     return found[0]
 
 
-def _verify_call(camp, row, owner, claims, journals, *, allowed_roles=None, operations=None):
+def _verify_call(camp, row, owner, claims, journals, *, allowed_roles=None, operations=None, state=None):
     from .context.types import digest as wire_digest
     call_id = row["call_id"]
     intent = _one(journals["llm_api_intents.jsonl"], call_id, "intent")
@@ -197,7 +197,12 @@ def _verify_call(camp, row, owner, claims, journals, *, allowed_roles=None, oper
             raise ValueError("paid_round_settlement_usage_changed")
     if (claim.get("actual") or {}).get("llm_calls") != 1:
         raise ValueError("paid_round_settlement_call_count_changed")
-    full = _wire_observation(camp, json.loads(request["user"]), role=row["role"])
+    wire = json.loads(request["user"])
+    from .staged_planning_recovery import PLANNING_CONTEXT_VERSION, _input_snapshot
+    if wire.get("planning_context_version") == PLANNING_CONTEXT_VERSION:
+        full, _ = _input_snapshot(camp, wire, row, owner, state=state)
+    else:
+        full = _wire_observation(camp, wire, role=row["role"])
     if round_id(full) != rid:
         raise ValueError("paid_round_original_input_changed")
     raw = copy.deepcopy(response["reply"])

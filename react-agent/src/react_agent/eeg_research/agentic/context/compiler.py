@@ -28,6 +28,12 @@ SCIENCE_IDENTITY = ("candidate_id", "method_revision", "source_hash", "config_ha
     "held_out_subject", "selection_manifest_hash", "fidelity", "evidence_id", "suite_id", "job_id", "run_id", "artifact_id")
 
 
+def is_research_planning_input(role: str, payload: dict[str, Any]) -> bool:
+    """Identify the explicit science-only staged Planner/Critic projection."""
+    return role in {"research_planner", "research_critic"} and payload.get(
+        "planning_context_version") == "research_planning_input.v1"
+
+
 def native_row_identity(row: dict[str, Any]) -> dict[str, Any]:
     identity = {key: row[key] for key in SCIENCE_IDENTITY if key in row}
     scientific = row.get("screening") or row.get("aggregate")
@@ -69,7 +75,10 @@ def render_role_system(role: str, system: str, *, instructions: Any = None, sche
         system += "\nCURRENT_INSTRUCTIONS\n" + canonical(instructions)
     if schema is not None:
         system += "\nOUTPUT_SCHEMA\n" + canonical(compact_schema(schema))
-    if "\nINPUT DELIVERY CONTRACT\n" not in "\n" + system:
+    independent_planning = (role in {"research_planner", "research_critic"}
+                            and execution_version == "single_plan_v1"
+                            and planning_mode == "propose_then_critic")
+    if not independent_planning and "\nINPUT DELIVERY CONTRACT\n" not in "\n" + system:
         system += "\n" + CORE_CONTRACT + "ROLE_MISSION\n" + policy.mission
     return system
 
@@ -250,9 +259,12 @@ class ContextCompiler:
             return Blocked("policy_missing", {"role": request.role})
         # Compiler cannot enter its own paid maintenance from a maintenance call.
         maintenance = request.mode in MAINTENANCE_MODES or _IN_MAINTENANCE.get()
+        scientific_planning = is_research_planning_input(request.role, request.payload)
         self.registry = ContextSourceRegistry(self.camp, request.campaign_id)
         self.snapshot_store = None
-        snapshot_delivery = self._snapshot_delivery(request)
+        # The staged builder already selects the required scientific context.
+        # Working-memory control records remain local to the source manifest.
+        snapshot_delivery = None if scientific_planning else self._snapshot_delivery(request)
         active_candidates = _active_candidate_ids(request)
         required_evidence = _required_evidence_ids(request)
         merged_input = copy.deepcopy(request.payload)
@@ -318,7 +330,13 @@ class ContextCompiler:
                 choices, unknown = representations_for(block, payload, role=request.role,
                                                         excerpt_cap=request.budget.excerpt_chars, abstracted=abstracted,
                                                         complete_read_paths=frozenset(read_paths.get((block.source_ref, block.source_hash), ())))
-                frontier = _scientific_frontier(block, payload, active_candidates)
+                if scientific_planning:
+                    # Do not change the competitors or science after the native
+                    # input snapshot is frozen. Oversized essential input must
+                    # fail its ordinary budget check, not become opaque handles.
+                    choices = [next(choice for choice in choices if choice.kind == "FULL")]
+                    unknown = []
+                frontier = None if scientific_planning else _scientific_frontier(block, payload, active_candidates)
                 if frontier is not None:
                     # Native active identities, not recency/FIFO, select this set.
                     choices = [frontier]
@@ -328,7 +346,7 @@ class ContextCompiler:
                 cap = (request.budget.retrieval_chars if key in {"retrieved_memory", "retrieved_knowledge", "retrieved_context", "memory", "lessons", "skills"}
                        else request.budget.snapshot_max_chars if key == "working_snapshot"
                        else request.budget.recent_chars if key == "recent_decisions" else None)
-                bounded = _bounded_optional(block, payload, cap) if cap else None
+                bounded = _bounded_optional(block, payload, cap) if cap and not scientific_planning else None
                 if bounded is not None:
                     choices, unknown = [bounded], []
                 entries.append({"path": path, "key": key, "block": block, "choices": choices,
@@ -348,7 +366,7 @@ class ContextCompiler:
             if entry["row"] and entry["raw"].get("candidate_id") in active_candidates:
                 current_identity.update({key: entry["raw"][key] for key in ("seed", "protocol_hash", "evaluation_key", "evaluator_hash") if key in entry["raw"]})
         for entry in entries:
-            if not entry["row"] or not active_candidates:
+            if scientific_planning or not entry["row"] or not active_candidates:
                 continue
             raw = entry["raw"]; candidate = raw.get("candidate_id")
             row_refs = {str(raw[key]) for key in ("evidence_id", "artifact_id", "suite_id", "job_id", "run_id") if raw.get(key)}
@@ -387,7 +405,9 @@ class ContextCompiler:
                 "source_hash": block.source_hash, "total_count": len(rows), "delivered_count": len(selected),
                 "body_delivery": "REF_ONLY", "omission_is_not_completion": True})
 
-        system = render_role_system(request.role, request.system, instructions=request.instructions, schema=request.schema)
+        system = render_role_system(request.role, request.system, instructions=request.instructions, schema=request.schema,
+            execution_version="single_plan_v1" if scientific_planning else None,
+            planning_mode="propose_then_critic" if scientific_planning else None)
         # These are assembled before measuring. Sending code must reuse them.
         transport_fields: dict[str, Any] = copy.deepcopy(request.transport_options)
         transport_fields.setdefault("model", request.model)
@@ -420,9 +440,10 @@ class ContextCompiler:
                 else:
                     _put(payload, path, copy.deepcopy(rep.content))
             payload.update(copy.deepcopy(base_extras))
-            payload = deduplicate(payload)
+            if not scientific_planning:
+                payload = deduplicate(payload)
             # Manifest growth is confined to a sidecar, never replayed wholesale.
-            payload["context_delivery"] = {
+            delivery = {
                 "protocol": "eeg.context.v1", "source_count": len(source_blocks),
                 "source_dependency_digest": dependency_digest, "policy_version": request.policy_version,
                 "source_registry": "campaign_delivery_only", "native_read_receipts_satisfied": False,
@@ -434,6 +455,8 @@ class ContextCompiler:
                                 "source_hash": entry["block"].source_hash, "fidelity": entry["choices"][entry["choice"]].kind}
                                for entry in entries if not entry.get("omit_delivery") and not entry["row"] and entry["choices"][entry["choice"]].kind in {"PARTIAL", "REF_ONLY"}][:min(request.budget.max_manifest_entries, 16)],
             }
+            if not scientific_planning:
+                payload["context_delivery"] = delivery
             user = canonical(payload)
             return payload, user, measure(system, user, request, transport_fields)
 
@@ -542,7 +565,7 @@ class ContextCompiler:
         payload, user, report = render()
 
         maintenance_outcome = "not_requested"
-        if (before_report["chars"] >= request.budget.high_chars or not before_report["provider_budget_ok"]) and not maintenance:
+        if (before_report["chars"] >= request.budget.high_chars or not before_report["provider_budget_ok"]) and not maintenance and not scientific_planning:
             if request.allow_semantic_compaction and request.allow_sync_memory_maintenance and request.maintenance_callback and request.remaining_api_calls != 0:
                 token = _IN_MAINTENANCE.set(True)
                 try:
@@ -594,6 +617,10 @@ class ContextCompiler:
             return NeedsContext(tuple(missing), reads, "unclassified_or_unread_required_field", report,
                                 {"max_reads": request.budget.max_reads, "max_read_chars": request.budget.max_read_chars})
         if not report["ready_budget_ok"]:
+            if scientific_planning:
+                return Blocked("research_planning_input_exceeds_budget",
+                    {"role": request.role, "minimum_necessary_chars": report["chars"]}, report,
+                    ("a smaller native scientific projection or larger authorized provider window",))
             kernel_report = measure(system, canonical({}), request, transport_fields)
             if not kernel_report["ready_budget_ok"]:
                 return Blocked("protected_input_too_large", {"affected_task": request.task_id,

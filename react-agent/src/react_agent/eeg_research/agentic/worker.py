@@ -38,6 +38,14 @@ POLLS_PER_DECISION_TICK = 50
 IMPLEMENT_ATTEMPTS = 3
 
 
+def _default_session_failed_check(policy, recovery: dict, check: dict) -> bool:
+    """A default tool window can hand a real failure to reserved repairs."""
+    return bool(policy is not None and policy.max_tool_steps is None
+        and check.get("ok") is False and check.get("error") != "gpu_check_pending"
+        and 0 < recovery.get("tool_step_limit", 0) <= recovery.get("steps_used", 0)
+        and recovery.get("failed_checks_used", 0) < recovery.get("failed_check_limit", 0))
+
+
 def _context_maintenance_boundary(state: dict[str, Any]) -> bool:
     """Closed memory can finish after this exact recoverable Planner limit."""
     if state.get("status") in {"created", "planning"}:
@@ -347,6 +355,22 @@ def _stored_review(workspace: Path, *, candidate_id: str, attempt_id: str, input
     return apply_review_filter(payload, satisfied=satisfied_invariants(workspace))
 
 
+def _checked_repair_implementation(workspace: Path, payload: dict, *, candidate_id: str,
+                                   attempt_id: str, design_v2: bool) -> bool:
+    """A Reviewer transport retry reuses this attempt's completed preflight."""
+    from .native_patch import _check_fingerprint
+    from .semantic_memory import read_json
+    sha = source_hash(workspace)
+    if payload.get("status") != "ready_for_review" or not result_matches(payload,
+            candidate_id=candidate_id, attempt_id=attempt_id,
+            phase="implement_candidate", input_hash=sha):
+        return False
+    check = read_json(workspace / "checks.json")
+    return (check.get("ok") is True and check.get("source_sha256") == sha
+        and (not design_v2 or check.get("check_scope") == "complete")
+        and check.get("check_fingerprint") == _check_fingerprint(workspace, None))
+
+
 def _review_or_reuse(
     camp_dir: Path,
     workspace: Path,
@@ -585,7 +609,8 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         if state.get("status") in {"paused", "cancelled"}:
             return
         from react_agent.eeg_research.agentic.coding_recovery import policy as coding_policy
-        modern_recovery = coding_policy(camp_dir / "candidates" / "_policy_probe") is not None
+        recovery_policy = coding_policy(camp_dir / "candidates" / "_policy_probe")
+        modern_recovery = recovery_policy is not None
         from .design_contract import design_contract_version
         native_v2 = design_contract_version(json.loads((camp_dir / "goal.json").read_text())) == "v2"
         if state.get("evaluation_mode") == "loso_method_search" and not modern_recovery and not native_v2:
@@ -644,7 +669,9 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             spec["repair_intervention_coverage"] = repair.get("intervention_coverage")
             spec["repair_unverified_invariants"] = repair.get("unverified_invariants") or []
             if design_v2:
-                spec["review_mode"] = "targeted"
+                previous_review = repair.get("previous_review") or {}
+                spec["review_mode"] = ("targeted" if previous_review.get("status") in {"ready", "needs_fix", "blocked"}
+                                       and not repair.get("initial_implementation_review") else "full")
                 spec["review_focus"] = repair.get("review_focus") or {"issues": repair.get("issues") or []}
                 spec["review_focus"]["previous_review"] = repair.get("previous_review")
         workspace.mkdir(parents=True, exist_ok=True)
@@ -742,9 +769,12 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                    or spec.get("current_user_instruction") else {}),
             )
         outcome: dict[str, Any] | None = None
-        if impl_path.is_file() and not repairing:
-            outcome = json.loads(impl_path.read_text(encoding="utf-8"))
-        else:
+        if impl_path.is_file():
+            saved = json.loads(impl_path.read_text(encoding="utf-8"))
+            if not repairing or _checked_repair_implementation(workspace, saved,
+                    candidate_id=candidate_id, attempt_id=attempt["attempt_id"], design_v2=design_v2):
+                outcome = saved
+        if outcome is None:
             from react_agent.eeg_research.agentic.handoffs import record_read_delivery, prepare_read_delivery
             prepare_read_delivery(spec.get("artifact_reads") or [])
             digest = request_digest(request=spec)
@@ -838,7 +868,10 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             # A failed preflight is concrete engineering feedback, even before
             # the first review. Keep the same approved candidate and bounded
             # repair policy rather than making repair an unavailable action.
-            if (used < limit and outcome.get("detail") not in {"budget_exhausted", "coding_lineage_budget_exhausted", "coding_no_progress_exhausted"}
+            session_check_failure = (outcome.get("detail") == "coding_lineage_budget_exhausted"
+                and _default_session_failed_check(recovery_policy, row.get("coding_recovery") or {}, check))
+            if (used < limit and (outcome.get("detail") not in {"budget_exhausted", "coding_lineage_budget_exhausted", "coding_no_progress_exhausted"}
+                                  or session_check_failure)
                     and (check.get("error") or check.get("failures"))
                     and (workspace / "extension/eeg_candidate.py").is_file()):
                 # Reviewer findings that were being repaired stay open: fixing the
@@ -1805,11 +1838,24 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         from react_agent.eeg_research.agentic.experiment_gate import experiment_is_approved
         from react_agent.eeg_research.agentic.loop import _design_experiment
         if (state.get("evaluation_mode") != "loso_method_search" or state.get("live_job")
-                or state.get("active_suite") or not reason.strip() or experiment_is_approved(state.get("experiment"))):
+                or state.get("active_suite") or not reason.strip()):
+            raise ValueError("designer_retry_requires_quiescent_unapproved_method_design")
+        from .designer_recovery import is_contract_failure, is_retry_plan, retry_contract_design
+        from .selected_plan import load_plan
+        if is_retry_plan(load_plan(camp_dir, state)):
+            result = retry_contract_design(camp_dir, state, reason=reason, designer=_lazy("experiment_designer"))
+            _sync_ledger(camp_dir, state)
+            return result
+        if experiment_is_approved(state.get("experiment")):
             raise ValueError("designer_retry_requires_quiescent_unapproved_method_design")
         artifact = resolve_verified_artifact(camp_dir, str(state.get("experiment_ref") or ""))
         prior = json.loads(Path(artifact["path"]).read_text())
         failure = (prior.get("payload") or {}).get("design_failure") or {}
+        if artifact.get("kind") == "experiment_spec" and is_contract_failure(failure):
+            result = retry_contract_design(camp_dir, state, artifact=artifact, prior=prior,
+                                          reason=reason, designer=_lazy("experiment_designer"))
+            _sync_ledger(camp_dir, state)
+            return result
         decision = (state.get("decisions") or [{}])[-1]
         if (artifact.get("kind") != "experiment_spec" or prior.get("status") != "blocked"
                 or failure.get("error_type") != "role_context_budget_requires_artifact_pages"
@@ -1829,6 +1875,12 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 "experiment_ref": state.get("experiment_ref"), "original_decision_id": decision["decision_id"],
                 "prior_artifact_id": artifact["artifact_id"], "reason": reason}
 
+    def retry_coder(camp_dir: Path, state: dict[str, Any], *, reason: str) -> dict:
+        from .coder_stage_recovery import retry_coder_stage
+        result = retry_coder_stage(camp_dir, state, reason=reason, services={"implement": do_implement})
+        _sync_ledger(camp_dir, state)
+        return result
+
     return {
         "launch": launch,
         "critic": lazy_backend("research_critic"),
@@ -1841,6 +1893,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         "context_maintenance": maintain_context,
         "revalidate_feedback": revalidate_feedback,
         "retry_design": retry_design,
+        "retry_coder": retry_coder,
         "revalidate_review": revalidate_review,
         "librarian": _lazy("research_librarian"),
         "designer": _lazy("experiment_designer"),
@@ -1855,11 +1908,16 @@ def run_worker(camp: Path, *, poll_seconds: float = 30.0, max_ticks: int = 200) 
     if successor:
         return {"status": "budget_delegated", "successor": successor}
     lock_path = camp / "worker.lock"
-    handle = lock_path.open("a", encoding="utf-8")
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        return {"status": "worker_already_running"}
+    with lock_path.open("a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return {"status": "worker_already_running"}
+        return _run_locked_worker(camp, poll_seconds=poll_seconds, max_ticks=max_ticks)
+
+
+def _run_locked_worker(camp: Path, *, poll_seconds: float, max_ticks: int) -> dict[str, Any]:
+    """Run while the caller owns the worker file descriptor and lock."""
     (camp / "worker.json").write_text(json.dumps({"pid": os.getpid(), "started_at": time.time()}), encoding="utf-8")
     state = load_state(camp)
     from react_agent.eeg_research.agentic.verification_cache import verification_scope

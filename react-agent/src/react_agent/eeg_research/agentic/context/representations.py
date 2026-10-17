@@ -74,12 +74,49 @@ def representations_for(block: SourceBlock, payload: Any, *, role: str, string_c
     selected_ranges: list[dict[str, Any]] = []
     covered_sections: list[str] = []
 
+    # Native source pages are already bounded by the reader. Retain recent
+    # useful pages in a fact card instead of treating their ``text`` as prose.
+    # This changes no full-read obligation: older pages remain registered and
+    # can be requested again if packing removes their exact bodies.
+    source_pages: set[str] = set()
+    if role == "candidate_coder":
+        from ..coder_source_view import source_page_lines
+        top_key = block.metadata.get("top_key")
+
+        def collect_pages(value: Any, path: str = "") -> None:
+            if isinstance(value, dict):
+                if source_page_lines(value) is not None and len(value["text"]) <= max(16_000, excerpt_cap):
+                    source_pages.add(path)
+                    return
+                for name, child in value.items():
+                    collect_pages(child, path + "/" + pointer_escape(name))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    collect_pages(child, path + "/" + str(index))
+
+        if top_key in {"current_file", "failure_source", "error_source_context",
+                       "edit_success_context", "edit_failure_context"}:
+            collect_pages(payload)
+        elif top_key == "history" and isinstance(payload, list):
+            recent = [(index, row.get("result")) for index, row in enumerate(payload)
+                      if isinstance(row, dict) and row.get("tool") == "read_code"
+                      and source_page_lines(row.get("result")) is not None]
+            for index, page in recent[-2:]:
+                collect_pages(page, "/" + str(index) + "/result")
+
     def visit(value: Any, path: str, key: str = "") -> Any:
         if path in complete_read_paths:
             # A verified full-field read must remain literally delivered after
             # packing. Reading the bytes does not grant execution permission.
             exact.append(path)
             return copy.deepcopy(value)
+        if path in source_pages:
+            exact.append(path + "/text")
+            selected_ranges.append({"path": path + "/text", "unit": "lines",
+                                    "start": value["start"], "end": value["end"]})
+            return {name: copy.deepcopy(child) if name == "text" else
+                    visit(child, path + "/" + pointer_escape(name), name)
+                    for name, child in value.items()}
         if isinstance(value, dict):
             if value.get("fidelity") == "PARTIAL" and ("actual_read_scope" in value or "actual_read_scopes" in value):
                 # Exact code pages already bounded by a registry read cannot be

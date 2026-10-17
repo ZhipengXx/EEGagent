@@ -1829,6 +1829,11 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
             context["selected_research_task"] = {"plan_id": selected["plan_id"],
                 **{key: selected["proposal"][key] for key in ("question", "task_description", "scientific_intent",
                     "evaluation_scope", "expected_observation", "completion_condition")}}
+            # Separate key: selected_research_task is compared verbatim in review revalidation.
+            from .planning_context import selection_basis
+            basis = selection_basis(camp, selected)
+            if basis is not None:
+                context["selection_basis"] = basis
     return context
 
 
@@ -1968,6 +1973,9 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
             payload["summary_zh"] = "设计调用未完成：" + str(exc) + "；草稿未批准"
             spec["role_status"] = "partial"
             spec["status"] = "draft"
+            if str(exc) == "design_contract_invalid":
+                spec.update(status="blocked", role_status="blocked", blocked_reason=str(exc))
+                blocked = True
             design_failed = True
     if design_failed or blocked:
         spec["status"] = "blocked" if blocked and spec.get("role_status") in {"requires_framework_extension", "blocked"} else "draft"

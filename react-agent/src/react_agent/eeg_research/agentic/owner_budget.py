@@ -584,7 +584,10 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
     configured = (config.get("envelopes") or {}).get(task_kind) or {}
     repairs = int(recovery_limits.get("max_repairs", recovery_limits.get("max_engineering_repairs", goal.get("max_repairs_per_candidate", 2))))
     steps = int(recovery_limits.get("coder_steps", 8))
-    reviewer_calls = 1 if (goal.get("research_execution") or {}).get("implementation_review_mode") == "single_pass" else 2
+    from .api_policy import api_request_policy
+    # A single accepted verdict may need the existing JSON/schema correction
+    # slot. Reserve the actual transport allowance for each review session.
+    reviewer_calls = api_request_policy(Path(camp)).max_attempts_per_operation
     defaults = {"experiment_designer": 2, "candidate_coder": 2 * steps * (repairs + 1), "candidate_reviewer": reviewer_calls * (repairs + 1), "result_analyst": 2}
     if (goal.get("research_execution") or {}).get("design_contract_version") == "v2":
         defaults["experiment_designer"] = 2 * (repairs + 1)
@@ -603,7 +606,16 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
         raise OwnerBudgetError("selected_chain_required_stage_missing")
     input_per = int(configured.get("input_tokens_per_call", config.get("input_tokens_per_call", 128000)))
     output_per = int(configured.get("output_tokens_per_call", config.get("output_tokens_per_call", 32768)))
-    role_resources = {role: resources({key: value * count for key, value in _request_resources(Path(camp), input_per, output_per).items()}) for role, count in roles.items()}
+    from .role_config import resolve_role_config
+    role_resources = {}
+    for role, count in roles.items():
+        role_output = output_per
+        if role in {"candidate_coder", "candidate_reviewer"}:
+            # The common allocation estimate used to be32k. A larger coding
+            # profile must fit its complete output bound before transport.
+            role_output = max(role_output, resolve_role_config(Path(camp), role).max_tokens)
+        role_resources[role] = resources({key: value * count for key, value in
+            _request_resources(Path(camp), input_per, role_output).items()})
     for row in role_resources.values():
         row["training_jobs"] = row["gpu_seconds"] = 0
     known = known_cost.get("resources", known_cost)

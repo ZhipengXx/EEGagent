@@ -345,6 +345,11 @@ def approve_experiment(
         return _stamp(failed, status="blocked", context=context, producer=producer, allowed=[])
     copied.pop("approval_record", None)
     copied.pop("experiment_ref", None)
+    # A failed brief was never assembled into an executable draft. Preserve its
+    # actual failure instead of diagnosing fields absent from that old draft.
+    if copied.get("status") == "blocked" and copied.get("blocked_reason"):
+        copied["allowed_actions"] = []
+        return _stamp(copied, status="blocked", context=context, producer=producer, allowed=[])
     draft_problem = executable_draft_problem(copied)
     evaluation = (context or {}).get("evaluation_contract") or {}
     mode = (context or {}).get("evaluation_mode") or evaluation.get("evaluation_mode")

@@ -176,6 +176,37 @@ def _review_single_measurement(camp: Path, state: dict, latest: dict, experiment
         "blocking_requirement_ids": missing, "evidence_refs": refs})
 
 
+def analysis_reply_errors(body: dict, payload: dict) -> list[dict]:
+    """Format errors the Analyst can correct in-call instead of producing a degraded artifact.
+
+    Reference/ID shape would otherwise make check_analysis_coverage block the stage;
+    an empty summary_zh would otherwise reach the Observation and the next Planner.
+    Marking a requirement unverified is a scientific judgement and is not reported.
+    """
+    review = payload.get("measurement_review")
+    if payload.get("review_stage") != "analysis" or not isinstance(review, dict):
+        return []
+    allowed = {review.get("artifact_id"), review.get("path"), *(review.get("evidence_refs") or [])} - {None}
+    declared = {row["requirement_id"] for row in payload.get("analysis_requirements") or []}
+    errors, seen = [], set()
+    if not str(body.get("summary_zh") or "").strip():
+        errors.append({"type": "analysis_summary_missing", "loc": ["summary_zh"],
+            "msg": "summary_zh is required: intervention, main result with exact numbers, hypothesis assessment, scope and unknowns"})
+    for index, row in enumerate(body.get("analysis_requirement_coverage") or []):
+        rid = row.get("requirement_id")
+        if rid in seen or (declared and rid not in declared):
+            errors.append({"type": "analysis_requirement_id_invalid", "loc": ["analysis_requirement_coverage", index, "requirement_id"],
+                "msg": f"{rid} must be a unique ID from analysis_requirements"})
+        seen.add(rid)
+        if row.get("status") != "implemented":
+            continue
+        for ref in row.get("evidence_refs") or []:
+            if ref not in allowed:
+                errors.append({"type": "analysis_evidence_ref_not_delivered", "loc": ["analysis_requirement_coverage", index, "evidence_refs"],
+                    "msg": f"{ref} is not a delivered evidence reference; use only: {sorted(allowed)}"})
+    return errors
+
+
 def check_analysis_coverage(reply: dict, experiment: dict, measurement_review: dict) -> dict:
     """Bind the Analyst's stage claims to the delivered measurement evidence."""
     requirements = requirements_for_stage(experiment, "analysis")

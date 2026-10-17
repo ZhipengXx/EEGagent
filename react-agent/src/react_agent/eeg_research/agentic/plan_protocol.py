@@ -144,6 +144,15 @@ def proposal_cost(proposal: dict, observation: dict) -> dict:
     return result
 
 
+def _check_basis(ids: list[str], observation: dict) -> None:
+    """Basis IDs name delivered observations only; absent delivery sets (legacy replay) are not guessed."""
+    if len(set(ids)) != len(ids):
+        raise ValueError("basis_observation_ids_duplicate")
+    delivered = observation.get("_delivered_observation_ids")
+    if delivered is not None and any(item not in delivered for item in ids):
+        raise ValueError("basis_observation_id_not_delivered")
+
+
 def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
     try:
         item = ResearchPlanProposal.model_validate(raw).model_dump()
@@ -180,6 +189,7 @@ def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
                 registry = ContextSourceRegistry(Path(observation["_campaign_path"]))
             source = registry.get(ref, role="research_planner")
             registry.load(source, role="research_planner")
+        _check_basis(item.get("basis_observation_ids") or [], observation)
         if phase != "diagnostic" and observation.get("evaluation_mode") == "loso_method_search":
             folds = item["evaluation_scope"].get("folds")
             expected = 2 if phase == "screening_2fold" else 10
@@ -426,6 +436,10 @@ def normalize_critique(raw: Any, frozen_pool: dict, observation: dict) -> dict:
     winner = next(row["proposal_id"] for row in evaluations if row["rank"] == 1)
     if critique.selected_proposal_id != winner:
         return rejected("research_critique_selection_invalid", "critic_selected_proposal_must_match_rank_one")
+    try:
+        _check_basis(critique.selected_basis_observation_ids, observation)
+    except ValueError as exc:
+        return rejected("research_critique_basis_invalid", str(exc))
     cards = observation.get("experiment_observations") or []
     if isinstance(cards, dict):
         cards = [row.get("body") or row for row in cards.get("cards") or []]
@@ -443,6 +457,8 @@ def normalize_critique(raw: Any, frozen_pool: dict, observation: dict) -> dict:
         "planning_mode": "propose_then_critic", "proposal_pool_digest": frozen_pool["pool_digest"],
         "native_cost_by_id": copy.deepcopy(frozen_pool["native_cost_by_id"]),
         "validation_records": records, "raw_digest": digest(raw)}
+    if "selected_basis_observation_ids" in critique.model_fields_set:
+        record["selected_basis_observation_ids"] = list(critique.selected_basis_observation_ids)
     return {"ok": True, "detail": None, "raw": copy.deepcopy(raw), "round": record,
         "valid_proposals": copy.deepcopy(proposals), "selected_proposal": copy.deepcopy(by_id[winner]),
         "validation_records": records}

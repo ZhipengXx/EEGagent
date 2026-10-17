@@ -8,7 +8,11 @@ from typing import Any
 
 
 def _symbol_line(source: str, symbol: str) -> int | None:
-    """Line of `Class::method`, `Class.method` or `func` in the current source."""
+    """Resolve definitions and direct module/class assignment-name leaves.
+
+    Assignment targets must be simple Names; destructuring, attribute targets
+    and function-local bindings are not exposed as module/class symbols.
+    """
     import ast
     try:
         tree = ast.parse(source)
@@ -16,13 +20,21 @@ def _symbol_line(source: str, symbol: str) -> int | None:
         return None
     parts = [part for part in re.split(r"::|\.", symbol) if part]
     scope: list[ast.stmt] = list(tree.body)
+    assignment_scope = True
     line = None
-    for part in parts:
+    for index, part in enumerate(parts):
         node = next((item for item in scope if isinstance(item, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
                      and item.name == part), None)
         if node is None:
+            if assignment_scope and index == len(parts) - 1:
+                for item in scope:
+                    targets = (item.targets if isinstance(item, ast.Assign) else
+                               [item.target] if isinstance(item, ast.AnnAssign) else [])
+                    if any(isinstance(target, ast.Name) and target.id == part for target in targets):
+                        return item.lineno
             return None
         line, scope = node.lineno, list(node.body)
+        assignment_scope = isinstance(node, ast.ClassDef)
     return line
 
 

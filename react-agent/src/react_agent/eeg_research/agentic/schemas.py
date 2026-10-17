@@ -263,12 +263,17 @@ class ResearchPlanProposal(DomainOutput):
     implementation_risk: str | None = Field(default=None, min_length=1, max_length=1000,
         description="Predicted engineering risk for this task; not execution permission or measured evidence.")
     value_rationale: str = Field(min_length=1, max_length=1500)
+    basis_observation_ids: list[str] = Field(default_factory=list, max_length=8, description=(
+        "observation_id values from this round's delivered experiment_observations or experiment_history"
+        " that this proposal builds on or deliberately departs from. Use [] when none apply."))
 
     @model_serializer(mode="wrap")
     def preserve_legacy_proposal_shape(self, handler):
+        # Pool digests bind the dumped proposals; unset newer fields keep old pools exact.
         row = handler(self)
-        if "implementation_risk" not in self.model_fields_set:
-            row.pop("implementation_risk", None)
+        for key in ("implementation_risk", "basis_observation_ids"):
+            if key not in self.model_fields_set:
+                row.pop(key, None)
         return row
 
     @model_validator(mode="after")
@@ -307,6 +312,15 @@ class ResearchPlanCritique(DomainOutput):
     evaluations: list[ResearchPlanEvaluation] = Field(min_length=2, max_length=4)
     selected_proposal_id: str = Field(min_length=1)
     selection_rationale: str = Field(min_length=1, max_length=1800)
+    selected_basis_observation_ids: list[str] = Field(default_factory=list, max_length=8, description=(
+        "Delivered observation_id values that support selecting this proposal. Use [] when none apply."))
+
+    @model_serializer(mode="wrap")
+    def preserve_legacy_critique_shape(self, handler):
+        row = handler(self)
+        if "selected_basis_observation_ids" not in self.model_fields_set:
+            row.pop("selected_basis_observation_ids", None)
+        return row
 
 
 class ResearchRound(DomainOutput):

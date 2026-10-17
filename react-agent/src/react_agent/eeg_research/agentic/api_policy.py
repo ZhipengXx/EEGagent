@@ -23,7 +23,7 @@ class ApiRequestPolicy(BaseModel):
     max_attempts_per_planner_round: int = Field(default=6, ge=1, le=100)
     unknown_usd_reserve: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     allow_output_budget_adjustment: bool = False
-    max_output_tokens: int = Field(default=65536, ge=1, le=131072)
+    max_output_tokens: int = Field(default=65536, ge=1, le=393216)
     output_retry_timeout_s: float | None = Field(default=None, gt=0, le=3600, allow_inf_nan=False)
     transport_backoff_s: float = Field(default=.25, ge=0, le=60, allow_inf_nan=False)
 

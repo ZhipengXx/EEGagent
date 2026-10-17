@@ -15,6 +15,99 @@ STAGE_ROLES = {"generation": "research_planner", "correction": "research_planner
 STAGE_FIELDS = frozenset({"proposal_pool", "proposal_pool_digest", "critic_repair_request",
     "plan_repair_request", "schema_error", "schema_repair_context", "previous",
     "correction_instruction", "staged_planning_stage", "planning_stage"})
+PLANNING_CONTEXT_VERSION = "research_planning_input.v1"
+INPUT_SCHEMA_VERSION = "eeg_research.paid_round_input.v1"
+
+
+def _native_observation(full):
+    native = copy.deepcopy(full)
+    native.pop("_paid_replay_readonly", None)
+    return native
+
+
+def publish_staged_input(camp, state, full, owner, payload, stage, *, native_pool=None):
+    """Freeze native inputs locally before invoking a lean Planner or Critic.
+
+    The model receives only ``payload``. The full observation and frozen pool
+    remain outside its prompt, available even if the process exits after the
+    paid response has settled but before the outer raw receipt is written.
+    """
+    from .loop import _write
+    if stage not in STAGE_ROLES:
+        raise ValueError("paid_staged_round_unknown_stage")
+    if payload.get("planning_context_version") != PLANNING_CONTEXT_VERSION:
+        return None  # Historical full-wire stages retain their original path.
+    rid = round_id(full)
+    if stage in {"critic", "critic_correction"}:
+        from .planning_context import critic_pool_input
+        if (not isinstance(native_pool, dict) or native_pool.get("round_id") != rid
+                or native_pool.get("pool_digest") != proposal_pool_digest(native_pool)
+                or payload.get("proposal_pool_digest") != native_pool["pool_digest"]
+                or payload.get("proposal_pool") != critic_pool_input(native_pool)):
+            raise ValueError("paid_staged_round_critic_pool_changed")
+    elif native_pool is not None:
+        raise ValueError("paid_staged_round_unexpected_pool")
+    receipt = {"schema_version": INPUT_SCHEMA_VERSION,
+        "planning_context_version": PLANNING_CONTEXT_VERSION,
+        "round_id": rid, "stage": stage, "role": STAGE_ROLES[stage],
+        "operation_id": rid + ":" + stage, "planning_owner": owner,
+        "input_observation_digest": digest(round_input(full)), "round_input": round_input(full),
+        "observation": _native_observation(full), "state_binding": paid.state_binding(camp, state),
+        "model_input": copy.deepcopy(payload), "native_pool": copy.deepcopy(native_pool)}
+    receipt["receipt_digest"] = digest(receipt)
+    path = Path(camp) / "research_round_inputs" / rid / (stage + ".json")
+    if path.is_file():
+        if paid._read(path) != receipt:
+            raise ValueError("paid_staged_round_input_snapshot_changed")
+    else:
+        _write(path, receipt, exclusive=True)
+    return receipt
+
+
+def _input_snapshot(camp, wire, row, owner, *, state=None):
+    """Bind the paid wire to its separately frozen native observation."""
+    rid = owner["round_id"]
+    operation = str(row.get("operation_id") or "")
+    stage = operation[len(rid) + 1:] if operation.startswith(rid + ":") else ""
+    if stage not in STAGE_ROLES:
+        raise ValueError("paid_staged_round_stage_identity_changed")
+    receipt = paid._read(Path(camp) / "research_round_inputs" / rid / (stage + ".json"))
+    unsigned = {key: value for key, value in receipt.items() if key != "receipt_digest"}
+    full, model_input = receipt.get("observation"), receipt.get("model_input")
+    if (receipt.get("schema_version") != INPUT_SCHEMA_VERSION
+            or receipt.get("planning_context_version") != PLANNING_CONTEXT_VERSION
+            or receipt.get("receipt_digest") != digest(unsigned)
+            or receipt.get("round_id") != rid or receipt.get("operation_id") != operation
+            or receipt.get("stage") != stage or receipt.get("role") != row.get("role")
+            or receipt.get("planning_owner") != owner.get("owner_id")
+            or not isinstance(full, dict) or not isinstance(model_input, dict)
+            or model_input.get("planning_context_version") != PLANNING_CONTEXT_VERSION
+            or round_id(full) != rid or receipt.get("round_input") != round_input(full)
+            or receipt.get("input_observation_digest") != digest(round_input(full))):
+        raise ValueError("paid_staged_round_input_snapshot_changed")
+    if state is not None and receipt.get("state_binding") != paid.state_binding(camp, state):
+        raise ValueError("paid_staged_round_current_binding_changed")
+    # Format/schema retries may add measured error feedback. They may not
+    # replace any scientific input or supply a different candidate pool.
+    added = set(wire) - set(model_input)
+    if (added - {"previous_response_error"}
+            or any(wire.get(key) != value for key, value in model_input.items())
+            or ("previous_response_error" in added and not isinstance(wire["previous_response_error"], dict))):
+        raise ValueError("paid_staged_round_delivered_input_changed")
+    full = copy.deepcopy(full)
+    pool = receipt.get("native_pool")
+    if stage in {"critic", "critic_correction"}:
+        from .planning_context import critic_pool_input
+        if (not isinstance(pool, dict) or pool.get("round_id") != rid
+                or pool.get("pool_digest") != proposal_pool_digest(pool)
+                or model_input.get("proposal_pool_digest") != pool["pool_digest"]
+                or model_input.get("proposal_pool") != critic_pool_input(pool)):
+            raise ValueError("paid_staged_round_critic_pool_changed")
+        full.update(proposal_pool=copy.deepcopy(pool), proposal_pool_digest=pool["pool_digest"])
+    elif pool is not None:
+        raise ValueError("paid_staged_round_unexpected_pool")
+    full["_paid_replay_readonly"] = True
+    return full, receipt
 
 
 def _original_observation(view):
@@ -51,7 +144,7 @@ def publish_staged_raw(camp, state, full, owner, raw, stage):
         "sequence": sequence, "stage": stage, "role": STAGE_ROLES[stage],
         "operation_id": rid + ":" + stage, "planning_owner": owner,
         "input_observation_digest": digest(round_input(full)), "round_input": round_input(full),
-        "observation": copy.deepcopy(full), "state_binding": paid.state_binding(camp, state),
+        "observation": _native_observation(full), "state_binding": paid.state_binding(camp, state),
         "raw": copy.deepcopy(raw)}
     receipt["receipt_digest"] = digest(receipt)
     _write(folder / (str(sequence).zfill(3) + ".json"), receipt, exclusive=True)
@@ -92,6 +185,64 @@ def _stages_order(stages):
         raise ValueError("paid_staged_round_generation_missing")
     if "critic_correction" in stages and "critic" not in stages:
         raise ValueError("paid_staged_round_critic_missing")
+
+
+def _returned_proof(camp, state, owner_id, returned):
+    """Preserve local injected-backend delivery without pretending it is paid."""
+    full, stages, _ = returned
+    rid = round_id(full)
+    proof = {"source": "backend_return_receipt", "stage_inputs": {}}
+    for stage in stages:
+        path = camp / "research_round_inputs" / rid / (stage + ".json")
+        if not path.is_file():
+            continue  # Historical full-wire injected backends have no snapshot.
+        model_input = paid._read(path).get("model_input") or {}
+        native, _ = _input_snapshot(camp, model_input,
+            {"operation_id": rid + ":" + stage, "role": STAGE_ROLES[stage]},
+            {"round_id": rid, "owner_id": owner_id}, state=state)
+        if _native_observation(_original_observation(native)) != _native_observation(full):
+            raise ValueError("paid_staged_round_response_inputs_conflict")
+        if stage == "generation":
+            proof["planner_delivery"] = _planner_delivery(model_input)
+        if stage in {"critic", "critic_correction"}:
+            proof["stage_inputs"][stage] = {key: copy.deepcopy(native[key])
+                for key in ("proposal_pool", "proposal_pool_digest")}
+    return proof
+
+
+def _local_input_proof(camp, state, owner):
+    """Recover unfinished stages' inputs without treating them as responses."""
+    rid = owner["round_id"]
+    folder = camp / "research_round_inputs" / rid
+    if not folder.is_dir():
+        return None
+    if (owner.get("kind") != "continuation" or owner.get("status") not in {"active", "released"}):
+        raise ValueError("paid_staged_round_planning_owner_binding_changed")
+    full = None
+    proof = {"source": "local_pre_call_input", "stage_inputs": {}, "stage_payloads": {}}
+    for stage in STAGE_ROLES:
+        path = folder / (stage + ".json")
+        if not path.is_file():
+            continue
+        model_input = paid._read(path).get("model_input") or {}
+        native, _ = _input_snapshot(camp, model_input,
+            {"operation_id": rid + ":" + stage, "role": STAGE_ROLES[stage]}, owner, state=state)
+        original = _original_observation(native)
+        paid._verify_current(camp, state, original)
+        if full is not None and _native_observation(full) != _native_observation(original):
+            raise ValueError("paid_staged_round_response_inputs_conflict")
+        full = original if full is None else full
+        proof["stage_payloads"][stage] = copy.deepcopy(model_input)
+        if stage == "generation":
+            proof["planner_delivery"] = _planner_delivery(model_input)
+        if stage in {"critic", "critic_correction"}:
+            proof["stage_inputs"][stage] = {key: copy.deepcopy(native[key])
+                for key in ("proposal_pool", "proposal_pool_digest")}
+    if full is None:
+        return None
+    if owner.get("observation_digest") != (state.get("terminal_observation_digest") or digest(round_input(full))):
+        raise ValueError("paid_staged_round_owner_observation_changed")
+    return full, proof
 
 
 def _verify_sources(camp, row):
@@ -142,7 +293,7 @@ def restore_staged_paid(camp, state):
             return None
         full, stages, _ = returned
         _stages_order(stages)
-        return full, owner_id, stages, {"source": "backend_return_receipt", "stage_inputs": {}}
+        return full, owner_id, stages, _returned_proof(camp, state, owner_id, returned)
     with sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True) as db:
         found = db.execute("SELECT payload FROM owners WHERE id=?", (owner_id,)).fetchone()
         owner = json.loads(found[0]) if found else None
@@ -153,21 +304,36 @@ def restore_staged_paid(camp, state):
         if returned:
             full, stages, _ = returned
             _stages_order(stages)
-            return full, owner_id, stages, {"source": "backend_return_receipt", "stage_inputs": {}}
+            return full, owner_id, stages, _returned_proof(camp, state, owner_id, returned)
         return None
     rid = owner["round_id"]
     if returned and round_id(returned[0]) != rid:
         raise ValueError("paid_staged_round_planning_owner_binding_changed")
     successful = [row for row in relevant if row.get("success") is True and
         paid._read(camp / "llm_responses" / (str(row["call_id"]) + ".json")).get("validation") == "valid"]
+    local_inputs = _local_input_proof(camp, state, owner)
     if not successful:
         if returned and provider_journal:
             raise ValueError("paid_staged_round_confirmed_response_missing")
         if not returned:
+            if local_inputs:
+                full, proof = local_inputs
+                if "generation" not in proof["stage_payloads"]:
+                    raise ValueError("paid_staged_round_generation_missing")
+                return full, owner_id, {}, proof
             return None
         full, stages, _ = returned
         _stages_order(stages)
-        return full, owner_id, stages, {"source": "backend_return_receipt", "stage_inputs": {}}
+        proof = _returned_proof(camp, state, owner_id, returned)
+        if local_inputs:
+            local_full, local_proof = local_inputs
+            if _native_observation(local_full) != _native_observation(full):
+                raise ValueError("paid_staged_round_response_inputs_conflict")
+            proof["stage_payloads"] = local_proof["stage_payloads"]
+            proof["stage_inputs"].update(local_proof["stage_inputs"])
+            if local_proof.get("planner_delivery") is not None:
+                proof["planner_delivery"] = local_proof["planner_delivery"]
+        return full, owner_id, stages, proof
     if (owner.get("kind") != "continuation" or owner.get("status") not in {"active", "released"}
             or state.get("terminal_observation_digest") and owner.get("observation_digest") != state["terminal_observation_digest"]):
         raise ValueError("paid_staged_round_planning_owner_binding_changed")
@@ -179,7 +345,7 @@ def restore_staged_paid(camp, state):
         if stage not in STAGE_ROLES or stage in stages or row.get("role") != STAGE_ROLES[stage]:
             raise ValueError("paid_staged_round_stage_identity_changed")
         view, raw, proof = paid._verify_call(camp, row, owner, claims, journals,
-            allowed_roles={STAGE_ROLES[stage]}, operations={rid + ":" + stage})
+            allowed_roles={STAGE_ROLES[stage]}, operations={rid + ":" + stage}, state=state)
         _verify_sources(camp, row)
         original = _original_observation(view)
         paid._verify_current(camp, state, original)
@@ -214,5 +380,15 @@ def restore_staged_paid(camp, state):
                 raise ValueError("paid_staged_round_returned_response_changed")
         full = original_full
     full["_paid_replay_readonly"] = True
+    stage_payloads = {}
+    if local_inputs:
+        local_full, local_proof = local_inputs
+        if _native_observation(local_full) != _native_observation(full):
+            raise ValueError("paid_staged_round_response_inputs_conflict")
+        for stage, value in local_proof["stage_inputs"].items():
+            if stage in stage_inputs and stage_inputs[stage] != value:
+                raise ValueError("paid_staged_round_critic_inputs_conflict")
+            stage_inputs[stage] = value
+        stage_payloads = local_proof["stage_payloads"]
     return full, owner_id, stages, {"source": "native_confirmed_response", "calls": proofs,
-                                  "stage_inputs": stage_inputs, "planner_delivery": planner_delivery}
+        "stage_inputs": stage_inputs, "planner_delivery": planner_delivery, "stage_payloads": stage_payloads}
