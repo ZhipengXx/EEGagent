@@ -153,6 +153,27 @@ def validate_designer_native_context(native_context: dict) -> list[dict]:
     return errors
 
 
+def _without_analysis_scope(raw: Any) -> tuple[Any, list[dict]]:
+    """Drop the one known mirrored key: scope "scientific" on an analysis requirement.
+
+    implementation_requirements carry scope; analysis requirements are always
+    scientific, and models copy the sibling key. Any other extra key, or another
+    scope value, still fails validation.
+    """
+    brief = raw.get("design_brief") if isinstance(raw, dict) else None
+    rows = brief.get("analysis_requirements") if isinstance(brief, dict) else None
+    if not isinstance(rows, list) or not any(isinstance(row, dict) and row.get("scope") == "scientific" for row in rows):
+        return raw, []
+    normalized, cleaned = [], []
+    for index, row in enumerate(rows):
+        if isinstance(row, dict) and row.get("scope") == "scientific":
+            row = {key: value for key, value in row.items() if key != "scope"}
+            normalized.append({"loc": ["design_brief", "analysis_requirements", index, "scope"],
+                               "kind": "redundant_scientific_scope_removed"})
+        cleaned.append(row)
+    return {**raw, "design_brief": {**brief, "analysis_requirements": cleaned}}, normalized
+
+
 def validate_designer_reply(raw: Any, native_context: dict,
                             delivered_context: dict | None = None) -> dict:
     """Validate only API-owned fields, then add local metadata and frozen facts.
@@ -165,12 +186,15 @@ def validate_designer_reply(raw: Any, native_context: dict,
     """
     result = {"reply": None, "errors": [], "native_errors": validate_designer_native_context(native_context),
               "design_brief": None, "experiment_spec": None}
+    raw, normalized = _without_analysis_scope(raw)
     try:
         reply = DesignerReply.model_validate(raw).model_dump()
     except ValidationError as exc:
         result["errors"] = _schema_errors(exc)
         return result
     result["reply"] = reply
+    if normalized:
+        result["normalizations"] = normalized
     if result["native_errors"]:
         return result
     errors = result["errors"]
@@ -219,7 +243,8 @@ def validate_designer_reply(raw: Any, native_context: dict,
         measurement_requirements=native_measurement_requirements(),
         required_capability_ids=list(dict.fromkeys(reply["additional_capability_ids"])),
         method_evidence_refs=copy.deepcopy(reply["evidence_refs"]),
-        expected_observation=content["expected_observation"] or task.get("expected_observation") or "",
+        # The selected task already fixes the expected observation; the Designer only tests it.
+        expected_observation=task.get("expected_observation") or "",
         completion_condition=task.get("completion_condition") or "",
     )
     for requirement in native_brief["implementation_requirements"]:

@@ -195,6 +195,9 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
             body = _science(view[key])
             if key in {"measured_parameter_counts", "parameter_count_comparisons"} and isinstance(body, dict):
                 body.pop("scope", None)
+            if key == "prior_design_brief" and isinstance(body, dict):
+                # The task fixes the expected observation; a revision must not echo it.
+                body.pop("expected_observation", None)
             if body:
                 result[key] = body
     for key in ("evaluation_mode", "scientific_unit", "science_scope", "scope", "cold_start_prior"):

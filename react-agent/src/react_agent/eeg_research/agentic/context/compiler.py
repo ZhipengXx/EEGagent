@@ -89,9 +89,36 @@ def _analysis_training_run(run: dict[str, Any]) -> dict[str, Any]:
         # Keep every epoch and metric without repeating the same JSON keys.
         points = learning.pop("points")
         columns = list(dict.fromkeys(key for row in points for key in row))
+        # A column recorded twice at different float precision is one curve.
+        equivalent = {}
+        for index, name in enumerate(columns):
+            same = next((kept for kept in columns[:index] if kept not in equivalent
+                         and _same_curve([row.get(kept) for row in points], [row.get(name) for row in points])), None)
+            if same is not None:
+                equivalent[name] = same
+        columns = [name for name in columns if name not in equivalent]
         learning["columns"] = columns
-        learning["rows"] = [[row.get(key) for key in columns] for row in points]
+        learning["rows"] = [[_curve_value(row.get(key)) for key in columns] for row in points]
+        if equivalent:
+            learning["equivalent_columns"] = equivalent
     return result
+
+
+def _curve_value(value: Any) -> Any:
+    # Four significant digits resolve every epoch-to-epoch change in these curves;
+    # the complete-precision rows remain readable through the cited local source.
+    return float(f"{value:.4g}") if isinstance(value, float) else value
+
+
+def _same_curve(left: list[Any], right: list[Any]) -> bool:
+    if not left or len(left) != len(right):
+        return False
+    for a, b in zip(left, right):
+        if isinstance(a, bool) or isinstance(b, bool) or not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+            return False
+        if abs(a - b) > 1e-6 * max(1.0, abs(a), abs(b)):
+            return False
+    return True
 
 
 def project_analysis_scientific_input(payload: dict[str, Any]) -> dict[str, Any]:

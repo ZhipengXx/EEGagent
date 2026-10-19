@@ -30,6 +30,7 @@ _FEEDBACK = (
     "history", "last_check", "edit_success_context", "edit_failure_context",
     "error_source_context", "failure_source", "runtime_note", "recovery_context",
 )
+_FEEDBACK_LOCAL = frozenset({"schema_version", "check_fingerprint"})
 _ARTIFACT_LOCAL = frozenset({"schema_version", "receipt_id", "request_digest", "sha256", "view_sha256",
     "content_injected", "delivery_status", "delivery_id", "satisfies_development_read_receipt"})
 
@@ -40,6 +41,31 @@ def is_coder_input(role: str, payload: dict[str, Any]) -> bool:
 
 def _pick(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     return {key: copy.deepcopy(value[key]) for key in fields if key in value} if isinstance(value, dict) else {}
+
+
+def _feedback_view(value: Any, current_sha256: str | None) -> Any:
+    """Drop local bookkeeping from tool feedback; native feedback files keep it.
+
+    Field-name inventories and check fingerprints carry no task content, and a
+    hash equal to the delivered current_file.sha256 only repeats that CAS value.
+    Other hashes stay: without a current_file they are the Coder's only base.
+    """
+    if isinstance(value, list):
+        return [_feedback_view(item, current_sha256) for item in value]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+    if "$context_pointer" in value:
+        return copy.deepcopy(value)
+    result = {}
+    for key, item in value.items():
+        if key in _FEEDBACK_LOCAL:
+            continue
+        if key == "keys" and isinstance(item, list) and all(isinstance(name, str) for name in item):
+            continue
+        if current_sha256 and key in {"sha256", "source_sha256"} and item == current_sha256:
+            continue
+        result[key] = _feedback_view(item, current_sha256)
+    return result
 
 
 def _expanded(payload: dict[str, Any]) -> dict[str, Any]:
@@ -212,7 +238,8 @@ def project_coder_input(native_payload: dict[str, Any]) -> dict[str, Any]:
     execution = _execution_state(view)
     if execution:
         result["execution_state"] = execution
-    feedback = {key: copy.deepcopy(view[key]) for key in _FEEDBACK
+    current = result["current_file"].get("sha256") if isinstance(result["current_file"], dict) else None
+    feedback = {key: _feedback_view(view[key], current) for key in _FEEDBACK
         if key in view and view[key] not in (None, [], {})}
     if feedback:
         result["tool_feedback"] = feedback

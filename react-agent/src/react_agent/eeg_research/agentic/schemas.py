@@ -717,7 +717,6 @@ class DesignerBriefContent(DesignerWireOutput):
     implementation_requirements: list[DesignerImplementationRequirement]
     analysis_requirements: list[DesignerAnalysisRequirement]
     applicability: DesignerText
-    expected_observation: DesignerText | None
 
 
 class DesignerReply(DesignerWireOutput):

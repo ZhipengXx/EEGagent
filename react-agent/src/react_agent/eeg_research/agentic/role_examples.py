@@ -637,8 +637,7 @@ def _designer_brief(payload: dict[str, Any]) -> list[dict[str, Any]]:
             "analysis_requirements": [{"requirement_id": "interpret_offset", "core": True,
                 "verification": "hypothesis_assessment",
                 "expected_behavior": "Interpret whether the measured result supports the offset hypothesis."}],
-            "applicability": "The selected task tests training robustness while keeping the parent encoder and loss.",
-            "expected_observation": None},
+            "applicability": "The selected task tests training robustness while keeping the parent encoder and loss."},
             "missing_inputs": [], "additional_capability_ids": [], "confounders": [], "evidence_refs": [],
             "summary_zh": "实现、测量、解释分别验收；仅修改训练变换，继承父候选模型和损失。"},
         "Coder binds source, native Measurement verifies receipts, Analyst interprets measured evidence. Runtime materializes inherited configs.")]
