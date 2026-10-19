@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .approved_design_context import project_approved_design
+from .context.representations import without_local_paths
 from .context.types import canonical, digest
 from .designer_context import _expanded
 
@@ -337,7 +338,7 @@ def prepare_review_input(native_payload: dict[str, Any]) -> tuple[dict, dict]:
     focus = payload.get("review_focus") or {}
     wire = {"reviewer_context_version": VERSION, "approved_design": approved,
         "runtime_contract": _runtime_contract(payload, experiment), "review_targets": targets,
-        "source_materials": sources, "check_facts": facts,
+        "source_materials": sources, "check_facts": without_local_paths(facts),
         "parameter_facts": copy.deepcopy(payload.get("parameter_census") or {"status": "unavailable"}),
         "review_scope": {"mode": payload.get("review_mode") or "full",
                          "affected_requirements": copy.deepcopy(focus.get("affected_requirements") or []) if isinstance(focus, dict) else []},

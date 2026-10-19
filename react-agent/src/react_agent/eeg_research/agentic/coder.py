@@ -17,11 +17,13 @@ TOOL_ARGUMENTS = {
     "list_project_files": {},
     "search_code": {"query": ("string", True)},
     "read_code": {"path": ("string", True), "start": ("integer", False), "end": ("integer", False)},
+    # path and expected_base_hash are bound by the runtime to the one writable
+    # file and the revision delivered in this request; a supplied value must agree.
     "apply_candidate_patch": {
-        "path": ("string", True), "content": ("string", True), "expected_base_hash": ("string", True),
+        "path": ("string", False), "content": ("string", True), "expected_base_hash": ("string", False),
     },
     "edit_candidate_code": {
-        "path": ("string", True), "edits": ("array", True), "expected_base_hash": ("string", True),
+        "path": ("string", False), "edits": ("array", True), "expected_base_hash": ("string", False),
     },
     "run_candidate_check": {},
     "inspect_check_result": {},
@@ -41,6 +43,9 @@ class CoderToolRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     tool: Literal[tuple(TOOL_ARGUMENTS)]
     args: dict[str, Any]
+
+
+RUNTIME_BOUND_WRITE_ARGS = ("path", "expected_base_hash")
 
 
 def tool_catalog() -> dict[str, Any]:

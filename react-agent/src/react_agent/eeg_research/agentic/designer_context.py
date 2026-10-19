@@ -214,7 +214,8 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
         result["capabilities"] = capability_view
     for key in ("parent_source", "control_source"):
         if view.get(key):
-            result[key] = _source(view[key])
+            from .context.representations import without_local_paths
+            result[key] = without_local_paths(_source(view[key]))
     config = view.get("parent_hook_config")
     if isinstance(config, dict):
         result["parent_hook_config"] = _pick(config, ("model", "objective", "transform", "negative_sampling_policy"))

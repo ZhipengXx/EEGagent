@@ -88,6 +88,28 @@ def _v2_science(value):
         and not key.endswith(("_hash", "_digest", "_fingerprint", "_sha256"))}
 
 
+_PLANNER_CARD_LOCAL = frozenset({"source_hash", "next_read", "read_capability",
+                                 "satisfies_development_read_receipt"})
+
+
+def planner_card_view(value):
+    """The v2 Planner has no read tool and never checks hashes: drop read
+    protocol and source hashes, keep $context_source citations, and shorten an
+    error fingerprint to 12 characters (equal failures still compare equal)."""
+    if isinstance(value, list):
+        return [planner_card_view(item) for item in value]
+    if not isinstance(value, dict) or "$context_pointer" in value:
+        return copy.deepcopy(value)
+    result = {}
+    for key, item in value.items():
+        if key in _PLANNER_CARD_LOCAL:
+            continue
+        if key == "error_fingerprint" and isinstance(item, str) and len(item) > 12:
+            item = item[:12]
+        result[key] = planner_card_view(item)
+    return result
+
+
 def _v2_observations(full, view):
     """Render only selected, complete cards; no native-store refill follows fit."""
     from .memory_delivery import project_memory_card
@@ -105,7 +127,7 @@ def _v2_observations(full, view):
                 row[key] = copy.deepcopy(card[key])
         if "applicability" in card and card["applicability"] != row.get("applicability"):
             row["applicability_status"] = copy.deepcopy(card["applicability"])
-        rows.append(row)
+        rows.append(planner_card_view(row))
     return rows
 
 
@@ -290,7 +312,8 @@ def _build_v2_proposer_input(full, delivered):
     result["research_goal"]["target_k"] = ((goal.get("research_execution") or {}).get("target_k", 3))
     from .handoffs import planner_baseline_scientific_source
     method = _pick(baseline, ("intervention", "model", "objective", "transform"))
-    method["scientific_source"] = planner_baseline_scientific_source(baseline)
+    from .context.representations import without_local_paths
+    method["scientific_source"] = without_local_paths(planner_baseline_scientific_source(baseline))
     # Explicit method constraints remain literal, even when parameter names look
     # like metadata. They are not reconstructed from Python prose.
     if baseline.get("scientific_parameters"):

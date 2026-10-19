@@ -556,6 +556,11 @@ def implement(
             request["finish_patch_template"] = contract["finish_patch_template"]
         reply = backend(request)
         tool, args, request_error = validate_coder_request(reply, request)
+        if tool in _WRITE_TOOLS and request_error is None:
+            # Bind before every downstream reader (progress, receipts, feedback): the
+            # one writable file, compared against the revision this request delivered.
+            args = {"path": "extension/eeg_candidate.py",
+                    "expected_base_hash": (current or {}).get("sha256") or "", **args}
         execution_args = dict(args)
         if tool == "read_code" and request_error is None:
             canonical = canonical_read_path(workspace, args["path"])

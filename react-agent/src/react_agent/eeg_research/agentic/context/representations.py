@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import re
 from typing import Any
 
 from .sources import pointer_get, pointer_escape
@@ -16,6 +17,45 @@ NARRATIVE_FIELDS = frozenset({"narrative", "explanation", "rationale", "reasonin
 CODE_FIELDS = frozenset({"source", "code", "implementation", "source_text", "code_text", "diff", "patch"})
 LOG_FIELDS = frozenset({"log", "logs", "stdout", "stderr", "traceback", "trace", "training_log"})
 FAILURE_WORDS = ("error", "fail", "conflict", "unknown", "partial", "unverified", "missing")
+
+
+_PATH_KEYS = frozenset({"source_ref", "file", "path"})
+
+
+def short_source_ref(value: str) -> str:
+    """Provider-facing name for a local file; native records keep the absolute path.
+
+    Package files become package-relative (eeg_training/model.py, the alias
+    the Designer reference check already accepts) and candidate workspace
+    files become workspace-relative (extension/eeg_candidate.py).
+    """
+    if not isinstance(value, str) or not value.startswith("/"):
+        return value
+    if "/src/react_agent/" in value:
+        return value.rsplit("/src/react_agent/", 1)[1]
+    # Candidate IDs are c<N>; a JSON pointer such as /candidates/0/... never matches.
+    match = re.search(r"/candidates/c[0-9]+/(.+)$", value)
+    return match.group(1) if match else value
+
+
+def without_local_paths(value: Any) -> Any:
+    """Shorten local file references and drop the interpreter path, recursively.
+
+    Free text such as tracebacks is left untouched, and request pointers are
+    copied as they are.
+    """
+    if isinstance(value, list):
+        return [without_local_paths(item) for item in value]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+    if "$context_pointer" in value:
+        return copy.deepcopy(value)
+    result = {}
+    for key, item in value.items():
+        if key == "python" and isinstance(item, str) and item.startswith("/"):
+            continue
+        result[key] = short_source_ref(item) if key in _PATH_KEYS and isinstance(item, str) else without_local_paths(item)
+    return result
 
 
 def source_kind(key: str, payload: Any) -> str:

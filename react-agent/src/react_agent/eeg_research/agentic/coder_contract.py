@@ -8,7 +8,8 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-from .coder import TOOL_ARGUMENTS, bound_implementation_requirements, tool_catalog, validate_tool_request
+from .coder import (RUNTIME_BOUND_WRITE_ARGS, TOOL_ARGUMENTS, bound_implementation_requirements, tool_catalog,
+                    validate_tool_request)
 
 
 def _request_value(payload: dict[str, Any], key: str) -> Any:
@@ -104,6 +105,11 @@ def coder_contract(payload: dict[str, Any]) -> dict[str, Any]:
     catalog = tool_catalog()
     branches = []
     for tool, fields in TOOL_ARGUMENTS.items():
+        if tool in {"apply_candidate_patch", "edit_candidate_code"}:
+            # The runtime binds the write target and its CAS base; the model never sends them.
+            fields = {name: spec for name, spec in fields.items() if name not in RUNTIME_BOUND_WRITE_ARGS}
+            catalog[tool]["args"] = {name: spec for name, spec in catalog[tool]["args"].items()
+                                     if name not in RUNTIME_BOUND_WRITE_ARGS}
         args_schema: dict[str, Any] = {"type": "object"}
         if fields is None:
             args_schema["additionalProperties"] = True

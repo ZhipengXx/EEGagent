@@ -267,7 +267,7 @@ def _coder_prompt_fields(mission: str, payload: dict) -> tuple[str, str]:
     # actual requests replace its generic example with this task's real keys.
     mission = mission.split("\nimplementation_map shape:", 1)[0]
     compact = payload.get("coder_context_version") == "coder_implementation_input.v2"
-    mission += (("\nUse approved_design for the implementation requirements and current_file.sha256 for compare-and-swap edits. " if compact else "\nUse candidate_identity for the current candidate metadata. ") +
+    mission += (("\nUse approved_design for the implementation requirements; edits apply to the delivered current_file revision. " if compact else "\nUse candidate_identity for the current candidate metadata. ") +
                 "Fill source_refs and optional probe in FINISH_PATCH_TEMPLATE using the current source. "
                 "Use existing single-line refs (extension/eeg_candidate.py:1) or AST symbols "
                 "(extension/eeg_candidate.py::EEGCandidate.build_encoder). "

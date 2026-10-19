@@ -10,7 +10,7 @@ import copy
 import json
 from typing import Any
 
-from .context.representations import deduplicate, resolve_request_pointer
+from .context.representations import deduplicate, resolve_request_pointer, short_source_ref, without_local_paths
 from .context.sources import assert_visible_payload, pointer_escape
 
 VERSION = "coder_implementation_input.v2"
@@ -43,6 +43,26 @@ def _pick(value: Any, fields: tuple[str, ...]) -> dict[str, Any]:
     return {key: copy.deepcopy(value[key]) for key in fields if key in value} if isinstance(value, dict) else {}
 
 
+def _runtime_source_view(value: Any) -> Any:
+    """Name runtime sources by the read_code alias the Coder can actually open."""
+    import os
+    from .coder import _REFERENCES
+    aliases = {os.path.normpath(str(path)): alias for alias, path in _REFERENCES.items()}
+
+    def visit(item):
+        if isinstance(item, list):
+            return [visit(child) for child in item]
+        if not isinstance(item, dict) or "$context_pointer" in item:
+            return copy.deepcopy(item)
+        result = {}
+        for key, child in item.items():
+            if key == "source_ref" and isinstance(child, str) and child.startswith("/"):
+                child = aliases.get(os.path.normpath(child), short_source_ref(child))
+            result[key] = visit(child) if isinstance(child, (dict, list)) else copy.deepcopy(child)
+        return result
+    return visit(value)
+
+
 def _feedback_view(value: Any, current_sha256: str | None) -> Any:
     """Drop local bookkeeping from tool feedback; native feedback files keep it.
 
@@ -62,6 +82,8 @@ def _feedback_view(value: Any, current_sha256: str | None) -> Any:
             continue
         if key == "keys" and isinstance(item, list) and all(isinstance(name, str) for name in item):
             continue
+        if key == "expected_base_hash":
+            continue  # Runtime-bound CAS input; the Coder no longer supplies it.
         if current_sha256 and key in {"sha256", "source_sha256"} and item == current_sha256:
             continue
         result[key] = _feedback_view(item, current_sha256)
@@ -224,7 +246,7 @@ def project_coder_input(native_payload: dict[str, Any]) -> dict[str, Any]:
     if interface:
         result["candidate_interface"] = interface
     if view.get("hook_config_runtime_source") is not None:
-        result["runtime_source"] = copy.deepcopy(view["hook_config_runtime_source"])
+        result["runtime_source"] = _runtime_source_view(view["hook_config_runtime_source"])
     sources = _sources(view)
     if sources:
         result["sources"] = sources
@@ -239,7 +261,7 @@ def project_coder_input(native_payload: dict[str, Any]) -> dict[str, Any]:
     if execution:
         result["execution_state"] = execution
     current = result["current_file"].get("sha256") if isinstance(result["current_file"], dict) else None
-    feedback = {key: _feedback_view(view[key], current) for key in _FEEDBACK
+    feedback = {key: without_local_paths(_feedback_view(view[key], current)) for key in _FEEDBACK
         if key in view and view[key] not in (None, [], {})}
     if feedback:
         result["tool_feedback"] = feedback

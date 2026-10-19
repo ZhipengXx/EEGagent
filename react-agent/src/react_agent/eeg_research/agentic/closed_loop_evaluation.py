@@ -148,7 +148,8 @@ def _terminal_delivery_proof(camp: Path, trace: dict, record: dict) -> dict:
     row, original = chosen[0], record["body"]
     from .memory_delivery import project_memory_card
     expected = project_memory_card({**record, "current_feedback": True}, role="research_planner")
-    expected_science = {**expected["body"], "observation_id": expected["record_id"]}
+    from .planning_context import planner_card_view
+    expected_science = planner_card_view({**expected["body"], "observation_id": expected["record_id"]})
     delivered_science = {key: value for key, value in row.items() if key not in
                          {"source_refs", "current_feedback", "condition_differences", "applicability_status"}}
     exact = {key: canonical(delivered_science.get(key)) == canonical(value) for key, value in expected_science.items()}
