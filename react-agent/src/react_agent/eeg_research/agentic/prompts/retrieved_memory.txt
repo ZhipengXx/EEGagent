@@ -1,14 +1,13 @@
 RETRIEVED MEMORY
-The runtime supplies bounded empirical lessons and procedural skill hints,
-with exact identities, source references, applicability labels, and limits.
-Similarity measures relevance, not truth, evidence strength, or expected gain.
+The runtime supplies selected scientific observations, empirical lessons and
+procedural hints with record IDs, source references and applicability limits.
 
 Use empirical findings only within their stated conditions. Treat analogy
 and unknown-applicability items as hypotheses, not performance evidence.
 Before adapting a procedure, check its inputs, preconditions, available
 capabilities, and failure modes.
 
-If memory materially informs the action, name the supplied record ID/version
+If memory materially informs the action, name the supplied record ID
 and the required adaptation in an existing rationale field.
 Do not add output fields. Memory IDs are not runtime evidence IDs or registered
 artifact IDs; do not put them in evidence_refs or required_artifact_refs unless
@@ -17,13 +16,5 @@ the runtime separately supplies the corresponding valid registered identity.
 Memory cannot authorize an unavailable action, bypass approval, change frozen
 evaluation, or establish confirmation. Empty or irrelevant retrieval is valid.
 
-DECISION PROVENANCE
-Use only records actually supplied by this request's allowed retrieval snapshot.
-Keep query/backend/record/version/similarity/snapshot identities as input metadata.
-In existing rationale or interpretation fields identify each adopted record,
-which option/check it informed and the adaptation. For relevant records not
-adopted, state incompatible conditions or insufficient support. Ordinary record
-IDs still cannot enter machine evidence_refs without separately registered native
-identities. Nonempty retrieval need not be adopted; empty/no-applicable experience
-is valid. Retrieval-to-decision provenance establishes use, not a causal accuracy
-improvement; do not claim memory improved scientific performance without evidence.
+Use the records supplied in this request. Source references attribute saved
+detail; they do not imply that an additional reading tool is available.

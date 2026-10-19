@@ -15,7 +15,8 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any, Callable
 
-from .compiler import ContextCompiler, is_research_planning_input
+from .compiler import (ContextCompiler, is_research_planning_input, is_designer_scientific_input,
+                       is_engineering_input, is_analysis_scientific_input)
 from .maintenance import MaintenanceBudget, MaintenanceCoordinator
 from .long_memory import LongMemoryPipeline, valid_source_ref
 from .recovery import incorporate_partial_reads, recover_context
@@ -498,9 +499,12 @@ class ContextService:
             _ACTIVE.reset(token)
 
     def _current_kernel(self, request: CompileRequest, *, callbacks: bool) -> CompileRequest:
-        if is_research_planning_input(request.role, request.payload):
-            # The native planning snapshot binds full state separately. Keep
-            # control revisions in the local manifest, not the model's science.
+        if (is_research_planning_input(request.role, request.payload)
+                or is_designer_scientific_input(request.role, request.payload)
+                or is_engineering_input(request.role, request.payload)
+                or is_analysis_scientific_input(request.role, request.payload)):
+            # Native planning snapshots / Designer assembly sidecars bind full
+            # state separately. Control revisions stay in the local manifest.
             return replace(request, authority_revision=authoritative_revision(self.camp, self.owned_calls),
                 maintenance_callback=None, allow_semantic_compaction=False,
                 allow_sync_memory_maintenance=False)
@@ -616,7 +620,11 @@ class ContextService:
         request = replace(request, payload=filtered)
         maintenance = request.mode in MAINTENANCE_MODES
         scientific_planning = is_research_planning_input(request.role, request.payload)
-        if not maintenance and not scientific_planning:
+        scientific_designer = is_designer_scientific_input(request.role, request.payload)
+        exact_science = (scientific_planning or scientific_designer
+                         or is_analysis_scientific_input(request.role, request.payload)
+                         or is_engineering_input(request.role, request.payload))
+        if not maintenance and not exact_science:
             try:
                 self.snapshot.invalidate_stale_sources(role=request.role)
                 self.capture_closed(request.payload)
@@ -641,7 +649,7 @@ class ContextService:
                 return exc.result
             request = replace(request, payload=payload)
         revision_before, calls_before = self.snapshot.revision, set(self.owned_calls)
-        callbacks = not maintenance and not scientific_planning and paid_maintenance_mode(self.camp) in {"legacy", "emergency"}
+        callbacks = not maintenance and not exact_science and paid_maintenance_mode(self.camp) in {"legacy", "emergency"}
         current = self._current_kernel(request, callbacks=callbacks)
         result = self.compiler.compile(current)
         if not maintenance and (self.snapshot.revision != revision_before or self.owned_calls != calls_before):

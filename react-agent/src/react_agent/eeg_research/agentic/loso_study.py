@@ -110,7 +110,7 @@ def create(study: Path, template: dict, data_root: Path, gpus: tuple[int, ...], 
     memory = MemoryConfig.model_validate(template.get("memory") or {}).model_dump()
     expected_memory = {"enabled": True, "skills_enabled": True, "model_id": "sentence-transformers/all-MiniLM-L6-v2",
                        "device": "cpu", "batch_size": 32, "top_k": 5, "min_similarity": 0.3,
-                       "context_chars_budget": 6000, "allow_model_download": False, "fallback": "legacy"}
+                       "content_chars_budget": 6000, "allow_model_download": False, "fallback": "legacy"}
     if any(memory.get(key) != value for key, value in expected_memory.items()) or not re.fullmatch(r"[0-9a-f]{40}", memory.get("model_revision") or ""):
         raise ValueError("study_requires_frozen_minilm_configuration")
     template = {**template, "memory": memory}

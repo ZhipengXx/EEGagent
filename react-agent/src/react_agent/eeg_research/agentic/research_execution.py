@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Mapping
 
 SINGLE_PLAN_VERSION = "single_plan_v1"
+SCIENCE_MAX_FIXES = 5
+SCIENCE_MAX_ATTEMPTS = 1 + SCIENCE_MAX_FIXES
 
 
 def research_goal(value: Mapping | Path | str) -> dict:
@@ -27,13 +29,38 @@ def independent_critic_enabled(value: Mapping | Path | str) -> bool:
     return single_plan_enabled(value) and config.get("planning_mode") == "propose_then_critic"
 
 
+def role_api_attempt_limit(value: Mapping | Path | str, role: str, default: int = 2) -> int:
+    """One role's total requests, including its initial request and corrections.
+
+    New scientific wires allow five corrections. Explicit role/global limits
+    remain authoritative; the global policy's *implicit* two-attempt default
+    continues to govern the other roles without blocking the new wires.
+    """
+    goal = research_goal(value)
+    config = goal.get("research_execution") or {}
+    fields = {"research_planner": "max_planner_api_attempts",
+              "research_critic": "max_critic_api_attempts",
+              "experiment_designer": "max_designer_api_attempts"}
+    field = fields.get(role)
+    version_field = ("design_contract_version" if role == "experiment_designer"
+                     else "planning_contract_version")
+    implicit = SCIENCE_MAX_ATTEMPTS if field and config.get(version_field) == "v2" else default
+    limit = config.get(field, implicit) if field else default
+    if type(limit) is not int or not 1 <= limit <= SCIENCE_MAX_ATTEMPTS:
+        raise ValueError("invalid_role_api_attempt_limit:" + role)
+    policy = goal.get("api_request_policy") or {}
+    if "max_attempts_per_operation" in policy:
+        from .api_policy import ApiRequestPolicy
+        limit = min(limit, ApiRequestPolicy.model_validate(policy).max_attempts_per_operation)
+    return limit
+
+
 def planning_call_budget(value: Mapping | Path | str) -> int:
     """The two planning stages share one finite native round allocation."""
     goal = research_goal(value)
-    config = goal.get("research_execution") or {}
     if not independent_critic_enabled(goal):
         return 2
-    return min(2, int(config.get("max_planner_api_attempts", 2))) + int(config.get("max_critic_api_attempts", 2))
+    return sum(role_api_attempt_limit(goal, role) for role in ("research_planner", "research_critic"))
 
 
 def paid_maintenance_mode(value: Mapping | Path | str) -> str:

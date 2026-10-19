@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 from typing import Any
@@ -360,6 +361,7 @@ def role_recovery_identity(camp: Path, role: str, target: str | None, request: d
                 "pid", "worker_pid", "supervisor_pid", "budget", "remaining_resources",
                 "task_id", "attempt_id", "input_digest", "_context_budget",
                 "summary", "summary_zh", "summary_en", "role_context_projection", "planner_context_projection",
+                "memory_retrieval_health", "memory_delivery_report", "memory_delivery_report_ref",
                 "llm_calls", "llm_calls_left", "input_tokens", "output_tokens", "reasoning_tokens",
                 "gpu_seconds_used", "gpu_seconds_left", "gpu_seconds_reserved", "training_jobs_left"}}
         if isinstance(value, list):
@@ -377,7 +379,11 @@ def role_recovery_identity(camp: Path, role: str, target: str | None, request: d
             "approval": binding, "prompt_hash": hashlib.sha256(system.encode()).hexdigest()[:16],
             "schema_hash": request_digest(request=schema), "evaluator": request.get("evaluation_population") or request.get("contract"),
             "evidence": semantic_view(request.get("artifact_reads") or request.get("evidence") or request.get("run_artifacts") or []),
-            "memory_snapshot": semantic_view(request.get("retrieved_memory") or request.get("memory") or request.get("lessons")),
+            "memory_snapshot": copy.deepcopy({
+                "role_memory": request.get("retrieved_memory") or request.get("memory") or request.get("lessons"),
+                "observations": request.get("observations") or request.get("experiment_observations"),
+                "knowledge": request.get("knowledge") or request.get("retrieved_knowledge"),
+            }),
             "legal_actions": request.get("available_actions") or request.get("allowed_actions") or [],
             "budget_feasibility": {"can_call": budget.get("llm_calls_left", 1) > 0,
                                    "can_implement": budget.get("llm_calls_left", 11) >= 11,

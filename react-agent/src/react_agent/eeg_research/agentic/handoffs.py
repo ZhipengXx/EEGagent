@@ -681,6 +681,99 @@ def candidate_cpu_check(camp: Path, target: str, binding: dict[str, Any],
     return view
 
 
+def planner_baseline_scientific_source(context: dict[str, Any]) -> dict[str, Any]:
+    """Read complete baseline scientific symbols, without the plugin wrapper.
+
+    This is a local pre-read for a Planner without source-reading tools. It
+    neither executes the module nor claims to deliver the whole training file.
+    Designer/Coder keep their existing complete candidate_context contract.
+    """
+    import ast
+    import builtins
+    import hashlib
+
+    reference = context.get("encoder_reference") or {}
+    source_ref = reference.get("source_ref") if isinstance(reference, dict) else None
+    if not isinstance(source_ref, str) or not source_ref:
+        return {"status": "unavailable", "missing_inputs": ["baseline_scientific_source"]}
+    path = Path(source_ref)
+    try:
+        raw = path.read_bytes()
+        expected = reference.get("source_hash")
+        if expected and hashlib.sha256(raw).hexdigest() != expected:
+            return {"status": "unavailable", "source_ref": source_ref,
+                    "missing_inputs": ["baseline_scientific_source_changed"]}
+        text = raw.decode("utf-8")
+        tree = ast.parse(text)
+    except (OSError, UnicodeError, SyntaxError, ValueError):
+        return {"status": "unavailable", "source_ref": source_ref,
+                "missing_inputs": ["baseline_scientific_source"]}
+    lines = text.splitlines(keepends=True)
+    names = ("ResidualAdd", "EEGProjectLayer", "contrastive_loss")
+    by_name = {node.name: node for node in tree.body
+               if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))}
+    missing = [name for name in names if name not in by_name]
+    if missing:
+        return {"status": "partial", "source_ref": source_ref, "scope": "complete_module",
+                "source": text, "missing_inputs": missing}
+    # Include same-module helpers/constants and the actual import bindings used
+    # by the scientific symbols. Python's dynamic module lookups cannot be
+    # proved closed statically; in that case deliver the real complete module.
+    bindings = dict(by_name)
+    imports = {}
+    local_imports = set()
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports[alias.asname or alias.name.split(".")[0]] = node
+                if alias.name.startswith("react_agent."):
+                    local_imports.add(alias.asname or alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                imports[alias.asname or alias.name] = node
+                if node.level or (node.module or "").startswith("react_agent."):
+                    local_imports.add(alias.asname or alias.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                for child in ast.walk(target):
+                    if isinstance(child, ast.Name):
+                        bindings[child.id] = node
+    selected, dependencies, pending, dynamic = {}, set(), list(names), set()
+    while pending:
+        name = pending.pop(0)
+        if name in selected:
+            continue
+        node = bindings[name]
+        selected[name] = node
+        local = {child.id for child in ast.walk(node) if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)}
+        local.update(child.arg for child in ast.walk(node) if isinstance(child, ast.arg))
+        for child in ast.walk(node):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load):
+                if child.id in bindings and child.id not in local and child.id not in selected:
+                    pending.append(child.id)
+                elif child.id in imports:
+                    dependencies.add(child.id)
+                elif child.id not in local and child.id not in dir(builtins) and child.id not in bindings:
+                    dynamic.add(child.id)
+            if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id in {"eval", "exec", "globals", "locals", "__import__"}:
+                dynamic.add(child.func.id)
+    unresolved = sorted(dynamic | (dependencies & local_imports))
+    if unresolved:
+        return {"status": "available", "source_ref": source_ref, "scope": "complete_module",
+                "source": text, "unresolved_dependencies": unresolved}
+    fragments = []
+    nodes = {id(node): (name, node) for name, node in selected.items()}
+    nodes.update({id(imports[name]): ("imports", imports[name]) for name in dependencies})
+    for name, node in sorted(nodes.values(), key=lambda pair: pair[1].lineno):
+        first = min([node.lineno, *(decorator.lineno for decorator in getattr(node, "decorator_list", []))])
+        last = node.end_lineno
+        fragments.append({"symbol": name, "line_start": first, "line_end": last,
+                          "text": "".join(lines[first - 1:last])})
+    return {"status": "available", "source_ref": source_ref,
+            "scope": "complete_named_symbols_with_local_dependencies", "fragments": fragments}
+
+
 def candidate_context(camp: Path, target: str) -> dict[str, Any]:
     """Use target-bound source/config; baseline has concrete behavior too."""
     protocol = load_protocol(camp) or {}
@@ -894,6 +987,9 @@ def load_analysis_views(camp: Path, state: dict[str, Any], *, target: str | None
         if registered.get("kind") != "analysis":
             continue
         payload = body.get("payload") or body.get("reply") or body
+        from .analysis_contract import analysis_memory_view, is_record
+        if is_record(payload):
+            payload = analysis_memory_view(payload)  # science view; the delivery check stays local
         views.append(development_view({"evidence_id": row.get("evidence_id"), "candidate_id": row.get("candidate_id"),
             "artifact_id": ref, "content_hash": registered["sha256"], "verification_status": "verified",
             "completion_status": body.get("status"), "run_evidence_id": key,

@@ -217,7 +217,23 @@ def create_campaign(
     }
     if goal.get("research_execution") is not None:
         from .schemas import ResearchExecutionConfig
-        goal["research_execution"] = ResearchExecutionConfig.model_validate(goal["research_execution"]).model_dump()
+        execution = dict(goal["research_execution"])
+        if not prepared and execution.get("design_contract_version") == "v2":
+            execution.setdefault("reviewer_contract_version", "v2")
+            execution.setdefault("coder_context_version", "v2")
+        for name in ("planning_mode", "proposal_correction_calls", "max_planner_api_attempts",
+                     "max_critic_api_attempts", "max_designer_api_attempts"):
+            if name in execution:
+                continue
+            # Freeze new campaign defaults. Prepared publications retain the
+            # exact limits already chosen, including an omitted legacy field.
+            if prepared:
+                frozen_execution = prepared["files"]["goal.json"].get("research_execution") or {}
+                if name in frozen_execution:
+                    execution[name] = frozen_execution[name]
+            else:
+                execution[name] = ResearchExecutionConfig.model_fields[name].default
+        goal["research_execution"] = ResearchExecutionConfig.model_validate(execution).model_dump()
         state["research_execution"] = goal["research_execution"]
     from react_agent.eeg_research.agentic.candidate_lifecycle import enabled
     if enabled(goal):
@@ -1181,7 +1197,7 @@ def tick(camp: Path, backend: Any, runner: Any | None = None, services: Services
         from react_agent.eeg_research.agentic.action_planning import planner_round_identity
         round_id = planner_round_identity(obs)
         from react_agent.eeg_research.agentic.semantic_memory import role_memory, apply_memory
-        frozen_memory = role_memory(camp, state=state)
+        frozen_memory = role_memory(camp, state=state, role="research_planner")
         def planner_request(request):
             bind = getattr(backend, "bind", None)
             if callable(bind):
@@ -1816,7 +1832,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
             method_screening_identity={key: screening_parent.get(key) for key in (
                 "evidence_id", "suite_id", "suite_ref", "suite_hash", "method_revision", "source_hash", "result_hash")})
     from react_agent.eeg_research.agentic.semantic_memory import role_memory, standalone_delivery
-    bundle = role_memory(camp, state=state, experiment=spec)
+    bundle = role_memory(camp, state=state, experiment=spec, role="experiment_designer")
     if bundle is not None:
         delivery = standalone_delivery(bundle)
         if delivery is not None:
@@ -1919,25 +1935,40 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
                 inner = reply.get("payload")
                 if spec_reply is None and isinstance(inner, dict):
                     spec_reply = inner.get("experiment_spec")
-                if design_v2:
+                if design_v2 and spec_reply is None:
                     brief = reply.get("design_brief")
                     if brief is None and isinstance(inner, dict):
                         brief = inner.get("design_brief")
-                    if brief is not None:
+                    if brief is not None and str(reply.get("status") or "") == "completed" and not reply.get("missing_inputs"):
                         selected_task = {**(context.get("selected_research_task") or {}),
                             **{key: spec[key] for key in ("parent_candidate_id", "control_candidate_id",
                                   "initial_fidelity", "negative_sampling_policy") if key in spec}}
                         spec_reply = materialize_design_brief(brief, selected_task, parent_config)
-                    elif str(reply.get("status") or "") == "completed":
+                    elif str(reply.get("status") or "") == "completed" and not reply.get("missing_inputs"):
                         raise DesignContractError("completed_design_requires_brief")
                 payload["summary_zh"] = str(reply.get("summary_zh") or payload["summary_zh"])
                 status = str(reply.get("status") or "")
+                semantic_missing = reply.get("missing_inputs") or []
+                for key in ("missing_inputs", "confounders", "evidence_refs", "additional_capability_ids"):
+                    if key in reply:
+                        payload[key] = reply[key]
+                if context.get("missing_inputs"):
+                    payload["unavailable_context"] = context["missing_inputs"]
+                if semantic_missing and status == "completed":
+                    status = "blocked"
                 if status in {"partial", "failed", "requires_framework_extension", "blocked"} or reply.get("requires_framework_extension"):
                     blocked = True
                     design_failed = True
                     spec["role_status"] = status or "requires_framework_extension"
-                    spec["status"] = "requires_framework_extension" if status in {"requires_framework_extension", "blocked"} or reply.get("requires_framework_extension") else "draft"
-                    spec["missing_capability"] = reply.get("required_capability_ids") or reply.get("missing_inputs")
+                    spec["status"] = "requires_framework_extension" if status == "requires_framework_extension" or reply.get("requires_framework_extension") else "blocked" if status == "blocked" else "draft"
+                    if semantic_missing:
+                        spec["missing_inputs"] = semantic_missing
+                        spec["blocked_reason"] = "missing_required_inputs"
+                    elif status == "requires_framework_extension":
+                        spec["blocked_reason"] = "requires_framework_extension"
+                        spec["missing_capability"] = reply.get("additional_capability_ids") or reply.get("required_capability_ids") or []
+                    else:
+                        spec["blocked_reason"] = "designer_" + (status or "blocked")
             if isinstance(spec_reply, dict):
                 spec_reply = dict(spec_reply)
                 if spec_reply.get("status") == "approved":
@@ -1973,7 +2004,7 @@ def _design_experiment(camp: Path, state: dict[str, Any], decision: dict[str, An
             payload["summary_zh"] = "设计调用未完成：" + str(exc) + "；草稿未批准"
             spec["role_status"] = "partial"
             spec["status"] = "draft"
-            if str(exc) == "design_contract_invalid":
+            if str(exc) in {"design_contract_invalid", "designer_output_invalid", "designer_native_input_invalid", "designer_correction_attempts_exhausted"}:
                 spec.update(status="blocked", role_status="blocked", blocked_reason=str(exc))
                 blocked = True
             design_failed = True

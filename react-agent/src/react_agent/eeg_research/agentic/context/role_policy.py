@@ -68,7 +68,7 @@ ROLE_REQUIRED = {
     "research_critic": CONTROL_FIELDS | frozenset({"experiment_observations", "history_navigation", "context_delivery_version", "proposal_pool", "proposal_pool_digest", "retrieved_knowledge", "retrieved_memory", "native_cost_by_id"}),
     "candidate_coder": frozenset({"candidate_interface", "implementation_source", "source", "code", "approved_spec", "experiment", "repair_task", "checks", "candidate_checks", "implementation_lifecycle"}),
     "candidate_reviewer": frozenset({"candidate_interface", "implementation_source", "approved_spec", "experiment", "checks", "candidate_checks", "development_metrics", "evidence"}),
-    "result_analyst": frozenset({"evidence", "run", "method_suite", "method_screenings", "method_suites", "metrics", "diagnostics", "verified_training_diagnostics", "comparison", "latest_comparison", "scores", "results"}),
+    "result_analyst": frozenset({"evidence", "run", "method_suite", "method_screenings", "method_suites", "metrics", "diagnostics", "verified_training_diagnostics", "comparison", "latest_comparison", "scores", "results", "analysis_context_version", "research_context", "analysis_facts", "analysis_requirements"}),
     "experiment_designer": frozenset({"candidate_interface", "confirmation_policy", "experiment", "hypothesis", "approved_spec", "candidate_admissions", "evaluation_population"}),
     "memory_curator": frozenset({"source_cards", "closed_groups", "closed_sections", "fact_card", "episode", "run", "evidence", "method_suite"}),
     "result_auditor": frozenset({"evidence", "report", "report_draft", "method_suite", "method_suites", "method_screenings", "metrics", "comparison", "checks", "audit_feedback"}),
@@ -90,6 +90,11 @@ def role_policy(role: str, *, execution_version: str | None = None, planning_mod
         # remain registered/readable rather than compulsory literal payloads.
         required = (required - HISTORY_FIELDS) | frozenset({"experiment_observations", "history_navigation", "context_delivery_version"})
     mission = MISSIONS[role]
+    if role == "experiment_designer":
+        required = frozenset({"goal", "selected_research_task", "selection_basis", "candidate_interface",
+            "parent_source", "control_source", "parent_hook_config", "confirmation_policy",
+            "evaluation_contract", "unavailable_context"})
+        mission = "Design the selected method using supplied scientific constraints, actual source and applicable evidence."
     if execution_version == "single_plan_v1" and role == "research_planner":
         mission = "Compare 2–4 bounded research tasks against current observation cards, costs and permissions; select one task to feedback."
         if planning_mode == "propose_then_critic":

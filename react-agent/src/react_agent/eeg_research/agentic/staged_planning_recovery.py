@@ -10,12 +10,15 @@ from . import paid_research_round as paid
 from .action_planning import digest
 from .plan_protocol import proposal_pool_digest, round_id, round_input
 
-STAGE_ROLES = {"generation": "research_planner", "correction": "research_planner",
-               "critic": "research_critic", "critic_correction": "research_critic"}
+PLANNER_STAGES = ("generation", "correction", *("correction_" + str(i) for i in range(2, 6)))
+CRITIC_STAGES = ("critic", "critic_correction", *("critic_correction_" + str(i) for i in range(2, 6)))
+STAGE_ROLES = {**dict.fromkeys(PLANNER_STAGES, "research_planner"),
+               **dict.fromkeys(CRITIC_STAGES, "research_critic")}
 STAGE_FIELDS = frozenset({"proposal_pool", "proposal_pool_digest", "critic_repair_request",
     "plan_repair_request", "schema_error", "schema_repair_context", "previous",
-    "correction_instruction", "staged_planning_stage", "planning_stage"})
+    "correction_instruction", "staged_planning_stage", "planning_stage", "_critic_context"})
 PLANNING_CONTEXT_VERSION = "research_planning_input.v1"
+PLANNING_CONTEXT_VERSIONS = frozenset({PLANNING_CONTEXT_VERSION, "research_planning_input.v2"})
 INPUT_SCHEMA_VERSION = "eeg_research.paid_round_input.v1"
 
 
@@ -25,7 +28,31 @@ def _native_observation(full):
     return native
 
 
-def publish_staged_input(camp, state, full, owner, payload, stage, *, native_pool=None):
+def _critic_view(full, model_input, pool, critic_context):
+    """Check local metadata and reconstruct only the science actually delivered."""
+    from .critic_contract import enabled, verify_critic_context
+    from .planning_context import critic_pool_input, delivered_observation_ids
+    if enabled(full):
+        if (not isinstance(critic_context, dict) or verify_critic_context(critic_context, pool)
+                or critic_context.get("delivered_observation_ids") != sorted(delivered_observation_ids(model_input))):
+            raise ValueError("paid_staged_round_critic_context_changed")
+        return "comparison", critic_pool_input(pool, critic_context=critic_context)
+    if critic_context is not None:
+        raise ValueError("paid_staged_round_unexpected_critic_context")
+    v2 = model_input.get("planning_context_version") == "research_planning_input.v2"
+    return "proposal_pool", (critic_pool_input(pool, contract=full.get("_planning_contract"))
+        if v2 else critic_pool_input(pool))
+
+
+def _stage_native_input(native):
+    result = {key: copy.deepcopy(native[key]) for key in ("proposal_pool", "proposal_pool_digest")}
+    if "_critic_context" in native:
+        result["critic_context"] = copy.deepcopy(native["_critic_context"])
+    return result
+
+
+def publish_staged_input(camp, state, full, owner, payload, stage, *, native_pool=None,
+                         critic_context=None):
     """Freeze native inputs locally before invoking a lean Planner or Critic.
 
     The model receives only ``payload``. The full observation and frozen pool
@@ -35,25 +62,34 @@ def publish_staged_input(camp, state, full, owner, payload, stage, *, native_poo
     from .loop import _write
     if stage not in STAGE_ROLES:
         raise ValueError("paid_staged_round_unknown_stage")
-    if payload.get("planning_context_version") != PLANNING_CONTEXT_VERSION:
+    context_version = payload.get("planning_context_version")
+    if context_version not in PLANNING_CONTEXT_VERSIONS:
         return None  # Historical full-wire stages retain their original path.
+    if (context_version == "research_planning_input.v2"
+            and (not isinstance(full.get("_planning_contract"), dict)
+                 or full["_planning_contract"].get("version") != "eeg_research.planning_contract.v2")):
+        raise ValueError("paid_staged_round_contract_missing")
     rid = round_id(full)
-    if stage in {"critic", "critic_correction"}:
-        from .planning_context import critic_pool_input
+    if stage in CRITIC_STAGES:
+        v2 = context_version == "research_planning_input.v2"
         if (not isinstance(native_pool, dict) or native_pool.get("round_id") != rid
                 or native_pool.get("pool_digest") != proposal_pool_digest(native_pool)
-                or payload.get("proposal_pool_digest") != native_pool["pool_digest"]
-                or payload.get("proposal_pool") != critic_pool_input(native_pool)):
+                or (not v2 and payload.get("proposal_pool_digest") != native_pool["pool_digest"])):
             raise ValueError("paid_staged_round_critic_pool_changed")
-    elif native_pool is not None:
+        key, view = _critic_view(full, payload, native_pool, critic_context)
+        if payload.get(key) != view:
+            raise ValueError("paid_staged_round_critic_pool_changed")
+    elif native_pool is not None or critic_context is not None:
         raise ValueError("paid_staged_round_unexpected_pool")
     receipt = {"schema_version": INPUT_SCHEMA_VERSION,
-        "planning_context_version": PLANNING_CONTEXT_VERSION,
+        "planning_context_version": context_version,
         "round_id": rid, "stage": stage, "role": STAGE_ROLES[stage],
         "operation_id": rid + ":" + stage, "planning_owner": owner,
         "input_observation_digest": digest(round_input(full)), "round_input": round_input(full),
         "observation": _native_observation(full), "state_binding": paid.state_binding(camp, state),
         "model_input": copy.deepcopy(payload), "native_pool": copy.deepcopy(native_pool)}
+    if critic_context is not None:
+        receipt["critic_context"] = copy.deepcopy(critic_context)
     receipt["receipt_digest"] = digest(receipt)
     path = Path(camp) / "research_round_inputs" / rid / (stage + ".json")
     if path.is_file():
@@ -75,18 +111,22 @@ def _input_snapshot(camp, wire, row, owner, *, state=None):
     unsigned = {key: value for key, value in receipt.items() if key != "receipt_digest"}
     full, model_input = receipt.get("observation"), receipt.get("model_input")
     if (receipt.get("schema_version") != INPUT_SCHEMA_VERSION
-            or receipt.get("planning_context_version") != PLANNING_CONTEXT_VERSION
+            or receipt.get("planning_context_version") not in PLANNING_CONTEXT_VERSIONS
             or receipt.get("receipt_digest") != digest(unsigned)
             or receipt.get("round_id") != rid or receipt.get("operation_id") != operation
             or receipt.get("stage") != stage or receipt.get("role") != row.get("role")
             or receipt.get("planning_owner") != owner.get("owner_id")
             or not isinstance(full, dict) or not isinstance(model_input, dict)
-            or model_input.get("planning_context_version") != PLANNING_CONTEXT_VERSION
+            or model_input.get("planning_context_version") != receipt.get("planning_context_version")
             or round_id(full) != rid or receipt.get("round_input") != round_input(full)
             or receipt.get("input_observation_digest") != digest(round_input(full))):
         raise ValueError("paid_staged_round_input_snapshot_changed")
     if state is not None and receipt.get("state_binding") != paid.state_binding(camp, state):
         raise ValueError("paid_staged_round_current_binding_changed")
+    if (receipt["planning_context_version"] == "research_planning_input.v2"
+            and (not isinstance(full.get("_planning_contract"), dict)
+                 or full["_planning_contract"].get("version") != "eeg_research.planning_contract.v2")):
+        raise ValueError("paid_staged_round_contract_missing")
     # Format/schema retries may add measured error feedback. They may not
     # replace any scientific input or supply a different candidate pool.
     added = set(wire) - set(model_input)
@@ -96,15 +136,19 @@ def _input_snapshot(camp, wire, row, owner, *, state=None):
         raise ValueError("paid_staged_round_delivered_input_changed")
     full = copy.deepcopy(full)
     pool = receipt.get("native_pool")
-    if stage in {"critic", "critic_correction"}:
-        from .planning_context import critic_pool_input
+    if stage in CRITIC_STAGES:
+        v2 = receipt["planning_context_version"] == "research_planning_input.v2"
         if (not isinstance(pool, dict) or pool.get("round_id") != rid
                 or pool.get("pool_digest") != proposal_pool_digest(pool)
-                or model_input.get("proposal_pool_digest") != pool["pool_digest"]
-                or model_input.get("proposal_pool") != critic_pool_input(pool)):
+                or (not v2 and model_input.get("proposal_pool_digest") != pool["pool_digest"])):
+            raise ValueError("paid_staged_round_critic_pool_changed")
+        key, view = _critic_view(full, model_input, pool, receipt.get("critic_context"))
+        if model_input.get(key) != view:
             raise ValueError("paid_staged_round_critic_pool_changed")
         full.update(proposal_pool=copy.deepcopy(pool), proposal_pool_digest=pool["pool_digest"])
-    elif pool is not None:
+        if receipt.get("critic_context") is not None:
+            full["_critic_context"] = copy.deepcopy(receipt["critic_context"])
+    elif pool is not None or receipt.get("critic_context") is not None:
         raise ValueError("paid_staged_round_unexpected_pool")
     full["_paid_replay_readonly"] = True
     return full, receipt
@@ -183,8 +227,13 @@ def _receipt_stages(camp, state, owner_id):
 def _stages_order(stages):
     if stages and "generation" not in stages:
         raise ValueError("paid_staged_round_generation_missing")
-    if "critic_correction" in stages and "critic" not in stages:
-        raise ValueError("paid_staged_round_critic_missing")
+    for role_stages in (PLANNER_STAGES, CRITIC_STAGES):
+        for index, stage in enumerate(role_stages):
+            if stage in stages and any(previous not in stages for previous in role_stages[:index]):
+                raise ValueError("paid_staged_round_critic_missing" if role_stages is CRITIC_STAGES
+                                 else "paid_staged_round_correction_predecessor_missing")
+    if list(stages) != [stage for stage in STAGE_ROLES if stage in stages]:
+        raise ValueError("paid_staged_round_stage_order_changed")
 
 
 def _returned_proof(camp, state, owner_id, returned):
@@ -204,9 +253,8 @@ def _returned_proof(camp, state, owner_id, returned):
             raise ValueError("paid_staged_round_response_inputs_conflict")
         if stage == "generation":
             proof["planner_delivery"] = _planner_delivery(model_input)
-        if stage in {"critic", "critic_correction"}:
-            proof["stage_inputs"][stage] = {key: copy.deepcopy(native[key])
-                for key in ("proposal_pool", "proposal_pool_digest")}
+        if stage in CRITIC_STAGES:
+            proof["stage_inputs"][stage] = _stage_native_input(native)
     return proof
 
 
@@ -235,9 +283,8 @@ def _local_input_proof(camp, state, owner):
         proof["stage_payloads"][stage] = copy.deepcopy(model_input)
         if stage == "generation":
             proof["planner_delivery"] = _planner_delivery(model_input)
-        if stage in {"critic", "critic_correction"}:
-            proof["stage_inputs"][stage] = {key: copy.deepcopy(native[key])
-                for key in ("proposal_pool", "proposal_pool_digest")}
+        if stage in CRITIC_STAGES:
+            proof["stage_inputs"][stage] = _stage_native_input(native)
     if full is None:
         return None
     if owner.get("observation_digest") != (state.get("terminal_observation_digest") or digest(round_input(full))):
@@ -356,16 +403,17 @@ def restore_staged_paid(camp, state):
         if stage == "generation":
             request = paid._read(camp / "llm_requests" / (row["call_id"] + ".json"))
             planner_delivery = _planner_delivery(json.loads(request["user"]))
-        if stage in {"critic", "critic_correction"}:
+        if stage in CRITIC_STAGES:
             pool = view.get("proposal_pool")
             pool_digest = view.get("proposal_pool_digest")
             if not isinstance(pool, dict) or not pool_digest or pool.get("pool_digest") != pool_digest:
                 raise ValueError("paid_staged_round_critic_pool_missing")
             if proposal_pool_digest(pool) != pool_digest:
                 raise ValueError("paid_staged_round_critic_pool_changed")
-            if "critic" in stage_inputs and stage_inputs["critic"] != {"proposal_pool": pool, "proposal_pool_digest": pool_digest}:
+            stage_input = _stage_native_input(view)
+            if "critic" in stage_inputs and stage_inputs["critic"] != stage_input:
                 raise ValueError("paid_staged_round_critic_inputs_conflict")
-            stage_inputs[stage] = {"proposal_pool": copy.deepcopy(pool), "proposal_pool_digest": pool_digest}
+            stage_inputs[stage] = stage_input
         stages[stage] = raw
         proofs.append({**proof, "stage": stage, "role": row["role"]})
     _stages_order(stages)

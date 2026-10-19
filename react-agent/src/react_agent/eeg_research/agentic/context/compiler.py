@@ -31,7 +31,88 @@ SCIENCE_IDENTITY = ("candidate_id", "method_revision", "source_hash", "config_ha
 def is_research_planning_input(role: str, payload: dict[str, Any]) -> bool:
     """Identify the explicit science-only staged Planner/Critic projection."""
     return role in {"research_planner", "research_critic"} and payload.get(
-        "planning_context_version") == "research_planning_input.v1"
+        "planning_context_version") in {"research_planning_input.v1", "research_planning_input.v2"}
+
+
+def is_designer_scientific_input(role: str, payload: dict[str, Any]) -> bool:
+    from ..designer_context import is_designer_input
+    return is_designer_input(role, payload)
+
+
+def is_engineering_input(role: str, payload: dict[str, Any]) -> bool:
+    """Explicit compact views own their source pages and exact check facts."""
+    return ((role == "candidate_reviewer" and payload.get("reviewer_context_version") == "reviewer_implementation_input.v2")
+            or (role == "candidate_coder" and payload.get("coder_context_version") == "coder_implementation_input.v2"))
+
+
+def is_analysis_scientific_input(role: str, payload: dict[str, Any]) -> bool:
+    return (role == "result_analyst" and payload.get("review_stage") == "analysis"
+            and payload.get("analysis_context_version") == "research_analysis_input.v1")
+
+
+def _analysis_diagnostic_view(value: Any) -> Any:
+    """Remove known export bookkeeping only inside native diagnostic nodes."""
+    if isinstance(value, list):
+        return [_analysis_diagnostic_view(item) for item in value]
+    if not isinstance(value, dict):
+        return copy.deepcopy(value)
+    local = {"schema_version", "source_sha256", "source_hash", "spec_hash", "config_hash",
+        "checkpoint_hash", "protocol_hash", "evaluator_hash", "evaluation_key", "fingerprint", "artifact_sha256",
+        "validation_identity", "training_inference_identity_fingerprint", "dependencies",
+        "source_bindings", "created_at", "recorded_at"}
+    return {key: Path(item).name if key in {"checkpoint", "checkpoint_id"} and isinstance(item, str)
+            else _analysis_diagnostic_view(item) for key, item in value.items() if key not in local}
+
+
+def _analysis_training_run(run: dict[str, Any]) -> dict[str, Any]:
+    result = {key: copy.deepcopy(value) for key, value in run.items() if key not in {
+        "source_hash", "spec_hash", "config_hash", "method_revision", "suite_id", "suite_hash", "job_id"}}
+    config = result.get("config")
+    if isinstance(config, dict) and isinstance(config.get("recipe"), dict):
+        # Model/objective/transform keys are scientific configuration and are
+        # intentionally untouched, even if a custom parameter is called hash.
+        config["recipe"] = {key: value for key, value in config["recipe"].items()
+                            if key not in {"data_root", "gpu"}}
+    for key in ("training_execution", "development_diagnostics", "checkpoint_selection", "development_metrics"):
+        if key in result:
+            result[key] = _analysis_diagnostic_view(result[key])
+    diagnostics = result.get("development_diagnostics")
+    items = diagnostics.get("items") if isinstance(diagnostics, dict) else None
+    dynamics = items.get("training_dynamics") if isinstance(items, dict) else None
+    if (isinstance(dynamics, dict) and "training_execution" in result
+            and dynamics.get("training_execution") == result["training_execution"]):
+        # Native exports repeat this record inside training dynamics. Deliver
+        # the identical scientific facts once; keep any differing observation.
+        dynamics.pop("training_execution", None)
+    learning = result.get("development_learning")
+    if isinstance(learning, dict) and isinstance(learning.get("points"), list) and learning["points"]:
+        # Keep every epoch and metric without repeating the same JSON keys.
+        points = learning.pop("points")
+        columns = list(dict.fromkeys(key for row in points for key in row))
+        learning["columns"] = columns
+        learning["rows"] = [[row.get(key) for key in columns] for row in points]
+    return result
+
+
+def project_analysis_scientific_input(payload: dict[str, Any]) -> dict[str, Any]:
+    """Scientific delivery only; native identities and provenance stay local."""
+    fields = ("analysis_context_version", "review_stage", "research_context", "analysis_requirements")
+    result = {key: copy.deepcopy(payload[key]) for key in fields if key in payload}
+    facts = payload.get("analysis_facts") or {}
+    result["analysis_facts"] = {key: copy.deepcopy(facts[key]) for key in (
+        "measurement", "coverage", "evaluation_context", "training_runs", "scientific_diagnostics",
+        "source_catalog", "allowed_evidence_refs"
+    ) if key in facts}
+    if isinstance(result["analysis_facts"].get("training_runs"), list):
+        result["analysis_facts"]["training_runs"] = [_analysis_training_run(run)
+            for run in result["analysis_facts"]["training_runs"]]
+    if "scientific_diagnostics" in result["analysis_facts"]:
+        result["analysis_facts"]["scientific_diagnostics"] = _analysis_diagnostic_view(
+            result["analysis_facts"]["scientific_diagnostics"])
+    for key in ("previous_response_error", "previous_response"):
+        if key in payload:
+            result[key] = copy.deepcopy(payload[key])
+    return result
 
 
 def native_row_identity(row: dict[str, Any]) -> dict[str, Any]:
@@ -67,7 +148,7 @@ def _compact_system_schema(system: str) -> str:
     return system
 
 
-def render_role_system(role: str, system: str, *, instructions: Any = None, schema: Any = None, execution_version: str | None = None, planning_mode: str | None = None) -> str:
+def render_role_system(role: str, system: str, *, instructions: Any = None, schema: Any = None, execution_version: str | None = None, planning_mode: str | None = None, compact_engineering: bool = False, compact_analysis: bool = False) -> str:
     """Freeze policy/schema text before native task and cache identity binding."""
     policy = role_policy(role, execution_version=execution_version, planning_mode=planning_mode)
     system = _compact_system_schema(system)
@@ -78,6 +159,10 @@ def render_role_system(role: str, system: str, *, instructions: Any = None, sche
     independent_planning = (role in {"research_planner", "research_critic"}
                             and execution_version == "single_plan_v1"
                             and planning_mode == "propose_then_critic")
+    if role == "experiment_designer" or compact_engineering or compact_analysis:
+        # The explicit Designer view contains scientific constraints, not a
+        # ledger/delivery protocol or tool for following context read handles.
+        return system
     if not independent_planning and "\nINPUT DELIVERY CONTRACT\n" not in "\n" + system:
         system += "\n" + CORE_CONTRACT + "ROLE_MISSION\n" + policy.mission
     return system
@@ -260,19 +345,29 @@ class ContextCompiler:
         # Compiler cannot enter its own paid maintenance from a maintenance call.
         maintenance = request.mode in MAINTENANCE_MODES or _IN_MAINTENANCE.get()
         scientific_planning = is_research_planning_input(request.role, request.payload)
+        scientific_designer = is_designer_scientific_input(request.role, request.payload)
+        scientific_analysis = is_analysis_scientific_input(request.role, request.payload)
+        exact_science = scientific_planning or scientific_designer or scientific_analysis or is_engineering_input(request.role, request.payload)
         self.registry = ContextSourceRegistry(self.camp, request.campaign_id)
         self.snapshot_store = None
         # The staged builder already selects the required scientific context.
         # Working-memory control records remain local to the source manifest.
-        snapshot_delivery = None if scientific_planning else self._snapshot_delivery(request)
+        snapshot_delivery = None if exact_science else self._snapshot_delivery(request)
         active_candidates = _active_candidate_ids(request)
         required_evidence = _required_evidence_ids(request)
-        merged_input = copy.deepcopy(request.payload)
-        if request.examples:
+        merged_input = (project_analysis_scientific_input(request.payload) if scientific_analysis
+                        else copy.deepcopy(request.payload))
+        # Memory diagnostics belong to the local selection manifest, including
+        # when a native controller uses the compact view before role projection.
+        for section in (merged_input, merged_input.get("observation")):
+            if isinstance(section, dict):
+                for key in ("memory_retrieval_health", "memory_delivery_report", "memory_delivery_report_ref"):
+                    section.pop(key, None)
+        if request.examples and not scientific_analysis:
             merged_input["current_examples"] = copy.deepcopy(list(request.examples))
-        if request.feedback is not None:
+        if request.feedback is not None and not scientific_analysis:
             merged_input["current_feedback"] = copy.deepcopy(request.feedback)
-        if request.retrieved:
+        if request.retrieved and not scientific_analysis:
             merged_input["retrieved_context"] = copy.deepcopy(list(request.retrieved))
         if snapshot_delivery:
             merged_input["working_snapshot"] = snapshot_delivery
@@ -282,6 +377,16 @@ class ContextCompiler:
             # Filter before any body hashing or persistence, including a sensitive
             # field whose producer forgot to attach a scope/visibility attribute.
             assert_visible_payload(merged_input, request.role)
+            if scientific_analysis:
+                # Full native task/source binding is immutable local evidence,
+                # not a second copy of training facts in the model request.
+                native_payload = {key: value for key, value in request.payload.items()
+                                  if key not in {"previous_response_error", "previous_response"}}
+                native = self.registry.capture(native_payload,
+                    block_id="analyst-native:" + digest(native_payload), kind="analysis_native_input",
+                    role=request.role, identity=dict(request.identity),
+                    metadata={"delivery_scope": "local_only_native_analysis"})
+                source_blocks.append(native)
             for supplied in request.source_blocks:
                 if supplied.campaign_id != request.campaign_id:
                     return Blocked("cross_campaign_source", {"block_id": supplied.block_id})
@@ -330,13 +435,13 @@ class ContextCompiler:
                 choices, unknown = representations_for(block, payload, role=request.role,
                                                         excerpt_cap=request.budget.excerpt_chars, abstracted=abstracted,
                                                         complete_read_paths=frozenset(read_paths.get((block.source_ref, block.source_hash), ())))
-                if scientific_planning:
-                    # Do not change the competitors or science after the native
-                    # input snapshot is frozen. Oversized essential input must
+                if exact_science:
+                    # Do not change selected science after the native input
+                    # is frozen. Oversized essential input must
                     # fail its ordinary budget check, not become opaque handles.
                     choices = [next(choice for choice in choices if choice.kind == "FULL")]
                     unknown = []
-                frontier = None if scientific_planning else _scientific_frontier(block, payload, active_candidates)
+                frontier = None if exact_science else _scientific_frontier(block, payload, active_candidates)
                 if frontier is not None:
                     # Native active identities, not recency/FIFO, select this set.
                     choices = [frontier]
@@ -346,7 +451,7 @@ class ContextCompiler:
                 cap = (request.budget.retrieval_chars if key in {"retrieved_memory", "retrieved_knowledge", "retrieved_context", "memory", "lessons", "skills"}
                        else request.budget.snapshot_max_chars if key == "working_snapshot"
                        else request.budget.recent_chars if key == "recent_decisions" else None)
-                bounded = _bounded_optional(block, payload, cap) if cap and not scientific_planning else None
+                bounded = _bounded_optional(block, payload, cap) if cap and not exact_science else None
                 if bounded is not None:
                     choices, unknown = [bounded], []
                 entries.append({"path": path, "key": key, "block": block, "choices": choices,
@@ -366,7 +471,7 @@ class ContextCompiler:
             if entry["row"] and entry["raw"].get("candidate_id") in active_candidates:
                 current_identity.update({key: entry["raw"][key] for key in ("seed", "protocol_hash", "evaluation_key", "evaluator_hash") if key in entry["raw"]})
         for entry in entries:
-            if scientific_planning or not entry["row"] or not active_candidates:
+            if exact_science or not entry["row"] or not active_candidates:
                 continue
             raw = entry["raw"]; candidate = raw.get("candidate_id")
             row_refs = {str(raw[key]) for key in ("evidence_id", "artifact_id", "suite_id", "job_id", "run_id") if raw.get(key)}
@@ -407,7 +512,9 @@ class ContextCompiler:
 
         system = render_role_system(request.role, request.system, instructions=request.instructions, schema=request.schema,
             execution_version="single_plan_v1" if scientific_planning else None,
-            planning_mode="propose_then_critic" if scientific_planning else None)
+            planning_mode="propose_then_critic" if scientific_planning else None,
+            compact_engineering=is_engineering_input(request.role, request.payload),
+            compact_analysis=request.role == "result_analyst" and request.payload.get("review_stage") == "analysis")
         # These are assembled before measuring. Sending code must reuse them.
         transport_fields: dict[str, Any] = copy.deepcopy(request.transport_options)
         transport_fields.setdefault("model", request.model)
@@ -440,7 +547,7 @@ class ContextCompiler:
                 else:
                     _put(payload, path, copy.deepcopy(rep.content))
             payload.update(copy.deepcopy(base_extras))
-            if not scientific_planning:
+            if not exact_science:
                 payload = deduplicate(payload)
             # Manifest growth is confined to a sidecar, never replayed wholesale.
             delivery = {
@@ -455,7 +562,7 @@ class ContextCompiler:
                                 "source_hash": entry["block"].source_hash, "fidelity": entry["choices"][entry["choice"]].kind}
                                for entry in entries if not entry.get("omit_delivery") and not entry["row"] and entry["choices"][entry["choice"]].kind in {"PARTIAL", "REF_ONLY"}][:min(request.budget.max_manifest_entries, 16)],
             }
-            if not scientific_planning:
+            if not exact_science:
                 payload["context_delivery"] = delivery
             user = canonical(payload)
             return payload, user, measure(system, user, request, transport_fields)
@@ -565,7 +672,7 @@ class ContextCompiler:
         payload, user, report = render()
 
         maintenance_outcome = "not_requested"
-        if (before_report["chars"] >= request.budget.high_chars or not before_report["provider_budget_ok"]) and not maintenance and not scientific_planning:
+        if (before_report["chars"] >= request.budget.high_chars or not before_report["provider_budget_ok"]) and not maintenance and not exact_science:
             if request.allow_semantic_compaction and request.allow_sync_memory_maintenance and request.maintenance_callback and request.remaining_api_calls != 0:
                 token = _IN_MAINTENANCE.set(True)
                 try:
@@ -617,8 +724,10 @@ class ContextCompiler:
             return NeedsContext(tuple(missing), reads, "unclassified_or_unread_required_field", report,
                                 {"max_reads": request.budget.max_reads, "max_read_chars": request.budget.max_read_chars})
         if not report["ready_budget_ok"]:
-            if scientific_planning:
-                return Blocked("research_planning_input_exceeds_budget",
+            if exact_science:
+                return Blocked("engineering_input_exceeds_budget" if is_engineering_input(request.role, request.payload)
+                    else "designer_input_exceeds_budget" if scientific_designer
+                    else "analysis_input_exceeds_budget" if scientific_analysis else "research_planning_input_exceeds_budget",
                     {"role": request.role, "minimum_necessary_chars": report["chars"]}, report,
                     ("a smaller native scientific projection or larger authorized provider window",))
             kernel_report = measure(system, canonical({}), request, transport_fields)

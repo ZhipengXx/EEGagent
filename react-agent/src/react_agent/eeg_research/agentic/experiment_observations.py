@@ -496,6 +496,8 @@ def _current_review_failure(camp: Path, state: dict, plan: dict) -> tuple[dict, 
 def record_experiment_observation(camp: Path, state: dict, plan: dict, execution_status: str,
                                   analysis_ref: str | None = None) -> dict:
     camp = Path(camp)
+    from .research_execution import research_goal
+    planning_v2 = ((research_goal(camp).get("research_execution") or {}).get("planning_contract_version") == "v2")
     proposal = plan.get("proposal") or plan.get("selected_proposal") or plan
     failure = copy.deepcopy(plan.get("engineering_failure") or {})
     engineering = execution_status in {"failed", "needs_replan"}
@@ -522,12 +524,24 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
             expected = method_screening_origin(measured) if screening else method_benchmark_origin(measured)
             if explanation.get(key) != expected:
                 raise ValueError("observation_analyst_measurement_origin_mismatch")
-        interpretation = {"artifact_id": analysis_ref, "sha256": row["sha256"], "candidate_id": row.get("candidate_id"), "interpretation_only": True,
-            "read_ref": analysis_ref, "points": {key: copy.deepcopy(explanation[key]) for key in (
+        from .analysis_contract import analysis_memory_view, is_record
+        if is_record(explanation):
+            # Staged records keep the complete summary; native facts stay the Observation's own.
+            view = analysis_memory_view(explanation)
+            points = {key: view[key] for key in ("hypothesis_assessment", "summary_zh", "limitations", "next_steps")}
+            if planning_v2:
+                points["findings"] = copy.deepcopy(view["findings"])
+            omitted = []
+        else:
+            points = {key: copy.deepcopy(explanation[key]) for key in (
                 "hypothesis_assessment", "summary_zh", "evidence_gaps", "suggested_next_actions")
-                if key in explanation and len(canonical(explanation[key])) <= 1200},
-            "omitted_point_fields": [key for key in ("hypothesis_assessment", "summary_zh", "evidence_gaps", "suggested_next_actions")
-                if key in explanation and len(canonical(explanation[key])) > 1200]}
+                if key in explanation and len(canonical(explanation[key])) <= 1200}
+            omitted = [key for key in ("hypothesis_assessment", "summary_zh", "evidence_gaps", "suggested_next_actions")
+                if key in explanation and len(canonical(explanation[key])) > 1200]
+        interpretation = {"artifact_id": analysis_ref, "sha256": row["sha256"], "candidate_id": row.get("candidate_id"), "interpretation_only": True,
+            "read_ref": analysis_ref, "points": points, "omitted_point_fields": omitted}
+        if is_record(explanation):
+            interpretation["record_version"] = explanation["record_version"]
         sources.append({"artifact_id": analysis_ref, "sha256": row["sha256"], "kind": row["kind"]})
     if engineering:
         feedback, failure_sources = _current_review_failure(camp, state, plan)
@@ -539,9 +553,11 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
         failure.setdefault("error_category", "engineering_failure")
     conditions = planner_applicability_context(camp, {**state, "experiment": plan,
         "evaluation_scope": proposal.get("evaluation_scope") or {}})
+    intervention = ((proposal.get("method") or proposal.get("task_description") or proposal.get("scientific_intent"))
+                    if planning_v2 else (proposal.get("scientific_intent") or proposal.get("task_description")))
     body = {"origin_campaign_id": camp.name, "plan_id": plan["plan_id"], "observation_kind": "engineering_failure" if engineering else "experiment",
         "execution_status": execution_status, "question": proposal.get("question"),
-        "intervention": proposal.get("scientific_intent") or proposal.get("task_description"),
+        "intervention": intervention,
         "identity": {key: plan[key] for key in ("candidate_id", "method_revision", "source_hash", "spec_hash", "scientific_intent_digest") if key in plan} |
             {key: conditions[key] for key in ("dataset", "modality") if key in conditions},
         "evaluation_scope": copy.deepcopy(proposal.get("evaluation_scope") or {}),
@@ -588,13 +604,86 @@ def _feedback_handle(record: dict, pointer: str = "", *, unit: str = "json", siz
             "next_read": request}
 
 
-def minimum_observation_card(record: dict, *, current: bool = False, context: dict | None = None) -> dict:
+def observation_science_view(body: dict, *, include_analysis: bool = True) -> dict:
+    """A pure delivery view; immutable observations remain the complete record.
+
+    Reuse the paid Analyst's complete summary instead of replaying every finding.
+    Scope and numeric results stay exact. Unknown fields are retained so a new
+    required fact cannot silently disappear through this adapter.
+    """
+    result = {key: copy.deepcopy(value) for key, value in body.items() if key != "analyst_interpretation"}
+    # The registered original and its digest bind these identities. Repeating
+    # storage and revision fields inside every scientific block adds no evidence.
+    for key in ("schema_version", "origin_campaign_id", "content_digest"):
+        result.pop(key, None)
+    identity = result.get("identity")
+    if isinstance(identity, dict) and body.get("observation_kind") != "engineering_failure":
+        for key in ("source_hash", "spec_hash", "scientific_intent_digest", "method_revision"):
+            identity.pop(key, None)
+    facts = result.get("native_facts")
+    if isinstance(facts, dict):
+        for key in ("candidate_id", "method_revision", "source_hash", "spec_hash",
+                    "selection_manifest_hash", "baseline_suite_hash"):
+            facts.pop(key, None)
+    applicability = result.get("applicability")
+    if isinstance(applicability, dict):
+        # Retrieval checks the original applicability before this view. Keep
+        # scientific conditions, including a possibly different historical recipe.
+        for key in ("campaign_id", "task", "evaluation_identity", "terminal_observation_id",
+                    "candidate_id", "source_hash", "spec_hash", "method_revision",
+                    "scientific_intent_digest", "selection_manifest_hash"):
+            applicability.pop(key, None)
+        recipe = applicability.get("training_recipe")
+        if isinstance(recipe, dict):
+            for key in ("data_root", "gpu"):
+                recipe.pop(key, None)
+            if (applicability.get("input_geometry") is not None
+                    and recipe.get("input_geometry") == applicability["input_geometry"]):
+                recipe.pop("input_geometry")
+        # Remove only exact repetitions, not historical differences. Each
+        # retained condition is already present in a scientific block of this card.
+        conditions = {"dataset": (identity or {}).get("dataset"),
+            "modality": (identity or {}).get("modality"),
+            **{key: (facts or {}).get(name) for key, name in (
+                ("scope", "scope"), ("seed", "seed"), ("fold_count", "required_fold_count"),
+                ("fold_ids", "screening_fold_ids"), ("screening_subjects", "screening_subjects"))}}
+        if isinstance(recipe, dict):
+            conditions["negative_sampling_policy"] = recipe.get("negative_sampling_policy")
+        for key, value in conditions.items():
+            if value is not None and key in applicability and canonical(applicability[key]) == canonical(value):
+                applicability.pop(key)
+    if isinstance(result.get("source_refs"), list):
+        result["source_refs"] = [{key: ref[key] for key in ("artifact_id", "source_ref") if key in ref}
+                                 for ref in result["source_refs"] if isinstance(ref, dict)
+                                 and (ref.get("artifact_id") or ref.get("source_ref"))]
+    interpretation = body.get("analyst_interpretation")
+    if isinstance(interpretation, dict) and include_analysis:
+        points = interpretation.get("points")
+        points = points if isinstance(points, dict) else interpretation
+        summary = {key: copy.deepcopy(points[key]) for key in
+                   ("hypothesis_assessment", "summary_zh", "summary", "limitations") if key in points}
+        if summary:
+            summary["interpretation_only"] = True
+            ref = interpretation.get("artifact_id") or interpretation.get("read_ref")
+            if ref:
+                summary["artifact_id"] = ref
+            result["analyst_interpretation"] = summary
+        else:
+            result.pop("analyst_interpretation", None)
+    else:
+        result.pop("analyst_interpretation", None)
+    return result
+
+
+def minimum_observation_card(record: dict, *, current: bool = False, context: dict | None = None,
+                             inline_analysis: bool = True) -> dict:
     """Deterministic feedback: exact identities/results, prose behind real reads.
 
     Large exact measurements or identities remain exact. If this minimum is too
     large the caller must report NeedsContext; it never clips native facts.
     """
-    body = record["body"]
+    original = record["body"]
+    body = observation_science_view(original, include_analysis=inline_analysis)
     from .context.representations import NARRATIVE_FIELDS, LOG_FIELDS
     prose_fields = NARRATIVE_FIELDS | LOG_FIELDS | {"reason", "error", "warning", "summary_zh"}
     omissions = []
@@ -651,32 +740,48 @@ def minimum_observation_card(record: dict, *, current: bool = False, context: di
             {key: value for key, value in failure.items() if key != "error"}, "/engineering_failure")
         selected["engineering_failure"].setdefault("error_category", "engineering_failure")
         selected["engineering_failure"].setdefault("error_fingerprint", content_hash({"error": failure.get("error"),
-            "source_hash": (body.get("identity") or {}).get("source_hash"), "spec_hash": (body.get("identity") or {}).get("spec_hash")}))
+                "source_hash": (original.get("identity") or {}).get("source_hash"), "spec_hash": (original.get("identity") or {}).get("spec_hash")}))
         if "error" in failure:
             omit("/engineering_failure/error", failure["error"])
     for key in ("question", "intervention", "unresolved_questions", "analyst_interpretation"):
         value = body.get(key)
+        if key == "unresolved_questions" and not value:
+            continue
         if value is not None:
-            if key in {"question", "intervention"} and len(canonical(value)) <= 512:
+            if key in {"question", "intervention", "analyst_interpretation"}:
                 selected[key] = copy.deepcopy(value)
             else:
                 omit("/" + key, value)
+    if original.get("analyst_interpretation") and not inline_analysis:
+        omit("/analyst_interpretation", original["analyst_interpretation"])
+    points = (original.get("analyst_interpretation") or {}).get("points") or {}
+    if inline_analysis and points.get("findings"):
+        # A source pointer documents that findings are saved, not available as a
+        # model tool. Planner receives the existing summary, not a partial finding.
+        omissions.append({"path": "/analyst_interpretation/points/findings",
+                          "reason": "complete_analysis_saved_summary_delivered"})
     if not next_reads:
         # A minimum blocked by an unfamiliar long obligation still gives a
         # usable page of that exact source, without classifying it as omitted.
-        text = first_text(body, "")
+        # The Analyst summary was delivered, and complete findings are an
+        # intentional saved detail. Do not add a redundant paging request for
+        # either. Unknown required fields still provide a real recovery page.
+        text = first_text({key: value for key, value in original.items()
+                           if key != "analyst_interpretation"}, "")
         if text:
             next_reads.append(_feedback_handle(record, text[0], unit="chars", size=len(text[1]))["next_read"])
-    label, differences = observation_applicability(body, context)
+    label, differences = observation_applicability(original, context)
     return {"record_type": "experiment_observation", "record_id": record["record_id"], "body": selected,
         "source_refs": copy.deepcopy(record["source_refs"]), "applicability": label,
         "condition_differences": differences, "current_feedback": current, "fidelity": "FACT_CARD",
-        "omissions": omissions, "full_record": _feedback_handle(record), "next_reads": next_reads,
-        "minimum_feedback_version": "eeg.observation.minimum.v1"}
+        "omissions": omissions,
+        "full_record": {key: value for key, value in _feedback_handle(record).items()
+                        if key in {"$context_source", "source_hash", "fidelity"}},
+        "next_reads": next_reads, "minimum_feedback_version": "eeg.observation.minimum.v2"}
 
 
-def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
-                        context: dict | None = None, retrieval_out: dict | None = None) -> dict:
+def _legacy_recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
+                               context: dict | None = None, retrieval_out: dict | None = None) -> dict:
     """Current terminal feedback is mandatory; optional history uses remaining space."""
     from .semantic_memory import retrieve, embedding_health
     from .context.retrieval import prepare_query
@@ -747,6 +852,11 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
             continue
         card = minimum_observation_card(record, current=mandatory, context=context)
         trial = {**result, "cards": result["cards"] + [card]}
+        if not fits(trial) and card["body"].get("analyst_interpretation"):
+            # Too large with its inline conclusion: deliver the reference and record the omission
+            # instead of blocking the round or claiming the text was delivered.
+            card = minimum_observation_card(record, current=mandatory, context=context, inline_analysis=False)
+            trial = {**result, "cards": result["cards"] + [card]}
         if fits(trial):
             result = trial
             if native_sources:
@@ -754,7 +864,7 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
         elif mandatory:
             handles = card["next_reads"]
             if not handles:
-                handles = [card["full_record"]["next_read"]]
+                handles = [_feedback_handle(record)["next_read"]]
             raise ObservationDeliveryRequired(NeedsContext(({"observation_id": record["record_id"],
                 "plan_id": body["plan_id"], "status": "minimum_current_feedback_exceeds_budget",
                 "minimum_chars": len(canonical(trial)), "minimum_utf8_token_upper_bound": len(canonical(trial).encode("utf-8")),
@@ -765,6 +875,131 @@ def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char
             result["omitted_history_count"] += 1
     fits(result)
     return result
+
+
+def _scientific_memory_enabled(camp: Path) -> bool:
+    """Memory delivery is independent of the Planner's output contract."""
+    return single_plan_enabled(camp)
+
+
+def recall_observations(camp: Path, question: str, *, recent=2, relevant=4, char_cap=16000, token_cap=16000,
+                        context: dict | None = None, retrieval_out: dict | None = None) -> dict:
+    """Freeze complete feedback plus one shared allowance for optional priors.
+
+    The legacy char/token arguments remain part of the old compiler API. The
+    single-plan flow applies the scientific content allowance here independently
+    of the Planner's response contract;
+    the final request compiler owns the complete wire and model token limits.
+    """
+    if not _scientific_memory_enabled(camp):
+        return _legacy_recall_observations(camp, question, recent=recent, relevant=relevant,
+            char_cap=char_cap, token_cap=token_cap, context=context, retrieval_out=retrieval_out)
+    from .semantic_memory import retrieve, embedding_health, planner_knowledge_delivery, record_delivery_report
+    from .context.retrieval import prepare_query
+    from .memory_delivery import project_memory_card, select_memory_cards
+
+    store = ExperimentObservationStore(camp)
+    records = store.records(limit=max(1, min(max(recent, 0), 2)), context=context)
+    current_id = (context or {}).get("terminal_observation_id")
+    current = store.records(limit=1, observation_id=current_id, context=context) if current_id else records[:1]
+    if current_id and not current:
+        raise ObservationDeliveryRequired(NeedsContext(({"observation_id": current_id,
+            "status": "current_observation_unreadable"},), (), "current_observation_unreadable"))
+    config = memory_config(camp)
+    health = {"backend": "recent_only", "degraded": False,
+        "reason": "similarity_not_requested" if config.enabled else "disabled",
+        "model": config.model_id, "revision": config.model_revision, "fingerprint": None,
+        "query": question, "query_status": "not_encoded", "indexing": {"status": "not_requested"}}
+    related_observations, knowledge_cards = [], []
+    knowledge = {"status": "disabled", "items": []}
+    rank_by_id = {}
+    if config.enabled and relevant > 0:
+        query = prepare_query(question=question, identities=[(context or {}).get("candidate_id")])["text"]
+        # Independent type allocations prevent a run of experiment hits from
+        # excluding every useful lesson before the shared content selection.
+        bundle = retrieve(camp, query, config=config, role="research_planner", context=context,
+                          record_types=frozenset({"experiment_observation"}))
+        knowledge_bundle = retrieve(camp, query, config=config, role="research_planner", context=context,
+                                    record_types=frozenset({"lesson", "knowledge"}))
+        health = embedding_health(bundle)
+        health.update(knowledge_indexing=knowledge_bundle.get("indexing"),
+            knowledge_candidate_count=knowledge_bundle.get("candidate_count"),
+            knowledge_query_status=knowledge_bundle.get("query_status"),
+            knowledge_query_sha256=knowledge_bundle.get("query_sha256"))
+        for candidate in (bundle, knowledge_bundle):
+            if candidate.get("degraded"):
+                raise ObservationDeliveryRequired(NeedsContext(({
+                    "status": "embedding_retrieval_unavailable", "embedding_health": embedding_health(candidate),
+                    "required_action": "Restore the frozen embedding backend and resume the same campaign."},), (),
+                    "embedding_retrieval_unavailable", {}, {"paid_maintenance_calls": 0}))
+            for item in candidate.get("items", []):
+                rank_by_id[(item["record_type"], item["record_id"])] = item
+        related_observations = bundle.get("items", [])[:min(max(relevant, 0), 5)]
+        knowledge = planner_knowledge_delivery(camp, knowledge_bundle, context=context)
+        knowledge_cards = knowledge.get("items", [])
+
+    current_id = current[0]["record_id"] if current else None
+    seen, dedup_keys = set(), {}
+
+    def observation_card(record):
+        identity = (record.get("record_type", "experiment_observation"), record["record_id"])
+        if identity in seen:
+            return None
+        body = record.get("body")
+        if body is None or record.get("minimum_feedback_version"):
+            original = store.records(limit=1, observation_id=record["record_id"], context=context)
+            body = original[0]["body"] if original else None
+        if body is None:
+            return None
+        mandatory = record["record_id"] == current_id
+        native_refs = tuple(sorted(ref.get("artifact_id") or ref.get("source_ref") or ref.get("path") or ""
+            for ref in body.get("source_refs", []) if isinstance(ref, dict)
+            and ref.get("kind") not in {"analysis", "result_analysis", "role_result", "analysis_output"}))
+        # The same native source is duplicate evidence only within the same
+        # scientific conditions and evaluation scope, never across folds/seeds.
+        native_identity = (native_refs, canonical(body.get("evaluation_scope")),
+                           canonical(observation_conditions(body)))
+        seen.add(identity)
+        label, differences = observation_applicability(body, context)
+        card = project_memory_card({**record, "record_type": "experiment_observation", "body": body,
+            "applicability": label, "condition_differences": differences, "current_feedback": mandatory},
+            role="research_planner", context=context)
+        if native_refs:
+            dedup_keys[identity] = native_identity
+        return card
+
+    priority = {"compatible_evidence": 0, "preconditions_met": 1, "analogy_only": 2,
+                "preconditions_mismatch": 2, "applicability_unknown": 3, "preconditions_unknown": 3}
+
+    def related_order(card):
+        row = rank_by_id.get((card["record_type"], card["record_id"]), {})
+        label = row.get("precondition_status", row.get("applicability", card.get("applicability")))
+        return (priority.get(label, 3) if isinstance(label, str) else 3, -float(row.get("cosine_score", 0)),
+                card["record_type"], card["record_id"], str(row.get("version", "")))
+
+    ordered = [card for record in current + records[:min(max(recent, 0), 2)]
+               if (card := observation_card(record)) is not None]
+    related = [card for record in related_observations if (card := observation_card(record)) is not None]
+    related.extend(project_memory_card(card, role="research_planner", context=context) for card in knowledge_cards)
+    ordered.extend(sorted(related, key=related_order))
+    selected = select_memory_cards(ordered, content_chars_budget=config.content_chars_budget,
+                                   mandatory_ids=[current_id] if current_id else (), dedup_keys=dedup_keys)
+    report_ref = record_delivery_report(camp, "research_planner", selected.report, retrieval=health)
+    observation_cards = [card for card in selected.cards if card["record_type"] == "experiment_observation"]
+    selected_knowledge = {"status": knowledge.get("status", "no_related_knowledge"),
+        "items": [card for card in selected.cards if card["record_type"] in {"lesson", "knowledge"}]}
+    if selected_knowledge["items"]:
+        selected_knowledge["status"] = "ready"
+    elif selected_knowledge["status"] == "ready":
+        selected_knowledge["status"] = "no_related_knowledge"
+    if retrieval_out is not None:
+        retrieval_out.update(selected_knowledge=selected_knowledge, selection_report=selected.report,
+                             selection_report_ref=report_ref)
+    return {"status": "ready", "cards": observation_cards,
+        "current_observation_id": current_id, "retrieval_health": health,
+        "omitted_history_count": sum(row.get("record_type") == "experiment_observation"
+                                     for row in selected.report["omitted"]),
+        "delivered_chars": len(canonical(observation_cards))}
 
 
 # Fields explicitly moved behind readable references in the versioned adapter.
@@ -825,7 +1060,11 @@ def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap
             char_cap=char_cap, token_cap=token_cap, retrieval_out=bundle)
         result["memory_retrieval_health"] = recalled.pop("retrieval_health")
         result["experiment_observations"] = recalled
-        if bundle:
+        if "selected_knowledge" in bundle:
+            result["retrieved_knowledge"] = bundle["selected_knowledge"]
+            result["memory_delivery_report"] = bundle["selection_report"]
+            result["memory_delivery_report_ref"] = bundle["selection_report_ref"]
+        elif bundle:
             result["retrieved_knowledge"] = planner_knowledge_delivery(camp, bundle, context=conditions)
         else:
             result["retrieved_knowledge"] = {"status": "disabled", "items": [],
@@ -833,7 +1072,9 @@ def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap
         navigation = [row for row in result.get("history_navigation") or []
                       if not str(row.get("field", "")).startswith("retrieved_knowledge/")]
         for card in result["retrieved_knowledge"]["items"]:
-            original = card["full_record"]
+            original = card.get("full_record")
+            if not isinstance(original, dict):
+                continue
             navigation.append({"field": "retrieved_knowledge/" + card["record_id"],
                 "$context_source": original["$context_source"], "source_hash": original["source_hash"],
                 "fidelity": "REF_ONLY", "read_capability": "registered_bounded_delivery_read",
@@ -841,6 +1082,10 @@ def compact_planner_view(camp: Path, fullobs: dict, *, char_cap=16000, token_cap
         result["history_navigation"] = navigation
         return result
     if fullobs.get("context_delivery_version") == "observation_card_first.v1":
+        if _scientific_memory_enabled(camp) and fullobs.get("memory_delivery_report"):
+            # A frozen scientific selection is already complete. The compiler
+            # can measure the same science without reretrieving or dropping it.
+            return copy.deepcopy(fullobs)
         # Recheck the actual request's budget without recapturing projections
         # as new authoritative heads for their original history sources.
         result = copy.deepcopy(fullobs)

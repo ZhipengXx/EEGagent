@@ -81,10 +81,8 @@ def curation_extension(camp: Path, completed_task: dict, episodes: list[dict], *
             continue
     allowed = {"origin_campaign_id": camp.name, "tasks": [task],
                "episodes": verified_episodes, "artifacts": [task["output_artifact"]]}
-    bundle = role_memory(camp, state=state)
+    bundle = role_memory(camp, state=state, role="memory_curator", record_types=frozenset({"skill"}))
     related = standalone_delivery(bundle) if bundle else None
-    if related:
-        related["items"] = [item for item in related["items"] if item["record_type"] == "skill"]
     return {"completed_subtask": task, "allowed_source_refs": allowed, "related_skills": related}
 
 
