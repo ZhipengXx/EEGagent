@@ -25,8 +25,8 @@ def single_plan_enabled(value: Mapping | Path | str) -> bool:
 
 
 def independent_critic_enabled(value: Mapping | Path | str) -> bool:
-    config = research_goal(value).get("research_execution") or {}
-    return single_plan_enabled(value) and config.get("planning_mode") == "propose_then_critic"
+    # Single-plan research always proposes, then has an independent Critic select.
+    return single_plan_enabled(value)
 
 
 def role_api_attempt_limit(value: Mapping | Path | str, role: str, default: int = 2) -> int:
@@ -42,9 +42,7 @@ def role_api_attempt_limit(value: Mapping | Path | str, role: str, default: int 
               "research_critic": "max_critic_api_attempts",
               "experiment_designer": "max_designer_api_attempts"}
     field = fields.get(role)
-    version_field = ("design_contract_version" if role == "experiment_designer"
-                     else "planning_contract_version")
-    implicit = SCIENCE_MAX_ATTEMPTS if field and config.get(version_field) == "v2" else default
+    implicit = SCIENCE_MAX_ATTEMPTS if field and single_plan_enabled(goal) else default
     limit = config.get(field, implicit) if field else default
     if type(limit) is not int or not 1 <= limit <= SCIENCE_MAX_ATTEMPTS:
         raise ValueError("invalid_role_api_attempt_limit:" + role)

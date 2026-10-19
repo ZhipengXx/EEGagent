@@ -587,7 +587,8 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
     # slot. Reserve the actual transport allowance for each review session.
     reviewer_calls = min(2, api_request_policy(Path(camp)).max_attempts_per_operation)
     defaults = {"experiment_designer": 2, "candidate_coder": 2 * steps * (repairs + 1), "candidate_reviewer": reviewer_calls * (repairs + 1), "result_analyst": 2}
-    if (goal.get("research_execution") or {}).get("design_contract_version") == "v2":
+    from .research_execution import single_plan_enabled
+    if single_plan_enabled(goal):
         from .research_execution import role_api_attempt_limit
         defaults["experiment_designer"] = role_api_attempt_limit(goal, "experiment_designer") * (repairs + 1)
     if task_kind in {"diagnosis", "validation", "confirmation"}:

@@ -4,7 +4,7 @@
 
 EEGagent connects a decoding question to a controlled experiment: choose what to test, implement a candidate, compare it with a control, and use the result to decide what comes next. Its primary workflow is code-level EEG / MEG image-retrieval research. A second workflow screens predicted fMRI responses.
 
-**Plan over alternatives.** The planner normally compares **2–4 candidate next actions in one call**, weighing the evidence gap, expected information, prerequisites and resource estimates. It records the alternatives, selects one and explains the choice; the runtime validates that selection before dispatch.
+**Plan over alternatives.** New `single_plan_v1` campaigns ask the Planner for **2–4 distinct plans**, then an independent Critic compares the valid pool and selects one for the Designer. The runtime validates the selection before dispatch; explicit `combined` mode keeps proposal and selection in one call.
 
 <p align="left">
   <a href="#inside-the-workbench"><img src="docs/figures/navigation/workbench.svg" width="146" height="44" alt="Workbench"></a>
@@ -61,11 +61,11 @@ Consider a question such as:
 
 This is an illustrative research question, rather than a reported result. In a campaign, it becomes a declared intervention with a matched control and a prediction that the experiment can support or weaken.
 
-![The EEG research loop: frame the question, build the candidate, read the evidence, and retain supported findings. Eight roles work through the campaign runtime.](docs/figures/02-eeg-agent-collaboration.png)
+![The EEG research loop: frame the question, build the candidate, read the evidence, and retain supported findings. The campaign runtime invokes the required roles.](docs/figures/02-eeg-agent-collaboration.png)
 
 | Research stage | What happens | What carries forward |
 | --- | --- | --- |
-| **Frame the question** | The planner compares legal next actions using evidence, expected information and resource estimates. The librarian supplies local methods; the designer drafts a testable intervention. | Selected action, rationale, hypothesis and control |
+| **Frame the question** | The planner proposes alternatives; an independent Critic compares them using evidence, expected information and resource estimates. The librarian supplies local methods; the designer drafts the selected intervention. | Selected plan, rationale, hypothesis and control |
 | **Build the candidate** | The runtime validates the experiment context. The coder implements an isolated extension; the reviewer checks it and can request repair. | Checked source and a bound run specification |
 | **Read the evidence** | The worker trains and evaluates. The runtime settles the matched comparison; the analyst interprets the hypothesis against source-bound diagnostics. | Diagnostics, assessment and a possible next action |
 | **Retain what is supported** | The auditor receives a report draft and dependency manifest. Verified feedback can request a correction or narrower claim; the curator proposes conditional lessons. | Scoped audit records, unresolved issues and accepted lessons |
@@ -78,9 +78,11 @@ These stages explain the collaboration; the campaign is state-driven. It invokes
 
 A next step can read missing evidence, diagnose a result, design a new candidate experiment, or replicate an eligible Full run. Different options can pursue different interventions or resolve different uncertainties. Each carries a target, evidence references, expected information, prerequisites, outcome interpretations and a cost basis.
 
-**One response contains the alternatives and the selection.** The saved decision includes `options`, `selected_option_id` and `selection_rationale`. The runtime checks the selected action against current targets, evidence, gates and budget, then dispatches that action. Its outcome becomes evidence for the next round.
+`single_plan_v1` campaigns always use **`research_execution.planning_mode: propose_then_critic`**. One Planner call proposes a batch of distinct plans (target 3, configurable from 2–4). The runtime validates the candidates, then one independent Critic call compares the entire valid pool and selects one original plan. Only that plan, its selection rationale and relevant memory basis go to the Designer. Normal planning therefore uses two API calls; correction calls are additional. Planner and Critic can use the same thinking model with separate prompts and contexts.
 
-New campaigns use `compare_options` by default. The planner prompt asks for 2–4 materially different options; a single option is allowed when only one is reasonable. The options are candidate research actions, while trained model candidates retain their own identities, source and experiment records.
+Every single-plan role has one current (v2) stage contract. The provider returns only what needs model judgment — proposals, comparisons, design briefs, tool calls, reviews and analyses — while identities, task scope, ranks, hashes and record assembly are filled and checked locally. Separating these responsibilities does not by itself establish higher accuracy or lower latency.
+
+Legacy action planning is separate: `planner_mode: compare_options` compares 2–4 next-action options in one response (one is allowed when only one is reasonable), with `options`, `selected_option_id` and `selection_rationale`. Those options are candidate research actions, while trained model candidates retain their own identities, source and experiment records.
 
 ### What makes this a decoding study
 
@@ -151,8 +153,8 @@ uv run python -m react_agent.eeg_research.agentic.cli start \
 | --- | --- |
 | Decoding task | EEG / MEG **image retrieval** from preprocessed signals; classification, image reconstruction, raw preprocessing and foundation-model adapters are unavailable |
 | Method evidence | Bundled local method cards; online literature retrieval is not implemented |
-| Role models | Eight independently configured EEG roles; thinking/effort, output budgets and wall-clock deadlines are applied to actual requests |
-| Planning and evidence reads | Default `compare_options`: usually **2–4 next-action alternatives**, one selected action and a saved rationale; bounded, verified artifact reads support selected role requests |
+| Role models | Eight base EEG roles plus the independent Critic; model, thinking/effort, output budgets and wall-clock deadlines are configured per role |
+| Planning and evidence reads | `single_plan_v1` campaigns use `propose_then_critic`: a batch of plans, one Critic comparison and one selected plan; legacy next-action planning retains `compare_options` |
 | Result audit | Structured report and dependency context, identity / freshness checks and tracked corrections; same-provider review does not establish independent replication |
 | Demonstrated results | Platform DEMO values are synthetic. Historical acceptance records describe their own revisions and do not establish a new retrieval benchmark gain |
 

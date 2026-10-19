@@ -188,19 +188,21 @@ class PlannerProposal(PlannerActionPayload):
 
 
 class ResearchExecutionConfig(DomainOutput):
-    """Explicit opt-in; frozen legacy campaigns keep their action protocol."""
+    """Explicit opt-in; goals without it keep the legacy action protocol."""
     version: Literal["single_plan_v1"]
     target_k: int = Field(default=3, ge=2, le=4)
     allow_degraded_singleton: bool = False
     proposal_correction_calls: int = Field(default=5, ge=0, le=5)
     max_planner_api_attempts: int = Field(default=6, ge=1, le=6)
-    planning_mode: Literal["combined", "propose_then_critic"] = "propose_then_critic"
-    implementation_review_mode: Literal["legacy", "single_pass"] = "legacy"
-    design_contract_version: Literal["v1", "v2"] = "v1"
-    planning_contract_version: Literal["v1", "v2"] = "v1"
-    critic_contract_version: Literal["v1", "v2"] = "v1"
-    reviewer_contract_version: Literal["v1", "v2"] = "v1"
-    coder_context_version: Literal["v1", "v2"] = "v1"
+    # Single-plan research has one stage contract per role. These fields only
+    # accept the current values, so a written goal cannot route to older wires.
+    planning_mode: Literal["propose_then_critic"] = "propose_then_critic"
+    implementation_review_mode: Literal["single_pass"] = "single_pass"
+    design_contract_version: Literal["v2"] = "v2"
+    planning_contract_version: Literal["v2"] = "v2"
+    critic_contract_version: Literal["v2"] = "v2"
+    reviewer_contract_version: Literal["v2"] = "v2"
+    coder_context_version: Literal["v2"] = "v2"
     max_critic_api_attempts: int = Field(default=6, ge=1, le=6)
     max_designer_api_attempts: int = Field(default=6, ge=1, le=6)
     max_engineering_repairs: int = Field(default=2, ge=0, le=2)
@@ -208,15 +210,6 @@ class ResearchExecutionConfig(DomainOutput):
         description="Stop after this many selected tasks have durable terminal observations; repairs and polling do not count.")
     paid_maintenance: Literal["off", "emergency", "batch"] | None = None
     budget: dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def planning_contract_requires_independent_critic(self):
-        if self.planning_contract_version == "v2" and self.planning_mode != "propose_then_critic":
-            raise ValueError("planning_contract_v2_requires_propose_then_critic")
-        if self.critic_contract_version == "v2" and (self.planning_contract_version != "v2"
-                or self.planning_mode != "propose_then_critic"):
-            raise ValueError("critic_contract_v2_requires_planning_v2_and_propose_then_critic")
-        return self
 
     @model_serializer(mode="wrap")
     def preserve_legacy_execution_shape(self, handler):
@@ -296,45 +289,11 @@ class ResearchPlanProposal(DomainOutput):
         return self
 
 
-class ResearchPlanEvaluation(DomainOutput):
-    proposal_id: str = Field(min_length=1)
-    rank: int = Field(ge=1, le=4)
-    value_rationale: str = Field(min_length=1, max_length=1500)
-    implementation_risk: str = Field(min_length=1, max_length=1000)
-
-
-class ResearchRoundDraft(DomainOutput):
-    """Provider drafts have no duplicate selected action or execution metadata."""
-    protocol_version: Literal["research_plan_draft.v1"]
-    proposals: list[Any] = Field(max_length=4, json_schema_extra={"items": ResearchPlanProposal.model_json_schema()})
-    evaluations: list[Any] = Field(max_length=4, json_schema_extra={"items": ResearchPlanEvaluation.model_json_schema()})
-    selected_proposal_id: str | None = None
-    selection_rationale: str = Field(min_length=1, max_length=1800)
-
-
 class ResearchProposalDraft(DomainOutput):
     """Proposal generation has no ranking or execution authority."""
     protocol_version: Literal["research_proposals.v1"]
     proposals: list[Any] = Field(min_length=2, max_length=4,
         json_schema_extra={"items": ResearchPlanProposal.model_json_schema()})
-
-
-class ResearchPlanCritique(DomainOutput):
-    """Independent comparison is bound to one native feasible proposal pool."""
-    protocol_version: Literal["research_plan_critique.v1"]
-    proposal_pool_digest: str = Field(min_length=1)
-    evaluations: list[ResearchPlanEvaluation] = Field(min_length=2, max_length=4)
-    selected_proposal_id: str = Field(min_length=1)
-    selection_rationale: str = Field(min_length=1, max_length=1800)
-    selected_basis_observation_ids: list[str] = Field(default_factory=list, max_length=8, description=(
-        "Delivered observation_id values that support selecting this proposal. Use [] when none apply."))
-
-    @model_serializer(mode="wrap")
-    def preserve_legacy_critique_shape(self, handler):
-        row = handler(self)
-        if "selected_basis_observation_ids" not in self.model_fields_set:
-            row.pop("selected_basis_observation_ids", None)
-        return row
 
 
 PlanningText = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
@@ -365,19 +324,6 @@ class PlannerGenerationWire(PlanningWireOutput):
 
 class PlannerCorrectionWire(PlanningWireOutput):
     proposals: list[Any] = Field(min_length=1, max_length=4)
-
-
-class CriticEvaluationWire(PlanningWireOutput):
-    proposal_id: PlanningText
-    rank: int = Field(ge=1, le=4)
-    value_rationale: PlanningText = Field(max_length=1500)
-    implementation_risk: PlanningText = Field(max_length=1000)
-
-
-class CriticWireReply(PlanningWireOutput):
-    evaluations: list[CriticEvaluationWire] = Field(min_length=2, max_length=4)
-    selection_rationale: PlanningText = Field(max_length=1800)
-    selected_basis_observation_ids: list[PlanningText] = Field(max_length=8)
 
 
 class CriticAssessmentWire(PlanningWireOutput):
@@ -915,7 +861,7 @@ class AuditReport(DomainOutput):
 
 DOMAIN_OUTPUT_MODELS = {
     "research_planner": PlannerProposal,
-    "research_critic": ResearchPlanCritique,
+    "research_critic": ResearchPlanCritiqueV2,
     "research_librarian": MethodEvidencePacket,
     "experiment_designer": ExperimentDesignResult,
     "candidate_reviewer": ImplementationReview,

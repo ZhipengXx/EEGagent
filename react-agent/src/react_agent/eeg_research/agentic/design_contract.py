@@ -39,14 +39,13 @@ class DesignContractError(ValueError):
 
 
 def design_contract_version(value: Mapping | Path | str | None) -> str:
-    """An absent version is v1, including frozen campaigns created earlier."""
-    from .research_execution import research_goal
+    """Single-plan research always uses v2; v1 remains only for the legacy action loop."""
+    from .research_execution import research_goal, single_plan_enabled
     value = research_goal(value) if value is not None else {}
     if value.get("design_contract_version") == "v2":
         return "v2"
     goal = value.get("goal") if isinstance(value.get("goal"), dict) else value
-    execution = goal.get("research_execution") or {}
-    return "v2" if execution.get("design_contract_version") == "v2" else "v1"
+    return "v2" if single_plan_enabled(goal) else "v1"
 
 
 def _validate_parameter_values(parameters: dict, configs: dict) -> None:

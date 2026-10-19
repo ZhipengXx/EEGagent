@@ -218,9 +218,6 @@ def create_campaign(
     if goal.get("research_execution") is not None:
         from .schemas import ResearchExecutionConfig
         execution = dict(goal["research_execution"])
-        if not prepared and execution.get("design_contract_version") == "v2":
-            execution.setdefault("reviewer_contract_version", "v2")
-            execution.setdefault("coder_context_version", "v2")
         for name in ("planning_mode", "proposal_correction_calls", "max_planner_api_attempts",
                      "max_critic_api_attempts", "max_designer_api_attempts"):
             if name in execution:
@@ -929,7 +926,7 @@ def observation(camp: Path) -> dict[str, Any]:
         "blocked_actions": blocked_actions(state),
         "trainable_ids": trainable,
         "budget": budget_snapshot(camp, state),
-        "capabilities": capability_manifest(protocol) if (goal.get("research_execution") or {}).get("design_contract_version") == "v2" else capability_manifest(),
+        "capabilities": capability_manifest(protocol) if (goal.get("research_execution") or {}).get("version") == "single_plan_v1" else capability_manifest(),
         "research_plan": consume_for_planner(camp, state),
         "memory": retrieve(
             state.get("memory") or [],

@@ -96,14 +96,16 @@ def _goal(max_api_calls: int) -> dict:
         "allowed_changes": ["eeg_encoder"], "frozen_components": ["split_manifest", "query_gallery_manifest",
             "evaluator", "metric_definition", "image_feature_target", "training_loss"],
         "research_execution": {"version": "single_plan_v1", "target_k": 2, "paid_maintenance": "off",
-            "max_engineering_repairs": 1, "max_planner_api_attempts": 2, "budget": {"envelopes": {
-                "new_method": {"role_calls": {"experiment_designer": 2, "candidate_coder": max(1, min(8, max_api_calls - 10)),
+            # Each planning round reserves one Planner and one Critic call; with
+            # the next diagnosis admission, coding keeps max_api_calls - 12.
+            "max_engineering_repairs": 1, "max_planner_api_attempts": 1, "max_critic_api_attempts": 1, "budget": {"envelopes": {
+                "new_method": {"role_calls": {"experiment_designer": 2, "candidate_coder": max(1, min(8, max_api_calls - 12)),
                     "candidate_reviewer": 2, "result_analyst": 2}, "training_jobs": 2, "gpu_seconds": 600}}}},
         "paid_maintenance": "off", "memory": {"enabled": False},
         "api_request_policy": {"max_attempts_per_operation": 2, "max_attempts_per_planner_round": 2, "transport_backoff_s": 0},
         "role_models": {role: {"model": "deepseek-flash", "max_tokens": 32768 if role == "candidate_coder" else 16384,
             "thinking": True, "reasoning_effort": "high"}
-            for role in ("research_planner", "experiment_designer", "candidate_coder", "candidate_reviewer", "result_analyst")},
+            for role in ("research_planner", "research_critic", "experiment_designer", "candidate_coder", "candidate_reviewer", "result_analyst")},
     }).model_dump()
 
 
@@ -138,27 +140,32 @@ def _terminal_delivery_proof(camp: Path, trace: dict, record: dict) -> dict:
             return [expand(child) for child in value]
         return value
     delivered = expand(payload)
-    cards = (delivered.get("experiment_observations") or {}).get("cards") or []
-    chosen = [card for card in cards if card.get("record_id") == record["record_id"] and card.get("current_feedback") is True]
+    # The v2 Planner input renders each card's science body as one flat row.
+    rows = delivered.get("observations") or []
+    chosen = [row for row in rows if row.get("observation_id") == record["record_id"] and row.get("current_feedback") is True]
     if len(chosen) != 1:
         return {"verified": False, "reason": "current_terminal_card_missing_or_nonunique"}
-    card, original = chosen[0], record["body"]
-    required = ("observation_id", "plan_id", "observation_kind", "identity", "execution_status", "evaluation_scope", "native_facts", "source_refs")
-    exact = {key: canonical(card.get("body", {}).get(key)) == canonical(original.get(key)) for key in required}
-    full = card.get("full_record") or {}
+    row, original = chosen[0], record["body"]
+    from .memory_delivery import project_memory_card
+    expected = project_memory_card({**record, "current_feedback": True}, role="research_planner")
+    expected_science = {**expected["body"], "observation_id": expected["record_id"]}
+    delivered_science = {key: value for key, value in row.items() if key not in
+                         {"source_refs", "current_feedback", "condition_differences", "applicability_status"}}
+    exact = {key: canonical(delivered_science.get(key)) == canonical(value) for key, value in expected_science.items()}
+    body_exact = canonical(delivered_science) == canonical(expected_science)
     reference = record["source_refs"][0]
-    handle_exact = (full.get("$context_source") == reference["source_ref"]
-        and full.get("source_hash") == reference["source_hash"] and full.get("json_pointer") == ""
-        and card.get("source_refs") == record["source_refs"])
+    reference_exact = canonical(row.get("source_refs") or []) == canonical(expected["source_refs"])
     store = ExperimentObservationStore(camp)
     source = store.registry.get(reference["source_ref"], role="research_planner")
     original_exact = store.registry.load(source, role="research_planner") == original
     read = store.registry.read(ReadRequest(reference["source_ref"], reference["source_hash"],
         "/native_facts/metrics", max_chars=2000), role="research_planner")
     metrics_exact = read.status == "ready" and read.content == original["native_facts"]["metrics"]
-    return {"verified": all(exact.values()) and handle_exact and original_exact and metrics_exact,
+    return {"verified": body_exact and reference_exact and original_exact and metrics_exact,
+        "delivery_view": "scientific_memory_card",
         "observation_id": original["observation_id"], "exact_fields": exact,
-        "source_handle_identity_exact": handle_exact, "original_registry_readback_exact": original_exact,
+        "complete_science_body_exact": body_exact, "source_reference_identity_exact": reference_exact,
+        "original_registry_readback_exact": original_exact,
         "bounded_metrics_readback_exact": metrics_exact, "source_ref": reference["source_ref"],
         "source_hash": reference["source_hash"], "actual_Planner_request_trace": trace["call_id"]}
 

@@ -12,8 +12,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from .action_planning import digest
-from .schemas import (ResearchExecutionConfig, ResearchPlanEvaluation,
-                      ResearchPlanProposal, ResearchRoundDraft, validate_research_task)
+from .schemas import ResearchExecutionConfig, ResearchPlanProposal, validate_research_task
 from .research_execution import single_plan_enabled
 
 VERSION = "single_plan_v1"
@@ -173,9 +172,8 @@ def _validate_proposal(raw: Any, observation: dict) -> tuple[dict | None, dict]:
                 raise ValueError("measurement_target_not_eligible")
         refs = {r.get("artifact_id") for r in observation.get("artifact_index") or []
                 if r.get("verification_status") == "verified"}
-        from .planning_contract import enabled as lean_planning_enabled
         for ref in item["required_context_refs"]:
-            if lean_planning_enabled(observation) and ref not in (observation.get("_delivered_context_refs") or set()):
+            if ref not in (observation.get("_delivered_context_refs") or set()):
                 raise ValueError("required_context_ref_not_delivered")
             if ref in refs:
                 continue
@@ -229,116 +227,6 @@ def pool_summary(proposals: list[dict], evaluations: list[dict], cfg: ResearchEx
             "unevaluated_proposal_ids": missing}
 
 
-def normalize_research_round(raw: Any, observation: dict, *, existing: list[dict] | None = None) -> dict:
-    cfg = config(observation)
-    try:
-        draft = ResearchRoundDraft.model_validate(raw)
-    except ValidationError as exc:
-        return {"ok": False, "detail": "research_round_schema_invalid", "raw": copy.deepcopy(raw),
-                "validation_records": [{"status": "rejected", "error": str(exc)}], "valid_proposals": []}
-    proposals, records = copy.deepcopy(existing or []), []
-    ids = {p["proposal_id"] for p in proposals}
-    def signature(proposal):
-        keys = ("task_kind", "target_candidate_ref", "scientific_intent", "evaluation_scope")
-        from .planning_contract import enabled as lean_planning_enabled
-        if lean_planning_enabled(observation):
-            keys += ("task_description",)
-        if proposal["task_kind"] != "new_method":
-            keys += ("question",)
-        return digest({k: proposal.get(k) for k in keys})
-    signatures = {signature(p) for p in proposals}
-    for row in draft.proposals:
-        proposal, trace = _validate_proposal(row, observation)
-        if proposal is not None:
-            operation_signature = signature(proposal)
-            if proposal["proposal_id"] in ids or operation_signature in signatures:
-                trace.update(status="rejected", error="duplicate_research_task")
-            elif len(proposals) >= 4:
-                trace.update(status="rejected", error="research_pool_at_maximum")
-            else:
-                proposals.append(proposal)
-                ids.add(proposal["proposal_id"])
-                signatures.add(operation_signature)
-        records.append(trace)
-    evaluations, evaluation_ids, ranks = [], set(), set()
-    for row in draft.evaluations:
-        try:
-            item = ResearchPlanEvaluation.model_validate(row).model_dump()
-            if item["proposal_id"] not in ids or item["proposal_id"] in evaluation_ids or item["rank"] in ranks:
-                raise ValueError("evaluation_unknown_duplicate_or_conflicting_rank")
-            evaluations.append(item)
-            evaluation_ids.add(item["proposal_id"])
-            ranks.add(item["rank"])
-        except (ValidationError, ValueError) as exc:
-            records.append({"status": "rejected", "error": str(exc), "evaluation": copy.deepcopy(row)})
-    by_id = {p["proposal_id"]: p for p in proposals}
-    ranked = sorted(evaluations, key=lambda e: e["rank"])
-    preferred = draft.selected_proposal_id
-    selected = preferred if preferred in by_id and preferred in evaluation_ids else (ranked[0]["proposal_id"] if ranked else None)
-    # Explicit rankings, never container order, provide fallback evidence.
-    summary = pool_summary(proposals, evaluations, cfg)
-    count, status = summary["valid_count"], summary["pool_status"]
-    ok = bool(selected and status in {"complete", "degraded_singleton"})
-    cards = observation.get("experiment_observations") or []
-    if isinstance(cards, dict):
-        cards = [r.get("body") or r for r in cards.get("cards") or []]
-    round_record = {"round_id": round_id(observation), "input_observation_ids": [r.get("observation_id") for r in
-        cards if r.get("observation_id")],
-        "input_observation_digest": digest(round_input(observation)), "target_k": cfg.target_k,
-        "proposals": proposals, "evaluations": evaluations, "selected_proposal_id": selected if ok else None,
-        **summary, "shortfall_reason": "missing_or_nonunique_proposal_evaluations" if summary["unevaluated_proposal_ids"] else
-        None if count >= cfg.target_k else "independent_rejections_or_insufficient_distinct_tasks", "selection_rationale": draft.selection_rationale,
-        "selection_source": "provider_selection_with_valid_evaluation" if selected == preferred else
-            "valid_evaluation_rank_fallback" if selected else None,
-        "validation_records": records, "raw_digest": digest(raw)}
-    if observation.get("terminal_observation_id") and observation["terminal_observation_id"] not in round_record["input_observation_ids"]:
-        round_record["input_observation_ids"].append(observation["terminal_observation_id"])
-    return {"ok": ok, "detail": None if ok else "research_pool_" + status,
-        "raw": copy.deepcopy(raw), "round": round_record, "valid_proposals": proposals,
-        "selected_proposal": by_id.get(selected) if ok else None, "validation_records": records}
-
-
-def decide_research_plan(observation: dict, backend) -> dict:
-    cfg = config(observation)
-    raw = backend(observation)
-    history = [copy.deepcopy(raw)]
-    parsed = normalize_research_round(raw, observation)
-    if not parsed["ok"] and cfg.proposal_correction_calls:
-        first_records = parsed.get("validation_records") or []
-        request = {**observation, "plan_repair_request": {"kind": "correct_research_proposals",
-            "valid_proposals": parsed.get("valid_proposals") or [],
-            "valid_evaluations": (parsed.get("round") or {}).get("evaluations") or [],
-            "missing_evaluation_ids": (parsed.get("round") or {}).get("unevaluated_proposal_ids") or [],
-            "rejected": parsed.get("validation_records") or [],
-            "reference_contract": {
-                "inline_context": "Use required_context_refs=[] when the delivered inline input is sufficient.",
-                "verified_artifact_ids": sorted(row["artifact_id"] for row in observation.get("artifact_index") or []
-                    if row.get("artifact_id") and row.get("verification_status") == "verified"),
-                "delivered_context_source_refs": sorted(observation.get("_delivered_context_refs") or []),
-                "invalid_reference_forms": ["JSON pointers such as /goal or /contract", "local paths", "hashes"]},
-            "instruction": "Keep valid proposals. Correct failed tasks once and provide explicit evaluations and selection. "
-                "Emit only schema properties; remove undeclared fields even when null. Apply the reference_contract exactly."}}
-        from .llm import LlmUnavailable
-        try:
-            corrected = backend(request)
-        except LlmUnavailable as exc:
-            if str(exc) not in {"planner_round_attempt_limit", "api_operation_attempt_limit", "budget_exhausted",
-                                "owner_request_unavailable:llm_calls"}:
-                raise
-            # A refused correction has no new response. Keep the already paid
-            # draft typed and durable, including its native validation shortfall.
-            parsed["proposal_history"] = history
-            parsed["correction_unavailable"] = {"reason": str(exc), "status": "not_sent"}
-            return parsed
-        history.append(copy.deepcopy(corrected))
-        parsed = normalize_research_round(corrected, observation, existing=parsed.get("valid_proposals"))
-        parsed["validation_records"] = first_records + parsed.get("validation_records", [])
-        if parsed.get("round"):
-            parsed["round"]["validation_records"] = parsed["validation_records"]
-    parsed["proposal_history"] = history
-    return parsed
-
-
 def proposal_pool_digest(pool: dict) -> str:
     """Bind the exact alternatives and native costs shown to the Critic."""
     return digest({"round_id": pool["round_id"], "proposals": pool["proposals"],
@@ -357,10 +245,7 @@ def freeze_proposal_pool(proposals: list[dict], observation: dict, *,
     for raw in proposals:
         proposal, trace = _validate_proposal(raw, observation)
         if proposal is not None:
-            keys = ("task_kind", "target_candidate_ref", "scientific_intent", "evaluation_scope")
-            from .planning_contract import enabled as lean_planning_enabled
-            if lean_planning_enabled(observation):
-                keys += ("task_description",)
+            keys = ("task_kind", "target_candidate_ref", "scientific_intent", "evaluation_scope", "task_description")
             if proposal["task_kind"] != "new_method":
                 keys += ("question",)
             signature = digest({key: proposal.get(key) for key in keys})
@@ -388,39 +273,27 @@ def freeze_proposal_pool(proposals: list[dict], observation: dict, *,
 def normalize_proposal_pool(raw: Any, observation: dict, *, existing: list[dict] | None = None,
                             stage: str = "generation") -> dict:
     """Planner supplies competing tasks; it cannot rank or select its own work."""
-    from .planning_contract import enabled as lean_planning_enabled, materialize_planner_reply
-    if lean_planning_enabled(observation):
-        assembled = materialize_planner_reply(raw, observation, stage=stage, existing=existing)
-        errors, native_errors = assembled["errors"], assembled["native_errors"]
-        records = [{"status": "rejected", "error": row["msg"], **row} for row in errors]
-        if native_errors:
-            return {"ok": False, "detail": "planning_native_input_invalid", "raw": copy.deepcopy(raw),
-                    "errors": errors, "native_errors": native_errors, "valid_proposals": copy.deepcopy(existing or []),
-                    "validation_records": records}
-        pool = freeze_proposal_pool([*copy.deepcopy(existing or []), *assembled["proposals"]], observation,
-                                    validation_records=records)
-        for row in pool["validation_records"]:
-            if row.get("error") and "loc" not in row:
-                pid = str(row.get("proposal_id") or "")
-                suffix = pid.rsplit("_", 1)[-1]
-                index = suffix.rsplit("p", 1)[-1] if "p" in suffix else suffix[1:]
-                loc = ["proposals", int(index) - 1] if index.isdigit() else ["proposals"]
-                errors.append({"loc": loc, "type": "planning_proposal_invalid", "msg": row["error"]})
-        ok = pool["pool_status"] == "complete" and not errors
-        return {"ok": ok, "detail": None if ok else "planning_proposal_invalid" if errors else "research_pool_" + pool["pool_status"],
-                "raw": copy.deepcopy(raw), "pool": pool, "valid_proposals": copy.deepcopy(pool["proposals"]),
-                "validation_records": copy.deepcopy(pool["validation_records"]), "errors": errors, "native_errors": []}
-    from .schemas import ResearchProposalDraft
-    try:
-        draft = ResearchProposalDraft.model_validate(raw)
-    except ValidationError as exc:
-        return {"ok": False, "detail": "research_proposal_schema_invalid", "raw": copy.deepcopy(raw),
-            "valid_proposals": [], "validation_records": [{"status": "rejected", "error": str(exc)}]}
-    pool = freeze_proposal_pool([*copy.deepcopy(existing or []), *draft.proposals], observation)
-    ok = pool["pool_status"] == "complete"
-    return {"ok": ok, "detail": None if ok else "research_pool_" + pool["pool_status"],
-        "raw": copy.deepcopy(raw), "pool": pool, "valid_proposals": copy.deepcopy(pool["proposals"]),
-        "validation_records": copy.deepcopy(pool["validation_records"])}
+    from .planning_contract import materialize_planner_reply
+    assembled = materialize_planner_reply(raw, observation, stage=stage, existing=existing)
+    errors, native_errors = assembled["errors"], assembled["native_errors"]
+    records = [{"status": "rejected", "error": row["msg"], **row} for row in errors]
+    if native_errors:
+        return {"ok": False, "detail": "planning_native_input_invalid", "raw": copy.deepcopy(raw),
+                "errors": errors, "native_errors": native_errors, "valid_proposals": copy.deepcopy(existing or []),
+                "validation_records": records}
+    pool = freeze_proposal_pool([*copy.deepcopy(existing or []), *assembled["proposals"]], observation,
+                                validation_records=records)
+    for row in pool["validation_records"]:
+        if row.get("error") and "loc" not in row:
+            pid = str(row.get("proposal_id") or "")
+            suffix = pid.rsplit("_", 1)[-1]
+            index = suffix.rsplit("p", 1)[-1] if "p" in suffix else suffix[1:]
+            loc = ["proposals", int(index) - 1] if index.isdigit() else ["proposals"]
+            errors.append({"loc": loc, "type": "planning_proposal_invalid", "msg": row["error"]})
+    ok = pool["pool_status"] == "complete" and not errors
+    return {"ok": ok, "detail": None if ok else "planning_proposal_invalid" if errors else "research_pool_" + pool["pool_status"],
+            "raw": copy.deepcopy(raw), "pool": pool, "valid_proposals": copy.deepcopy(pool["proposals"]),
+            "validation_records": copy.deepcopy(pool["validation_records"]), "errors": errors, "native_errors": []}
 
 
 def normalize_critique(raw: Any, frozen_pool: dict, observation: dict, *, critic_context: dict | None = None) -> dict:
@@ -430,7 +303,7 @@ def normalize_critique(raw: Any, frozen_pool: dict, observation: dict, *, critic
     native substitution. The Critic must select its rank-one alternative and
     provide the rationale for that exact selection.
     """
-    from .schemas import ResearchPlanCritique, ResearchPlanCritiqueV2, ResearchPlanEvaluationV2
+    from .schemas import ResearchPlanCritiqueV2, ResearchPlanEvaluationV2
 
     def rejected(detail, reason):
         return {"ok": False, "detail": detail, "raw": copy.deepcopy(raw),
@@ -450,30 +323,23 @@ def normalize_critique(raw: Any, frozen_pool: dict, observation: dict, *, critic
             raise ValueError("frozen_proposal_pool_no_longer_valid")
     except (KeyError, ValueError, TypeError) as exc:
         return rejected("research_proposal_pool_identity_invalid", str(exc))
-    from .critic_contract import enabled as compact_critic_enabled, materialize_critic_reply as materialize_compact_critic
-    from .planning_contract import enabled as lean_planning_enabled, materialize_critic_reply
-    compact_critic = compact_critic_enabled(observation)
-    critique_body = raw
-    if compact_critic or lean_planning_enabled(observation):
-        assembled = (materialize_compact_critic(raw, frozen_pool, observation, critic_context=critic_context)
-                     if compact_critic else materialize_critic_reply(raw, frozen_pool, observation))
-        if assembled["errors"] or assembled["native_errors"]:
-            errors = assembled["errors"]
-            detail = "critic_native_input_invalid" if assembled["native_errors"] else "planning_critic_invalid"
-            return {**rejected(detail, "Critic response or its frozen native input is incomplete or invalid."),
-                    "errors": errors, "native_errors": assembled["native_errors"],
-                    "validation_records": [{"status": "rejected", "error": row["msg"], **row} for row in errors]}
-        critique_body = assembled["reply"]
+    from .critic_contract import materialize_critic_reply
+    assembled = materialize_critic_reply(raw, frozen_pool, observation, critic_context=critic_context)
+    if assembled["errors"] or assembled["native_errors"]:
+        errors = assembled["errors"]
+        detail = "critic_native_input_invalid" if assembled["native_errors"] else "planning_critic_invalid"
+        return {**rejected(detail, "Critic response or its frozen native input is incomplete or invalid."),
+                "errors": errors, "native_errors": assembled["native_errors"],
+                "validation_records": [{"status": "rejected", "error": row["msg"], **row} for row in errors]}
     try:
-        critique = (ResearchPlanCritiqueV2 if compact_critic else ResearchPlanCritique).model_validate(critique_body)
+        critique = ResearchPlanCritiqueV2.model_validate(assembled["reply"])
     except ValidationError as exc:
         return rejected("research_critique_schema_invalid", str(exc))
     if critique.proposal_pool_digest != frozen_pool["pool_digest"]:
         return rejected("research_critique_pool_digest_mismatch", "critic_must_compare_exact_frozen_pool")
     proposals = copy.deepcopy(frozen_pool["proposals"])
     by_id = {proposal["proposal_id"]: proposal for proposal in proposals}
-    evaluation_model = ResearchPlanEvaluationV2 if compact_critic else ResearchPlanEvaluation
-    evaluations = [evaluation_model.model_validate(row).model_dump() for row in critique.evaluations]
+    evaluations = [ResearchPlanEvaluationV2.model_validate(row).model_dump() for row in critique.evaluations]
     ids = [row["proposal_id"] for row in evaluations]
     ranks = [row["rank"] for row in evaluations]
     if len(ids) != len(by_id) or len(set(ids)) != len(ids) or set(ids) != set(by_id):
@@ -484,8 +350,7 @@ def normalize_critique(raw: Any, frozen_pool: dict, observation: dict, *, critic
     if critique.selected_proposal_id != winner:
         return rejected("research_critique_selection_invalid", "critic_selected_proposal_must_match_rank_one")
     try:
-        basis_input = ({**observation, "_delivered_observation_ids": critic_context["delivered_observation_ids"]}
-                       if compact_critic else observation)
+        basis_input = {**observation, "_delivered_observation_ids": critic_context["delivered_observation_ids"]}
         _check_basis(critique.selected_basis_observation_ids, basis_input)
     except ValueError as exc:
         return rejected("research_critique_basis_invalid", str(exc))
@@ -508,8 +373,7 @@ def normalize_critique(raw: Any, frozen_pool: dict, observation: dict, *, critic
         "validation_records": records, "raw_digest": digest(raw)}
     if "selected_basis_observation_ids" in critique.model_fields_set:
         record["selected_basis_observation_ids"] = list(critique.selected_basis_observation_ids)
-    if compact_critic:
-        record["critic_protocol_version"] = critique.protocol_version
+    record["critic_protocol_version"] = critique.protocol_version
     return {"ok": True, "detail": None, "raw": copy.deepcopy(raw), "round": record,
         "valid_proposals": copy.deepcopy(proposals), "selected_proposal": copy.deepcopy(by_id[winner]),
         "validation_records": records}

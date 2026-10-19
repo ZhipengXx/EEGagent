@@ -497,7 +497,8 @@ def record_experiment_observation(camp: Path, state: dict, plan: dict, execution
                                   analysis_ref: str | None = None) -> dict:
     camp = Path(camp)
     from .research_execution import research_goal
-    planning_v2 = ((research_goal(camp).get("research_execution") or {}).get("planning_contract_version") == "v2")
+    from .planning_contract import enabled as planning_v2_enabled
+    planning_v2 = planning_v2_enabled(research_goal(camp))
     proposal = plan.get("proposal") or plan.get("selected_proposal") or plan
     failure = copy.deepcopy(plan.get("engineering_failure") or {})
     engineering = execution_status in {"failed", "needs_replan"}

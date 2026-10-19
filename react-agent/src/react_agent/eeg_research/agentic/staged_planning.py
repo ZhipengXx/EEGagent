@@ -7,7 +7,7 @@ import json
 from .plan_protocol import (freeze_proposal_pool, normalize_critique,
                             normalize_proposal_pool, proposal_cost, round_id)
 from .planning_context import (build_critic_input, build_proposer_input,
-                               delivered_observation_ids, minimal_validation_feedback)
+                               delivered_observation_ids)
 
 
 def _response_feedback(parsed, *, role):
@@ -82,13 +82,12 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
     from .research_execution import role_api_attempt_limit
     from .staged_planning_recovery import (CRITIC_STAGES, PLANNER_STAGES,
                                            publish_staged_input, publish_staged_raw)
-    from .planning_contract import enabled, freeze_planning_contract
-    v2 = enabled(full)
-    if v2 and "_planning_contract" not in full:
+    from .planning_contract import freeze_planning_contract
+    if "_planning_contract" not in full:
         full["_planning_contract"] = freeze_planning_contract(full)
     stages = copy.deepcopy(recovered_stages or {})
     rid = round_id(full)
-    if v2 and full["_planning_contract"].get("native_errors"):
+    if full["_planning_contract"].get("native_errors"):
         return {"ok": False, "detail": "planning_native_input_invalid", "valid_proposals": [],
                 "errors": [], "native_errors": copy.deepcopy(full["_planning_contract"]["native_errors"]),
                 "validation_records": [], "proposal_history": list(stages.values())}
@@ -111,14 +110,12 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
         return raw
 
     proposer_input = build_proposer_input(full, delivered)
-    if v2:
-        full["_delivered_context_refs"] = _delivered_references(proposer_input, full)
+    full["_delivered_context_refs"] = _delivered_references(proposer_input, full)
     # Snapshots keep ``full`` exact; only validation sees what was delivered.
     checked = {**full, "_delivered_observation_ids": delivered_observation_ids(proposer_input)}
     raw = request("generation", planner, proposer_input)
     parsed = normalize_proposal_pool(raw, checked)
-    if v2:
-        _publish_assembly(camp, full, parsed, raw, "generation")
+    _publish_assembly(camp, full, parsed, raw, "generation")
     if parsed.get("native_errors"):
         return {**parsed, "proposal_history": list(stages.values())}
     goal = full.get("goal") or full
@@ -127,32 +124,24 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
     for stage in PLANNER_STAGES[1:1 + planner_corrections]:
         if parsed["ok"]:
             break
-        if v2:
-            from .planning_contract import scientific_proposal_view
-            repair = {**proposer_input, "previous_response": json.dumps(raw, ensure_ascii=False),
-                "previous_response_error": _response_feedback(parsed, role="planner"),
-                "plan_repair_request": {"kind": "correct_research_proposals",
-                    "valid_proposals": [scientific_proposal_view(proposal, full)
-                                        for proposal in parsed.get("valid_proposals") or []],
-                    "remaining_slots": max(0, 4 - len(parsed.get("valid_proposals") or [])),
-                    "instruction": "Valid proposals are already retained locally. Return only replacement or additional distinct proposals; do not repeat or modify retained proposals, rank, evaluate or select."}}
-        else:
-            repair = {**proposer_input, "plan_repair_request": {"kind": "correct_research_proposals",
-                "valid_proposals": parsed.get("valid_proposals") or [],
-                "rejected": minimal_validation_feedback(parsed.get("validation_records") or []),
-                "instruction": "Keep the valid proposals above; return corrected or additional distinct proposals to complete the pool. Do not evaluate, rank or select them."}}
+        from .planning_contract import scientific_proposal_view
+        repair = {**proposer_input, "previous_response": json.dumps(raw, ensure_ascii=False),
+            "previous_response_error": _response_feedback(parsed, role="planner"),
+            "plan_repair_request": {"kind": "correct_research_proposals",
+                "valid_proposals": [scientific_proposal_view(proposal, full)
+                                    for proposal in parsed.get("valid_proposals") or []],
+                "remaining_slots": max(0, 4 - len(parsed.get("valid_proposals") or [])),
+                "instruction": "Valid proposals are already retained locally. Return only replacement or additional distinct proposals; do not repeat or modify retained proposals, rank, evaluate or select."}}
         from .llm import LlmUnavailable
         try:
             raw = request(stage, planner, repair)
         except LlmUnavailable as exc:
-            if not v2 or not _correction_refused(exc):
+            if not _correction_refused(exc):
                 raise
             return {**parsed, "proposal_history": list(stages.values()),
                     "correction_unavailable": {"reason": str(exc), "status": "not_sent"}}
-        parsed = (normalize_proposal_pool(raw, checked, existing=parsed.get("valid_proposals"), stage=stage)
-                  if v2 else normalize_proposal_pool(raw, checked, existing=parsed.get("valid_proposals")))
-        if v2:
-            _publish_assembly(camp, full, parsed, raw, stage)
+        parsed = normalize_proposal_pool(raw, checked, existing=parsed.get("valid_proposals"), stage=stage)
+        _publish_assembly(camp, full, parsed, raw, stage)
         if parsed.get("native_errors"):
             return {**parsed, "proposal_history": list(stages.values())}
     if not parsed["ok"]:
@@ -174,8 +163,7 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
         return {"ok": False, "detail": "research_pool_" + pool["pool_status"],
             "validation_records": pool["validation_records"], "proposal_history": list(stages.values())}
 
-    from .critic_contract import enabled as compact_critic_enabled, freeze_critic_context, verify_critic_context
-    compact_critic = compact_critic_enabled(full)
+    from .critic_contract import freeze_critic_context, verify_critic_context
     proof_inputs = (recovery_proof or {}).get("stage_inputs") or {}
     critic_context = None
     for stage in CRITIC_STAGES:
@@ -183,25 +171,22 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
         if original is not None and (original.get("proposal_pool_digest") != pool["pool_digest"]
                 or original.get("proposal_pool") != pool):
             raise ValueError("paid_critic_original_pool_changed")
-        if original is not None and compact_critic:
+        if original is not None:
             frozen_context = original.get("critic_context")
             if not isinstance(frozen_context, dict):
                 raise ValueError("paid_critic_original_context_missing")
             if critic_context is not None and critic_context != frozen_context:
                 raise ValueError("paid_critic_original_context_changed")
             critic_context = copy.deepcopy(frozen_context)
-    if compact_critic:
-        if critic_context is None:
-            critic_context = freeze_critic_context(pool, proposer_input)
-        native_errors = verify_critic_context(critic_context, pool)
-        if native_errors:
-            return {"ok": False, "detail": "critic_native_input_invalid", "native_errors": native_errors,
-                    "validation_records": [], "proposal_history": list(stages.values())}
-    critic_input = (build_critic_input(full, proposer_input, pool, critic_context=critic_context)
-                    if compact_critic else build_critic_input(full, proposer_input, pool))
+    if critic_context is None:
+        critic_context = freeze_critic_context(pool, proposer_input)
+    native_errors = verify_critic_context(critic_context, pool)
+    if native_errors:
+        return {"ok": False, "detail": "critic_native_input_invalid", "native_errors": native_errors,
+                "validation_records": [], "proposal_history": list(stages.values())}
+    critic_input = build_critic_input(full, proposer_input, pool, critic_context=critic_context)
     raw = request("critic", critic, critic_input, native_pool=pool, critic_context=critic_context)
-    result = (normalize_critique(raw, pool, checked, critic_context=critic_context)
-              if compact_critic else normalize_critique(raw, pool, checked))
+    result = normalize_critique(raw, pool, checked, critic_context=critic_context)
     if result.get("native_errors"):
         return {**result, "proposal_history": list(stages.values())}
     critic_limit = min(cfg.max_critic_api_attempts, role_api_attempt_limit(goal, "research_critic"))
@@ -209,26 +194,20 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
         if result["ok"]:
             break
         repair = {**critic_input,
-            "critic_repair_request": {"rejected": minimal_validation_feedback(result["validation_records"]),
-                "instruction": "Evaluate every frozen proposal exactly once, give unique ranks 1..N, select rank one, and explain that exact choice. Do not alter or invent proposals."}}
-        if compact_critic:
-            repair["critic_repair_request"] = {
-                "instruction": "Return a complete ordered evaluations list, each frozen proposal_ref exactly once. The first item is preferred. Fix the listed errors without altering or inventing proposals; numeric ranks and selected IDs are filled locally."}
-        if v2 or compact_critic:
-            repair["critic_repair_request"].pop("rejected", None)
-            repair.update(previous_response=json.dumps(raw, ensure_ascii=False),
-                          previous_response_error=_response_feedback(result, role="critic"))
+            "critic_repair_request": {
+                "instruction": "Return a complete ordered evaluations list, each frozen proposal_ref exactly once. The first item is preferred. Fix the listed errors without altering or inventing proposals; numeric ranks and selected IDs are filled locally."},
+            "previous_response": json.dumps(raw, ensure_ascii=False),
+            "previous_response_error": _response_feedback(result, role="critic")}
         from .llm import LlmUnavailable
         try:
             raw = request(stage, critic, repair, native_pool=pool,
                           critic_context=critic_context)
         except LlmUnavailable as exc:
-            if not (v2 or compact_critic) or not _correction_refused(exc):
+            if not _correction_refused(exc):
                 raise
             return {**result, "proposal_history": list(stages.values()),
                     "correction_unavailable": {"reason": str(exc), "status": "not_sent"}}
-        result = (normalize_critique(raw, pool, checked, critic_context=critic_context)
-                  if compact_critic else normalize_critique(raw, pool, checked))
+        result = normalize_critique(raw, pool, checked, critic_context=critic_context)
         if result.get("native_errors"):
             return {**result, "proposal_history": list(stages.values())}
     result["proposal_history"] = list(stages.values())

@@ -171,8 +171,7 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
     if goal:
         result["goal"] = goal
     task = _pick(view.get("selected_research_task"), _TASK)
-    planning_v2 = (((view.get("goal") or {}).get("research_execution") or {}).get("planning_contract_version") == "v2")
-    if planning_v2 and task:
+    if task:
         if "task_description" in task:
             task["method"] = task.pop("task_description")
         if "scientific_intent" in task:

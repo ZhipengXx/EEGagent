@@ -568,7 +568,6 @@ def add_role_examples(
     *,
     max_chars: int = EXAMPLE_CHARS,
     execution_version: str | None = None,
-    design_contract_version: str = "v1",
     max_count: int | None = None,
 ) -> dict[str, Any]:
     """Add complete deterministic examples within an independent field budget."""
@@ -579,7 +578,8 @@ def add_role_examples(
         "candidate_reviewer": _reviewer,
         "result_analyst": _analyst,
     }
-    if design_contract_version == "v2":
+    if execution_version == "single_plan_v1":
+        # Single-plan stage roles use the current contracts' examples only.
         if role == "experiment_designer":
             selectors[role] = _designer_brief
         elif role in {"candidate_coder", "candidate_reviewer"} or role == "result_analyst" and payload.get("review_stage") == "analysis":

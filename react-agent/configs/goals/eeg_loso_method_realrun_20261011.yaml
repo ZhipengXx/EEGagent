@@ -60,6 +60,6 @@ memory:
   batch_size: 32
   top_k: 5
   min_similarity: 0.3
-  context_chars_budget: 6000
+  content_chars_budget: 6000
   allow_model_download: false
   fallback: legacy

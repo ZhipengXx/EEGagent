@@ -1,6 +1,7 @@
 """Versioned, task-relevant missions for single-plan execution.
 
-Legacy files stay intact for exact paid-request recovery. Mechanical contracts
+Stage roles use runtime_v2; runtime_v1 keeps the supporting-role missions and
+implementation cases. Mechanical contracts
 are enforced by native validators; only active implementation cases are loaded.
 """
 from __future__ import annotations
@@ -11,10 +12,10 @@ ROOT = Path(__file__).with_name("prompts") / "runtime_v1"
 PROMPT_VERSION = "eeg_research.runtime_mission.single_plan.v1"
 
 
-def runtime_mission(role: str, *, design_contract_version: str = "v1", review_stage: str | None = None) -> str:
+def runtime_mission(role: str, *, review_stage: str | None = None) -> str:
+    # Stage roles have one current contract; supporting roles keep their missions.
     root = ROOT
-    if design_contract_version == "v2" and (role in {"experiment_designer", "candidate_coder", "candidate_reviewer"}
-            or role == "result_analyst" and review_stage == "analysis"):
+    if role in {"experiment_designer", "candidate_coder", "result_analyst"}:
         root = ROOT.parent / "runtime_v2"
     return (root / "shared_contract.txt").read_text(encoding="utf-8") + "\n\n" + (root / (role + ".txt")).read_text(encoding="utf-8")
 
@@ -46,7 +47,7 @@ def prompt_rule_mapping() -> dict:
         "authority, admissibility, current identity, exact cost mirrors": "native action/spec/owner validators; compact authority kernel",
         "scientific coverage, metric units, matched control, final-test scope": "native ExperimentObservation facts + shared mission",
         "candidate source, interfaces, checkpoints and actual-read obligations": "native code/check receipts + Coder/Reviewer mission",
-        "independent proposals, K shortfall and selection": "ResearchRoundDraft/ResearchPlanProposal validators + Planner mission",
+        "independent proposals, K shortfall and selection": "planning_contract wire + ResearchPlanProposal validators + Planner/Critic missions",
         "positive-mass InfoNCE, tied-image CE, objective-off": "conditional implementation notes; current approved definition remains authority",
         "ordered pooling, capacity probes, checkpoint layout": "conditional probe/check notes; native requirements validators",
         "pulse and particular tensor/config failures": "current native probe/error/source only; relevant engineering skill retrieval",

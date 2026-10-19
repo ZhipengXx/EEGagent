@@ -291,51 +291,31 @@ def system_prompt(role: str, *, memory=None, camp=None, review_stage: str | None
             if role == "candidate_coder":
                 from .coder import CoderToolRequest
                 model = CoderToolRequest
-            elif role == "research_planner":
-                from .schemas import ResearchRoundDraft, ResearchProposalDraft
-                from .research_execution import independent_critic_enabled
-                model = ResearchProposalDraft if independent_critic_enabled(camp) else ResearchRoundDraft
             schema = json.dumps(model.model_json_schema(),ensure_ascii=False) if model is not None else "{}"
-            from .research_execution import independent_critic_enabled
-            mission_role = "research_proposer" if role == "research_planner" and independent_critic_enabled(camp) else role
-            from .design_contract import design_contract_version
-            if role in {"research_planner", "research_critic"} and independent_critic_enabled(camp):
-                # These roles propose/compare science, with no source-read or
-                # implementation protocol. Their explicit mission and schema
+            if role == "research_planner":
+                # Planner and Critic propose/compare science, with no source-read
+                # or implementation protocol. Their explicit mission and schema
                 # are the complete provider-facing system contract.
-                from .planning_contract import enabled, planner_wire_schema, critic_wire_schema
-                from .research_execution import research_goal
-                planning_v2 = enabled(research_goal(camp))
-                mission = (PROMPTS / ("runtime_v2" if planning_v2 else "runtime_v1")
-                           / (mission_role + ".txt")).read_text(encoding="utf-8")
-                if planning_v2:
-                    repair = (planning_payload or {}).get("plan_repair_request") or {}
-                    schema_value = (planner_wire_schema(planning_payload or {}, correction=bool(repair),
-                        remaining=repair.get("remaining_slots", 4)) if role == "research_planner"
-                        else critic_wire_schema())
-                    schema = json.dumps(schema_value, ensure_ascii=False, separators=(",", ":"))
-                from .critic_contract import enabled as compact_critic_enabled, critic_wire_schema as compact_critic_schema
-                if role == "research_critic" and compact_critic_enabled(research_goal(camp)):
-                    mission = (PROMPTS / "runtime_v2" / "research_critic_compact.txt").read_text(encoding="utf-8")
-                    schema = json.dumps(compact_critic_schema(critic_context), ensure_ascii=False, separators=(",", ":"))
+                from .planning_contract import planner_wire_schema
+                mission = (PROMPTS / "runtime_v2" / "research_proposer.txt").read_text(encoding="utf-8")
+                repair = (planning_payload or {}).get("plan_repair_request") or {}
+                schema = json.dumps(planner_wire_schema(planning_payload or {}, correction=bool(repair),
+                    remaining=repair.get("remaining_slots", 4)), ensure_ascii=False, separators=(",", ":"))
+            elif role == "research_critic":
+                from .critic_contract import critic_wire_schema
+                mission = (PROMPTS / "runtime_v2" / "research_critic_compact.txt").read_text(encoding="utf-8")
+                schema = json.dumps(critic_wire_schema(critic_context), ensure_ascii=False, separators=(",", ":"))
+            elif role == "candidate_reviewer":
+                from .reviewer_contract import reviewer_wire_schema
+                mission = (PROMPTS / "runtime_v2" / "candidate_reviewer_compact.txt").read_text(encoding="utf-8")
+                schema = json.dumps(reviewer_wire_schema(reviewer_context or {}), ensure_ascii=False, separators=(",", ":"))
             else:
-                mission = runtime_mission(mission_role, design_contract_version=design_contract_version(camp),
-                                          review_stage=review_stage)
+                mission = runtime_mission(role, review_stage=review_stage)
             if role == "candidate_coder" and coder_payload is not None:
                 mission, schema = _coder_prompt_fields(mission, coder_payload)
-            if role == "candidate_reviewer":
-                from .research_execution import research_goal
-                if (research_goal(camp).get("research_execution") or {}).get("implementation_review_mode") == "single_pass":
-                    mission += "\nKeep one short sentence per coverage item and cite its source/check. Do not repeat full contracts, source or check reports."
-                if (research_goal(camp).get("research_execution") or {}).get("reviewer_contract_version") == "v2":
-                    from .reviewer_contract import reviewer_wire_schema
-                    mission = (PROMPTS / "runtime_v2" / "candidate_reviewer_compact.txt").read_text(encoding="utf-8")
-                    schema = json.dumps(reviewer_wire_schema(reviewer_context or {}), ensure_ascii=False, separators=(",", ":"))
-            from .research_execution import research_goal
-            compact_engineering = ((role == "candidate_reviewer" and (research_goal(camp).get("research_execution") or {}).get("reviewer_contract_version") == "v2")
-                                   or (role == "candidate_coder" and (coder_payload or {}).get("coder_context_version") == "coder_implementation_input.v2"))
+            compact_engineering = role == "candidate_reviewer" or (role == "candidate_coder" and coder_payload is not None)
             return render_role_system(role, mission + "\nOUTPUT_SCHEMA\n" + schema + "\nReturn one JSON object.\n",execution_version="single_plan_v1",
-                planning_mode="propose_then_critic" if independent_critic_enabled(camp) else None,
+                planning_mode="propose_then_critic",
                 compact_engineering=compact_engineering,
                 compact_analysis=role == "result_analyst" and review_stage == "analysis")
     shared = (PROMPTS / "shared_contract.txt").read_text(encoding="utf-8")
@@ -725,7 +705,7 @@ def _request_trace(camp: Path, row: dict[str, Any], *, system: str,
     user_sha = hashlib.sha256(user.encode("utf-8")).hexdigest()
     identity = {key: row.get(key) for key in
                 ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash", "requested_model")}
-    for key in ("coder_format_feedback_revision", "coder_format_recovery", "review_format_recovery", "designer_assembly_ref", "reviewer_delivery_ref"):
+    for key in ("coder_format_feedback_revision", "coder_format_recovery", "designer_assembly_ref", "reviewer_delivery_ref"):
         if key in row:
             identity[key] = row[key]
     if row.get("operation"):
@@ -813,7 +793,7 @@ def _response_trace(camp: Path, row: dict[str, Any], reply: Any, *, validation: 
     identity = {key: row.get(key) for key in
                 ("call_id", "role", "prompt_hash", "candidate_id", "attempt_id", "task_id", "input_digest", "input_hash",
                  "request_trace_ref", "request_system_sha256", "request_user_sha256")}
-    for key in ("coder_format_feedback_revision", "coder_format_recovery", "review_format_recovery", "designer_assembly_ref", "reviewer_delivery_ref"):
+    for key in ("coder_format_feedback_revision", "coder_format_recovery", "designer_assembly_ref", "reviewer_delivery_ref"):
         if key in row:
             identity[key] = row[key]
     if row.get("operation"):
@@ -1157,9 +1137,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
     def active_domain_model():
         from .research_execution import single_plan_enabled
         if role == "research_planner" and single_plan_enabled(camp):
-            from .schemas import ResearchRoundDraft, ResearchProposalDraft
-            from .research_execution import independent_critic_enabled
-            return ResearchProposalDraft if independent_critic_enabled(camp) else ResearchRoundDraft
+            from .schemas import ResearchProposalDraft
+            return ResearchProposalDraft
         return domain_model_for(role,memory,camp=camp,review_stage=active_review_stage)
 
     def call(payload: dict[str, Any], *, critic_context: dict | None = None) -> dict[str, Any]:
@@ -1167,26 +1146,23 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         from .context.compiler import is_research_planning_input, is_analysis_scientific_input
         scientific_planning = is_research_planning_input(role, payload)
         scientific_analysis = is_analysis_scientific_input(role, payload)
-        from .planning_contract import enabled as planning_contract_enabled
-        from .research_execution import independent_critic_enabled, research_goal
-        planning_wire = (role in {"research_planner", "research_critic"}
-                         and independent_critic_enabled(camp)
-                         and planning_contract_enabled(research_goal(camp)))
+        from .research_execution import research_goal, single_plan_enabled
+        goal = research_goal(camp)
+        # Single-plan stage roles have exactly one wire each; only the legacy
+        # action loop (no research_execution) keeps its original role schemas.
+        single_plan = single_plan_enabled(goal)
+        planning_wire = role in {"research_planner", "research_critic"} and single_plan
         if planning_wire:
             if payload.get("planning_context_version") != "research_planning_input.v2":
                 raise LlmUnavailable("planning_input_contract_missing")
-            from .critic_contract import enabled as compact_critic_enabled
-            if (role == "research_critic" and compact_critic_enabled(research_goal(camp))
-                    and not isinstance(critic_context, dict)):
+            if role == "research_critic" and not isinstance(critic_context, dict):
                 raise LlmUnavailable("critic_native_context_missing")
             system = system_prompt(role, memory=memory, camp=camp, planning_payload=payload,
                                    critic_context=critic_context)
             prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
-        from .design_contract import design_contract_version
-        designer_wire = role == "experiment_designer" and design_contract_version(camp) == "v2"
-        execution = research_goal(camp).get("research_execution") or {}
-        reviewer_wire = role == "candidate_reviewer" and execution.get("reviewer_contract_version") == "v2"
-        coder_wire = role == "candidate_coder" and execution.get("coder_context_version") == "v2"
+        designer_wire = role == "experiment_designer" and single_plan
+        reviewer_wire = role == "candidate_reviewer" and single_plan
+        coder_wire = role == "candidate_coder" and single_plan
         reviewer_native = reviewer_draft = reviewer_bound = reviewer_delivery_ref = None
         reviewer_frozen_input = None
         if role == "candidate_coder":
@@ -1194,12 +1170,9 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             # call or the uncompiled input. Recovery below uses its frozen view.
             call.coder_source_request = None
         active_review_stage = payload.get("review_stage")
-        if role == "result_analyst" and active_review_stage != "analysis":
-            from .research_execution import single_plan_enabled
-            from .design_contract import design_contract_version
-            if single_plan_enabled(camp) and design_contract_version(camp) == "v2":
-                # New research has one analysis contract; never fall back to the legacy schema.
-                raise LlmUnavailable("analysis_stage_contract_missing")
+        if role == "result_analyst" and active_review_stage != "analysis" and single_plan:
+            # Single-plan research has one analysis contract; never fall back to the legacy schema.
+            raise LlmUnavailable("analysis_stage_contract_missing")
         if role == "result_analyst":
             system = system_prompt(role, memory=memory, camp=camp, review_stage=payload.get("review_stage"))
             prompt_hash = hashlib.sha256(system.encode("utf-8")).hexdigest()[:16]
@@ -1311,11 +1284,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         logical_operation = operation_id(role, payload, bound, resolved.role_config_hash)
         request_semantics = operation_id(role, payload,
             {key: value for key, value in bound.items() if key != "operation_id"}, "")
-        from .research_execution import research_goal
-        execution = research_goal(camp).get("research_execution") or {}
-        single_pass_review = role == "candidate_reviewer" and execution.get("implementation_review_mode") == "single_pass"
+        single_pass_review = reviewer_wire
         format_recovery = None
-        review_recovery = None
         designer_native = None
         designer_assembly_ref = None
         designer_pending = None
@@ -1338,12 +1308,6 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 bound=bound, revision=CODER_FORMAT_FEEDBACK_REVISION)
             if format_recovery is not None:
                 logical_operation = format_recovery["operation_id"]
-        elif single_pass_review and not reviewer_wire:
-            from .review_format_recovery import review_format_recovery
-            review_recovery = review_format_recovery(camp, logical_operation, payload=payload,
-                bound=bound, config_hash=resolved.role_config_hash)
-            if review_recovery is not None:
-                logical_operation = review_recovery["operation_id"]
 
         def validate_recovered(reply, frozen_payload, frozen_prompt_hash):
             parsed = dict(reply)
@@ -1519,14 +1483,10 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             from .review_format_recovery import operation_attempt_limit
             attempt_limit = operation_attempt_limit(camp, logical_operation, attempt_limit)
         for _attempt in range(first_attempt, attempt_limit):
-            request_mode = "repair" if external_repair or last is not None or schema_error is not None or format_recovery is not None or review_recovery is not None else "normal"
+            request_mode = "repair" if external_repair or last is not None or schema_error is not None or format_recovery is not None else "normal"
             call_payload = ((reviewer_frozen_input if reviewer_frozen_input is not None else reviewer_draft)
                 if reviewer_wire else designer_frozen_input if designer_frozen_input is not None
                 else analyst_frozen_input if analyst_frozen_input is not None else payload)
-            if review_recovery is not None:
-                call_payload = {**(call_payload if reviewer_wire else payload),
-                    "previous_response_error": {**review_format_feedback(review_recovery["rejected_format"]),
-                        "recovery": {key: value for key, value in review_recovery.items() if key != "rejected_format"}}}
             if format_recovery is not None:
                 call_payload = {**payload,
                     "previous_response_error": {**coder_format_feedback(format_recovery["rejected_format"]),
@@ -1576,15 +1536,6 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                         # Unapproved model JSON is text, not request-local
                         # pointer syntax or a new source/evidence container.
                         "previous_response": json.dumps(previous_domain, ensure_ascii=False)}
-                elif scientific_planning:
-                    # Errors are feedback for this response, not a replay of
-                    # previous drafts, audit records or validation history.
-                    errors = (schema_feedback or {}).get("validation_errors") or []
-                    call_payload = {**call_payload, "previous_response_error": {
-                        "kind": "schema_invalid",
-                        "errors": [{key: error[key] for key in ("loc", "type", "msg") if key in error}
-                                   for error in errors],
-                        "instruction": "Return a complete corrected JSON object matching OUTPUT_SCHEMA. Correct the listed fields while keeping the scientific task and candidate pool unchanged."}}
                 else:
                     call_payload = {**call_payload, "schema_error": schema_error, "previous": previous_domain,
                                     "schema_repair_context": schema_feedback,
@@ -1603,9 +1554,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 hints = conditional_hints(role, call_payload)
                 if hints:
                     call_payload = {**call_payload,"relevant_implementation_hints":hints}
-                from .design_contract import design_contract_version
-                call_payload = add_role_examples(call_payload, role, memory, max_count=1, execution_version="single_plan_v1",
-                    design_contract_version=design_contract_version(camp))
+                call_payload = add_role_examples(call_payload, role, memory, max_count=1, execution_version="single_plan_v1")
             else:
                 call_payload = add_role_examples(call_payload, role, memory)
             if designer_wire:
@@ -1678,7 +1627,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                        reasoning_effort=resolved.reasoning_effort,
                        application_retry_kind=("domain_schema" if schema_error is not None else
                                                "output_truncated" if last is not None and getattr(last.usage, "failure_kind", None) == "output_truncated" else
-                                               "invalid_json" if last is not None else "review_format_recovery" if review_recovery is not None else
+                                               "invalid_json" if last is not None else
                                                "native_planner_repair" if external_repair else None),
                        role_context_revision=projection["revision"],
                        role_context_original_user_chars=projection["original_user_chars"],
@@ -1689,9 +1638,6 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 if format_recovery is not None:
                     row["coder_format_recovery"] = {key: value for key, value in format_recovery.items()
                                                    if key != "rejected_format"}
-            if review_recovery is not None:
-                row["review_format_recovery"] = {key: value for key, value in review_recovery.items()
-                                                if key != "rejected_format"}
             append_ui_event(
                 camp,
                 "llm_call_started",

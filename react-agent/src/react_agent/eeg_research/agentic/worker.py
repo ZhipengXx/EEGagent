@@ -417,15 +417,6 @@ def _review_or_reuse(
             recoverable=False,
         )
         return None
-    if stored is None and config_hash and revalidation_reason is None:
-        from .review_revalidation import authorized_config
-        authorized = authorized_config(camp_dir, workspace, state, config_hash)
-        if authorized:
-            stored = _stored_review(workspace, candidate_id=str(workspace.name),
-                attempt_id=str(attempt["attempt_id"]), input_hash=digest,
-                role_config_hash=authorized["role_config"]["role_config_hash"], **review_binding)
-            if stored and stored.get("operation_id") != authorized["operation_id"]:
-                raise ValueError("review_revalidation_completed_operation_changed")
     if stored is not None and revalidation_reason is None:
         from react_agent.eeg_research.agentic.native_patch import enforce_requirement_review
         return enforce_requirement_review(workspace, spec, stored)
@@ -1073,6 +1064,10 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 or state.get("status") == "cancelled" or not reason.strip()
                 or not re.fullmatch(r"c[1-9][0-9]*", candidate_id)):
             raise ValueError("review_revalidation_requires_quiescent_checked_candidate_and_reason")
+        if review_overrides:
+            # The 32k retry proof only modeled the removed single-plan v1 Reviewer.
+            # Until it is ported to the v2 Reviewer, no paid retry is opened.
+            raise ValueError("review_revalidation_32k_unsupported_for_v2_reviewer")
         workspace = camp_dir / "candidates" / candidate_id
         row = next((item for item in state.get("candidates") or [] if item.get("candidate_id") == candidate_id), None)
         source = workspace / "extension/eeg_candidate.py"
@@ -1082,89 +1077,6 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         prior_path = workspace / "review.json"
         prior = json.loads(prior_path.read_text()) if prior_path.is_file() else None
         impl = json.loads((workspace / "implementation.json").read_text())
-        if review_overrides:
-            from .review_revalidation import truncated_proof, authorize, authorized_config, paid_review_proof, record_paid_review
-            from .role_config import resolve_role_config
-            from .owner_budget import budget_owner
-            pinned = {path: file_sha256(path) for path in (source, check_path, workspace / "spec.json",
-                workspace / "attempt.json", camp_dir / "goal.json")}
-            authorization = authorized_config(camp_dir, workspace, state,
-                resolve_role_config(camp_dir, "candidate_reviewer").role_config_hash)
-            stored = _stored_review(workspace, candidate_id=candidate_id, attempt_id=impl["attempt_id"],
-                input_hash=file_sha256(source), role_config_hash=authorization["role_config"]["role_config_hash"]) if authorization else None
-            recovered = None
-            if stored is not None:
-                if stored.get("operation_id") != authorization["operation_id"]:
-                    raise ValueError("review_revalidation_completed_operation_changed")
-                proof = authorization
-                from .native_patch import enforce_requirement_review
-                verdict = enforce_requirement_review(workspace, spec, stored)
-            elif (recovered := paid_review_proof(camp_dir, state, candidate_id)) is not None:
-                proof, authorization = recovered["proof"], recovered["authorization"]
-                record_paid_review(camp_dir, recovered)
-                class PaidReviewer:
-                    role_config = resolve_role_config(camp_dir, "candidate_reviewer", {"max_tokens": 32768})
-                    model = role_config.model
-                    review_evidence_request = recovered["request"]
-                    def __call__(self, payload):
-                        return recovered["reply"]
-                identity = {"candidate_id": candidate_id, "attempt_id": proof["attempt_id"],
-                    "phase": "review_candidate", "operation_id": authorization["operation_id"],
-                    "input_hash": proof["source_hash"], "role_config_hash": authorization["role_config"]["role_config_hash"]}
-                verdict = review(workspace, spec, summary, PaidReviewer(), PaidReviewer.model, identity=identity)
-            else:
-                proof = truncated_proof(camp_dir, state, candidate_id)
-                authorization = authorize(camp_dir, proof, reason)
-                reviewer = role_backend(camp, "candidate_reviewer", overrides=review_overrides["candidate_reviewer"])
-                if reviewer.role_config.semantics() != authorization["role_config"]:
-                    raise ValueError("review_revalidation_resolved_profile_changed")
-                with budget_owner(camp_dir, proof["budget_owner"].removesuffix(":role:candidate_reviewer"), purpose="mainline"):
-                    verdict = _review_or_reuse(camp_dir, workspace, spec, summary, reviewer, state,
-                        revalidation_reason=reason, revalidation_operation=authorization["operation_id"])
-            if any(file_sha256(path) != sha for path, sha in pinned.items()):
-                raise ValueError("review_revalidation_changed_frozen_inputs")
-            _sync_ledger(camp_dir, state)
-            if verdict is None:
-                raise LlmUnavailable(str(state.get("detail") or "review_revalidation_unavailable"))
-            row.update(review=verdict["status"], review_format_failed=verdict.get("format_failed"),
-                       status="ready" if verdict["status"] == "ready" else "review_" + verdict["status"])
-            if verdict["status"] == "ready":
-                from .run_context import persist_approved_binding
-                state.pop("implementation_review_blocked", None)
-                state.update(candidate_ready=True, candidate_id=candidate_id, repair_task=None, experiment_failed=False)
-                persist_approved_binding(camp_dir, candidate_id, spec["experiment"],
-                    spec_ref=state.get("experiment_ref"), attempt_id=proof["attempt_id"], source_hash=proof["source_hash"])
-            else:
-                # The native Reviewer can still reject the checked implementation.
-                # Preserve its judgment; a retry does not grant scientific approval.
-                state["candidate_ready"] = False
-                blocking = [issue for issue in verdict.get("issues") or [] if issue.get("severity") == "blocking"]
-                repairable = verdict["status"] == "needs_fix" or (bool(blocking) and all(
-                    issue.get("category") == "candidate_defect" and issue.get("smallest_correction") for issue in blocking))
-                used = int((state.get("repair_task") or {}).get("used") or 0)
-                if repairable and used < int(state.get("max_repairs_per_candidate", 2)):
-                    state["repair_task"] = {"candidate_id": candidate_id, "issues": verdict.get("issues") or [],
-                        "intervention_coverage": verdict.get("intervention_coverage"),
-                        "unverified_invariants": verdict.get("unverified_invariants") or [], "remaining": 1, "used": used + 1}
-                    state["experiment_failed"] = False
-                else:
-                    state["repair_task"] = None
-                    state["experiment_failed"] = True
-            evidence = {"evidence_id": "ev_impl_" + candidate_id, "kind": "implementation",
-                "candidate_id": candidate_id, "summary": row}
-            old = next((i for i, item in enumerate(state.get("evidence") or []) if item.get("evidence_id") == evidence["evidence_id"]), None)
-            if old is None:
-                state.setdefault("evidence", []).append(evidence)
-            else:
-                state["evidence"][old] = evidence
-            state.pop("failure", None)
-            state.pop("detail", None)
-            if state.get("status") == "blocked":
-                state["status"] = "created"
-            return {"status": row["status"], "candidate_id": candidate_id, "reason": reason,
-                "source_hash": proof["source_hash"], "candidate_source_rewritten": False,
-                **({"recovered_paid_call_id": recovered["receipt"]["call_id"], "api_calls_added": 0} if recovered else {}),
-                "authorization_id": authorization["authorization_id"], "operation_id": authorization["operation_id"]}
         if (not row or not prior
                 or checks.get("ok") is not True or checks.get("source_sha256") != file_sha256(source)
                 or checks.get("check_fingerprint") != _check_fingerprint(workspace, None)
@@ -1254,8 +1166,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         feedback_goal = json.loads((camp_dir / "goal.json").read_text())
         from .research_execution import single_plan_enabled, paid_maintenance_mode
         task_protocol = single_plan_enabled(feedback_goal)
-        from .design_contract import design_contract_version
-        scientific_analysis = task_protocol and design_contract_version(feedback_goal) == "v2"
+        scientific_analysis = task_protocol
         optional_curation = task_protocol or (method_mode and feedback_goal.get("evaluation_schedule") == "screen_then_confirm")
         scientific_rows = state.get("evidence") or []
         if method_mode:

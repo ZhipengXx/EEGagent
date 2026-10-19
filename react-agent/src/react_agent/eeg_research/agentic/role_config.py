@@ -95,7 +95,8 @@ def resolve_role_config(camp: Path | dict | None, role: str, overrides: dict | N
         goal = json.loads(path.read_text()) if path.is_file() else {}
         path = camp / "role_config_overrides.json"
         cli = json.loads(path.read_text()) if path.is_file() else {}
-    if role == "research_planner" and (goal.get("research_execution") or {}).get("planning_mode") == "propose_then_critic":
+    # Every single-plan Planner is the staged proposer, whatever mode keys the goal records.
+    if role == "research_planner" and (goal.get("research_execution") or {}).get("version") == "single_plan_v1":
         value.update(model="deepseek-v4-pro", thinking=True, reasoning_effort="high",
                      max_tokens=32768, timeout_s=240)
         sources.update({name: "staged_planner_default" for name in FIELDS})

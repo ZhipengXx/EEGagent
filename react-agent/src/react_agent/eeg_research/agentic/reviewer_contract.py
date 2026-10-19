@@ -67,7 +67,8 @@ def enabled(full_or_goal: dict | Path | None) -> bool:
     if full.get("contract_version") == VERSION or full.get("reviewer_context_version") == INPUT_VERSION:
         return True
     goal = full.get("goal") if isinstance(full.get("goal"), dict) else full
-    return (goal.get("research_execution") or {}).get("reviewer_contract_version") == "v2"
+    from .research_execution import single_plan_enabled
+    return single_plan_enabled(goal)
 
 
 def reviewer_wire_schema(context: dict) -> dict:

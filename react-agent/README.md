@@ -70,7 +70,7 @@ below was verified with the real model on CPU:
     "batch_size": 32,
     "top_k": 5,
     "min_similarity": 0.30,
-    "context_chars_budget": 6000,
+    "content_chars_budget": 6000,
     "allow_model_download": false,
     "fallback": "legacy"
   }
@@ -130,20 +130,25 @@ are recorded using the tokenizer. A changed body/version or fingerprint cannot
 reuse stale output; explicit rebuild replaces invalid vectors.
 
 Existing lesson applicability rules group candidates before cosine ranking.
-Lessons and procedural hints share one total Top-k and one serialized context
-budget. The budget counts the compact JSON (`ensure_ascii=False`, separators
-`,:`) of the actual added model-input fields: Planner `lessons` plus
-`retrieved_memory`, or Designer/Coder `retrieved_memory`. Legacy fallback counts
-only its new metadata and preserves the original lessons. The reported
-`context_chars_used` includes its own serialized digits. Zero or insufficient
-budget omits the new field; complete records are omitted rather than shortening
-their procedures. Compatible lessons have priority over analogy/unknown items; similarity
-never upgrades evidence strength. Oversized bodies are omitted with truncation
-metadata. An empty result is valid. Original lesson languages are retained;
-MiniLM is English-focused and there is no automatic translation.
+`content_chars_budget` controls the optional historical scientific content
+delivered to a role (default 6000 Unicode characters, range 0–30000). Observation,
+lesson, knowledge and permitted skill cards share this allowance. Current
+terminal feedback is mandatory and separate from the optional allowance.
+Scientific content selection applies to every `single_plan_v1` campaign.
+Scientific text, values, conditions and dynamic metric/parameter names count;
+fixed schema names, JSON punctuation and citation identifiers do not. Retrieval
+diagnostics remain local. Whole cards are selected without shortening scientific
+summaries or procedures, and similarity never upgrades evidence strength.
+Complete archived records are unchanged. The final API request still counts all
+serialized keys, punctuation, citations, schemas and output reservations against
+its existing request budget. Original lesson languages are retained; MiniLM is
+English-focused and there is no automatic translation.
 
-The planner receives selected lessons once plus memory identities/scores. The
-designer and coder receive their bounded bodies in `retrieved_memory`. Curator
+The planner receives selected scientific cards and short source identities;
+the Critic reuses the same round's selected memory. Embedding identities, cosine
+scores, encoding health and selection accounting remain local in
+`CAMPAIGN_DIR/memory_deliveries/<digest>.json`. The designer and coder receive
+their selected bodies in `retrieved_memory`. Curator
 skills are extracted during the existing post-analysis call using an extended
 schema and the same validator. Task/episode/artifact identities and hashes are
 checked against the injected development-source manifest before preserving the
@@ -157,6 +162,16 @@ reuses the same ID/version/hash/body without replaying completed tools. Existing
 in-flight attempts without semantic input are not retrofitted. Indexing or skill
 storage failure does not rerun the paid curator or invalidate a completed
 analysis.
+
+A read-only replay of a completed real Observation selected the card at 2768
+scientific characters under the default 6000 allowance; its former optional
+packet was 6301 characters and had been omitted. The new scientific card's full
+wire JSON is 4305 characters, with its complete 469-character summary and
+limitations. Planner, Critic and the compiled request received identical memory,
+and hashes of the original run files were unchanged. This validation used zero
+external API calls and zero GPU training; it does not establish API latency or
+model-quality improvements. The implementation note and replay evidence are kept
+with the local validation records, outside the published repository.
 
 Corrupt or locked snapshot storage blocks implementation with a recoverable
 `MemorySnapshotError`, before coder tools or model calls. The sidecar is retained

@@ -19,9 +19,8 @@ def enabled(full_or_goal: dict | None) -> bool:
     full = full_or_goal or {}
     goal = full.get("goal") if isinstance(full.get("goal"), dict) else full
     execution = full.get("research_execution") or goal.get("research_execution") or {}
-    return (execution.get("critic_contract_version") == "v2"
-            and execution.get("planning_contract_version") == "v2"
-            and execution.get("planning_mode", "propose_then_critic") == "propose_then_critic")
+    from .research_execution import SINGLE_PLAN_VERSION
+    return isinstance(execution, dict) and execution.get("version") == SINGLE_PLAN_VERSION
 
 
 def _error(kind: str, loc, message: str) -> dict:

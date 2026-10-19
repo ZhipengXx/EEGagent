@@ -13,7 +13,7 @@ import sqlite3
 from pathlib import Path
 
 from .action_planning import digest
-from .plan_protocol import normalize_research_round, round_id, round_input
+from .plan_protocol import round_id, round_input
 
 
 def _read(path):
@@ -51,21 +51,6 @@ def state_binding(camp, state):
             "terminal_observation_id", "terminal_observation_digest", "selected_plan", "candidates",
             "candidate_id", "candidate_ready", "candidate_admissions", "detached_candidates")},
         "evidence": _science_rows(state.get("evidence"))}
-
-
-def publish_raw(camp, state, full, owner, raw, *, correction=False):
-    """The backend-return boundary precedes all proposal validation and release."""
-    from .loop import _write
-    rid = round_id(full)
-    folder = camp / "research_round_raw" / rid
-    sequence = len(list(folder.glob("*.json")))
-    receipt = {"schema_version": "eeg_research.paid_round_raw.v1", "round_id": rid,
-        "sequence": sequence, "operation_id": rid + (":correction" if correction else ":generation"),
-        "planning_owner": owner, "input_observation_digest": digest(round_input(full)),
-        "round_input": round_input(full), "observation": copy.deepcopy(full),
-        "state_binding": state_binding(camp, state), "raw": copy.deepcopy(raw)}
-    receipt["receipt_digest"] = digest(receipt)
-    _write(folder / (str(sequence).zfill(3) + ".json"), receipt, exclusive=True)
 
 
 def _verify_current(camp, state, full):
@@ -218,96 +203,3 @@ def _verify_call(camp, row, owner, claims, journals, *, allowed_roles=None, oper
         "context_request_digest": row["context_request_digest"], "response_reply_sha256": row["response_reply_sha256"]}
 
 
-def restore_paid(camp, state):
-    """Return a proved paid round, or None before ordinary context collection."""
-    owner_id = (state.get("selected_plan") or {}).get("continuation_owner") or "bootstrap:initial_planner"
-    returned = None
-    for folder in sorted((camp / "research_round_raw").glob("research_round_*")):
-        receipts = [_read(path) for path in sorted(folder.glob("*.json"))]
-        if not receipts or receipts[0].get("planning_owner") != owner_id:
-            continue
-        first = receipts[0]
-        binding = state_binding(camp, state)
-        if first.get("state_binding") != binding:
-            raise ValueError("paid_round_current_binding_changed")
-        full = copy.deepcopy(first["observation"])
-        for sequence, receipt in enumerate(receipts):
-            unsigned = {key: value for key, value in receipt.items() if key != "receipt_digest"}
-            if (receipt.get("receipt_digest") != digest(unsigned) or receipt.get("sequence") != sequence
-                    or receipt.get("schema_version") != "eeg_research.paid_round_raw.v1"
-                    or receipt.get("round_id") != round_id(full) or receipt.get("round_input") != round_input(full)
-                    or receipt.get("input_observation_digest") != digest(round_input(full))
-                    or receipt.get("state_binding") != binding or receipt.get("planning_owner") != owner_id
-                    or receipt.get("observation") != first["observation"]
-                    or receipt.get("operation_id") not in {round_id(full) + ":generation", round_id(full) + ":correction"}):
-                raise ValueError("paid_round_raw_receipt_changed")
-        _verify_current(camp, state, full)
-        full["_paid_replay_readonly"] = True
-        returned = full, owner_id, [row["raw"] for row in receipts], {"source": "backend_return_receipt"}
-        break
-    db_path = camp / "resource_owners.sqlite"
-    if not db_path.is_file():
-        return returned
-    with sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True) as db:
-        found = db.execute("SELECT payload FROM owners WHERE id=?", (owner_id,)).fetchone()
-        owner = json.loads(found[0]) if found else None
-        claims = {identity: json.loads(payload) for identity, payload in db.execute("SELECT id,payload FROM claims")}
-    if not owner or not owner.get("round_id"):
-        if returned:
-            raise ValueError("paid_round_planning_owner_missing")
-        return None
-    rid = owner["round_id"]
-    if returned and rid != round_id(returned[0]):
-        raise ValueError("paid_round_planning_owner_binding_changed")
-    if (camp / "research_rounds" / (rid + ".json")).is_file():
-        return returned
-    journals = {name: _rows(camp, name) for name in ("llm_calls.jsonl", "llm_api_intents.jsonl", "api_operation_attempts.jsonl")}
-    paid = [row for row in journals["llm_calls.jsonl"] if row.get("budget_owner") == owner_id
-            and row.get("role") == "research_planner" and row.get("success") is True
-            and _read(camp / "llm_responses" / (str(row["call_id"]) + ".json")).get("validation") == "valid"]
-    if not paid:
-        # Local injected backends have no provider ledger. A native attempted
-        # request cannot use that local receipt path to excuse missing proof.
-        if ((returned and any(row.get("budget_owner") == owner_id for row in journals["llm_api_intents.jsonl"]))
-                or any(row.get("budget_owner") == owner_id and row.get("success") is True
-                       for row in journals["llm_calls.jsonl"])):
-            raise ValueError("paid_round_confirmed_response_missing")
-        return returned
-    if (owner.get("kind") != "continuation" or owner.get("status") not in {"active", "released"}
-            or (state.get("terminal_observation_digest") and owner.get("observation_digest") != state["terminal_observation_digest"])):
-        raise ValueError("paid_round_planning_owner_binding_changed")
-    history, proofs, full = [], [], None
-    for row in paid:
-        _one(journals["llm_calls.jsonl"], row["call_id"], "settlement")
-        view, raw, proof = _verify_call(camp, row, owner, claims, journals)
-        _verify_current(camp, state, view)
-        if full is not None and round_input(full) != round_input(view):
-            raise ValueError("paid_round_response_inputs_conflict")
-        full = view
-        history.append(raw)
-        proofs.append(proof)
-    if owner.get("observation_digest") != (state.get("terminal_observation_digest") or digest(round_input(full))):
-        raise ValueError("paid_round_owner_observation_changed")
-    if returned:
-        if len(history) < len(receipts) or round_input(returned[0]) != round_input(full):
-            raise ValueError("paid_round_returned_response_proof_missing")
-        for receipt, raw, proof in zip(receipts, history, proofs):
-            if receipt["raw"] != raw or receipt["operation_id"] != proof["operation_id"]:
-                raise ValueError("paid_round_returned_response_changed")
-        # A correction can settle immediately before its outer raw receipt is
-        # written. Its existing native response is the durable tail; no receipt
-        # or original response is replaced to complete this same round.
-    return full, owner_id, history, {"source": "native_confirmed_response", "calls": proofs}
-
-
-def revalidate_history(full, history):
-    parsed, records, valid = None, [], None
-    for raw in history:
-        parsed = normalize_research_round(raw, full, existing=valid)
-        valid = parsed.get("valid_proposals")
-        records += parsed.get("validation_records") or []
-    parsed["proposal_history"] = copy.deepcopy(history)
-    parsed["validation_records"] = records
-    if parsed.get("round"):
-        parsed["round"]["validation_records"] = records
-    return parsed

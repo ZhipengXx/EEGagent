@@ -44,7 +44,12 @@ def run_evaluation(root: Path, *, real_api: bool, max_api_calls: int = 6) -> dic
     from . import loop, llm
     from .experiment_observations import ExperimentObservationStore, compact_planner_view
     from .owner_budget import OwnerBudgetError, finish_planner_round, planner_owner, snapshot
-    from .plan_protocol import decide_research_plan, round_id
+    from .api_policy import planner_api_round
+    from .plan_protocol import config, round_id
+    from .planning_context import build_proposer_input
+    from .planning_contract import freeze_planning_contract
+    from .research_execution import planning_call_budget
+    from .staged_planning import decide_staged_plan
     from .schemas import GoalSpec
 
     scenarios = [
@@ -59,18 +64,24 @@ def run_evaluation(root: Path, *, real_api: bool, max_api_calls: int = 6) -> dic
         # Each independent evaluation gets its own bootstrap owner. It does not
         # pretend to be a continuation without an executed terminal observation.
         remaining = max_api_calls - spent
-        if remaining < 2:
+        if remaining < 2:  # One Planner and one Critic request at minimum.
             results.append({"scenario": name, "ok": False, "status": "deferred",
                 "error": "insufficient_budget_for_bounded_planner", "actual_API_attempts": 0})
             break
+        # Planner and Critic share this scenario's remaining attempts. The goal's
+        # wider llm_calls allowance only admits the complete (never dispatched)
+        # task before the Critic; spent attempts stay under max_api_calls.
+        stage_attempts = max(1, min(2, remaining // 2))
         goal = GoalSpec.model_validate({
             "goal_id": "planning_" + name, "objective": question,
-            "max_llm_calls": 2, "max_training_jobs": 0, "max_gpu_seconds": 0,
+            "max_llm_calls": 40, "max_training_jobs": 0, "max_gpu_seconds": 0,
             "max_candidates": 0, "allowed_training_actions": [], "training_seeds": [0], "confirmation_target_pairs": 1,
             "research_execution": {"version": "single_plan_v1", "target_k": 3,
-                "allow_degraded_singleton": False, "max_planner_api_attempts": 2},
+                "allow_degraded_singleton": False, "max_planner_api_attempts": stage_attempts,
+                "max_critic_api_attempts": stage_attempts},
             "paid_maintenance": "off", "memory": {"enabled": True},
-            "role_models": {"research_planner": {"model": "deepseek-flash", "max_tokens": 16384}},
+            "role_models": {"research_planner": {"model": "deepseek-flash", "max_tokens": 16384},
+                            "research_critic": {"model": "deepseek-flash", "max_tokens": 16384}},
         }).model_dump()
         loop.create_campaign(root, goal=goal, contract={"fingerprint": "synthetic_planning_only.v1",
             "task_type": "eeg_image_retrieval", "research_scope": "synthetic_diagnostic_planning"}, request_id=goal["goal_id"])
@@ -98,15 +109,19 @@ def run_evaluation(root: Path, *, real_api: bool, max_api_calls: int = 6) -> dic
             "evaluation_guard": {"planning_only": True, "synthetic_input": True,
                 "selected_work_is_not_dispatched": True, "training_authorization": False}}
         digest = hashlib.sha256(json.dumps(full, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        full["_planning_contract"] = freeze_planning_contract(full)
         started = time.time()
-        backend = llm.role_backend(camp, "research_planner")
-        wire = compact_planner_view(camp, full)
+        planner = llm.role_backend(camp, "research_planner")
+        critic = llm.role_backend(camp, "research_critic")
+        wire = build_proposer_input(full, compact_planner_view(camp, full))
+        cfg = config(full)
+        limits = {"max_engineering_repairs": cfg.max_engineering_repairs,
+                  "max_repairs": cfg.max_engineering_repairs, "coder_steps": 8}
         owner_id = None
         try:
             with planner_owner(camp, observation_digest=digest, round_id=round_id(full)) as owner_id:
-                backend.bind(operation_id="planning_eval:" + name)
-                result = decide_research_plan(full, lambda request: backend(
-                    compact_planner_view(camp, request)))
+                with planner_api_round(camp, round_id(full), max_attempts=planning_call_budget(camp)):
+                    result = decide_staged_plan(camp, state, full, wire, planner, critic, owner_id, limits, cfg)
         except (llm.LlmUnavailable, OwnerBudgetError, ValueError, OSError) as error:
             result = {"ok": False, "error": str(error), "error_type": type(error).__name__}
         finally:

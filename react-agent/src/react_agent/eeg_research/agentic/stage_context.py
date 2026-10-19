@@ -71,8 +71,7 @@ def with_selected_task(payload: dict[str, Any], role: str, selected: dict[str, A
     proposal = selected.get("proposal") or {}
     fields = ("question", "task_description", "scientific_intent", "evaluation_scope",
               "expected_observation", "completion_condition")
-    if (role == "experiment_designer" and
-            (((payload.get("goal") or {}).get("research_execution") or {}).get("planning_contract_version") == "v2")):
+    if role == "experiment_designer":
         fields += ("task_kind", "target_candidate_ref")
     if payload.get("review_stage") in {"implementation", "analysis"}:
         fields = ("question", "scientific_intent")

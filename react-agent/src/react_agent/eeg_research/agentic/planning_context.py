@@ -13,26 +13,6 @@ import re
 VERSION = "research_planning_input.v1"
 VERSION_V2 = "research_planning_input.v2"
 
-GOAL_FIELDS = (
-    "objective", "task_type", "dataset", "research_scope", "evaluation_mode",
-    "evaluation_schedule", "primary_metric", "direction", "allowed_changes",
-    "frozen_components", "allowed_training_actions", "required_fold_count",
-    "training_seeds", "checkpoint_policy", "subject_aggregation",
-    "min_practical_gain_pp", "selection_min_delta", "benchmark_subjects",
-    "benchmark_feedback_enabled", "final_test_enabled",
-)
-CONTRACT_FIELDS = (
-    "task_type", "dataset", "label", "research_scope", "evaluation_mode",
-    "generalization_target", "primary_metric", "direction", "required_fold_count",
-    "subject_aggregation", "val_mode", "input_shape", "embedding_dim",
-    "benchmark_scope", "independent_final_test", "final_test_enabled",
-    "within_batch_role", "legacy_unverified_note",
-)
-INTERFACE_FIELDS = (
-    "input", "output", "dataset", "c_num", "channels", "timesteps", "gallery_size",
-    "build_encoder", "build_training_objective", "build_training_transform",
-    "fit_statistics", "not_available", "runtime_guarantees",
-)
 TASK_ACTIONS = frozenset({"design_experiment", "propose_experiment", "run_screening",
     "run_confirmation", "run_full", "run_pilot", "collect_diagnostics", "diagnose_results"})
 
@@ -85,138 +65,6 @@ def _source(value):
     if isinstance(value, dict) and isinstance(value.get("encoder_reference"), dict):
         result["encoder_reference"] = _pick(value["encoder_reference"], ("excerpt", "source_ref"))
     return result
-
-
-def _observation_cards(value, *, cleaner=None, compact=False):
-    cleaner = cleaner or _scientific_data
-    cards = value.get("cards", []) if isinstance(value, dict) else value or []
-    result = []
-    for card in cards:
-        body = card.get("body", card)
-        if compact:
-            from .experiment_observations import observation_science_view
-            body = observation_science_view(body)
-        row = _pick(body, ("observation_id", "observation_kind", "question", "intervention",
-            "execution_status", "evaluation_scope", "native_facts", "analyst_interpretation",
-            "unresolved_questions", "applicability"))
-        if isinstance(row.get("analyst_interpretation"), dict):
-            # Same flat shape the stored-science refill uses, so a delivered summary appears once.
-            row["analyst_interpretation"] = _analysis(row["analyst_interpretation"])
-        identity = _pick(body.get("identity") or {}, ("candidate_id", "dataset", "modality", "method_revision"))
-        if identity:
-            row["identity"] = identity
-        failure = _pick(body.get("engineering_failure") or {},
-            ("error", "error_category", "reason", "summary"))
-        issues = (body.get("engineering_failure") or {}).get("blocking_issues") or []
-        if issues:
-            failure["blocking_issues"] = [summary for issue in issues
-                if (summary := _pick(issue, ("issue_id", "requirement_id", "kind", "error_class",
-                    "detail", "expected", "coverage_detail", "summary", "reason", "error")))]
-        if failure:
-            row["engineering_failure"] = failure
-        for key in ("current_feedback", "fidelity", "condition_differences"):
-            if key in card:
-                row[key] = copy.deepcopy(card[key])
-        # Keep each source identifier once for attribution, not its read protocol.
-        from .context.representations import delivered_source_refs
-        refs = sorted(delivered_source_refs(card))
-        if refs:
-            row["source_refs"] = [{"source_ref": ref} for ref in refs]
-        result.append(cleaner(row))
-    return result
-
-
-# Run bookkeeping inside applicability rows; scientific conditions remain.
-APPLICABILITY_BOOKKEEPING = frozenset({"campaign_id", "task", "evaluation_identity", "terminal_observation_id"})
-
-
-def _applicability(row, geometry):
-    applicability = row.get("applicability")
-    if not isinstance(applicability, dict):
-        return
-    for key in APPLICABILITY_BOOKKEEPING:
-        applicability.pop(key, None)
-    if geometry is not None and applicability.get("input_geometry") == geometry:
-        applicability.pop("input_geometry")
-    recipe = applicability.get("training_recipe")
-    if isinstance(recipe, dict):
-        recipe.pop("data_root", None)
-        recipe.pop("gpu", None)
-        if geometry is not None and recipe.get("input_geometry") == geometry:
-            recipe.pop("input_geometry")
-
-
-def _analysis(value):
-    points = (value or {}).get("points") if isinstance(value, dict) else None
-    points = points if isinstance(points, dict) else value
-    return _pick(points, ("hypothesis_assessment", "summary_zh", "summary"))
-
-
-def _stored_science(body):
-    """Fields the bounded observation card moves behind reads; no read tool exists here."""
-    result = {}
-    analysis = _analysis(body.get("analyst_interpretation"))
-    if analysis:
-        result["analyst_interpretation"] = analysis
-    if body.get("unresolved_questions"):
-        result["unresolved_questions"] = copy.deepcopy(body["unresolved_questions"])
-    failure = body.get("engineering_failure")
-    if isinstance(failure, dict) and failure.get("error"):
-        result["engineering_failure"] = {"error": copy.deepcopy(failure["error"])}
-    return result
-
-
-def _history_row(body, *, cleaner=None):
-    cleaner = cleaner or _scientific_data
-    facts = _pick(body.get("native_facts") or {}, ("phase", "metrics", "paired_scores", "paired_delta_pp",
-        "promotion", "missing", "required_fold_count", "full_required_fold_count"))
-    identity = body.get("identity") or {}
-    row = {"observation_id": body.get("observation_id"), "observation_kind": body.get("observation_kind"),
-        "candidate_id": identity.get("candidate_id") or (body.get("applicability") or {}).get("candidate_id"),
-        "execution_status": body.get("execution_status"), "question": body.get("question"),
-        "intervention": body.get("intervention"), "evaluation_scope": copy.deepcopy(body.get("evaluation_scope")),
-        "native_facts": facts}
-    row.update(_stored_science(body))
-    if isinstance(body.get("engineering_failure"), dict):
-        row.setdefault("engineering_failure", {})["error_category"] = body["engineering_failure"].get("error_category")
-    return cleaner({key: value for key, value in row.items() if value is not None})
-
-
-def _campaign_observations(full):
-    """Every terminal observation of this campaign, oldest first, from the native store."""
-    from pathlib import Path
-    camp = full.get("_campaign_path")
-    if not camp or not (Path(camp) / "experiment_observations").is_dir():
-        return []
-    from .experiment_observations import ExperimentObservationStore
-    return [record["body"] for record in reversed(ExperimentObservationStore(Path(camp)).records())]
-
-
-def _knowledge(value):
-    if not isinstance(value, dict):
-        return _scientific_data(value)
-    result = _pick(value, ("status",))
-    result["items"] = [_scientific_data(_pick(item, ("record_id", "record_type", "body",
-        "source_ref", "scope", "applicability", "condition_differences", "is_scientific_evidence")))
-        for item in value.get("items") or []]
-    return result
-
-
-def _cost(value):
-    result = _pick(value, ("known", "confidence", "basis", "runtime_allocation_bound"))
-    if "predicted" in value:
-        predicted = value["predicted"]
-        result["predicted"] = _pick(predicted,
-            ("llm_calls", "input_tokens", "output_tokens", "wall_seconds", "implementation_risk"))
-        implementation = _pick(predicted.get("implementation") or {},
-            ("required", "reuses_frozen_implementation", "reported_assessment"))
-        if implementation:
-            result["predicted"]["implementation"] = implementation
-    return _scientific_data(result)
-
-
-def _v2_enabled(full):
-    return ((full.get("goal") or {}).get("research_execution") or {}).get("planning_contract_version") == "v2"
 
 
 def _v2_science(value):
@@ -295,16 +143,6 @@ def _v2_knowledge(view):
                 seen.add(identity)
     if result["items"] and result["status"] == "no_related_knowledge":
         result["status"] = "ready"
-    return result
-
-
-def _v2_cost(value):
-    """A native fold/allocation estimate is not a measured candidate runtime."""
-    known = value.get("known") or {}
-    result = {key: copy.deepcopy(known[key]) for key in ("training_jobs",) if key in known}
-    if "gpu_seconds" in known:
-        result["gpu_seconds_estimate"] = copy.deepcopy(known["gpu_seconds"])
-    result.update(_pick(value, ("basis", "confidence")))
     return result
 
 
@@ -509,129 +347,7 @@ def _build_v2_proposer_input(full, delivered):
 
 def build_proposer_input(full: dict, delivered: dict) -> dict:
     """Use the already retrieved science; native full remains outside the prompt."""
-    if _v2_enabled(full) or delivered.get("planning_context_version") == VERSION_V2:
-        return _build_v2_proposer_input(full, delivered)
-    if delivered.get("planning_context_version") == VERSION:
-        result = copy.deepcopy(delivered)
-        for field in ("proposal_pool", "proposal_pool_digest", "plan_repair_request",
-                      "critic_repair_request", "previous_response_error"):
-            result.pop(field, None)
-        result["planning_stage"] = "propose"
-        return result
-    view = _expanded(delivered)
-    goal = view.get("goal") or full.get("goal") or {}
-    result = {"planning_context_version": VERSION, "planning_stage": "propose",
-        "goal": _pick(goal, GOAL_FIELDS)}
-    for section, fields in {
-        "screening": ("fold_count", "subjects", "selection", "selection_seed", "training_recipe", "min_mean_gain_pp"),
-        "confirmation": ("fold_count", "freeze_method_before_screening", "subject_aggregation", "max_exploration_confirmations"),
-        "research_execution": ("target_k", "max_completed_rounds"),
-    }.items():
-        if section in goal:
-            result["goal"][section] = _pick(goal[section], fields)
-    goal_view = result["goal"]
-    # Contract values repeated from the goal carry no extra information.
-    result["contract"] = {key: value for key, value in
-        _pick(view.get("contract") or full.get("contract") or {}, CONTRACT_FIELDS).items()
-        if key not in {"label", "legacy_unverified_note"} and (key not in goal_view or goal_view[key] != value)}
-    repeated = {"evaluation_mode": "evaluation_mode", "evaluation_schedule": "evaluation_schedule",
-        "declared_full_primary_metric": "primary_metric", "full_required_fold_count": "required_fold_count"}
-    for key in ("evaluation_mode", "evaluation_schedule", "primary_metric", "declared_full_primary_metric",
-                "full_required_fold_count", "scientific_unit", "science_scope", "screening_evidence_scope",
-                "measured_parameter_counts", "parameter_count_comparisons", "verified_encoder_structural_facts"):
-        value = view.get(key)
-        if value is None or value == [] or (key in repeated and goal_view.get(repeated[key]) == value):
-            continue
-        if key == "parameter_count_comparisons" and isinstance(value, dict) and not value.get("comparisons"):
-            continue
-        result[key] = _scientific_data(value)
-    if isinstance(result.get("measured_parameter_counts"), dict):
-        result["measured_parameter_counts"].pop("scope", None)
-    if full.get("frozen_evaluation_scopes"):
-        result["frozen_evaluation_scopes"] = copy.deepcopy(full["frozen_evaluation_scopes"])
-    result["candidate_interface"] = _pick(view.get("candidate_interface") or {}, INTERFACE_FIELDS)
-    # A projected baseline must include the actual encoder, not just its wrapper.
-    baseline = view.get("baseline_source")
-    if not baseline:
-        baseline = next((full.get(key) for key in ("parent_source", "control_source")
-            if (full.get(key) or {}).get("candidate_id") == "baseline"), None)
-    if baseline:
-        result["baseline_source"] = _source(baseline)
-        (result["baseline_source"].get("frozen_training_policy") or {}).pop("interpretation", None)
-    capabilities = view.get("capabilities") or {}
-    result["capabilities"] = {key: {name: _pick(item, ("status", "verified", "default", "when"))
-        for name, item in capabilities.get(key, {}).items()}
-        for key in ("hooks", "task_adapters", "negative_sampling_policies") if key in capabilities}
-    result["available_actions"] = [action for action in view.get("available_actions", full.get("available_actions", []))
-        if action in TASK_ACTIONS]
-    result["eligible_targets"] = {key: copy.deepcopy(targets) for key, targets in
-        (view.get("eligible_targets") or full.get("eligible_targets") or {}).items() if key in TASK_ACTIONS}
-    result["candidates"] = [_pick(item, ("candidate_id", "status")) for item in
-        view.get("candidates", full.get("candidates", []))]
-    if view.get("candidate_id"):
-        result["current_candidate"] = _pick(view, ("candidate_id", "candidate_ready"))
-    experiment = view.get("experiment") or {}
-    if experiment:
-        result["previous_experiment"] = _scientific_data(_pick(experiment,
-            ("candidate_id", "parent_candidate_id", "control_candidate_id", "hypothesis", "intervention",
-             "scientific_intent", "principal_intervention", "evaluation_scope")))
-        if result["previous_experiment"].get("principal_intervention") == result["previous_experiment"].get("intervention"):
-            result["previous_experiment"].pop("principal_intervention", None)
-    sources = full.get("training_target_sources") or {}
-    if isinstance(sources, dict):
-        sources = sources.get("by_candidate", sources)
-        result["target_sources"] = {key: _source(value) for key, value in sources.items()
-            if isinstance(value, dict) and value.get("candidate_id") != "baseline"}
-    for key in ("evaluation_population", "confirmation_policy"):
-        if key in view:
-            result[key] = _scientific_data(view[key])
-    budget = view.get("budget") or full.get("budget") or {}
-    result["budget"] = _pick(budget, ("llm_calls_left", "gpu_seconds_left", "training_jobs_left"))
-    costs = view.get("action_cost_estimates") or full.get("action_cost_estimates") or {}
-    entries = costs.get("by_action_target") or costs
-    # An estimate whose every cost component is unknown says nothing comparable.
-    result["action_cost_estimates"] = {key: _scientific_data(_pick(value,
-        ("estimated_cost", "cost_confidence", "cost_scope", "unknown_components")))
-        for key, value in entries.items() if key.split(":", 1)[0] in TASK_ACTIONS and isinstance(value, dict)
-        and not (isinstance(value.get("estimated_cost"), dict) and value["estimated_cost"]
-                 and all(cost is None for cost in value["estimated_cost"].values()))}
-    if view.get("memory_delivery_report"):
-        # Scientific Memory selection also applies to the v1 planning contract.
-        # Its public section names stay stable; selected science is never
-        # replaced by a reloaded, larger campaign-history view.
-        result["experiment_observations"] = _v2_observations(full, view)
-        result["retrieved_knowledge"] = _v2_knowledge(view)
-        instruction = view.get("current_user_instruction") or full.get("current_user_instruction")
-        if instruction:
-            result["current_user_instruction"] = _pick(instruction, ("request_zh", "requested_task_kind"))
-        return result
-    result["experiment_observations"] = _observation_cards(view.get("experiment_observations"))
-    geometry = ((result.get("baseline_source") or {}).get("recipe") or {}).get("input_geometry")
-    # Retrieval bounds which cards are delivered; the planning view still needs
-    # every terminal result of this campaign to avoid repeating a tested method.
-    stored = {body["observation_id"]: body for body in _campaign_observations(full)}
-    for row in result["experiment_observations"]:
-        _applicability(row, geometry)
-        body = stored.get(row.get("observation_id"))
-        if body:
-            for key, value in _scientific_data(_stored_science(body)).items():
-                if isinstance(value, dict) and isinstance(row.get(key), dict):
-                    row[key] = {**row[key], **value}
-                else:
-                    row.setdefault(key, value)
-    delivered_ids = {row.get("observation_id") for row in result["experiment_observations"]}
-    history = [_history_row(body) for observation_id, body in stored.items() if observation_id not in delivered_ids]
-    if history:
-        result["experiment_history"] = history
-    if "retrieved_knowledge" in view:
-        result["retrieved_knowledge"] = _knowledge(view["retrieved_knowledge"])
-    for key in ("retrieved_memory", "memory", "lessons"):
-        if view.get(key):
-            result[key] = _scientific_data(view[key])
-    instruction = view.get("current_user_instruction") or full.get("current_user_instruction")
-    if instruction:
-        result["current_user_instruction"] = _pick(instruction, ("request_zh", "requested_task_kind"))
-    return result
+    return _build_v2_proposer_input(full, delivered)
 
 
 def delivered_observation_ids(view: dict) -> frozenset[str]:
@@ -757,70 +473,26 @@ def _critic_v2_comparison(pool, full, critic_context):
     return result
 
 
-def critic_pool_input(pool: dict, full: dict | None = None, *, contract: dict | None = None,
-                      critic_context: dict | None = None) -> dict:
+def critic_pool_input(pool: dict, full: dict | None = None, *, critic_context: dict | None = None) -> dict:
     """Compare every exact alternative, with costs rather than check trajectories."""
-    from .critic_contract import enabled as lean_critic_enabled
-    if critic_context is not None or lean_critic_enabled(full or {}):
-        return _critic_v2_comparison(pool, full, critic_context)
-    contract = contract or (full or {}).get("_planning_contract")
-    if isinstance(contract, dict) and contract.get("version") == "eeg_research.planning_contract.v2":
-        from .planning_contract import scientific_proposal_view
-        context = {"goal": {"research_execution": {"planning_contract_version": "v2"}},
-                   "_planning_contract": contract}
-        return {"proposals": [{"proposal_id": item["proposal_id"], **scientific_proposal_view(item, context)}
-                              for item in pool["proposals"]],
-                "native_cost_by_id": {pid: _v2_cost(value) for pid, value in pool["native_cost_by_id"].items()}}
-    return {"proposals": copy.deepcopy(pool["proposals"]),
-        "native_cost_by_id": {pid: _cost(cost) for pid, cost in pool["native_cost_by_id"].items()},
-        "pool_digest": pool["pool_digest"]}
+    return _critic_v2_comparison(pool, full, critic_context)
 
 
 def build_critic_input(full: dict, delivered: dict, native_pool: dict,
                        critic_context: dict | None = None) -> dict:
-    from .critic_contract import enabled as lean_critic_enabled
-    if lean_critic_enabled(full):
-        # These science blocks were already delivered to the Planner. Do not
-        # re-read sources, refill memory, or repeat protocol assembly here.
-        required = ("research_goal", "protocol", "baseline_method", "observations", "knowledge", "resources")
-        if delivered.get("planning_context_version") != VERSION_V2 or any(key not in delivered for key in required):
-            raise ValueError("critic_frozen_science_input_missing")
-        context = _critic_v2_context(native_pool, full, critic_context)
-        if set(context["delivered_observation_ids"]) != set(delivered_observation_ids(delivered)):
-            raise ValueError("critic_delivered_observations_changed")
-        result = {"planning_context_version": VERSION_V2, "planning_stage": "critic"}
-        result.update({key: copy.deepcopy(delivered[key]) for key in required})
-        result["research_goal"].pop("target_k", None)
-        result["resources"].pop("native_cost_basis", None)
-        result["comparison"] = critic_pool_input(native_pool, full, critic_context=context)
-        return result
-    result = build_proposer_input(full, delivered)
-    if result.get("planning_context_version") == VERSION_V2:
-        for field in ("plan_repair_request", "critic_repair_request", "previous_response_error", "previous_response"):
-            result.pop(field, None)
-        result.update(planning_stage="critic", proposal_pool=critic_pool_input(native_pool, full))
-        return result
-    result.update(planning_stage="critic", proposal_pool=critic_pool_input(native_pool),
-                  proposal_pool_digest=native_pool["pool_digest"])
+    # These science blocks were already delivered to the Planner. Do not
+    # re-read sources, refill memory, or repeat protocol assembly here.
+    required = ("research_goal", "protocol", "baseline_method", "observations", "knowledge", "resources")
+    if delivered.get("planning_context_version") != VERSION_V2 or any(key not in delivered for key in required):
+        raise ValueError("critic_frozen_science_input_missing")
+    context = _critic_v2_context(native_pool, full, critic_context)
+    if set(context["delivered_observation_ids"]) != set(delivered_observation_ids(delivered)):
+        raise ValueError("critic_delivered_observations_changed")
+    result = {"planning_context_version": VERSION_V2, "planning_stage": "critic"}
+    result.update({key: copy.deepcopy(delivered[key]) for key in required})
+    result["research_goal"].pop("target_k", None)
+    result["resources"].pop("native_cost_basis", None)
+    result["comparison"] = critic_pool_input(native_pool, full, critic_context=context)
     return result
 
 
-def minimal_validation_feedback(records: list[dict]) -> list[dict]:
-    """Only actionable errors; Pydantic's echoed input values are not feedback."""
-    result = []
-    for record in records:
-        if not record.get("error"):
-            continue
-        lines = []
-        for line in str(record["error"]).splitlines():
-            if "errors.pydantic.dev/" in line or re.match(r"^\d+ validation errors? for ", line):
-                continue
-            # The diagnostic input_value can be an entire model response.
-            line = re.sub(r"(\[type=[^,\]]+),.*", r"\1]", line)
-            if line.strip():
-                lines.append(line)
-        row = {"error": "\n".join(lines)}
-        row.update(_pick(record, ("proposal_id", "field", "type")))
-        if row not in result:
-            result.append(row)
-    return result

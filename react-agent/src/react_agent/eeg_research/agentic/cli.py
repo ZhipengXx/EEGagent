@@ -130,13 +130,7 @@ def goal(campaign: str, design=None) -> dict:
     return {
         "goal_id": campaign,
         "planner_mode": "compare_options",
-        "research_execution": {"version": "single_plan_v1", "planning_mode": "propose_then_critic",
-            "planning_contract_version": "v2",
-            "critic_contract_version": "v2",
-            "reviewer_contract_version": "v2", "coder_context_version": "v2",
-            "proposal_correction_calls": 5, "max_planner_api_attempts": 6,
-            "max_critic_api_attempts": 6, "max_designer_api_attempts": 6,
-            "implementation_review_mode": "single_pass", "design_contract_version": "v2", "budget": {"envelopes": {
+        "research_execution": {"version": "single_plan_v1", "budget": {"envelopes": {
             kind: {"training_jobs": 2, "gpu_seconds": 2 * gpu / 20,
                 "allocation_basis": "authorized_global_gpu_seconds_per_training_job",
                 "authority": "maximum_runtime_allocation_not_cost_estimate"}
@@ -176,20 +170,8 @@ def _execution_goal(submitted: dict, execution_version: str | None) -> dict:
         submitted["research_execution"] = {**(submitted.get("research_execution") or {}), "version": "single_plan_v1"}
     elif execution_version is not None:
         raise ValueError("execution_version_invalid")
+    # Single-plan stage contracts and attempt limits come from ResearchExecutionConfig.
     execution = submitted.get("research_execution") or {}
-    if execution.get("version") == "single_plan_v1" and execution.get("planning_mode", "propose_then_critic") == "propose_then_critic":
-        execution = {**execution}
-        execution.setdefault("planning_contract_version", "v2")
-        if execution.get("planning_contract_version") == "v2":
-            execution.setdefault("critic_contract_version", "v2")
-            execution.setdefault("proposal_correction_calls", 5)
-            execution.setdefault("max_planner_api_attempts", 6)
-            execution.setdefault("max_critic_api_attempts", 6)
-        if execution.get("design_contract_version") == "v2":
-            execution.setdefault("max_designer_api_attempts", 6)
-            execution.setdefault("reviewer_contract_version", "v2")
-            execution.setdefault("coder_context_version", "v2")
-        submitted["research_execution"] = execution
     if execution.get("version") == "single_plan_v1" and submitted.get("evaluation_mode", "single_target") == "single_target":
         from math import isfinite
         jobs, gpu_seconds = submitted.get("max_training_jobs", 20), submitted.get("max_gpu_seconds", DEFAULT_MAX_GPU_SECONDS)

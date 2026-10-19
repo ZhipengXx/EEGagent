@@ -101,7 +101,19 @@ uv run python -m react_agent.eeg_research.agentic.cli status \
 
 `create` freezes the protocol and writes state; `start` launches the worker and can consume API and GPU budget. Use `pause`, `resume` or `stop` with the same campaign name to control it. A lock prevents a second worker for that campaign.
 
-New goals default to `planner_mode=compare_options`: the planner normally compares 2–4 next-action options in one response and records the alternatives, selected option and rationale. One is allowed when only one is reasonable. Runtime checks precede dispatch of the selected action. Use `--planner-mode single_action` on `create` only when the legacy interface is intended. An existing campaign's persisted goal remains authoritative when resumed.
+New `single_plan_v1` campaigns default to `research_execution.planning_mode: propose_then_critic`. One Planner call proposes a batch of distinct plans (target 3, configurable from 2–4); the runtime validates them, then one separate Critic call compares the complete valid pool and selects one original plan for the Designer. Normal planning uses two API calls, excluding corrections. The roles can use the same thinking model with separate prompts and contexts; this separation alone does not guarantee higher accuracy or lower latency.
+
+For a custom goal, select the research planning mode under `research_execution`:
+
+```yaml
+research_execution:
+  version: single_plan_v1
+  planning_mode: propose_then_critic
+```
+
+`propose_then_critic` is the only single-plan planning mode, and every stage role uses its current (v2) contract; goals that request another mode or an older contract version are rejected. A legacy goal remains legacy unless `--execution-version single_plan_v1` is selected on `create`.
+
+Legacy next-action planning uses the separate `planner_mode=compare_options`: the planner normally compares 2–4 action options in one response and records the alternatives, selected option and rationale. One is allowed when only one is reasonable. Runtime checks precede dispatch of the selected action. Use `--planner-mode single_action` on `create` only when the legacy interface is intended.
 
 ### Inspect an exported candidate pack
 
@@ -139,7 +151,7 @@ The native code-level worker requires the configured LLM backend. Offline rule s
 | Evaluation | Frozen split, query/gallery, metric and image-feature identities; research decisions use validation evidence |
 | Confirmation | Matched full-run seed pairs and an explicit policy; a short pilot does not confirm improvement |
 | Memory | Episodes and conditional lessons; requested evidence levels cannot replace runtime evidence |
-| Planner | Single-call next-action comparisons with exact targets, evidence, prerequisites and resource estimates; runtime gates still determine executability |
+| Planner / Critic | `single_plan_v1` campaigns use batch proposal → independent Critic comparison → one Designer plan; legacy next-action planning retains a single planning call |
 | Artifact reads | Bounded development views with verified hashes, page identities and recorded consumer delivery; a read receipt is not experimental evidence |
 | Audit context | Structured report draft, development dependency manifest and verified analyses; identity / dependency freshness checks govern reusable feedback and tracked corrections |
 | Other tasks | Classification, image reconstruction, raw preprocessing and foundation-model adapters are currently unavailable |

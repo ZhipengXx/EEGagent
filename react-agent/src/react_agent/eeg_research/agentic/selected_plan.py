@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .action_planning import digest
-from .plan_protocol import (config, decide_research_plan, measurement_action,
+from .plan_protocol import (config, measurement_action,
                             pool_summary, proposal_cost, round_id, round_input,
                             scientific_projection, validate_task)
 from .research_execution import single_plan_enabled
@@ -428,10 +428,7 @@ def _finish(camp: Path, state: dict, plan: dict, status: str, *, detail: str | N
         continuation = finish_selected_plan(camp, plan_id=plan["plan_id"],
             observation_digest=plan["terminal_observation_digest"])
         plan["continuation_owner"] = continuation.get("owner_id")
-    from .design_contract import design_contract_version
-    from .loop import _read
-    routed_replan = (status == "needs_replan" and bool(state.get("needs_replan"))
-                     and design_contract_version(_read(camp / "goal.json")) == "v2")
+    routed_replan = status == "needs_replan" and bool(state.get("needs_replan"))
     if routed_replan:
         state.pop("needs_replan", None)
         for key in ("repair_task", "design_revision_task", "design_revision_failure", "framework_issue_task"):
@@ -624,18 +621,14 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
     from .loop import _read, _sync_ledger, _write, event, observation, persist_failure, save_state
     from .owner_budget import allocate_selected_plan, planner_owner, finish_planner_round
     from .api_policy import planner_api_round
-    from .paid_research_round import restore_paid, publish_raw, revalidate_history
     # Paid recovery must precede observation/compaction: both may capture new
     # delivery sources even though no provider request is eventually sent.
-    from .research_execution import independent_critic_enabled, planning_call_budget
-    staged_mode = independent_critic_enabled(camp)
-    if staged_mode:
-        from .staged_planning_recovery import restore_staged_paid
-        recovered = restore_staged_paid(camp.resolve(), state)
-    else:
-        recovered = restore_paid(camp.resolve(), state)
+    # Single-plan rounds always propose first, then have an independent Critic select.
+    from .research_execution import planning_call_budget
+    from .staged_planning_recovery import restore_staged_paid
+    recovered = restore_staged_paid(camp.resolve(), state)
     full = recovered[0] if recovered else observation(camp)
-    if staged_mode and not recovered and (camp / "method_search_manifest.json").is_file():
+    if not recovered and (camp / "method_search_manifest.json").is_file():
         # Supply actual frozen fold identifiers even on the first round, when
         # neither a previous experiment nor an observation card exists yet.
         from .method_suite import manifest
@@ -649,29 +642,28 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
                 "seed": common["seed"], "controls": ["baseline"]}
         full["frozen_evaluation_scopes"] = {"phases": scopes,
             **{key: common[key] for key in ("metric", "metric_unit", "aggregation") if key in common}}
-    if staged_mode:
-        from .planning_contract import enabled, freeze_planning_contract
-        if enabled(full) and not isinstance(full.get("_planning_contract"), dict):
-            if "execution_protocol" not in full and (camp / "execution_protocol.json").is_file():
-                from .execution_protocol import load_protocol
-                full["execution_protocol"] = load_protocol(camp) or {}
-            full["_planning_contract"] = freeze_planning_contract(full)
-        native_errors = (full.get("_planning_contract") or {}).get("native_errors") or []
-        if native_errors:
-            persist_failure(camp, state, phase="planner", error_type="planning_native_input_invalid",
-                detail="Frozen native task scope is unavailable", recoverable=True,
-                diagnostics={"native_errors": native_errors})
-            save_state(camp, state)
-            return state
+    from .planning_contract import freeze_planning_contract
+    if not isinstance(full.get("_planning_contract"), dict):
+        if "execution_protocol" not in full and (camp / "execution_protocol.json").is_file():
+            from .execution_protocol import load_protocol
+            full["execution_protocol"] = load_protocol(camp) or {}
+        full["_planning_contract"] = freeze_planning_contract(full)
+    native_errors = (full.get("_planning_contract") or {}).get("native_errors") or []
+    if native_errors:
+        persist_failure(camp, state, phase="planner", error_type="planning_native_input_invalid",
+            detail="Frozen native task scope is unavailable", recoverable=True,
+            diagnostics={"native_errors": native_errors})
+        save_state(camp, state)
+        return state
     cfg = config(full)
     input_digest = state.get("terminal_observation_digest") or digest(round_input(full))
     research_round_id = round_id(full)
     from .experiment_observations import compact_planner_view, ObservationDeliveryRequired
     try:
-        if recovered and staged_mode:
+        if recovered:
             delivered = recovered[3].get("planner_delivery") or compact_planner_view(camp, full)
         else:
-            delivered = full if recovered else compact_planner_view(camp, full)
+            delivered = compact_planner_view(camp, full)
     except ObservationDeliveryRequired as exc:
         from dataclasses import asdict
         # Persist the actual typed obligation before planning owner/API admission.
@@ -693,20 +685,12 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
             state.pop("detail", None)
         event(camp, "planner_context_resolved", round_id=research_round_id,
               input_observation_digest=input_digest)
-    if staged_mode and not recovered:
+    if not recovered:
         from .planning_context import build_proposer_input
         delivered = build_proposer_input(full, delivered)
     from .context.representations import delivered_source_refs
     context_refs = delivered_source_refs(delivered)
     full["_delivered_context_refs"] = sorted(set(full.get("_delivered_context_refs") or []) | {ref for ref in context_refs if ref})
-    def request(payload):
-        bind = getattr(backend, "bind", None)
-        if callable(bind):
-            bind(operation_id=research_round_id + (":correction" if payload.get("plan_repair_request") else ":generation"))
-        raw = backend(payload)
-        publish_raw(camp, state, full, planning_owner, raw,
-                    correction=bool(payload.get("plan_repair_request")))
-        return raw
     round_path = camp / "research_rounds" / (research_round_id + ".json")
     draft_path = camp / "research_round_drafts" / (research_round_id + ".json")
     saved = _read(round_path)
@@ -728,34 +712,21 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
             "detail": "research_pool_" + str(saved.get("pool_status"))}
     else:
         paid_draft = _read(draft_path)
-        if recovered and not staged_mode:
-            _, planning_owner, history, proof = recovered
-            parsed = revalidate_history(full, history)
-            if not paid_draft:
-                _write(draft_path, {"input_observation_digest": digest(round_input(full)),
-                    "planning_owner": planning_owner, "parsed": parsed, "paid_recovery_proof": proof}, exclusive=True)
-            elif paid_draft.get("input_observation_digest") != digest(round_input(full)) or paid_draft.get("planning_owner") != planning_owner:
-                raise ValueError("research_round_draft_identity_conflict")
-        elif paid_draft:
+        if paid_draft:
             if paid_draft["input_observation_digest"] != digest(round_input(full)):
                 raise ValueError("research_round_draft_identity_conflict")
             parsed = paid_draft["parsed"]
             planning_owner = paid_draft["planning_owner"]
         else:
-            if staged_mode and critic is None:
+            if critic is None:
                 raise ValueError("independent_research_critic_service_missing")
             with planner_owner(camp, observation_digest=input_digest, round_id=research_round_id) as planning_owner:
-                round_attempts = planning_call_budget(camp) if staged_mode else cfg.max_planner_api_attempts
-                with planner_api_round(camp, research_round_id, max_attempts=round_attempts):
-                    if staged_mode:
-                        from .staged_planning import decide_staged_plan
-                        parsed = decide_staged_plan(camp, state, full, delivered, backend, critic,
-                            planning_owner, limits, cfg,
-                            recovered_stages=recovered[2] if recovered else None,
-                            recovery_proof=recovered[3] if recovered else None)
-                    else:
-                        parsed = decide_research_plan(full, lambda req: request({**delivered,
-                            **({"plan_repair_request": req["plan_repair_request"]} if req.get("plan_repair_request") else {})}))
+                with planner_api_round(camp, research_round_id, max_attempts=planning_call_budget(camp)):
+                    from .staged_planning import decide_staged_plan
+                    parsed = decide_staged_plan(camp, state, full, delivered, backend, critic,
+                        planning_owner, limits, cfg,
+                        recovered_stages=recovered[2] if recovered else None,
+                        recovery_proof=recovered[3] if recovered else None)
             # Persist paid drafts before releasing the continuation, so a crash
             # after comparison never buys or reuses another planning allowance.
             _write(draft_path, {"input_observation_digest": digest(round_input(full)),
@@ -768,37 +739,7 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
             save_state(camp, state)
             return state
         if parsed.get("round"):
-            from .owner_budget import preview_selected_plan
             native_round = parsed["round"]
-            if not staged_mode:
-                feasible = []
-                for item in native_round["proposals"]:
-                    preview = preview_selected_plan(camp, task_kind=item["task_kind"],
-                        known_cost=proposal_cost(item, full)["known"], recovery_limits=limits)
-                    if preview.get("ok"):
-                        feasible.append(item)
-                    else:
-                        native_round["validation_records"].append({"proposal_id": item["proposal_id"],
-                            "status": "rejected", "error": preview.get("reason"), "stage": "complete_task_budget"})
-                by_id = {item["proposal_id"]: item for item in feasible}
-                evaluations = [item for item in native_round["evaluations"] if item["proposal_id"] in by_id]
-                ranking = sorted(evaluations, key=lambda item: item["rank"])
-                prior_selected = native_round["selected_proposal_id"]
-                selected_id = prior_selected if prior_selected in by_id else next((item["proposal_id"]
-                    for item in ranking if item["proposal_id"] in by_id), None)
-                native_round.update(proposals=feasible, evaluations=evaluations,
-                                    **pool_summary(feasible, evaluations, cfg))
-                native_round["shortfall_reason"] = ("missing_or_nonunique_proposal_evaluations"
-                    if native_round["unevaluated_proposal_ids"] else
-                    "independent_validation_or_complete_task_budget_rejections"
-                    if native_round["valid_count"] < cfg.target_k else None)
-                ok = bool(selected_id and native_round["pool_status"] in {"complete", "degraded_singleton"})
-                native_round["selected_proposal_id"] = selected_id if ok else None
-                if ok and selected_id != prior_selected:
-                    native_round["selection_source"] = "valid_evaluation_rank_budget_fallback"
-                    native_round["selection_rationale"] += " Native complete-task admission selected the highest-ranked feasible evaluation."
-                parsed.update(ok=ok, selected_proposal=by_id.get(selected_id) if ok else None,
-                    detail=None if ok else "research_pool_" + native_round["pool_status"])
             _write(round_path, {**native_round, "proposal_history": parsed["proposal_history"],
                 "planning_owner": planning_owner}, exclusive=True)
         else:
@@ -839,9 +780,6 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
     from .loop import (_launch, _record_job, _sync_ledger, candidate_implementation_target,
                        load_state, observation, save_state)
     from .owner_budget import budget_owner
-    from .design_contract import design_contract_version
-    from .loop import _read
-    design_v2 = design_contract_version(_read(camp / "goal.json")) == "v2"
     if recover_initial_selection(camp, state):
         return state
     from .iteration_control import maybe_complete_research
@@ -903,10 +841,7 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         save_plan(camp, state, plan)
         return state
     if plan["current_step"] == "design":
-        from .planning_contract import enabled as planning_contract_enabled
-        from .research_execution import research_goal
-        intervention = (plan["proposal"]["task_description"] if planning_contract_enabled(research_goal(camp))
-                        else plan["proposal"]["scientific_intent"])
+        intervention = plan["proposal"]["task_description"]
         draft = {"intervention": intervention, "parent_candidate_id": "baseline",
                  "control_candidate_id": "baseline", "initial_fidelity": "pilot" if
                     plan["proposal"]["evaluation_scope"].get("phase") == "pilot" else "full"}
@@ -926,7 +861,7 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         plan.update(status="implementing", current_step="implement")
         save_plan(camp, state, plan)
         return state
-    if design_v2 and plan["current_step"] == "design_revision":
+    if plan["current_step"] == "design_revision":
         revision = state.get("design_revision_task")
         if not isinstance(revision, dict) or revision.get("candidate_id") != plan["candidate_id"]:
             return _blocked(camp, state, plan, "design_revision_task_missing")
@@ -969,7 +904,7 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         plan["attempt"] += 1
         if state.get("needs_replan"):
             return _finish(camp, state, plan, "needs_replan", detail=str(state["needs_replan"]))
-        if design_v2 and state.get("design_revision_task"):
+        if state.get("design_revision_task"):
             revision = state["design_revision_task"]
             if revision.get("candidate_id") != plan["candidate_id"]:
                 raise ValueError("selected_plan_design_revision_candidate_changed")

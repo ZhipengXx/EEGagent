@@ -30,18 +30,12 @@ def _native_observation(full):
 
 def _critic_view(full, model_input, pool, critic_context):
     """Check local metadata and reconstruct only the science actually delivered."""
-    from .critic_contract import enabled, verify_critic_context
+    from .critic_contract import verify_critic_context
     from .planning_context import critic_pool_input, delivered_observation_ids
-    if enabled(full):
-        if (not isinstance(critic_context, dict) or verify_critic_context(critic_context, pool)
-                or critic_context.get("delivered_observation_ids") != sorted(delivered_observation_ids(model_input))):
-            raise ValueError("paid_staged_round_critic_context_changed")
-        return "comparison", critic_pool_input(pool, critic_context=critic_context)
-    if critic_context is not None:
-        raise ValueError("paid_staged_round_unexpected_critic_context")
-    v2 = model_input.get("planning_context_version") == "research_planning_input.v2"
-    return "proposal_pool", (critic_pool_input(pool, contract=full.get("_planning_contract"))
-        if v2 else critic_pool_input(pool))
+    if (not isinstance(critic_context, dict) or verify_critic_context(critic_context, pool)
+            or critic_context.get("delivered_observation_ids") != sorted(delivered_observation_ids(model_input))):
+        raise ValueError("paid_staged_round_critic_context_changed")
+    return "comparison", critic_pool_input(pool, critic_context=critic_context)
 
 
 def _stage_native_input(native):

@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from .schemas import (CriticWireReply, PlannerCorrectionWire, PlannerGenerationWire,
+from .schemas import (PlannerCorrectionWire, PlannerGenerationWire,
                       PlannerProposalWire, PlannerTaskProposalWire)
 
 VERSION = "eeg_research.planning_contract.v2"
@@ -25,10 +25,12 @@ _COMPLETION = {
 
 
 def enabled(full: dict | None) -> bool:
+    """Every single-plan round uses this planning contract."""
     full = full or {}
     goal = full.get("goal") if isinstance(full.get("goal"), dict) else full
     execution = full.get("research_execution") or goal.get("research_execution") or {}
-    return execution.get("planning_contract_version") == "v2"
+    from .research_execution import SINGLE_PLAN_VERSION
+    return isinstance(execution, dict) and execution.get("version") == SINGLE_PLAN_VERSION
 
 
 def _error(kind, loc, message):
@@ -157,10 +159,6 @@ def planner_wire_schema(full: dict | None = None, *, correction: bool = False, r
                 "items": item}}}
 
 
-def critic_wire_schema() -> dict:
-    return CriticWireReply.model_json_schema()
-
-
 def _validation_errors(exc: ValidationError, prefix=()) -> list[dict]:
     return [_error(row["type"], (*prefix, *row["loc"]),
                    "missing " + str(row["loc"][-1]) if row["type"] == "missing" and row["loc"] else row["msg"])
@@ -252,29 +250,3 @@ def materialize_planner_reply(raw: Any, full: dict, *, stage: str = "generation"
     return result
 
 
-def materialize_critic_reply(raw: Any, frozen_pool: dict, full: dict) -> dict:
-    result = {"reply": None, "errors": [], "native_errors": []}
-    try:
-        wire = CriticWireReply.model_validate(raw).model_dump()
-    except ValidationError as exc:
-        result["errors"] = _validation_errors(exc)
-        return result
-    ids = [row["proposal_id"] for row in wire["evaluations"]]
-    wanted = {row["proposal_id"] for row in frozen_pool.get("proposals") or []}
-    if len(ids) != len(set(ids)) or set(ids) != wanted:
-        result["errors"].append(_error("planning_critic_coverage_invalid", ["evaluations"],
-                                      "Evaluate every frozen proposal exactly once."))
-    ranks = [row["rank"] for row in wire["evaluations"]]
-    if set(ranks) != set(range(1, len(wanted) + 1)) or len(set(ranks)) != len(ranks):
-        result["errors"].append(_error("planning_critic_rank_invalid", ["evaluations"],
-                                      "Ranks must be unique and complete from 1 to N."))
-    basis = wire["selected_basis_observation_ids"]
-    delivered = full.get("_delivered_observation_ids") or set()
-    if len(set(basis)) != len(basis) or any(ref not in delivered for ref in basis):
-        result["errors"].append(_error("planning_critic_basis_invalid", ["selected_basis_observation_ids"],
-                                      "Use unique observation IDs from the actual delivered context."))
-    if not result["errors"]:
-        result["reply"] = {"protocol_version": "research_plan_critique.v1",
-            "proposal_pool_digest": frozen_pool["pool_digest"], **wire,
-            "selected_proposal_id": next(row["proposal_id"] for row in wire["evaluations"] if row["rank"] == 1)}
-    return result

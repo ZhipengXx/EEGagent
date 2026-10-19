@@ -538,10 +538,6 @@ def _correction_view(reply: Any) -> dict[str, Any]:
 
 def decide(observation: dict[str, Any], backend: Backend, *, repairs: int = 0) -> dict[str, Any]:
     """At most three attempts under the same immutable observation and gates."""
-    from .research_execution import single_plan_enabled
-    if single_plan_enabled(observation.get("goal") or observation):
-        from .plan_protocol import decide_research_plan
-        return decide_research_plan(observation, backend)
     allowed = observation.get("available_actions") or []
     known = set(observation.get("_known_evidence_ids") or [])
     trainable = set(observation.get("trainable_ids") or ["baseline"])
