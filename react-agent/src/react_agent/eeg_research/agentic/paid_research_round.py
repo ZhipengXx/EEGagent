@@ -198,8 +198,8 @@ def _verify_call(camp, row, owner, claims, journals, *, allowed_roles=None, oper
     if (claim.get("actual") or {}).get("llm_calls") != 1:
         raise ValueError("paid_round_settlement_call_count_changed")
     wire = json.loads(request["user"])
-    from .staged_planning_recovery import PLANNING_CONTEXT_VERSION, _input_snapshot
-    if wire.get("planning_context_version") == PLANNING_CONTEXT_VERSION:
+    from .staged_planning_recovery import PLANNING_CONTEXT_VERSIONS, _input_snapshot
+    if wire.get("planning_context_version") in PLANNING_CONTEXT_VERSIONS:
         full, _ = _input_snapshot(camp, wire, row, owner, state=state)
     else:
         full = _wire_observation(camp, wire, role=row["role"])

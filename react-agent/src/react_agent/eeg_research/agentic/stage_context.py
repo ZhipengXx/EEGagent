@@ -58,11 +58,22 @@ def implementation_stage_payload(payload: dict[str, Any], *, reviewer: bool = Tr
 
 def with_selected_task(payload: dict[str, Any], role: str, selected: dict[str, Any]) -> dict[str, Any]:
     """Keep final transport enrichment within the caller's stage view."""
+    from .designer_context import is_designer_input
+    from .context.compiler import is_engineering_input
+    scientific_analysis = (role == "result_analyst" and payload.get("review_stage") == "analysis"
+                           and payload.get("analysis_context_version") == "research_analysis_input.v1")
+    if is_designer_input(role, payload) or is_engineering_input(role, payload) or scientific_analysis:
+        # Native task identity remains in the role ledger. Do not expand an
+        # already frozen Designer delivery with IDs or a second task view.
+        return payload
     if role in {"candidate_coder", "candidate_reviewer"}:
         payload = implementation_stage_payload(payload, reviewer=role == "candidate_reviewer")
     proposal = selected.get("proposal") or {}
     fields = ("question", "task_description", "scientific_intent", "evaluation_scope",
               "expected_observation", "completion_condition")
+    if (role == "experiment_designer" and
+            (((payload.get("goal") or {}).get("research_execution") or {}).get("planning_contract_version") == "v2")):
+        fields += ("task_kind", "target_candidate_ref")
     if payload.get("review_stage") in {"implementation", "analysis"}:
         fields = ("question", "scientific_intent")
     return {**payload, "selected_research_task": {key: copy.deepcopy(proposal[key]) for key in fields if key in proposal},

@@ -499,6 +499,22 @@ def _route_v2_repairs(camp: Path, state: dict[str, Any], candidate_id: str,
     """Route concrete findings to the role that can change their cause."""
     issues = [dict(issue) for issue in verdict.get("issues") or []
               if isinstance(issue, dict) and issue.get("severity") == "blocking"]
+    state.pop("implementation_review_blocked", None)
+    if not issues and verdict.get("reviewer_contract_version") == "v2":
+        # Unverified implementation is a missing conclusion, not evidence of
+        # a framework or candidate defect. No repair agent can act on it yet.
+        state["candidate_ready"] = False
+        state["repair_task"] = None
+        state["implementation_review_blocked"] = {
+            "candidate_id": candidate_id,
+            "unverified_targets": verdict.get("unverified_target_refs") or [],
+            "native_binding_errors": verdict.get("native_binding_errors") or [],
+            "summary_zh": verdict.get("summary_zh")}
+        state["experiment_failed"] = False
+        persist_failure(camp, state, phase="review_candidate", error_type="implementation_review_unverified",
+                        detail=verdict.get("summary_zh") or "Implementation review has unresolved evidence.",
+                        recoverable=True)
+        return "native"
     for issue in issues:
         kind = issue.get("kind")
         if kind == "core_implementation_contradicted" and issue.get("expected") and issue.get("check_ref"):
@@ -567,12 +583,14 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         def bind(**identity):
             fields.clear()
             fields.update(identity)
-        def call(payload: dict[str, Any]) -> dict[str, Any]:
+        def call(payload: dict[str, Any], *, critic_context: dict | None = None) -> dict[str, Any]:
             nonlocal client
             if client is None:
                 client = role_backend(camp, role)
             if fields:
                 client.bind(**fields)
+            if critic_context is not None:
+                return client(payload, critic_context=critic_context)
             return client(payload)
         call.bind = bind
         return call
@@ -929,6 +947,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             row["review_format_failed"] = verdict.get("format_failed")
             row["review_operation_id"] = verdict.get("operation_id")
             if verdict["status"] == "ready":
+                state.pop("implementation_review_blocked", None)
                 state["candidate_ready"] = True
                 state["candidate_id"] = candidate_id
                 state["repair_task"] = None
@@ -1111,6 +1130,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                        status="ready" if verdict["status"] == "ready" else "review_" + verdict["status"])
             if verdict["status"] == "ready":
                 from .run_context import persist_approved_binding
+                state.pop("implementation_review_blocked", None)
                 state.update(candidate_ready=True, candidate_id=candidate_id, repair_task=None, experiment_failed=False)
                 persist_approved_binding(camp_dir, candidate_id, spec["experiment"],
                     spec_ref=state.get("experiment_ref"), attempt_id=proof["attempt_id"], source_hash=proof["source_hash"])
@@ -1234,6 +1254,8 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         feedback_goal = json.loads((camp_dir / "goal.json").read_text())
         from .research_execution import single_plan_enabled, paid_maintenance_mode
         task_protocol = single_plan_enabled(feedback_goal)
+        from .design_contract import design_contract_version
+        scientific_analysis = task_protocol and design_contract_version(feedback_goal) == "v2"
         optional_curation = task_protocol or (method_mode and feedback_goal.get("evaluation_schedule") == "screen_then_confirm")
         scientific_rows = state.get("evidence") or []
         if method_mode:
@@ -1253,6 +1275,10 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                         "suite_ref": latest["suite_ref"], "suite_hash": latest["suite_hash"],
                         "complete_fold_count": 2 if screening_mode else 10,
                         "required_fold_count": 2 if screening_mode else 10, "independent_seed_count": 1}
+        elif scientific_analysis:
+            # The staged collector reads the existing exports. Legacy feedback
+            # generation can launch an unnecessary full-query diagnostic job.
+            feedback = {}
         else:
             feedback = ensure_development_feedback(camp_dir, state, latest)
         bound_hypothesis = latest.get("hypothesis")
@@ -1291,20 +1317,22 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         from react_agent.eeg_research.agentic.artifacts import request_digest, resolve_verified_artifact
         from react_agent.eeg_research.agentic.handoffs import development_view, load_analysis_views
         from react_agent.eeg_research.agentic.roles import begin_role_task, finish_role_task
-        from react_agent.eeg_research.agentic.schemas import ResultAnalysis
+        from react_agent.eeg_research.agentic.schemas import LegacyResultAnalysis
 
         payload["run_identity"] = {key: latest.get(key) for key in (
             "job_id", "source_hash", "config_hash", "spec_hash", "checkpoint_id", "contract_fingerprint", "result_hash")}
         from react_agent.eeg_research.agentic.handoffs import candidate_context
-        payload["candidate_context"] = candidate_context(camp_dir, str(latest["candidate_id"]))
+        if not scientific_analysis:
+            payload["candidate_context"] = candidate_context(camp_dir, str(latest["candidate_id"]))
         from react_agent.eeg_research.agentic.measurement_context import evaluation_population_context
         payload["evaluation_population"] = evaluation_population_context(load_protocol(camp_dir))
         from react_agent.eeg_research.agentic.handoffs import verified_encoder_structural_facts
-        payload["verified_encoder_structural_facts"] = verified_encoder_structural_facts(camp_dir, state,
-            target_ids={str(latest["candidate_id"])})
+        payload["verified_encoder_structural_facts"] = ([] if scientific_analysis else
+            verified_encoder_structural_facts(camp_dir, state, target_ids={str(latest["candidate_id"])}))
         from react_agent.eeg_research.agentic.research_progress import verified_training_diagnostic_facts
-        payload["verified_training_diagnostics"] = verified_training_diagnostic_facts(camp_dir, state,
-            str(latest["candidate_id"]), str(latest.get("source_hash")), str(latest.get("spec_hash")))
+        payload["verified_training_diagnostics"] = ([] if scientific_analysis else
+            verified_training_diagnostic_facts(camp_dir, state, str(latest["candidate_id"]),
+                str(latest.get("source_hash")), str(latest.get("spec_hash"))))
         from react_agent.eeg_research.agentic.research_progress import objective_effectiveness_findings
         payload["objective_effectiveness_findings"] = objective_effectiveness_findings(camp_dir,state,
             str(latest["candidate_id"]),str(latest.get("source_hash")),str(latest.get("spec_hash")))
@@ -1325,6 +1353,14 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         if not stage_experiment and (state.get("experiment") or {}).get("spec_hash") == latest.get("spec_hash"):
             stage_experiment = state["experiment"]
         measurement_review = None
+        from .design_contract import design_contract_version
+        if (trigger.get("kind") == "selected_task_measurement" and design_contract_version(feedback_goal) == "v2"
+                and not has_stage_contract(stage_experiment)):
+            # New research has exactly one (staged) analysis contract; no legacy fallback.
+            persist_failure(camp_dir, state, phase="analysis", error_type="analysis_stage_contract_missing",
+                detail="The selected task experiment has no v2 stage contract.", recoverable=False)
+            _sync_ledger(camp_dir, state)
+            return
         if has_stage_contract(stage_experiment):
             from .stage_reviews import review_measurement
             measurement_review = review_measurement(camp_dir, state, latest, stage_experiment,
@@ -1373,7 +1409,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         from react_agent.eeg_research.agentic.development_feedback import _ensure_report
         payload["matched_run_history"] = []
         for row in matched:
-            if latest["fidelity"] == "full" and not method_mode:
+            if latest["fidelity"] == "full" and not method_mode and not scientific_analysis:
                 try:
                     _ensure_report(camp_dir, state, row)
                 except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
@@ -1392,11 +1428,11 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                     independent_seed_count=1)
         declared = [int(seed) for seed in (state.get("training_seeds") or json.loads((camp_dir / "goal.json").read_text()).get("training_seeds") or [])]
         payload["candidate_seed_coverage"] = candidate_seed_coverage(latest, scientific_rows, declared)
-        payload["verified_development_facts"] = verified_diagnostic_facts(camp_dir, state,
+        payload["verified_development_facts"] = [] if scientific_analysis else verified_diagnostic_facts(camp_dir, state,
             job_ids={str(row["job_id"]) for row in matched if row.get("job_id")},
             suite_ids={str(row["suite_id"]) for row in matched if row.get("suite_id")} if method_mode else None,
             max_facts=12)
-        payload["development_feedback_history"] = [] if method_mode else [
+        payload["development_feedback_history"] = [] if method_mode or scientific_analysis else [
             {"job_id":row.get("job_id"), "training_seed":row.get("seed"),
              **ensure_development_feedback(camp_dir, state, row)} for row in same_revision]
         from react_agent.eeg_research.agentic.analysis_coverage import coverage_summary
@@ -1404,7 +1440,7 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             payload["verified_development_facts"], payload["development_feedback_history"])
         payload["run_artifacts"] = []
         job_dir = Path(str(latest.get("job_dir") or ""))
-        if latest.get("job_dir") and job_dir.resolve().is_relative_to(camp_dir.resolve()):
+        if not scientific_analysis and latest.get("job_dir") and job_dir.resolve().is_relative_to(camp_dir.resolve()):
             from react_agent.eeg_research.agentic.artifacts import file_digest
             for name in ("run_record.json", "metrics.json", "selected_checkpoint.json", "hook_consumed.json", "capabilities_used.json", "source_binding.json", "frozen_run_spec.json"):
                 path = job_dir / name
@@ -1417,7 +1453,6 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
             payload.update(evaluation_mode="loso_method_search", primary_metric="benchmark.loso_mean_fixed_gallery_top1",
                            method_suite=suite_result, benchmark_permission={"authorized": True, "partial_feedback": False},
                            scientific_unit="one_complete_method_suite_seed0", independent_seed_count=1,
-                           verified_training_diagnostics=latest.get("diagnostics"),
                            evaluation_population={"unit": "ten_subjects_equal_weight", "query_count_per_subject": 200,
                                                   "candidate_count_per_subject": 200, "required_fold_count": 10},
                            limitations=["method_development_benchmark_used_for_search", "no_independent_final_test",
@@ -1459,6 +1494,26 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 payload["latest"].update(metric_scope="two_fold_development", phase="screening_2fold",
                                         screening_result=suite_result["screening_result"])
         if measurement_review is not None:
+            if scientific_analysis:
+                from .analysis_context import collect_analysis_evidence
+                try:
+                    payload["analysis_evidence"] = collect_analysis_evidence(camp_dir, state, latest,
+                        verified_result=suite_result if method_mode else None)
+                    collected = payload["analysis_evidence"]
+                    for kind in ("objective_semantic_findings", "objective_effectiveness_findings"):
+                        for finding in payload.get(kind) or []:
+                            ref = finding.get("artifact_id")
+                            if not ref or ref in collected["source_bindings"]:
+                                continue
+                            source = resolve_verified_artifact(camp_dir, ref)
+                            collected["source_bindings"][ref] = {"path": source["path"], "sha256": source["sha256"]}
+                            collected["source_catalog"].append({"source_ref": ref, "content_kind": kind,
+                                "scientific_scope": finding.get("scope") or "source_development_diagnostic"})
+                except (OSError, ValueError, KeyError, TypeError) as exc:
+                    persist_failure(camp_dir, state, phase="analysis_input",
+                        error_type="analysis_native_evidence_unavailable", detail=str(exc), recoverable=True)
+                    _sync_ledger(camp_dir, state)
+                    return
             from .stage_reviews import analysis_stage_payload
             payload = analysis_stage_payload(payload, stage_experiment, measurement_review)
         payload = development_view(payload)
@@ -1481,27 +1536,36 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         analysis_inputs = [Path(latest["suite_ref"])] if method_mode else []
         if measurement_review is not None:
             analysis_inputs.append(Path(measurement_review["path"]))
+        analysis_inputs.extend(Path(source["path"]) for source in
+            (payload.get("analysis_facts", {}).get("source_bindings") or {}).values())
+        analysis_inputs = list(dict.fromkeys(analysis_inputs))
         task = begin_role_task(camp_dir, role="result_analyst", inputs=analysis_inputs,
                                candidate_id=latest.get("candidate_id"), request=payload)
         task_payload = {**payload, "task_id": task["task_id"], "attempt_id": task["attempt_id"], "input_digest": task["input_digest"]}
         billed = 0
         analysis_review = None
+        staged = measurement_review is not None
+        if staged:
+            from .analysis_contract import (analysis_delivery_check, analysis_memory_view, check_inputs,
+                failure_check, materialize_analysis_record, parse_analysis_reply)
         try:
             raw_reply = analyst(task_payload)
             billed += 1
             body = raw_reply.get("payload") if isinstance(raw_reply.get("payload"), dict) else raw_reply
-            body = {key: value for key, value in body.items() if key not in {
-                "schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "status", "artifact_refs",
-                "method_benchmark_origin", "method_screening_origin"}}
-            reply = ResultAnalysis.model_validate(body).model_dump()
-            role_status = str(raw_reply.get("status") or "completed")
-            if role_status not in {"completed", "partial", "failed", "blocked"}:
-                role_status = "partial"
-            if measurement_review is not None:
-                from .stage_reviews import check_analysis_coverage
-                analysis_review = check_analysis_coverage(reply, stage_experiment, measurement_review)
-                if analysis_review["status"] != "completed" and role_status == "completed":
-                    role_status = "blocked"
+            if staged:
+                reply, stored = parse_analysis_reply(body)
+                # A cached task returns its stored record; a fresh reply is bound to the native facts once.
+                reply = stored or materialize_analysis_record(payload["analysis_facts"], reply,
+                    analysis_delivery_check(reply, *check_inputs(payload)))
+                role_status = "completed" if reply["delivery_check"]["status"] == "complete" else "blocked"
+            else:
+                body = {key: value for key, value in body.items() if key not in {
+                    "schema_version", "task_id", "attempt_id", "input_digest", "prompt_hash", "status", "artifact_refs",
+                    "method_benchmark_origin", "method_screening_origin"}}
+                reply = LegacyResultAnalysis.model_validate(body).model_dump()
+                role_status = str(raw_reply.get("status") or "completed")
+                if role_status not in {"completed", "partial", "failed", "blocked"}:
+                    role_status = "partial"
         except LlmUnavailable as exc:
             if method_mode and str(exc) in _METHOD_ROLE_HARD_BLOCKS:
                 _sync_ledger(camp_dir, state)
@@ -1512,6 +1576,9 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         except ValueError as exc:
             reply = {"hypothesis_assessment": None, "summary_zh": f"分析格式未通过运行时验证：{type(exc).__name__}"}
             role_status = "failed"
+        if staged and role_status == "failed":
+            reply = materialize_analysis_record(payload["analysis_facts"], None,
+                failure_check(check_inputs(payload)[0], reply["summary_zh"]), summary_zh=reply["summary_zh"])
         target = camp_dir / "analyses" / f"{latest['evidence_id']}_{task['task_id']}.json"
         benchmark_origin = {}
         if method_mode:
@@ -1521,9 +1588,9 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
         envelope = finish_role_task(camp_dir, task, {**reply, "status": role_status,
             "prompt_hash": raw_reply.get("prompt_hash", "") if "raw_reply" in locals() else "", **benchmark_origin},
             kind="analysis", path=target, candidate_id=latest.get("candidate_id"))
-        if measurement_review is not None:
+        if staged:
             from .stage_reviews import check_analysis_coverage, save_analysis_review
-            analysis_review = analysis_review or check_analysis_coverage(reply, stage_experiment, measurement_review)
+            analysis_review = check_analysis_coverage(reply["delivery_check"], stage_experiment, measurement_review)
             if role_status != "completed":
                 analysis_review["status"] = "blocked"
             analysis_review = save_analysis_review(camp_dir, analysis_review, artifact_id=envelope["artifact_refs"][-1])
@@ -1535,7 +1602,8 @@ def build_services(camp: Path, *, role_overrides: dict | None = None,
                 "analysis_input_digest": digest,
                 "analysis_artifact_id": envelope["artifact_refs"][-1],
                 "status": role_status,
-                "summary": {key: reply.get(key) for key in ("hypothesis_assessment", "summary_zh", "suggested_next_actions")},
+                "summary": ({key: analysis_memory_view(reply)[key] for key in ("hypothesis_assessment", "summary_zh", "next_steps")}
+                            if staged else {key: reply.get(key) for key in ("hypothesis_assessment", "summary_zh", "suggested_next_actions")}),
             }
         if measurement_review is not None:
             analysis_row.update(measurement_review_ref=measurement_review["artifact_id"],

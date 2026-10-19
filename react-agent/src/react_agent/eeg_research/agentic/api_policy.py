@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from pydantic import BaseModel, ConfigDict, Field
 
+from .research_execution import SCIENCE_MAX_ATTEMPTS
+
 ROUND = contextvars.ContextVar("eeg_planner_api_round", default=None)
 ROUND_AUTHORIZATION = contextvars.ContextVar("eeg_planner_round_authorization", default=None)
 ATTEMPTS = "api_operation_attempts.jsonl"
@@ -19,8 +21,8 @@ AUTHORIZATION_BINDINGS = "planner_authorization_bindings.jsonl"
 
 class ApiRequestPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    max_attempts_per_operation: int = Field(default=2, ge=1, le=2)
-    max_attempts_per_planner_round: int = Field(default=6, ge=1, le=100)
+    max_attempts_per_operation: int = Field(default=2, ge=1, le=SCIENCE_MAX_ATTEMPTS)
+    max_attempts_per_planner_round: int = Field(default=2 * SCIENCE_MAX_ATTEMPTS, ge=1, le=100)
     unknown_usd_reserve: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     allow_output_budget_adjustment: bool = False
     max_output_tokens: int = Field(default=65536, ge=1, le=393216)
@@ -160,9 +162,10 @@ def reserve_operation_attempt(camp: Path, *, operation: str, call_id: str,
                               metadata: dict | None = None) -> dict:
     """Write before transport, including crashes before the main intent journal."""
     from react_agent.eeg_research.agentic.llm import LlmUnavailable
-    if not 1 <= max_attempts <= 2:
+    if type(max_attempts) is not int or not 1 <= max_attempts <= SCIENCE_MAX_ATTEMPTS:
         raise ValueError("invalid_operation_attempt_limit")
-    max_attempts = min(max_attempts, api_request_policy(camp).max_attempts_per_operation)
+    from .research_execution import role_api_attempt_limit
+    max_attempts = min(max_attempts, role_api_attempt_limit(camp, (metadata or {}).get("role") or "backend_direct"))
     camp.mkdir(parents=True, exist_ok=True)
     round_ = ROUND.get()
     if round_ and round_[0] != str(camp.resolve()):
@@ -183,16 +186,22 @@ def reserve_operation_attempt(camp: Path, *, operation: str, call_id: str,
                 raise LlmUnavailable("api_call_request_identity_conflict")
             return same_call
         used = sum(row["operation_id"] == operation for row in rows)
+        # A restart/configuration change cannot enlarge an already reserved
+        # operation. Its first journaled allowance remains an upper bound.
+        frozen_limits = [row["max_operation_attempts"] for row in rows
+                         if row.get("operation_id") == operation
+                         and type(row.get("max_operation_attempts")) is int]
+        if frozen_limits:
+            max_attempts = min(max_attempts, *frozen_limits)
         if used >= max_attempts:
             raise LlmUnavailable("api_operation_attempt_limit", diagnostics={"operation_id": operation, "actual_attempts": used})
         if round_ and sum(row.get("planner_round_id") == round_[1] for row in rows) >= round_[2]:
             raise LlmUnavailable("planner_round_attempt_limit", diagnostics={"planner_round_id": round_[1]})
         if round_:
-            from .research_execution import independent_critic_enabled, research_goal
+            from .research_execution import independent_critic_enabled
             role = (metadata or {}).get("role")
             if independent_critic_enabled(camp) and role in {"research_planner", "research_critic"}:
-                config = research_goal(camp)["research_execution"]
-                limit = min(2, int(config.get("max_planner_api_attempts", 2))) if role == "research_planner" else int(config.get("max_critic_api_attempts", 2))
+                limit = role_api_attempt_limit(camp, role)
                 if sum(row.get("planner_round_id") == round_[1] and row.get("role") == role for row in rows) >= limit:
                     raise LlmUnavailable("planning_stage_attempt_limit", diagnostics={"planner_round_id": round_[1], "role": role})
         safe_metadata = {key: (metadata or {}).get(key) for key in ("role", "task_id", "attempt_id", "input_digest",

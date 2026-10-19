@@ -131,6 +131,11 @@ def goal(campaign: str, design=None) -> dict:
         "goal_id": campaign,
         "planner_mode": "compare_options",
         "research_execution": {"version": "single_plan_v1", "planning_mode": "propose_then_critic",
+            "planning_contract_version": "v2",
+            "critic_contract_version": "v2",
+            "reviewer_contract_version": "v2", "coder_context_version": "v2",
+            "proposal_correction_calls": 5, "max_planner_api_attempts": 6,
+            "max_critic_api_attempts": 6, "max_designer_api_attempts": 6,
             "implementation_review_mode": "single_pass", "design_contract_version": "v2", "budget": {"envelopes": {
             kind: {"training_jobs": 2, "gpu_seconds": 2 * gpu / 20,
                 "allocation_basis": "authorized_global_gpu_seconds_per_training_job",
@@ -172,6 +177,19 @@ def _execution_goal(submitted: dict, execution_version: str | None) -> dict:
     elif execution_version is not None:
         raise ValueError("execution_version_invalid")
     execution = submitted.get("research_execution") or {}
+    if execution.get("version") == "single_plan_v1" and execution.get("planning_mode", "propose_then_critic") == "propose_then_critic":
+        execution = {**execution}
+        execution.setdefault("planning_contract_version", "v2")
+        if execution.get("planning_contract_version") == "v2":
+            execution.setdefault("critic_contract_version", "v2")
+            execution.setdefault("proposal_correction_calls", 5)
+            execution.setdefault("max_planner_api_attempts", 6)
+            execution.setdefault("max_critic_api_attempts", 6)
+        if execution.get("design_contract_version") == "v2":
+            execution.setdefault("max_designer_api_attempts", 6)
+            execution.setdefault("reviewer_contract_version", "v2")
+            execution.setdefault("coder_context_version", "v2")
+        submitted["research_execution"] = execution
     if execution.get("version") == "single_plan_v1" and submitted.get("evaluation_mode", "single_target") == "single_target":
         from math import isfinite
         jobs, gpu_seconds = submitted.get("max_training_jobs", 20), submitted.get("max_gpu_seconds", DEFAULT_MAX_GPU_SECONDS)
@@ -377,6 +395,12 @@ def main(argv: list[str] | None = None) -> int:
         from react_agent.eeg_research.agentic.role_config import role_config_preview
         try:
             source = load_goal_file(args.goal) if args.goal else args.root.resolve() / args.campaign
+            if isinstance(source, dict) and (source.get("research_execution") or {}).get("version") == "single_plan_v1":
+                # A goal-file preview describes a new campaign; a campaign-path
+                # preview below continues to read its already frozen settings.
+                from .schemas import ResearchExecutionConfig
+                source["research_execution"].setdefault("planning_mode",
+                    ResearchExecutionConfig.model_fields["planning_mode"].default)
             if args.command == "role-config-preview":
                 result = role_config_preview(source, overrides)
             else:

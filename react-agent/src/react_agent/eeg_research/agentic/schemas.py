@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_serializer, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_serializer, model_validator
 
 SCHEMA_VERSION = "eeg_research.v1.9"
 ROLE_RESULT_VERSION = "eeg_research.role_result.v1"
@@ -192,22 +192,36 @@ class ResearchExecutionConfig(DomainOutput):
     version: Literal["single_plan_v1"]
     target_k: int = Field(default=3, ge=2, le=4)
     allow_degraded_singleton: bool = False
-    proposal_correction_calls: int = Field(default=1, ge=0, le=1)
-    max_planner_api_attempts: int = Field(default=2, ge=1, le=6)
-    planning_mode: Literal["combined", "propose_then_critic"] = "combined"
+    proposal_correction_calls: int = Field(default=5, ge=0, le=5)
+    max_planner_api_attempts: int = Field(default=6, ge=1, le=6)
+    planning_mode: Literal["combined", "propose_then_critic"] = "propose_then_critic"
     implementation_review_mode: Literal["legacy", "single_pass"] = "legacy"
     design_contract_version: Literal["v1", "v2"] = "v1"
-    max_critic_api_attempts: int = Field(default=2, ge=1, le=2)
+    planning_contract_version: Literal["v1", "v2"] = "v1"
+    critic_contract_version: Literal["v1", "v2"] = "v1"
+    reviewer_contract_version: Literal["v1", "v2"] = "v1"
+    coder_context_version: Literal["v1", "v2"] = "v1"
+    max_critic_api_attempts: int = Field(default=6, ge=1, le=6)
+    max_designer_api_attempts: int = Field(default=6, ge=1, le=6)
     max_engineering_repairs: int = Field(default=2, ge=0, le=2)
     max_completed_rounds: int | None = Field(default=None, ge=1,
         description="Stop after this many selected tasks have durable terminal observations; repairs and polling do not count.")
     paid_maintenance: Literal["off", "emergency", "batch"] | None = None
     budget: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def planning_contract_requires_independent_critic(self):
+        if self.planning_contract_version == "v2" and self.planning_mode != "propose_then_critic":
+            raise ValueError("planning_contract_v2_requires_propose_then_critic")
+        if self.critic_contract_version == "v2" and (self.planning_contract_version != "v2"
+                or self.planning_mode != "propose_then_critic"):
+            raise ValueError("critic_contract_v2_requires_planning_v2_and_propose_then_critic")
+        return self
+
     @model_serializer(mode="wrap")
     def preserve_legacy_execution_shape(self, handler):
         row = handler(self)
-        for name in ("planning_mode", "implementation_review_mode", "max_critic_api_attempts", "design_contract_version"):
+        for name in ("planning_mode", "implementation_review_mode", "max_critic_api_attempts", "max_designer_api_attempts", "design_contract_version", "planning_contract_version", "critic_contract_version", "reviewer_contract_version", "coder_context_version"):
             if name not in self.model_fields_set:
                 row.pop(name, None)
         return row
@@ -321,6 +335,80 @@ class ResearchPlanCritique(DomainOutput):
         if "selected_basis_observation_ids" not in self.model_fields_set:
             row.pop("selected_basis_observation_ids", None)
         return row
+
+
+PlanningText = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
+
+
+class PlanningWireOutput(DomainOutput):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class PlannerProposalWire(PlanningWireOutput):
+    question: PlanningText = Field(max_length=1200)
+    method: PlanningText = Field(max_length=2500)
+    rationale: PlanningText = Field(max_length=1500)
+    expected_observation: PlanningText = Field(max_length=1200)
+    implementation_risk: PlanningText | None = Field(max_length=1000)
+    basis_observation_ids: list[PlanningText] = Field(max_length=8)
+    required_context_refs: list[PlanningText] = Field(max_length=8)
+
+
+class PlannerTaskProposalWire(PlannerProposalWire):
+    task_ref: PlanningText
+
+
+class PlannerGenerationWire(PlanningWireOutput):
+    # Per-item validation lives in planning_contract, preserving valid siblings.
+    proposals: list[Any] = Field(min_length=2, max_length=4)
+
+
+class PlannerCorrectionWire(PlanningWireOutput):
+    proposals: list[Any] = Field(min_length=1, max_length=4)
+
+
+class CriticEvaluationWire(PlanningWireOutput):
+    proposal_id: PlanningText
+    rank: int = Field(ge=1, le=4)
+    value_rationale: PlanningText = Field(max_length=1500)
+    implementation_risk: PlanningText = Field(max_length=1000)
+
+
+class CriticWireReply(PlanningWireOutput):
+    evaluations: list[CriticEvaluationWire] = Field(min_length=2, max_length=4)
+    selection_rationale: PlanningText = Field(max_length=1800)
+    selected_basis_observation_ids: list[PlanningText] = Field(max_length=8)
+
+
+class CriticAssessmentWire(PlanningWireOutput):
+    proposal_ref: PlanningText
+    assessment: PlanningText = Field(max_length=2500)
+
+
+class CriticComparisonWire(PlanningWireOutput):
+    """Model order is preference order; ranks and native IDs belong to code."""
+    evaluations: list[CriticAssessmentWire] = Field(min_length=2, max_length=4)
+    selection_rationale: PlanningText = Field(max_length=1800)
+
+
+class CriticHistoryComparisonWire(CriticComparisonWire):
+    selected_basis_observation_ids: list[PlanningText] = Field(max_length=8)
+
+
+class ResearchPlanEvaluationV2(DomainOutput):
+    proposal_id: PlanningText
+    rank: int = Field(ge=1, le=4)
+    assessment: PlanningText = Field(max_length=2500)
+
+
+class ResearchPlanCritiqueV2(DomainOutput):
+    """Canonical compact Critic record, fully assembled by native code."""
+    protocol_version: Literal["research_plan_critique.v2"]
+    proposal_pool_digest: PlanningText
+    evaluations: list[ResearchPlanEvaluationV2] = Field(min_length=2, max_length=4)
+    selected_proposal_id: PlanningText
+    selection_rationale: PlanningText = Field(max_length=1800)
+    selected_basis_observation_ids: list[PlanningText] = Field(max_length=8)
 
 
 class ResearchRound(DomainOutput):
@@ -466,21 +554,6 @@ class AnalysisRequirement(DomainOutput):
     expected_behavior: str = Field(min_length=1)
     core: bool = True
     verification: Literal["evidence_grounding", "paired_comparison", "scope_limits", "hypothesis_assessment"]
-
-
-class StageRequirementCoverage(DomainOutput):
-    requirement_id: str = Field(min_length=1)
-    status: Literal["implemented", "contradicted", "unverified"]
-    detail: str = Field(min_length=1)
-    evidence_refs: list[str] = Field(default_factory=list)
-
-    @model_validator(mode="after")
-    def verified_stage_has_evidence(self):
-        if any(not reference.strip() for reference in self.evidence_refs):
-            raise ValueError("stage_requirement_evidence_ref_empty")
-        if self.status in {"implemented", "contradicted"} and not self.evidence_refs:
-            raise ValueError("verified_stage_requirement_needs_evidence_refs")
-        return self
 
 
 class DesignerExperimentSpec(BaseModel):
@@ -629,6 +702,94 @@ class ExperimentDesignBriefResult(DomainOutput):
         return self
 
 
+# These models describe only the new Designer API answer. The native brief above
+# also contains fields owned by the runtime and remains the stored/Coder format.
+# No wire field has a default: absence must be reported before materialization.
+DesignerText = Annotated[str, StringConstraints(min_length=1, pattern=r"\S")]
+
+
+class DesignerWireOutput(DomainOutput):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class DesignerHookChange(DesignerWireOutput):
+    mode: Literal["inherit", "replace"]
+    config: dict[str, Any] | None
+
+    @model_validator(mode="after")
+    def explicit_config_mode(self):
+        if self.mode == "replace" and self.config is None:
+            raise ValueError("replace_hook_requires_config")
+        if self.mode == "inherit" and self.config is not None:
+            raise ValueError("inherit_hook_cannot_override_config")
+        return self
+
+
+class DesignerHookChanges(DesignerWireOutput):
+    model: DesignerHookChange
+    objective: DesignerHookChange
+    transform: DesignerHookChange
+
+
+class DesignerWindowProbe(DesignerWireOutput):
+    """Scientific shape only; Coder supplies real module paths later."""
+
+    slot_count: int = Field(ge=2, le=32)
+    window_axis: Literal[-1, 2]
+    layout: Literal["flatten_channel_major", "flatten_window_major", "channel_window", "window_channel"]
+
+
+class DesignerImplementationRequirement(DesignerWireOutput):
+    requirement_id: DesignerText
+    scope: Literal["scientific", "engineering"]
+    core: bool
+    expected_behavior: DesignerText
+    verification: Literal["source_review", "ordered_window_slots"]
+    probe: DesignerWindowProbe | None
+
+    @model_validator(mode="after")
+    def matching_probe(self):
+        if self.verification == "ordered_window_slots" and self.probe is None:
+            raise ValueError("ordered_window_requirement_needs_typed_probe")
+        if self.verification == "source_review" and self.probe is not None:
+            raise ValueError("source_review_requirement_cannot_have_window_probe")
+        return self
+
+
+class DesignerAnalysisRequirement(DesignerWireOutput):
+    requirement_id: DesignerText
+    core: bool
+    verification: Literal["evidence_grounding", "paired_comparison", "scope_limits", "hypothesis_assessment"]
+    expected_behavior: DesignerText
+
+
+class DesignerBriefContent(DesignerWireOutput):
+    hypothesis: DesignerText
+    principal_intervention: DesignerText
+    hook_changes: DesignerHookChanges
+    scientific_parameters: dict[str, Any]
+    implementation_requirements: list[DesignerImplementationRequirement]
+    analysis_requirements: list[DesignerAnalysisRequirement]
+    applicability: DesignerText
+    expected_observation: DesignerText | None
+
+
+class DesignerReply(DesignerWireOutput):
+    status: Literal["completed", "partial", "failed", "blocked", "requires_framework_extension"]
+    design_brief: DesignerBriefContent | None
+    missing_inputs: list[DesignerText]
+    additional_capability_ids: list[DesignerText]
+    confounders: list[DesignerText]
+    evidence_refs: list[DesignerText]
+    summary_zh: DesignerText
+
+    @model_validator(mode="after")
+    def completed_has_brief(self):
+        if self.status == "completed" and not self.missing_inputs and self.design_brief is None:
+            raise ValueError("completed_design_requires_brief")
+        return self
+
+
 class ImplementationIssue(BaseModel):
     model_config = ConfigDict(extra="allow")
     severity: Literal["blocking", "non_blocking"]
@@ -696,33 +857,24 @@ class LegacyResultAnalysis(DomainOutput):
     summary_zh: str = ""
 
 
-class ResultAnalysis(DomainOutput):
-    execution_assessment: Any = None
-    hypothesis_assessment: Literal["supported", "weakened", "inconclusive", "not_tested"] | None = None
-    observations: list[dict[str, Any]] = Field(default_factory=list)
-    prediction_checks: list[dict[str, Any]] = Field(default_factory=list)
-    interpretations: list[Any] = Field(default_factory=list)
-    competing_explanations: list[Any] = Field(default_factory=list)
-    evidence_gaps: list[Any] = Field(default_factory=list)
-    suggested_next_actions: list[Any] = Field(default_factory=list)
-    scope_limits: list[str] = Field(default_factory=list)
-    evidence_refs: list[str] = Field(default_factory=list)
-    analysis_requirement_coverage: list[StageRequirementCoverage] = Field(default_factory=list)
-    summary_zh: str = ""
+class AnalysisFinding(DomainOutput):
+    """One ARIS-style finding: observation, interpretation, implication, optional next step."""
 
-    @model_serializer(mode="wrap")
-    def preserve_legacy_analysis_shape(self, handler):
-        row = handler(self)
-        if "analysis_requirement_coverage" not in self.model_fields_set:
-            row.pop("analysis_requirement_coverage", None)
-        return row
+    observation: str
+    interpretation: str
+    implication: str
+    next_step: str | None
+    evidence_refs: list[str]
+    requirement_ids: list[str]
 
-    @model_validator(mode="after")
-    def unique_analysis_requirement_coverage(self):
-        ids = [item.requirement_id for item in self.analysis_requirement_coverage]
-        if len(ids) != len(set(ids)):
-            raise ValueError("duplicate_analysis_requirement_coverage_id")
-        return self
+
+class AnalystReply(DomainOutput):
+    """Staged Analyst output. No defaults: a missing key is a missing answer, not an empty one."""
+
+    hypothesis_assessment: Literal["supported", "weakened", "inconclusive", "not_tested"]
+    findings: list[AnalysisFinding] = Field(min_length=1)
+    limitations: list[str]
+    summary_zh: str
 
 
 class LessonProposal(DomainOutput):
@@ -767,7 +919,7 @@ DOMAIN_OUTPUT_MODELS = {
     "research_librarian": MethodEvidencePacket,
     "experiment_designer": ExperimentDesignResult,
     "candidate_reviewer": ImplementationReview,
-    "result_analyst": ResultAnalysis,
+    "result_analyst": AnalystReply,
     "memory_curator": LessonProposal,
     "result_auditor": AuditReport,
 }

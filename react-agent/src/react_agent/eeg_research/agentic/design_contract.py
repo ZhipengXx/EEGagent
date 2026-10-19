@@ -17,6 +17,19 @@ from .schemas import DesignerBrief
 SECTIONS = ("model", "objective", "transform")
 HOOKS = {"model": "build_encoder", "objective": "build_training_objective",
          "transform": "build_training_transform"}
+NATIVE_MEASUREMENT_PREFIX = "native_measurement_"
+
+
+def native_measurement_requirements() -> list[dict[str, Any]]:
+    """Runtime predicates under the frozen protocol, never invented by Designer."""
+    predicates = (
+        ("run_identity", "The native receipt must match the accepted candidate, source, spec and result bytes."),
+        ("paired_coverage", "Native completed coverage must contain the required matched folds or control runs."),
+        ("metric_integrity", "Native verified metrics and aggregation must be finite and valid; a negative delta remains valid."),
+    )
+    return [{"requirement_id": NATIVE_MEASUREMENT_PREFIX + verification,
+             "verification": verification, "core": True, "expected_behavior": behavior}
+            for verification, behavior in predicates]
 
 
 class DesignContractError(ValueError):

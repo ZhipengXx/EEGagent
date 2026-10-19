@@ -189,7 +189,7 @@ def _legacy_prompt_provenance(camp: Path, task: dict[str, Any],
     calls = camp / "llm_calls.jsonl"
     if not calls.is_file():
         return None
-    from react_agent.eeg_research.agentic.schemas import ResultAnalysis
+    from react_agent.eeg_research.agentic.schemas import LegacyResultAnalysis as ResultAnalysis
 
     def normalized(value: Any) -> dict[str, Any]:
         body = value.get("payload") if isinstance(value.get("payload"), dict) else value

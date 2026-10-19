@@ -32,6 +32,24 @@ def _request_value(payload: dict[str, Any], key: str) -> Any:
 
 
 def _declarations(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    # A frozen compact request must carry the exact same declaration roster
+    # used to generate its system schema. In particular, a missing roster must
+    # never silently fall back to the legacy unconstrained map on paid recovery.
+    if payload.get("coder_context_version") == "coder_implementation_input.v2":
+        design = _request_value(payload, "approved_design")
+        rows = design.get("implementation_requirements") if isinstance(design, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError("coder_native_input_invalid:missing_implementation_requirements")
+        identifiers = []
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get("requirement_id"), str)
+                    or not row["requirement_id"].strip()
+                    or (row.get("probe") is not None and not isinstance(row["probe"], dict))):
+                raise ValueError("coder_native_input_invalid:invalid_implementation_requirements")
+            identifiers.append(row["requirement_id"])
+        if len(identifiers) != len(set(identifiers)):
+            raise ValueError("coder_native_input_invalid:duplicate_requirement_id")
+        return rows, True
     spec = _request_value(payload, "experiment_spec")
     spec = spec if isinstance(spec, dict) else {}
     experiment = spec.get("experiment") or spec
@@ -136,9 +154,17 @@ def coder_contract(payload: dict[str, Any]) -> dict[str, Any]:
 def validate_coder_request(reply: Any, payload: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
     """Check task-specific shape before execution, without claiming code validity."""
     tool, args, error = validate_tool_request(reply)
+    if payload.get("coder_context_version") == "coder_implementation_input.v2":
+        try:
+            declarations, known = _declarations(payload)
+        except ValueError as exc:
+            return tool, args, {"ok": False, "error": "coder_native_input_invalid", "detail": str(exc)}
+    else:
+        declarations, known = [], False
     if error is not None or tool != "finish_patch" or "implementation_map" not in args:
         return tool, args, error
-    declarations, known = _declarations(payload)
+    if payload.get("coder_context_version") != "coder_implementation_input.v2":
+        declarations, known = _declarations(payload)
     if not known:
         return tool, args, None
     mapping = args["implementation_map"]

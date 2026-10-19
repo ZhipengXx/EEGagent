@@ -276,15 +276,13 @@ def _request_resources(camp, input_bound, output_bound, *, frozen_pricing=None):
 def _planning_resources(camp, input_bound, output_bound, calls):
     """Reserve both planning stages against their actual routing and finite caps."""
     camp = Path(camp)
-    from .research_execution import independent_critic_enabled
+    from .research_execution import independent_critic_enabled, role_api_attempt_limit, SCIENCE_MAX_ATTEMPTS
     if not independent_critic_enabled(camp):
         return resources({key: calls * value for key, value in
                           _request_resources(camp, input_bound, output_bound).items()})
-    goal = _read(camp / "goal.json")
-    execution = goal.get("research_execution") or {}
-    limits = {"research_planner": min(2, int(execution.get("max_planner_api_attempts", 2))),
-              "research_critic": int(execution.get("max_critic_api_attempts", 2))}
-    if (any(not 1 <= count <= 2 for count in limits.values())
+    limits = {role: role_api_attempt_limit(camp, role)
+              for role in ("research_planner", "research_critic")}
+    if (any(not 1 <= count <= SCIENCE_MAX_ATTEMPTS for count in limits.values())
             or type(calls) is not int or not 2 <= calls <= sum(limits.values())):
         raise OwnerBudgetError("staged_planning_requires_both_finite_roles")
     counts = {role: 1 for role in limits}
@@ -587,10 +585,11 @@ def _envelope(camp, task_kind, known_cost, recovery_limits):
     from .api_policy import api_request_policy
     # A single accepted verdict may need the existing JSON/schema correction
     # slot. Reserve the actual transport allowance for each review session.
-    reviewer_calls = api_request_policy(Path(camp)).max_attempts_per_operation
+    reviewer_calls = min(2, api_request_policy(Path(camp)).max_attempts_per_operation)
     defaults = {"experiment_designer": 2, "candidate_coder": 2 * steps * (repairs + 1), "candidate_reviewer": reviewer_calls * (repairs + 1), "result_analyst": 2}
     if (goal.get("research_execution") or {}).get("design_contract_version") == "v2":
-        defaults["experiment_designer"] = 2 * (repairs + 1)
+        from .research_execution import role_api_attempt_limit
+        defaults["experiment_designer"] = role_api_attempt_limit(goal, "experiment_designer") * (repairs + 1)
     if task_kind in {"diagnosis", "validation", "confirmation"}:
         defaults = {"result_analyst": 2}
     feedback_reports = known_cost.get("feedback_report_count",1)

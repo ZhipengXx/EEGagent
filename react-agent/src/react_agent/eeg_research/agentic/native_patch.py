@@ -930,6 +930,10 @@ def filter_runtime_blocking(
 
 def apply_review_filter(result: dict[str, Any], *, satisfied: set[str] | None = None) -> dict[str, Any]:
     """Recompute review status after already-satisfied invariants are marked."""
+    if result.get("reviewer_contract_version") == "v2":
+        # V2 has already combined exact checks, required/optional judgments and
+        # retained issues. Its canonical verdict must not enter legacy gates.
+        return dict(result)
     issues = filter_runtime_blocking(list(result.get("issues") or []), satisfied=satisfied)
     blocking = [row for row in issues if row.get("severity") == "blocking"]
     updated = dict(result)
@@ -963,6 +967,8 @@ def apply_review_filter(result: dict[str, Any], *, satisfied: set[str] | None = 
 def enforce_requirement_review(workspace: Path, spec: dict[str, Any], result: dict[str, Any],
                                checks: dict[str, Any] | None = None) -> dict[str, Any]:
     """Bind each core coverage item to current source/check evidence, including on reuse."""
+    if result.get("reviewer_contract_version") == "v2":
+        return _enforce_native_review_binding(workspace, spec, result, checks)
     from pydantic import ValidationError
     from react_agent.eeg_research.agentic.binding import file_sha256
     from react_agent.eeg_research.agentic.implementation_semantics import requirements_hash
@@ -1084,6 +1090,40 @@ def enforce_requirement_review(workspace: Path, spec: dict[str, Any], result: di
     return updated
 
 
+def _enforce_native_review_binding(workspace: Path, spec: dict, result: dict,
+                                   checks: dict | None = None) -> dict:
+    """Revalidate provenance on reuse without manufacturing model findings."""
+    from .binding import file_sha256
+    from .implementation_semantics import requirements_hash
+    from .reviewer_contract import validate_current_bindings
+    errors = []
+    try:
+        ref = result["reviewer_delivery_ref"]
+        path = Path(ref["path"])
+        if not path.resolve().is_relative_to((workspace.parent.parent / "reviewer_inputs").resolve()):
+            raise ValueError("reviewer_delivery_path_invalid")
+        if file_sha256(path) != ref["sha256"]:
+            raise ValueError("reviewer_delivery_hash_mismatch")
+        context = json.loads(path.read_text(encoding="utf-8"))["native_context"]
+        errors.extend(validate_current_bindings(context))
+        experiment = spec.get("experiment") or spec
+        if result.get("approved_spec_hash") != experiment.get("spec_hash"):
+            errors.append("approved_spec_changed")
+        current = checks if checks is not None else json.loads((workspace / "checks.json").read_text(encoding="utf-8"))
+        declarations = experiment.get("implementation_requirements") or []
+        if (current.get("ok") is not True
+                or current.get("source_sha256") != file_sha256(workspace / "extension/eeg_candidate.py")
+                or current.get("check_fingerprint") != _check_fingerprint(workspace, None)
+                or (declarations and (current.get("implementation_semantics") or {}).get("requirements_hash") != requirements_hash(declarations))):
+            errors.append("current_check_binding_invalid")
+    except (OSError, KeyError, ValueError, TypeError) as exc:
+        errors.append(str(exc))
+    if errors:
+        return {**result, "status": "blocked", "requirement_evidence_current": False,
+                "native_binding_errors": errors}
+    return {**result, "requirement_evidence_current": True}
+
+
 def _parameter_census(workspace: Path) -> dict[str, Any]:
     """Trainable scalar counts for this candidate and the measured baseline."""
     from react_agent.eeg_research.agentic.measurement_context import measured_parameter_counts
@@ -1177,25 +1217,33 @@ def review(
             }
         )
     format_failed = not _review_valid(reply)
-    result = apply_review_filter(
-        {
-            "status": "blocked" if format_failed else reply["status"],
-            "model_status": "blocked" if format_failed else reply["status"],
-            "issues": [] if format_failed else reply.get("issues") or [],
-            "review_limits": None if format_failed else reply.get("review_limits"),
-            "intervention_coverage": None if format_failed else reply.get("intervention_coverage"),
-            "requirement_coverage": [] if format_failed else reply.get("requirement_coverage") or [],
-            "verified_invariants_with_refs": [] if format_failed else reply.get("verified_invariants_with_refs") or [],
-            "unverified_invariants": [] if format_failed else reply.get("unverified_invariants") or [],
-            "summary_zh": "审查回复格式不合格，按受阻处理。" if format_failed else reply.get("summary_zh"),
-            "format_failed": format_failed,
-            "schema_repaired": repaired,
-            "calls": 2 if repaired else 1,
-            "reviewer_model": model,
-            "same_family_as_executor": True,
-        },
-        satisfied=satisfied_invariants(workspace, contract_summary),
-    )
+    if isinstance(reply, dict) and reply.get("reviewer_contract_version") == "v2":
+        # The strict provider reply was checked and assembled at the transport
+        # boundary. Legacy filters would reintroduce deleted duplicate fields
+        # and mistake uncertainty for a code defect.
+        result = {**reply, "format_failed": False,
+                  "reviewer_model": model, "same_family_as_executor": True,
+                  "reviewer_delivery_ref": getattr(backend, "reviewer_delivery_ref", None)}
+    else:
+        result = apply_review_filter(
+            {
+                "status": "blocked" if format_failed else reply["status"],
+                "model_status": "blocked" if format_failed else reply["status"],
+                "issues": [] if format_failed else reply.get("issues") or [],
+                "review_limits": None if format_failed else reply.get("review_limits"),
+                "intervention_coverage": None if format_failed else reply.get("intervention_coverage"),
+                "requirement_coverage": [] if format_failed else reply.get("requirement_coverage") or [],
+                "verified_invariants_with_refs": [] if format_failed else reply.get("verified_invariants_with_refs") or [],
+                "unverified_invariants": [] if format_failed else reply.get("unverified_invariants") or [],
+                "summary_zh": "审查回复格式不合格，按受阻处理。" if format_failed else reply.get("summary_zh"),
+                "format_failed": format_failed,
+                "schema_repaired": repaired,
+                "calls": 2 if repaired else 1,
+                "reviewer_model": model,
+                "same_family_as_executor": True,
+            },
+            satisfied=satisfied_invariants(workspace, contract_summary),
+        )
     if identity:
         for key in ("candidate_id", "attempt_id", "phase", "operation_id", "approved_spec_hash", "intervention_config_hash", "implementation_map_hash"):
             if identity.get(key):
@@ -1210,7 +1258,7 @@ def review(
     if payload.get("review_stage") == "implementation":
         result["review_stage"] = "implementation"
     experiment = spec.get("experiment") or {}
-    if (experiment.get("principal_intervention") or experiment.get("intervention")) and not result.get("intervention_coverage"):
+    if result.get("reviewer_contract_version") != "v2" and (experiment.get("principal_intervention") or experiment.get("intervention")) and not result.get("intervention_coverage"):
         result["status"] = "needs_fix"
         result["coverage_unresolved"] = True
         result["issues"].append({"severity": "blocking", "kind": "intervention_coverage_missing",

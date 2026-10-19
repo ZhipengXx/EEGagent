@@ -17,7 +17,7 @@ from react_agent.eeg_research.agentic.embedding import (
     MiniLMBackend, backend_for, cached_vector, canonical, content_hash, memory_config, vector_blob,
 )
 from react_agent.eeg_research.agentic.context.retrieval import (
-    MAX_CANDIDATES, MAX_DELIVERY_CHARS, deduplicate_hits, prepare_query,
+    MAX_CANDIDATES, prepare_query, scientific_support_key,
 )
 
 GROUPS = ("compatible_evidence", "analogy_only", "applicability_unknown")
@@ -448,7 +448,8 @@ def _embedding_ready(bundle: dict) -> bool:
     return not bundle.get("degraded") and bool(bundle.get("fingerprint"))
 
 
-def candidates(camp: Path, config: MemoryConfig, context: dict | None = None, *, query: str = "") -> list[dict]:
+def candidates(camp: Path, config: MemoryConfig, context: dict | None = None, *, query: str = "",
+               record_types: frozenset[str] | None = None) -> list[dict]:
     from react_agent.eeg_research.agentic.memory import EpisodeStore, query_lessons
 
     require_eeg_campaign(camp)
@@ -537,6 +538,8 @@ def candidates(camp: Path, config: MemoryConfig, context: dict | None = None, *,
         known = {row["record_id"] for row in observations}
         observations += [row for row in recent if row["record_id"] not in known]
         rows = observations + rows
+    if record_types is not None:
+        rows = [row for row in rows if row["record_type"] in record_types]
     rows = rows[:MAX_CANDIDATES]
     for row in rows:
         row["search_text"] = _search_text(row["record_type"], row["body"])
@@ -574,111 +577,54 @@ def index_records(store: SidecarStore, records: list[dict], backend, *, rebuild:
     return stats
 
 
-def _delivery_fields(bundle: dict, *, standalone: bool) -> dict:
-    """Serialize the exact added request fields, including the size statistic itself."""
-    # The search query is derived from the current goal/plan, not a memory record.
-    # Keep its full text in retrieval diagnostics; role fields carry its identity
-    # without spending the whole-record budget on a second copy of that text.
-    # Cache bookkeeping stays in diagnostics; the embedding fingerprint retains
-    # builder identity in role fields. Record bodies and source refs stay whole.
-    metadata = {key: copy.deepcopy(value) for key, value in bundle.items()
-                if key not in {"lessons", "indexing", "text_builder_version"}}
-    query = str(bundle.get("query") or "")
-    query_identity = {"query_sha256": hashlib.sha256(query.encode("utf-8")).hexdigest()}
-    if len(canonical({"query": query})) > len(canonical(query_identity)):
-        metadata.pop("query", None)
-        metadata.update(query_identity)
-    fields = {"retrieved_memory": metadata}
-    if _embedding_ready(bundle):
-        if standalone:
-            for item in metadata["items"]:
-                if item["record_type"] == "lesson":
-                    item["body"] = copy.deepcopy(next(
-                        row for row in bundle["lessons"][item["applicability"]]
-                        if row["lesson_id"] == item["record_id"]))
-        else:
-            fields["lessons"] = copy.deepcopy(bundle["lessons"])
-    metadata["context_chars_used"] = 0
-    while True:
-        size = len(canonical(fields))
-        if size == metadata["context_chars_used"]:
-            return fields
-        metadata["context_chars_used"] = size
+def _delivery_fields(bundle: dict, *, standalone: bool = False) -> dict:
+    """Model-visible cards only; retrieval and selection diagnostics stay local."""
+    return {"retrieved_memory": {
+        "status": ("retrieval_unavailable" if bundle.get("degraded") else
+                   "ready" if bundle.get("items") else "no_memory_selected"),
+        "items": copy.deepcopy(bundle.get("items") or []),
+    }}
 
 
 def _fit_delivery(bundle: dict, *, standalone: bool = False) -> tuple[dict | None, dict]:
-    """One whole-record budget rule for Planner and standalone role requests."""
-    budget = min(bundle["context_chars_budget"], MAX_DELIVERY_CHARS)
-    if budget <= 0 or bundle.get("delivery_available") is False or bundle.get("reason") == "disabled":
-        return None, {}
-    source_items = bundle["items"] if _embedding_ready(bundle) else []
-    selected = copy.deepcopy(bundle)
-    selected.update(items=[], lessons={key: [] for key in GROUPS}, hit_count=0)
-    omitted = int(bundle.get("omitted_count", 0))
+    """Project before selecting whole cards; never charge the retrieval envelope."""
+    from .memory_delivery import project_memory_card, select_memory_cards
 
-    def measure(candidate):
-        candidate["omitted_count"] = omitted + len(source_items) - len(candidate["items"])
-        candidate["truncated"] = bool(bundle.get("truncated") or candidate["omitted_count"])
-        fields = _delivery_fields(candidate, standalone=standalone)
-        candidate["context_chars_used"] = fields["retrieved_memory"]["context_chars_used"]
-        return fields
-
-    fields = measure(selected)
-    if selected["context_chars_used"] > budget:
+    if bundle.get("delivery_available") is False or bundle.get("reason") == "disabled":
         return None, {}
-    for item in source_items:
-        trial = copy.deepcopy(selected)
-        trial["items"].append(copy.deepcopy(item))
-        if item["record_type"] == "lesson":
-            body = next(row for row in bundle["lessons"][item["applicability"]]
-                        if row["lesson_id"] == item["record_id"])
-            trial["lessons"][item["applicability"]].append(copy.deepcopy(body))
-        trial["hit_count"] = len(trial["items"])
-        trial_fields = measure(trial)
-        if trial["context_chars_used"] > budget:
-            if item["record_type"] == "experiment_observation":
-                from .experiment_observations import minimum_observation_card
-                minimum = minimum_observation_card(item)
-                # Native classification was computed against the retrieval's
-                # complete current context; projection cannot upgrade it.
-                minimum["applicability"] = item["applicability"]
-                minimum["condition_differences"] = copy.deepcopy(item["condition_differences"])
-                trial["items"][-1].update(minimum)
-                trial_fields = measure(trial)
-            # A long entry may still be useful through an explicitly partial
-            # record card.  Preserve the original body in SQLite; this view
-            # does not claim a full read or semantic coverage.
-            partial = copy.deepcopy(trial["items"][-1].get("body") if item["record_type"] != "lesson" else body)
-            selected_ranges = {}
-            for key in ("statement", "description_en", "trigger_en", "summary_zh"):
-                if isinstance(partial.get(key), str) and len(partial[key]) > 1200:
-                    original = partial[key]
-                    partial[key] = original[:1200]
-                    selected_ranges[key] = {"char_range": [0, 1200], "full_chars": len(original),
-                                            "full_text_hash": hashlib.sha256(original.encode()).hexdigest()}
-            if selected_ranges:
-                trial["items"][-1]["representation"] = {"kind": "partial_record_card", "selected_ranges": selected_ranges,
-                    "full_record_id": item["record_id"], "full_record_hash": item["content_hash"],
-                    "complete": False, "actual_read": False}
-                if item["record_type"] != "lesson":
-                    trial["items"][-1]["body"] = partial
-                else:
-                    trial["lessons"][item["applicability"]][-1] = partial
-                trial_fields = measure(trial)
-        if trial["context_chars_used"] <= budget:
-            selected, fields = trial, trial_fields
-    fields = measure(selected)
-    return selected, fields
+    cards = []
+    if _embedding_ready(bundle):
+        for item in bundle.get("items") or []:
+            record = copy.deepcopy(item)
+            if record.get("record_type") == "lesson" and "body" not in record:
+                record["body"] = copy.deepcopy(next(row for row in
+                    bundle.get("lessons", {}).get(record["applicability"], [])
+                    if row["lesson_id"] == record["record_id"]))
+            cards.append(project_memory_card(record, role=bundle.get("role", "research_planner")))
+    dedup_keys = {(item["record_type"], item["record_id"]): scientific_support_key(item)
+                  for item in bundle.get("items") or []}
+    selection = select_memory_cards(cards, content_chars_budget=bundle["content_chars_budget"], dedup_keys=dedup_keys)
+    selected = {**bundle, "items": selection.cards, "delivery_report": selection.report,
+                "selected_count": len(selection.cards)}
+    return selected, _delivery_fields(selected, standalone=standalone)
+
+
+def record_delivery_report(camp: Path, role: str, report: dict, *, retrieval: dict | None = None) -> str:
+    """Persist a local delivery decision without making diagnostics model input."""
+    from .context.sources import atomic_immutable
+
+    payload = {"role": role, "selection": copy.deepcopy(report)}
+    if retrieval is not None:
+        payload["retrieval"] = embedding_health(retrieval)
+    path = Path(camp) / "memory_deliveries" / (content_hash(payload) + ".json")
+    atomic_immutable(path, canonical(payload))
+    return str(path)
 
 
 def _finalize_bundle(bundle: dict) -> dict:
-    fitted, _ = _fit_delivery(bundle)
-    if fitted is not None:
-        return fitted
-    return {**bundle, "items": [], "lessons": {key: [] for key in GROUPS}, "hit_count": 0,
-            "context_chars_used": 0, "delivery_available": False,
-            "truncated": bool(bundle.get("truncated") or bundle["items"]),
-            "omitted_count": int(bundle.get("omitted_count", 0)) + len(bundle["items"])}
+    """Finalize local ranked candidates, before any role content selection."""
+    bundle["retrieval_hit_count"] = len(bundle.get("items") or [])
+    return bundle
 
 
 def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
@@ -692,7 +638,7 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
               "items": [], "lessons": {k: [] for k in GROUPS}, "candidate_count": 0, "hit_count": 0,
               "model": config.model_id, "revision": config.model_revision, "fingerprint": None,
               "indexing": {"indexed": 0, "reused": 0, "pending": 0, "failed": 0}, "query_status": "not_encoded",
-              "context_chars_budget": min(config.context_chars_budget, MAX_DELIVERY_CHARS), "truncated": False}
+              "content_chars_budget": config.content_chars_budget, "role": role, "truncated": False}
     if not config.enabled:
         if require_embedding:
             raise EmbeddingUnavailable("memory_disabled")
@@ -700,9 +646,7 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
     try:
         require_eeg_campaign(camp)
         context = {**build_context(camp, state=state, experiment=experiment), **(context or {})}
-        records = candidates(camp, config, context, query=query)
-        if record_types is not None:
-            records = [row for row in records if row["record_type"] in record_types]
+        records = candidates(camp, config, context, query=query, record_types=record_types)
         from .research_execution import single_plan_enabled
         if single_plan_enabled(camp) and role == "research_planner":
             # Engineering procedures belong to Coder/Reviewer, not every round.
@@ -764,12 +708,20 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
         for _, _, _, row, score in ranked[:max(0, min(config.top_k, 32))]:
             item = {k: copy.deepcopy(v) for k, v in row.items() if k not in {"search_text", "text_hash", "body", "embedding_chunks"}}
             item["cosine_score"] = score
-            if row["record_type"] in {"skill", "experiment_observation", "knowledge"}:
-                item["body"] = copy.deepcopy(row["body"])
+            item["body"] = copy.deepcopy(row["body"])
             bundle["items"].append(item)
             if row["record_type"] == "lesson":
                 bundle["lessons"][row["applicability"]].append(copy.deepcopy(row["body"]))
-        selected = deduplicate_hits(bundle["items"], role=role)
+        # Only duplicate record identities may disappear before content fitting.
+        # A large representative must not hide a smaller whole card sharing its
+        # native support; support deduplication follows successful selection.
+        seen_records = set()
+        selected = []
+        for item in bundle["items"]:
+            identity = (item["record_type"], item["record_id"])
+            if identity not in seen_records:
+                seen_records.add(identity)
+                selected.append(item)
         selected_ids = {item["record_id"] for item in selected}
         bundle["omitted_count"] = len(bundle["items"]) - len(selected)
         bundle["items"] = selected
@@ -790,13 +742,14 @@ def retrieve(camp: Path, query: str | None = None, *, state: dict | None = None,
 
 
 def planner_knowledge_delivery(camp: Path, bundle: dict, *, context: dict | None = None) -> dict:
-    """Small prior/analogy cards backed by original registered record bodies."""
+    """Build complete prior cards; the Planner selects all history together."""
     from .context.sources import ContextSourceRegistry
     from .context.representations import handle
-    from .experiment_observations import observation_applicability
+    from .memory_delivery import project_memory_card
+
     result = {"status": "no_related_knowledge", "items": [], "omitted": [], "omitted_count": 0,
               "scientific_evidence": False, "execution_authority": False,
-              "budget_chars": min(int(bundle.get("context_chars_budget") or 0), MAX_DELIVERY_CHARS)}
+              "content_chars_budget": int(bundle.get("content_chars_budget") or 0)}
     if not _embedding_ready(bundle):
         result["status"] = "embedding_unavailable" if bundle.get("degraded") else "disabled"
         return result
@@ -811,89 +764,87 @@ def planner_knowledge_delivery(camp: Path, bundle: dict, *, context: dict | None
             text = original.get("statement") if item["record_type"] == "lesson" else _search_text("knowledge", original)
             if not isinstance(text, str) or not text.strip():
                 raise ValueError("knowledge_body_missing")
-            conditions = original.get("conditions") or original.get("preconditions") or {}
-            label, differences = observation_applicability(conditions, context)
-            original_refs = copy.deepcopy(item.get("source_refs") or [])
-            full = handle(source)
-            full["next_read"] = {"source_ref": source.source_ref, "source_hash": source.source_hash,
-                                 "json_pointer": "", "max_chars": 2000}
-            card = {key: copy.deepcopy(item[key]) for key in ("record_type", "record_id", "version", "content_hash", "cosine_score")}
-            card.update(body={"statement": text[:800]}, conditions=copy.deepcopy(conditions),
-                applicability=label, condition_differences=differences, source_refs=original_refs,
-                similarity_method="MiniLM_normalized_cosine" if bundle["backend"] == "minilm" else "synthetic_embedding_cosine",
-                source_retrieval=item.get("source_retrieval", "native_validated_lesson"),
-                knowledge_role="prior_or_analogy", scientific_evidence=False, execution_authority=False,
-                full_record=full, omissions=([{"path": "/statement" if item["record_type"] == "lesson" else "derived_known_text_fields",
-                    "selected_char_range": [0, 800], "full_chars": len(text), "complete": False}] if len(text) > 800 else []))
-            trial = {**result, "status": "ready", "items": result["items"] + [card]}
-            if len(canonical(trial)) <= result["budget_chars"]:
-                result = trial
-            else:
-                result["omitted_count"] += 1
-                result["omitted"].append({"record_id": item["record_id"], "reason": "knowledge_delivery_budget"})
+            # The candidate may carry a native coverage update beside the
+            # original lesson; retain it without changing its source identity.
+            record = {**item, "body": copy.deepcopy(item.get("body") or original)}
+            card = project_memory_card(record, role="research_planner", context=context)
+            card.update(knowledge_role="prior_or_analogy", scientific_evidence=False, execution_authority=False)
+            # Native navigation stays on this local intermediate object. The
+            # shared selector projects it out before constructing model input.
+            card["full_record"] = handle(source)
+            result["items"].append(card)
+            result["status"] = "ready"
         except (OSError, ValueError, KeyError, TypeError) as exc:
             result["omitted_count"] += 1
             result["omitted"].append({"record_id": item.get("record_id"), "reason": "knowledge_source_unreadable", "detail": str(exc)[:120]})
-    # Omission metadata is bounded too; never let optional knowledge steal the
-    # mandatory current observation's minimum allocation.
-    while result["omitted"] and len(canonical(result)) > result["budget_chars"]:
-        result["omitted"].pop()
     return result
+
+
+def _selected_delivery(bundle: dict) -> dict:
+    cached = bundle.get("_delivery_fields")
+    if cached is not None:
+        return copy.deepcopy(cached)
+    _, fields = _fit_delivery(bundle, standalone=True)
+    return fields
 
 
 def apply_memory(request: dict, bundle: dict) -> dict:
     result = copy.deepcopy(request)
-    _, fields = _fit_delivery(bundle)
-    result.update(fields)
+    result.update(_selected_delivery(bundle))
     return result
 
 
-def role_memory(camp: Path, *, state: dict | None = None, experiment: dict | None = None) -> dict | None:
+def role_memory(camp: Path, *, state: dict | None = None, experiment: dict | None = None,
+                role: str = "research_planner", record_types: frozenset[str] | None = None) -> dict | None:
     config = memory_config(camp)
-    return retrieve(camp, state=state, experiment=experiment, config=config) if config.enabled else None
+    if not config.enabled:
+        return None
+    bundle = retrieve(camp, state=state, experiment=experiment, config=config, role=role, record_types=record_types)
+    selected, fields = _fit_delivery(bundle, standalone=True)
+    bundle["_delivery_fields"] = fields
+    if selected is not None:
+        bundle["_delivery_report"] = selected["delivery_report"]
+        bundle["_delivery_report_ref"] = record_delivery_report(camp, role, selected["delivery_report"], retrieval=bundle)
+    return bundle
 
 
 def standalone_delivery(bundle: dict) -> dict | None:
-    """Designer/coder lack the planner's legacy lessons view: include each body once."""
-    _, fields = _fit_delivery(bundle, standalone=True)
-    return fields.get("retrieved_memory")
+    """Attach an already selected role view, with every body appearing once."""
+    return _selected_delivery(bundle).get("retrieved_memory")
 
 
 def coder_delivery(camp: Path, workspace: Path, attempt_id: str, spec: dict, *, state: dict,
                    previous_spec: dict, previous_attempt_id: str | None) -> dict | None:
+    from .memory_delivery import PROJECTION_VERSION, memory_content_chars
+
     config = memory_config(camp)
     if not config.enabled:
         return None
     spec_hash = (spec.get("experiment") or {}).get("spec_hash")
     def build():
-        # A pre-feature in-flight attempt retains its original lack of semantic input.
-        existing = previous_attempt_id == attempt_id
-        if existing and "retrieved_memory" in previous_spec:
-            body = previous_spec["retrieved_memory"]
-        elif existing and ((workspace / "coder_log.jsonl").is_file() or (workspace / "implementation.json").is_file()):
-            body = None
-        else:
-            bundle = role_memory(camp, state=state, experiment=spec["experiment"])
-            body = standalone_delivery(bundle) if bundle else None
-        return {"spec_hash": spec_hash, "retrieved_memory": body}
+        bundle = role_memory(camp, state=state, experiment=spec["experiment"], role="candidate_coder")
+        body = standalone_delivery(bundle) if bundle else None
+        return {"spec_hash": spec_hash, "retrieved_memory": body,
+                "projection_version": PROJECTION_VERSION, "content_chars_budget": config.content_chars_budget,
+                "delivery_report": copy.deepcopy((bundle or {}).get("_delivery_report"))}
     frozen = SidecarStore(camp).freeze("coder:" + workspace.name + ":" + attempt_id, build)
     if not isinstance(frozen, dict) or "spec_hash" not in frozen or "retrieved_memory" not in frozen:
         raise ValueError("frozen_memory_payload_invalid")
     if frozen["spec_hash"] != spec_hash:
         raise ValueError("frozen_memory_experiment_changed")
+    if frozen.get("projection_version") != PROJECTION_VERSION:
+        raise ValueError("frozen_memory_projection_changed")
     body = frozen["retrieved_memory"]
     if body is not None:
-        if not isinstance(body, dict):
+        if not isinstance(body, dict) or not isinstance(body.get("items"), list):
             raise ValueError("frozen_memory_payload_invalid")
-        stored_budget = body.get("context_chars_budget", config.context_chars_budget)
+        stored_budget = frozen["content_chars_budget"]
         if not isinstance(stored_budget, int) or isinstance(stored_budget, bool) or stored_budget < 0:
             raise ValueError("frozen_memory_budget_invalid")
-        size = len(canonical({"retrieved_memory": body}))
-        if size > min(config.context_chars_budget, stored_budget):
+        size = sum(memory_content_chars(card, role="candidate_coder") for card in body["items"])
+        if size > stored_budget:
             raise ValueError(f"frozen_memory_budget_exceeded:{size}")
-        if not isinstance(body.get("items"), list):
-            raise ValueError("frozen_memory_payload_invalid")
-    return frozen["retrieved_memory"]
+    return body
 
 
 def main(argv=None) -> int:

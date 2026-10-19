@@ -649,6 +649,20 @@ def _select(camp: Path, state: dict, backend, critic=None) -> dict:
                 "seed": common["seed"], "controls": ["baseline"]}
         full["frozen_evaluation_scopes"] = {"phases": scopes,
             **{key: common[key] for key in ("metric", "metric_unit", "aggregation") if key in common}}
+    if staged_mode:
+        from .planning_contract import enabled, freeze_planning_contract
+        if enabled(full) and not isinstance(full.get("_planning_contract"), dict):
+            if "execution_protocol" not in full and (camp / "execution_protocol.json").is_file():
+                from .execution_protocol import load_protocol
+                full["execution_protocol"] = load_protocol(camp) or {}
+            full["_planning_contract"] = freeze_planning_contract(full)
+        native_errors = (full.get("_planning_contract") or {}).get("native_errors") or []
+        if native_errors:
+            persist_failure(camp, state, phase="planner", error_type="planning_native_input_invalid",
+                detail="Frozen native task scope is unavailable", recoverable=True,
+                diagnostics={"native_errors": native_errors})
+            save_state(camp, state)
+            return state
     cfg = config(full)
     input_digest = state.get("terminal_observation_digest") or digest(round_input(full))
     research_round_id = round_id(full)
@@ -889,7 +903,11 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         save_plan(camp, state, plan)
         return state
     if plan["current_step"] == "design":
-        draft = {"intervention": plan["proposal"]["scientific_intent"], "parent_candidate_id": "baseline",
+        from .planning_contract import enabled as planning_contract_enabled
+        from .research_execution import research_goal
+        intervention = (plan["proposal"]["task_description"] if planning_contract_enabled(research_goal(camp))
+                        else plan["proposal"]["scientific_intent"])
+        draft = {"intervention": intervention, "parent_candidate_id": "baseline",
                  "control_candidate_id": "baseline", "initial_fidelity": "pilot" if
                     plan["proposal"]["evaluation_scope"].get("phase") == "pilot" else "full"}
         if not _native_step(camp, state, plan, "design_experiment", services, runner, raw={

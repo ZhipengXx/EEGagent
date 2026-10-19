@@ -127,18 +127,31 @@ def source_signature(item: dict) -> str:
                                    separators=(",", ":")).encode()).hexdigest()
 
 
+def scientific_support_key(item: dict) -> tuple:
+    """Local deduplication identity; it never enters a model card."""
+    body = item.get("body") or {}
+    facts = body.get("native_facts") or {}
+    science_scope = {"evaluation_scope": body.get("evaluation_scope"),
+        "conditions": body.get("conditions") or body.get("preconditions") or body.get("applicability"),
+        "facts": {key: facts[key] for key in ("scope", "seed", "screening_fold_ids", "screening_subjects")
+                  if key in facts}}
+    key = (source_signature(item), item.get("applicability"),
+           json.dumps(item.get("condition_differences") or {}, sort_keys=True),
+           json.dumps(science_scope, sort_keys=True))
+    if not item.get("source_refs"):
+        key += (item.get("record_type"), item.get("record_id"))
+    return key
+
+
 def deduplicate_hits(items: list[dict], role: str = "research_planner") -> list[dict]:
     """Choose a role-appropriate representative only for identical support/scope."""
     prefer = "skill" if role in {"candidate_coder", "candidate_reviewer"} else "lesson"
-    ordered = sorted(items, key=lambda item: (item.get("record_type") != prefer,
-                     -float(item.get("cosine_score", 0)), str(item.get("record_id", ""))))
-    seen = set(); result = []
-    for item in ordered:
-        key = (source_signature(item), item.get("applicability"),
-               json.dumps(item.get("condition_differences") or {}, sort_keys=True))
-        # Empty supports cannot justify conflating unrelated claims.
-        if not item.get("source_refs"):
-            key += (item.get("record_id"),)
+    seen = {}; result = []
+    for item in items:
+        key = scientific_support_key(item)
         if key not in seen:
-            seen.add(key); result.append(item)
+            seen[key] = len(result)
+            result.append(item)
+        elif item.get("record_type") == prefer and result[seen[key]].get("record_type") != prefer:
+            result[seen[key]] = item
     return result

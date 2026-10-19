@@ -6,13 +6,106 @@ the original frozen request, and never grants an action or scientific gate.
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from .types import digest
+
+
+@dataclass(frozen=True)
+class PendingRoleCorrection:
+    """A proven paid answer that still needs its existing bounded correction.
+
+    This is not an adopted answer or a new operation authorization. The caller
+    revalidates ``reply`` against ``frozen_payload`` and resumes the original
+    operation after ``prior_application_attempts`` already reserved requests.
+    """
+
+    reply: dict
+    frozen_payload: dict
+    frozen_system: str
+    frozen_prompt_hash: str
+    operation_id: str
+    prior_application_attempts: int
+    call_id: str
+    validation: str
+    context_sidecars: dict
+
+
+def _pending_designer_correction(camp: Path, call: dict, response: dict,
+                                traced: dict, frozen_payload: dict,
+                                calls: list[dict]) -> PendingRoleCorrection:
+    """Keep durable operation attempts, including non-domain failures, spent."""
+    from ..research_execution import role_api_attempt_limit
+
+    operation = call.get("operation_id")
+    attempts = [row for row in _rows(camp / "api_operation_attempts.jsonl")
+                if operation and row.get("operation_id") == operation]
+    if not operation or not any(row.get("call_id") == call.get("call_id") for row in attempts):
+        raise _error("role_recovery_operation_attempt_proof_missing")
+    ids = {row.get("call_id") for row in attempts}
+    ids.update(row.get("call_id") for row in calls if row.get("operation_id") == operation)
+    ids.discard(None)
+    role = call.get("role", "experiment_designer")
+    limit = min(role_api_attempt_limit(camp, role),
+                *(int(row.get("max_operation_attempts", 2)) for row in attempts))
+    if len(ids) >= limit:
+        raise _error("reviewer_correction_attempts_exhausted" if role == "candidate_reviewer"
+                     else "analysis_correction_attempts_exhausted" if role == "result_analyst"
+                     else "designer_correction_attempts_exhausted")
+    sidecars = copy.deepcopy(call.get("context_sidecars") or {})
+    if call.get("designer_assembly_ref"):
+        sidecars["designer_assembly_ref"] = copy.deepcopy(call["designer_assembly_ref"])
+    return PendingRoleCorrection(
+        reply=copy.deepcopy(response["reply"]),
+        frozen_payload=copy.deepcopy(frozen_payload),
+        frozen_system=traced["system"],
+        frozen_prompt_hash=traced["prompt_hash"],
+        operation_id=operation,
+        prior_application_attempts=len(ids),
+        call_id=call["call_id"],
+        validation=str(response.get("validation") or "pending"),
+        context_sidecars=sidecars,
+    )
+
+
+def _verify_designer_assembly(camp: Path, call: dict, traced: dict,
+                             response: dict, expected: dict) -> None:
+    """Scientific wire omits identity; immutable local assembly keeps it."""
+    ref = call.get("designer_assembly_ref")
+    if (not isinstance(ref, dict) or not ref.get("path") or not ref.get("sha256")
+            or any(row.get("designer_assembly_ref") != ref for row in (traced, response))):
+        raise _error("role_recovery_designer_assembly_proof_missing")
+    path = Path(ref["path"]).resolve()
+    if not path.is_relative_to((camp / "designer_inputs").resolve()):
+        raise _error("role_recovery_designer_assembly_path_invalid")
+    raw = path.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != ref["sha256"]:
+        raise _error("role_recovery_designer_assembly_hash_mismatch")
+    snapshot = json.loads(raw)
+    if (not isinstance(snapshot, dict)
+            or snapshot.get("schema_version") != "eeg_research.designer_assembly.v1"
+            or not isinstance(snapshot.get("assembly_context"), dict)
+            or snapshot.get("operation_id") != call.get("operation_id")
+            or any(snapshot.get(key) != expected.get(key)
+                   for key in ("task_id", "attempt_id", "input_digest")
+                   if expected.get(key) is not None)):
+        raise _error("role_recovery_designer_assembly_identity_mismatch")
+
+
+def _designer_domain_error(exc: Exception) -> bool:
+    """Do not turn an identity or source validation failure into a retry."""
+    from pydantic import ValidationError
+    from ..roles import RoleResultError
+
+    return isinstance(exc, ValidationError) or (
+        isinstance(exc, RoleResultError)
+        and str(exc) in {"recovered_designer_contract_invalid", "designer_output_invalid"})
 
 
 def _rows(path: Path) -> list[dict]:
@@ -55,7 +148,10 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
                        validate_reply: Callable[[dict, dict, str], dict],
                        task: dict | None = None, operation_id: str | None = None,
                        identity: dict | None = None,
-                       request_semantics_digest: str | None = None) -> dict | None:
+                       request_semantics_digest: str | None = None,
+                       allow_designer_correction: bool = False,
+                       allow_reviewer_correction: bool = False,
+                       allow_analysis_correction: bool = False) -> dict | PendingRoleCorrection | None:
     """Return a validated original reply, or block a paid-but-unproven reply.
 
     Nothing is returned for a request that has never reached transport. Known
@@ -129,7 +225,17 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
         for key in ("task_id", "attempt_id", "input_digest", "candidate_id", "input_hash"):
             if expected.get(key) is not None and any(row.get(key) != expected[key] for row in (call, traced, response)):
                 raise _error("role_recovery_identity_mismatch")
-        if task and any(frozen_user.get(key) != task[key] for key in ("task_id", "attempt_id", "input_digest")):
+        designer_scientific_wire = (role == "experiment_designer"
+                                   and frozen_user.get("designer_context_version") == "designer_scientific_input.v1")
+        from .compiler import is_analysis_scientific_input, project_analysis_scientific_input
+        analyst_scientific_wire = is_analysis_scientific_input(role, frozen_user)
+        if designer_scientific_wire:
+            _verify_designer_assembly(camp, call, traced, response, task or call)
+        elif role == "candidate_reviewer" and frozen_user.get("reviewer_context_version") == "reviewer_implementation_input.v2":
+            from ..reviewer_transport import verify_review_delivery
+            verify_review_delivery(camp, call, traced, response, frozen_user)
+        elif not analyst_scientific_wire and task and any(
+                frozen_user.get(key) != task[key] for key in ("task_id", "attempt_id", "input_digest")):
             raise _error("role_recovery_request_identity_mismatch")
         if any(row.get("call_id") != call_id or row.get("role") != role for row in (traced, response)):
             raise _error("role_recovery_trace_identity_mismatch")
@@ -159,7 +265,18 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
             return None
         revalidate_review_schema = (role == "candidate_reviewer"
                                     and response.get("validation") == "domain_schema_invalid")
-        if (response.get("validation") not in {"pending", "valid"} and not revalidate_review_schema
+        revalidate_designer = (allow_designer_correction and designer_scientific_wire
+                              and response.get("validation") in {
+                                  "pending", "valid", "domain_schema_invalid",
+                                  "design_contract_invalid", "designer_output_invalid"})
+        revalidate_reviewer = (allow_reviewer_correction and role == "candidate_reviewer"
+                              and frozen_user.get("reviewer_context_version") == "reviewer_implementation_input.v2"
+                              and response.get("validation") in {"pending", "valid", "reviewer_output_invalid"})
+        revalidate_analysis = (allow_analysis_correction and analyst_scientific_wire
+                               and response.get("validation") in {"pending", "valid", "domain_schema_invalid", "analysis_reply_invalid"})
+        if (response.get("validation") not in {"pending", "valid"}
+                and not revalidate_review_schema and not revalidate_designer and not revalidate_reviewer
+                and not revalidate_analysis
                 or not isinstance(response.get("reply"), dict)):
             raise _error("role_recovery_reply_invalid")
         reply = response["reply"]
@@ -177,17 +294,47 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
         manifest = json.loads(Path(manifest_ref).read_text(encoding="utf-8"))
         registry = ContextSourceRegistry(camp)
         source_rows = []
+        analyst_native = None
         for source in manifest.get("sources", []):
             block = registry.get(source["source_ref"], role=role,
                                  require_current=str(source["block_id"]).startswith("closed:"))
-            registry.load(block, role=role, require_current=str(source["block_id"]).startswith("closed:"))
+            source_payload = registry.load(block, role=role,
+                require_current=str(source["block_id"]).startswith("closed:"))
             if block.source_hash != source["source_hash"]:
                 raise _error("role_recovery_source_changed")
             source_rows.append({"block_id": block.block_id, "source_ref": block.source_ref,
                 "source_hash": block.source_hash, "revision": block.source_revision, "visibility": list(block.visibility)})
+            if analyst_scientific_wire and str(source["block_id"]).startswith("analyst-native:"):
+                if analyst_native is not None:
+                    raise _error("role_recovery_analysis_native_ambiguous")
+                analyst_native = source_payload
         if digest(source_rows) != manifest.get("source_dependency_digest"):
             raise _error("role_recovery_source_manifest_changed")
-        result = validate_reply(reply, frozen_user, system_hash[:16])
+        if analyst_scientific_wire:
+            if not isinstance(analyst_native, dict):
+                raise _error("role_recovery_analysis_native_missing")
+            if task and any(analyst_native.get(key) != task[key]
+                            for key in ("task_id", "attempt_id", "input_digest")):
+                raise _error("role_recovery_analysis_native_identity_mismatch")
+            original = {key: value for key, value in frozen_user.items()
+                        if key not in {"previous_response_error", "previous_response"}}
+            if project_analysis_scientific_input(analyst_native) != original:
+                raise _error("role_recovery_analysis_science_changed")
+        try:
+            result = validate_reply(reply, frozen_user, system_hash[:16])
+        except Exception as exc:
+            if revalidate_designer and _designer_domain_error(exc):
+                return _pending_designer_correction(camp, call, response, traced, frozen_user, calls)
+            if revalidate_reviewer and str(exc) == "recovered_reviewer_contract_invalid":
+                return _pending_designer_correction(camp, call, response, traced, frozen_user, calls)
+            if revalidate_analysis:
+                from pydantic import ValidationError
+                if isinstance(exc, ValidationError) or str(exc) == "recovered_analysis_reply_invalid":
+                    # Source and paid-call proof above have already passed.
+                    # Resume the full original native binding, never a current
+                    # caller's reconstructed or newly retrieved input.
+                    return _pending_designer_correction(camp, call, response, traced, analyst_native, calls)
+            raise
         if not isinstance(result, dict):
             raise _error("role_recovery_domain_validator_invalid")
     except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -206,6 +353,9 @@ def recover_role_reply(camp: Path, *, role: str, resolved: Any,
     if revalidate_review_schema:
         receipt["original_validation"] = response["validation"]
         receipt["revalidated_by"] = "current_review_schema_and_source_references"
+    if revalidate_designer and response.get("validation") not in {"pending", "valid"}:
+        receipt["original_validation"] = response["validation"]
+        receipt["revalidated_by"] = "current_designer_contract_and_frozen_input"
     existing = _rows(camp / "role_response_recovery.jsonl")
     if not any(row.get("call_id") == call_id and row.get("task_id") == receipt["task_id"] for row in existing):
         with (camp / "role_response_recovery.jsonl").open("a", encoding="utf-8") as stream:
