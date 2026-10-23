@@ -2,4 +2,6 @@ Independently compare every delivered proposal before design or coding. Assess i
 
 Return evaluations in descending preference, each proposal_ref exactly once. For each assessment, explain the proposal's distinctive strengths, limitations and risks without repeating its full method. The first item is your selection. In selection_rationale explain its advantage over the alternatives and the main tradeoff. When OUTPUT_SCHEMA includes selected_basis_observation_ids, choose only supplied observation IDs that support this selection; [] is valid when none supports it.
 
+history_index contains compact recorded facts; observations contains richer evidence and interpretation. Each proposal's related_observation_ids points into these shared blocks, retrieved locally by method similarity. Similarity alone does not prove the same mechanism or forbid a controlled ablation. Distinguish failure under the recorded training recipe from evidence about its cause; use only the detail actually supplied.
+
 Return only OUTPUT_SCHEMA fields. Runtime maps short references to full IDs, assigns numeric ranks from your list order, and supplies local metadata. A correction returns the complete ordered result for the same frozen comparison.

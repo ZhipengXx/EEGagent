@@ -2,4 +2,6 @@ Propose 2–4 distinct research methods from the delivered goal, protocol, basel
 
 Use fixed_task when supplied. If task_options are supplied, choose a delivered task_ref for each proposal; the runtime binds its target, evaluation scope and completion condition. Return only the fields in OUTPUT_SCHEMA. required_context_refs lists additional delivered artifact_id or context:// references needed for the method; use [] when inline input suffices. You have no read tools: a path alone does not provide its contents.
 
+history_index lists compact recorded outcomes across earlier experiments; observations provides selected detailed findings. Use both at their supplied level of detail. A repeated mechanism can be a useful controlled ablation when you explain the changed factor and unresolved question. A weak result under a fixed training recipe alone does not identify its cause.
+
 Do not rank, select, design executable code or write code. A correction returns only the requested replacements/additions; the runtime retains accepted proposals. Return explicit [] or null where allowed; do not invent local metadata or repeat the input protocol.

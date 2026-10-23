@@ -13,6 +13,7 @@ from .schemas import CriticComparisonWire, CriticHistoryComparisonWire, Research
 
 VERSION = "eeg_research.critic_contract.v2"
 _CONTEXT_KEYS = {"version", "pool_digest", "alias_to_id", "delivered_observation_ids"}
+_RELATED_KEY = "related_observation_ids_by_proposal"
 
 
 def enabled(full_or_goal: dict | None) -> bool:
@@ -56,14 +57,17 @@ def freeze_critic_context(pool: dict, delivered_view: dict) -> dict:
     aliases, errors = _pool_identity(pool)
     if errors:
         raise ValueError(errors[0]["type"])
-    return {"version": VERSION, "pool_digest": pool["pool_digest"], "alias_to_id": aliases,
-            "delivered_observation_ids": sorted(delivered_observation_ids(delivered_view))}
+    result = {"version": VERSION, "pool_digest": pool["pool_digest"], "alias_to_id": aliases,
+              "delivered_observation_ids": sorted(delivered_observation_ids(delivered_view))}
+    if _RELATED_KEY in delivered_view:
+        result[_RELATED_KEY] = {key: list(value) for key, value in delivered_view[_RELATED_KEY].items()}
+    return result
 
 
 def verify_critic_context(context: Any, pool: dict) -> list[dict]:
     """Local identity failures must never become requests for model correction."""
     aliases, errors = _pool_identity(pool)
-    if not isinstance(context, dict) or set(context) != _CONTEXT_KEYS:
+    if not isinstance(context, dict) or set(context) not in (_CONTEXT_KEYS, _CONTEXT_KEYS | {_RELATED_KEY}):
         return [*errors, _error("critic_native_context_invalid", ["critic_context"],
                                "The original frozen Critic context is required.")]
     if (context.get("version") != VERSION or context.get("pool_digest") != pool.get("pool_digest")
@@ -75,6 +79,13 @@ def verify_critic_context(context: Any, pool: dict) -> list[dict]:
             or len(set(item for item in ids if isinstance(item, str))) != len(ids)):
         errors.append(_error("critic_native_context_history_invalid", ["critic_context", "delivered_observation_ids"],
                              "The frozen delivered observation identities are invalid."))
+    related = context.get(_RELATED_KEY)
+    if related is not None and (not isinstance(related, dict) or set(related) != set(aliases.values())
+            or not isinstance(ids, list)
+            or any(not isinstance(rows, list) or any(not isinstance(identity, str) or identity not in ids
+                                                   for identity in rows) for rows in related.values())):
+        errors.append(_error("critic_native_context_history_invalid", ["critic_context", _RELATED_KEY],
+                             "Related history must belong to each frozen proposal and delivered observation set."))
     return errors
 
 

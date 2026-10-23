@@ -710,14 +710,38 @@ def finish_selected_plan(camp, *, plan_id, observation_digest):
         return continuation
 
 
+def allocate_research_continuation(camp, *, owner_id, observation_digest):
+    """Allocate a new Planner envelope from remaining global resources."""
+    camp = Path(camp)
+    config = ((_read(camp / "goal.json").get("research_execution") or {}).get("budget") or {})
+    planning = (config.get("envelopes") or {}).get("planning") or {}
+    from .research_execution import planning_call_budget
+    amount = _planning_resources(camp,
+        int(planning.get("input_tokens_per_call", config.get("input_tokens_per_call", 128000))),
+        int(planning.get("output_tokens_per_call", config.get("output_tokens_per_call", 32768))),
+        planning_call_budget(camp))
+    with _transaction(camp) as conn:
+        owner = _allocate(conn, camp, owner_id, amount, kind="continuation",
+                          binding={"observation_digest": observation_digest})
+        owner["observation_digest"] = observation_digest
+        _put(conn, "owners", owner_id, owner)
+        return owner
+
+
 @contextlib.contextmanager
 def planner_owner(camp, *, observation_digest, round_id):
     camp = Path(camp)
     if not enabled(camp):
         yield None
         return
+    from .iteration_continuation import planning_continuation_owner
+    extension_owner = planning_continuation_owner(camp, observation_digest)
     with _transaction(camp) as conn:
         matches = [row for row in _all(conn, "owners") if row["kind"] == "continuation" and row.get("observation_digest") == observation_digest]
+        if extension_owner:
+            matches = [row for row in matches if row["owner_id"] == extension_owner]
+            if not matches:
+                raise OwnerBudgetError("research_continuation_owner_missing")
         if matches:
             owner = matches[0]
             if owner.get("round_id") not in {None, round_id}:

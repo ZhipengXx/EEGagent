@@ -41,10 +41,6 @@ The workbench is available at [http://127.0.0.1:8765](http://127.0.0.1:8765).
 
 - [Architecture and handoffs](../docs/architecture.md)
 - [Workflow commands and configuration](../docs/running.md)
-- [fMRI screening configuration](docs/fmri_check.md)
-- [Planned screening](docs/fmri_agentic_v1_3.md)
-- [Campaign commands and recovery](docs/eeg_research_v1_8.md) — historical revision; compare its limitations with current source
-- [Canonical acceptance and evidence boundaries](docs/revision_acceptance_canonical.md)
 
 The ReAct entry originates from the [LangGraph ReAct template](https://github.com/langchain-ai/react-agent). Its optional search and model configuration are separate from the two research workflows.
 

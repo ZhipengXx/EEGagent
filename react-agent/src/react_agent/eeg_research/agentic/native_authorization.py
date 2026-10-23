@@ -107,7 +107,8 @@ def effective_goal(camp: Path) -> dict:
     if receipt:
         goal = {**goal, "max_candidates": receipt["max_candidates"],
             "research_authorization_ref": receipt["authorization_hash"]}
-    return goal
+    from .iteration_continuation import apply_continuation_goal
+    return apply_continuation_goal(camp, goal)
 
 
 def apply_authorized_scope(camp: Path, state: dict) -> None:
@@ -120,6 +121,8 @@ def apply_authorized_scope(camp: Path, state: dict) -> None:
             "authorization_ref": receipt["authorization_hash"]}
     elif state.get("research_authorization_ref"):
         raise AuthorizationError("research_authorization_projection_without_receipt")
+    from .iteration_continuation import apply_continuation_scope
+    apply_continuation_scope(camp, state)
 
 
 def authorized_maintenance_turn(camp: Path, base_turn_id: str) -> tuple[str, str] | None:

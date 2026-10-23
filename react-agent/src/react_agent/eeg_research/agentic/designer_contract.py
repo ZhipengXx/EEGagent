@@ -33,11 +33,12 @@ def _aliases(reference: str) -> set[str]:
     return aliases
 
 
-def _delivered_references(context: dict) -> tuple[set[str], dict[str, dict]]:
+def _delivered_references(context: dict) -> tuple[set[str], dict[str, dict], set[str]]:
     """Collect explicit identities and supplied source text, not arbitrary prose."""
     from .designer_context import DESIGNER_MATERIAL_FIELDS, designer_allowed_refs
     refs = {alias for reference in designer_allowed_refs(context) for alias in _aliases(reference)}
     sources: dict[str, dict] = {}
+    ambiguous_sources: set[str] = set()
     identity_keys = {"path", "url", "uri", "artifact_id", "evidence_id", "observation_id", "record_id",
                      "method_id", "lesson_id", "knowledge_id", "source_ref", "$context_source", "approval_ref",
                      "analysis_artifact_ref", "evidence_refs", "source_refs", "supporting_episode_ids",
@@ -55,6 +56,9 @@ def _delivered_references(context: dict) -> tuple[set[str], dict[str, dict]]:
             ref = value.get("source_ref")
             if isinstance(ref, str) and isinstance(value.get("source", value.get("excerpt")), str):
                 for alias in _aliases(ref):
+                    previous = sources.get(alias)
+                    if previous and previous.get("source", previous.get("excerpt")) != value.get("source", value.get("excerpt")):
+                        ambiguous_sources.add(alias)
                     sources[alias] = value
             for key, child in value.items():
                 if key in identity_keys:
@@ -72,7 +76,7 @@ def _delivered_references(context: dict) -> tuple[set[str], dict[str, dict]]:
     # authority to unrelated top-level metadata.
     for key in DESIGNER_MATERIAL_FIELDS:
         visit(_context_value(context, key))
-    return refs, sources
+    return refs, sources, ambiguous_sources
 
 
 def _valid_reference(reference: str, refs: set[str], sources: dict[str, dict]) -> bool:
@@ -174,6 +178,45 @@ def _without_analysis_scope(raw: Any) -> tuple[Any, list[dict]]:
     return {**raw, "design_brief": {**brief, "analysis_requirements": cleaned}}, normalized
 
 
+def _normalize_designer_reply(raw: Any, delivered: dict, refs: set[str],
+                              sources: dict[str, dict], ambiguous_sources: set[str]) -> tuple[Any, list[dict]]:
+    """Remove known empty echoes; never infer or repair scientific decisions."""
+    raw, normalized = _without_analysis_scope(raw)
+    if not isinstance(raw, dict):
+        return raw, normalized
+    result = copy.deepcopy(raw)
+    # Analysis has no implementation probe. A populated object may describe an
+    # intended test, so only an explicit null can be removed without guessing.
+    brief = result.get("design_brief")
+    rows = brief.get("analysis_requirements") if isinstance(brief, dict) else None
+    for index, row in enumerate(rows if isinstance(rows, list) else []):
+        if isinstance(row, dict) and "probe" in row and row["probe"] is None:
+            row.pop("probe")
+            normalized.append({"loc": ["design_brief", "analysis_requirements", index, "probe"],
+                               "kind": "empty_analysis_probe_removed"})
+    absent = object()
+    unavailable = _context_value(delivered, "unavailable_context", absent)
+    if unavailable is not absent and result.get("unavailable_context", absent) == unavailable:
+        result.pop("unavailable_context")
+        normalized.append({"loc": ["unavailable_context"], "kind": "exact_input_echo_removed"})
+    evidence_refs = result.get("evidence_refs")
+    for index, reference in enumerate(evidence_refs if isinstance(evidence_refs, list) else []):
+        if not isinstance(reference, str) or reference in refs:
+            continue
+        match = re.fullmatch(r"(.+)#([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)", reference)
+        if not match:
+            continue
+        path, symbol = match.groups()
+        if "://" in path or path not in sources or path in ambiguous_sources or re.fullmatch(r"L[0-9]+", symbol):
+            continue
+        canonical = path + "::" + symbol
+        if _valid_reference(canonical, refs, sources):
+            evidence_refs[index] = canonical
+            normalized.append({"loc": ["evidence_refs", index], "kind": "source_symbol_separator_normalized",
+                               "from": reference, "to": canonical})
+    return result, normalized
+
+
 def validate_designer_reply(raw: Any, native_context: dict,
                             delivered_context: dict | None = None) -> dict:
     """Validate only API-owned fields, then add local metadata and frozen facts.
@@ -186,15 +229,17 @@ def validate_designer_reply(raw: Any, native_context: dict,
     """
     result = {"reply": None, "errors": [], "native_errors": validate_designer_native_context(native_context),
               "design_brief": None, "experiment_spec": None}
-    raw, normalized = _without_analysis_scope(raw)
+    delivered = native_context if delivered_context is None else delivered_context
+    refs, sources, ambiguous_sources = _delivered_references(delivered)
+    raw, normalized = _normalize_designer_reply(raw, delivered, refs, sources, ambiguous_sources)
+    if normalized:
+        result["normalizations"] = normalized
     try:
         reply = DesignerReply.model_validate(raw).model_dump()
     except ValidationError as exc:
         result["errors"] = _schema_errors(exc)
         return result
     result["reply"] = reply
-    if normalized:
-        result["normalizations"] = normalized
     if result["native_errors"]:
         return result
     errors = result["errors"]
@@ -202,8 +247,6 @@ def validate_designer_reply(raw: Any, native_context: dict,
     def error(kind, loc, message):
         errors.append({"type": kind, "loc": loc, "msg": message})
 
-    delivered = native_context if delivered_context is None else delivered_context
-    refs, sources = _delivered_references(delivered)
     for index, reference in enumerate(reply["evidence_refs"]):
         if not _valid_reference(reference, refs, sources):
             error("designer_evidence_ref_not_delivered", ["evidence_refs", index],

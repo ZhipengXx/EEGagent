@@ -35,6 +35,7 @@ class MemoryConfig(BaseModel):
     top_k: int = 5
     min_similarity: float = Field(default=0.30, ge=-1, le=1, allow_inf_nan=False)
     content_chars_budget: int = Field(default=6000, ge=0, le=30000)
+    per_observation_tokens_budget: int = Field(default=6000, ge=0)
     allow_model_download: bool = False
     fallback: Literal["legacy"] = "legacy"
 
@@ -49,8 +50,8 @@ def memory_config(camp: Path) -> MemoryConfig:
     # The delivery allowance still controls recent scientific history when no
     # semantic backend is used, so retain that independent configuration.
     if isinstance(raw, dict) and not raw.get("enabled", False):
-        return MemoryConfig(content_chars_budget=raw.get(
-            "content_chars_budget", MemoryConfig.model_fields["content_chars_budget"].default))
+        return MemoryConfig(**{key: raw.get(key, MemoryConfig.model_fields[key].default)
+                               for key in ("content_chars_budget", "per_observation_tokens_budget")})
     return MemoryConfig.model_validate(raw)
 
 

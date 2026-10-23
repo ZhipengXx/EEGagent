@@ -149,12 +149,16 @@ def _run(sources: _Sources, *, arm: str, job: Path, identity: dict, freeze: dict
     dynamics = (diagnostics.get("items") or {}).get("training_dynamics") or {}
     execution = copy.deepcopy(dynamics.get("training_execution") or _unavailable("training_execution_not_exported"))
     learning = _learning(sources, job)
+    from .suite_diagnostics import learning_profile
+    profile = learning_profile(learning["points"], selected, read_coverage=learning["read_coverage"])
     if learning.get("source_ref"):
         refs.append(learning["source_ref"])
+        profile["source_ref"] = learning["source_ref"]
     return {"arm": arm, **copy.deepcopy(identity), "job_id": job.name,
             "config": _config(spec), "training_execution": execution,
             "development_diagnostics": diagnostics, "checkpoint_selection": selected,
             "development_metrics": metrics, "development_learning": learning,
+            "learning_profile": profile,
             "diagnostic_scope": DEVELOPMENT_SCOPE, "source_refs": list(dict.fromkeys(refs))}
 
 

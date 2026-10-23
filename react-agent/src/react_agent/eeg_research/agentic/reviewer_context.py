@@ -119,7 +119,31 @@ def _freeze_source(alias: str, supplied: dict, *, fallback_path: str = "",
     native = {"kind": "source", "native_path": native_path, "sha256": actual_hash,
         "source": text, "full_source": source, "segments": segments,
         "symbol_spans": _symbols(source), "delivered_ranges": ranges, "full": full}
+    # Navigation uses the same literal delivery boundary as the validator. A
+    # visible function signature does not make its omitted body available.
+    from .reviewer_contract import resolve_evidence_reference
+    wire["symbol_refs"] = [alias + "::" + symbol for symbol in native["symbol_spans"]
+        if resolve_evidence_reference(alias + "::" + symbol, {"evidence": {alias: native}})]
+    wire["line_ranges"] = copy.deepcopy(ranges)
     return wire, native
+
+
+def _check_refs(facts: dict) -> list[str]:
+    """Short navigation for common checks; keep their values in check_facts."""
+    from .reviewer_contract import _resolve_pointer
+    pointers = ("/ok", "/shape", "/output_shape", "/finite", "/finite_gradients",
+        "/params_with_grad", "/params_trainable", "/checkpoint_round_trip",
+        "/training_objective_finite", "/implementation_semantics/requirements",
+        "/multigpu_check/ok", "/multigpu_check/result/custom_objective",
+        "/multigpu_check/result/eval_transform_calls", "/multigpu_check/result/batches")
+    result = []
+    for pointer in pointers:
+        try:
+            _resolve_pointer(facts, pointer)
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        result.append("checks:" + pointer)
+    return result
 
 
 def _clean_checks(checks: dict) -> dict:
@@ -341,6 +365,7 @@ def prepare_review_input(native_payload: dict[str, Any]) -> tuple[dict, dict]:
         "source_materials": sources, "check_facts": without_local_paths(facts),
         "parameter_facts": copy.deepcopy(payload.get("parameter_census") or {"status": "unavailable"}),
         "review_scope": {"mode": payload.get("review_mode") or "full",
+                         "check_refs": _check_refs(facts),
                          "affected_requirements": copy.deepcopy(focus.get("affected_requirements") or []) if isinstance(focus, dict) else []},
         "relevant_context": _relevant_context(payload, spec)}
     evidence["parameters"] = {"kind": "parameters", "facts": copy.deepcopy(wire["parameter_facts"]),

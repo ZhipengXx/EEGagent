@@ -942,25 +942,78 @@ def matched_diagnostics(state: dict[str, Any], target: str) -> dict[str, Any] | 
     return None
 
 
-def load_analysis_views(camp: Path, state: dict[str, Any], *, target: str | None = None) -> list[dict[str, Any]]:
+def matched_screening_baseline_diagnostics(camp: Path, source: dict[str, Any]) -> dict[str, Any]:
+    """Read the control freezes of an already verified screening, not history.
+
+    Baseline evidence need not have a separate campaign row. The accepted pair
+    fixes the suite, folds, recipe and jobs; a newer unrelated baseline cannot
+    stand in for that control. This narrow reader never opens learning curves.
+    """
+    from .analysis_context import _Sources, _config
+    sources = _Sources(camp)
+    result = source["screening"]
+    scores = result.get("baseline_scores") or []
+    expected_folds = result.get("screening_fold_ids") or []
+    if len(scores) != len(expected_folds) or {score.get("fold_id") for score in scores} != set(expected_folds):
+        raise ValueError("designer_matched_baseline_fold_coverage_mismatch")
+    records = []
+    for score in scores:
+        freeze = sources.document(score["freeze_ref"], expected_sha=score["freeze_sha256"])
+        if freeze.get("candidate_id") != "baseline" or freeze.get("suite_hash") != result.get("baseline_suite_hash"):
+            raise ValueError("designer_matched_baseline_identity_mismatch")
+        for key in ("fold_id", "seed", "checkpoint_hash", "suite_hash"):
+            if freeze.get(key) != score.get(key):
+                raise ValueError("designer_matched_baseline_score_mismatch:" + key)
+        job = sources.path(freeze["job_dir"])
+        config_path = job / "frozen_run_spec.json"
+        config_hash = next((dep["sha256"] for dep in freeze.get("dependencies") or []
+                           if Path(dep["path"]).name == "frozen_run_spec.json"
+                           and sources.path(dep["path"]) == config_path), None)
+        if not config_hash:
+            raise ValueError("designer_matched_baseline_config_binding_missing")
+        config = sources.document(config_path, expected_sha=config_hash)
+        if config.get("target_id") != "baseline" or config.get("seed") != freeze.get("seed"):
+            raise ValueError("designer_matched_baseline_config_identity_mismatch")
+        records.append({"fold_id": freeze["fold_id"], "held_out_subject": freeze.get("held_out_subject"),
+            "seed": freeze["seed"], "job_id": job.name, "config": _config(config),
+            "development_diagnostics": freeze.get("diagnostics"),
+            "checkpoint_selection": freeze.get("selected_checkpoint"),
+            "development_metrics": freeze.get("development_metrics"),
+            "freeze_ref": score["freeze_ref"], "freeze_sha256": score["freeze_sha256"]})
+    return development_view({"status": "verified_matched_baseline", "candidate_id": "baseline",
+        "scope": "source_subject_development", "matched_screening_evidence_id": source["evidence_id"],
+        "suite_hash": result["baseline_suite_hash"], "folds": records,
+        "independent_final_test": False})
+
+
+def load_analysis_views(camp: Path, state: dict[str, Any], *, target: str | None = None,
+                        sources_by_evidence_id: dict | None = None,
+                        artifacts_by_id: dict | None = None) -> list[dict[str, Any]]:
     """Only registered bytes belonging to an analysis pointer are full handoffs."""
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
 
     views = []
     latest_completed = {}
     superseded = {}
+    documents = {}
+    artifacts_by_id = {} if artifacts_by_id is None else artifacts_by_id
     for row in state.get("evidence") or []:
         if row.get("kind") != "analysis" or (target and row.get("candidate_id") != target):
             continue
         key = row.get("run_evidence_id")
-        if key and row.get("status") == "completed" and row.get("analysis_artifact_id"):
+        ref = row.get("analysis_artifact_id")
+        if not ref:
+            continue
+        if ref not in documents:
             try:
-                registered = resolve_verified_artifact(camp, row["analysis_artifact_id"])
-                if state.get("evaluation_mode") == "loso_method_search":
-                    registered = development_artifact(camp, row["analysis_artifact_id"])
-                body = json.loads(Path(registered["path"]).read_text(encoding="utf-8"))
+                registered = (development_artifact(camp, ref, sources_by_evidence_id=sources_by_evidence_id,
+                                                   artifacts_by_id=artifacts_by_id)
+                    if state.get("evaluation_mode") == "loso_method_search" else resolve_verified_artifact(camp, ref))
+                documents[ref] = registered, json.loads(Path(registered["path"]).read_text(encoding="utf-8"))
             except (OSError, ValueError):
-                continue
+                documents[ref] = None
+        if documents[ref] is not None and key and row.get("status") == "completed":
+            registered, body = documents[ref]
             if registered.get("kind") == "analysis" and body.get("status") == "completed":
                 previous = latest_completed.get(key)
                 if previous:superseded.setdefault(key, []).append(previous.get("evidence_id"))
@@ -975,15 +1028,11 @@ def load_analysis_views(camp: Path, state: dict[str, Any], *, target: str | None
         ref = row.get("analysis_artifact_id")
         if not ref:
             continue
-        try:
-            registered = resolve_verified_artifact(camp, ref)
-            if state.get("evaluation_mode") == "loso_method_search":
-                registered = development_artifact(camp, ref)
-            body = json.loads(Path(registered["path"]).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        if documents.get(ref) is None:
             views.append({"evidence_id": row.get("evidence_id"), "artifact_id": ref,
                           "verification_status": "invalid", "missing_inputs": ["analysis_hash_or_file"]})
             continue
+        registered, body = documents[ref]
         if registered.get("kind") != "analysis":
             continue
         payload = body.get("payload") or body.get("reply") or body
@@ -1014,7 +1063,20 @@ def _registry_rows(camp: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
+def development_artifact(camp: Path, artifact_id: str, *, sources_by_evidence_id: dict | None = None,
+                         artifacts_by_id: dict | None = None) -> dict[str, Any]:
+    """Reuse verified reads only within one caller-owned input assembly."""
+    if artifacts_by_id is not None and artifact_id in artifacts_by_id:
+        return artifacts_by_id[artifact_id]
+    result = _development_artifact(camp, artifact_id, sources_by_evidence_id=sources_by_evidence_id,
+                                   artifacts_by_id=artifacts_by_id)
+    if artifacts_by_id is not None:
+        artifacts_by_id[artifact_id] = result
+    return result
+
+
+def _development_artifact(camp: Path, artifact_id: str, *, sources_by_evidence_id: dict | None = None,
+                          artifacts_by_id: dict | None = None) -> dict[str, Any]:
     """Memory reading has a stricter boundary than approved external source consumers."""
     from react_agent.eeg_research.agentic.artifacts import resolve_verified_artifact
     row = resolve_verified_artifact(camp, artifact_id)
@@ -1028,6 +1090,9 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
     if path.stat().st_size > READ_FILE_BYTES:
         raise ValueError("artifact_exceeds_read_file_limit")
     body = json.loads(path.read_text(encoding="utf-8"))
+    source = next((item for item in (sources_by_evidence_id or {}).values()
+        if item.get("kind") == row.get("kind") and item.get("suite_ref") == str(path)
+        and item.get("result_hash") == row.get("sha256")), None)
     def contains_screening_scope(value: Any) -> bool:
         if isinstance(value, dict):
             return (value.get("scope") == "two_fold_development"
@@ -1043,7 +1108,7 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
         if (common.get("evaluation_schedule") != "screen_then_confirm" or path != expected
                 or common["benchmark_permission"].get("partial_feedback") != "fixed_two_fold_only"):
             raise ValueError("screening_artifact_requires_frozen_opt_in")
-        computed = read_screening(camp, suite_id)
+        computed = source["screening"] if source is not None else read_screening(camp, suite_id)
         if body.get("screening") != computed or computed.get("coverage") != 2:
             raise ValueError("screening_artifact_requires_two_valid_folds")
         return {**row, "development_scope": "two_fold_development", "native_completion_verified": True}
@@ -1052,7 +1117,8 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
         origin = payload.get("method_screening_origin") if isinstance(payload, dict) else None
         full_origin = payload.get("method_benchmark_origin") if isinstance(payload, dict) else None
         if isinstance(origin, dict) and row.get("kind") in {"analysis", "lessons"}:
-            return _derived_method_artifact(camp, row, body, origin, screening=True)
+            return _derived_method_artifact(camp, row, body, origin, screening=True,
+                sources_by_evidence_id=sources_by_evidence_id, artifacts_by_id=artifacts_by_id)
         if not isinstance(full_origin, dict):
             raise ValueError("screening_artifact_requires_native_origin")
     def contains_benchmark_scope(value: Any) -> bool:
@@ -1066,7 +1132,8 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
         origin = payload.get("method_benchmark_origin") if isinstance(payload, dict) else None
         if row.get("kind") not in {"analysis", "lessons"} or not isinstance(origin, dict):
             raise ValueError("benchmark_artifact_requires_native_complete_suite_kind")
-        return _derived_method_artifact(camp, row, body, origin)
+        return _derived_method_artifact(camp, row, body, origin,
+            sources_by_evidence_id=sources_by_evidence_id, artifacts_by_id=artifacts_by_id)
     if row.get("kind") == "method_suite":
         # An artifact kind/scope label never grants benchmark permission. Bind
         # the opt-in goal, frozen manifest, exact native path and all ten score
@@ -1080,7 +1147,7 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
         expected = (camp / "suites" / suite_id / "aggregate.json").resolve()
         if path != expected or not permission.get("authorized") or permission.get("partial_feedback") not in {False, "fixed_two_fold_only"}:
             raise ValueError("method_benchmark_read_identity_or_permission_mismatch")
-        computed = read_aggregate(camp, suite_id)
+        computed = source["aggregate"] if source is not None else read_aggregate(camp, suite_id)
         if (body.get("aggregate") != computed or computed.get("status") != "complete"
                 or computed.get("coverage") != 10 or computed.get("required_fold_count") != 10
                 or computed.get("scope") != "method_development_benchmark"
@@ -1094,7 +1161,9 @@ def development_artifact(camp: Path, artifact_id: str) -> dict[str, Any]:
 
 
 def _derived_method_artifact(camp: Path, row: dict[str, Any], body: dict[str, Any],
-                             origin: dict[str, Any], *, screening: bool = False) -> dict[str, Any]:
+                             origin: dict[str, Any], *, screening: bool = False,
+                             sources_by_evidence_id: dict | None = None,
+                             artifacts_by_id: dict | None = None) -> dict[str, Any]:
     """Allow only a completed native role receipt bound to a current full suite.
 
     Registered bytes, producer/task identity, aggregate input dependency, current
@@ -1115,17 +1184,21 @@ def _derived_method_artifact(camp: Path, row: dict[str, Any], body: dict[str, An
         raise ValueError("method_derived_artifact_requires_completed_producer")
     envelope = validate_role_result(body, task)
     state = json.loads((camp / "campaign_state.json").read_text(encoding="utf-8"))
-    if screening:
-        from react_agent.eeg_research.agentic.screening import verified_screening_records
-        sources = verified_screening_records(camp, state)
-    else:
-        sources = verified_suite_records(camp, state)
-    source = next((item for item in sources
-                   if item["evidence_id"] == origin.get("run_evidence_id")), None)
+    source = (sources_by_evidence_id or {}).get(origin.get("run_evidence_id"))
+    if source is None:
+        if screening:
+            from react_agent.eeg_research.agentic.screening import verified_screening_records
+            sources = verified_screening_records(camp, state, evidence_ids={origin.get("run_evidence_id")})
+        else:
+            sources = verified_suite_records(camp, state, evidence_ids={origin.get("run_evidence_id")})
+        source = next(iter(sources), None)
+        if source is not None and sources_by_evidence_id is not None:
+            sources_by_evidence_id[source["evidence_id"]] = source
     origin_builder = method_screening_origin if screening else method_benchmark_origin
     if source is None or origin != origin_builder(source):
         raise ValueError("method_derived_artifact_native_origin_mismatch")
-    native = development_artifact(camp, origin["screening_artifact_id" if screening else "aggregate_artifact_id"])
+    native = development_artifact(camp, origin["screening_artifact_id" if screening else "aggregate_artifact_id"],
+        sources_by_evidence_id={source["evidence_id"]: source}, artifacts_by_id=artifacts_by_id)
     if (native["path"] != origin["suite_ref"] or native["sha256"] != origin["result_hash"]
             or not any(Path(ref).resolve() == Path(native["path"]).resolve()
                        for ref in task.get("input_artifact_refs") or [])):
@@ -1144,7 +1217,8 @@ def _derived_method_artifact(camp: Path, row: dict[str, Any], body: dict[str, An
             "native_completion_verified": True, "method_screening_origin" if screening else "method_benchmark_origin": origin}
 
 
-def artifact_index(camp: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
+def artifact_index(camp: Path, state: dict[str, Any], *, sources_by_evidence_id: dict | None = None,
+                   artifacts_by_id: dict | None = None) -> list[dict[str, Any]]:
     """Identifiers and hashes are an index; they do not claim the model read the bytes."""
     rows = []
     evidence = state.get("evidence") or []
@@ -1155,7 +1229,8 @@ def artifact_index(camp: Path, state: dict[str, Any]) -> list[dict[str, Any]]:
         missing = []
         validated = None
         try:
-            validated = development_artifact(camp, str(ref))
+            validated = development_artifact(camp, str(ref), sources_by_evidence_id=sources_by_evidence_id,
+                                             artifacts_by_id=artifacts_by_id)
         except (OSError, ValueError, KeyError) as exc:
             missing = [str(exc)]
         linked = [row for row in evidence if ref in (row.get("artifact_refs") or []) or

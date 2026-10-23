@@ -222,7 +222,7 @@ def resolve_evidence_reference(reference: str, context: dict) -> dict | None:
         row = evidence.get(alias)
         if not isinstance(row, dict) or row.get("kind") != "source":
             return None
-        span = (row.get("symbol_spans") or {}).get(symbol)
+        span = (row.get("symbol_spans") or {}).get(symbol.replace("::", "."))
         if span is None and isinstance(row.get("source"), str):
             from .review_context import _symbol_line
             line = _symbol_line(row["source"], symbol)
@@ -260,6 +260,58 @@ def resolve_evidence_reference(reference: str, context: dict) -> dict | None:
         return {"kind": kind, "alias": alias, "native_ref": native_ref,
                 "pointer": pointer, "fact": fact}
     return None
+
+
+def evidence_reference_feedback(reference: str, context: dict) -> str:
+    """Explain a failed citation against delivered data, without granting scope."""
+    evidence = context.get("evidence") or {}
+    if "::" in reference:
+        alias, symbol = reference.split("::", 1)
+        row = evidence.get(alias)
+        if not isinstance(row, dict):
+            return "unknown_alias: use a supplied source_ref from source_materials."
+        if row.get("kind") != "source":
+            return "reference_kind_invalid: symbol citations require a source alias."
+        if symbol.replace("::", ".") in (row.get("symbol_spans") or {}):
+            return ("symbol_not_fully_delivered: " + reference + "; delivered line ranges are "
+                + json.dumps(row.get("delivered_ranges") or [])
+                + ". Cite delivered lines that establish the claim; use unverified if they do not.")
+        return "unknown_symbol: " + reference + "; use source_materials.symbol_refs or delivered line_ranges."
+    if ":/" in reference:
+        alias, pointer = reference.split(":", 1)
+        row = evidence.get(alias)
+        if not isinstance(row, dict):
+            return "unknown_alias: use checks:/pointer or parameters:/pointer for delivered facts."
+        if row.get("kind") not in {"checks", "parameters"}:
+            return "reference_kind_invalid: JSON pointers require checks or parameters."
+        # A same-name leaf can suggest the actual nested path, but is never
+        # substituted automatically: matching names need not support the claim.
+        leaf = pointer.rsplit("/", 1)[-1].replace("~1", "/").replace("~0", "~")
+        matches = []
+        def visit(value, path=""):
+            if len(matches) >= 3:
+                return
+            children = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, list) else ()
+            for key, child in children:
+                part = str(key).replace("~", "~0").replace("/", "~1")
+                child_path = path + "/" + part
+                if str(key) == leaf:
+                    matches.append(alias + ":" + child_path)
+                if len(matches) >= 3:
+                    return
+                visit(child, child_path)
+        visit(row.get("facts"))
+        hint = " Delivered same-name nodes: " + ", ".join(matches) + "." if matches else " Use the exact path in delivered facts."
+        return "pointer_not_found: " + reference + "." + hint
+    match = re.fullmatch(r"([^:]+):([1-9][0-9]*)", reference)
+    if match:
+        alias = match.group(1)
+        row = evidence.get(alias)
+        if not isinstance(row, dict):
+            return "unknown_alias: use a supplied source_ref from source_materials."
+        return ("line_not_delivered: " + reference + "; delivered line ranges are "
+            + json.dumps(row.get("delivered_ranges") or []) + ".")
+    return "reference_format_invalid: use alias::Symbol, alias:line, checks:/pointer or parameters:/pointer."
 
 
 def _target_probe(target: dict, context: dict) -> dict | None:
@@ -362,7 +414,7 @@ def validate_reviewer_reply(raw: Any, context: dict, delivered: dict | None = No
         for index, reference in enumerate(row["evidence_refs"]):
             resolved = resolve_evidence_reference(reference, context)
             if resolved is None:
-                errors.append(_error("review_evidence_reference_invalid", ["assessments", ref, "evidence_refs", index], "Cite a delivered source symbol/line, checks:/pointer or parameters:/pointer fact."))
+                errors.append(_error("review_evidence_reference_invalid", ["assessments", ref, "evidence_refs", index], evidence_reference_feedback(reference, context)))
             else:
                 refs.append(resolved)
         resolved_rows[ref] = refs
@@ -392,7 +444,7 @@ def validate_reviewer_reply(raw: Any, context: dict, delivered: dict | None = No
                 errors.append(_error("review_issue_resolution_conflict", [*loc, "previous_issue_ref"], "A resolved prior issue cannot also be returned as an open update."))
         for position, reference in enumerate(issue["evidence_refs"]):
             if resolve_evidence_reference(reference, context) is None:
-                errors.append(_error("review_evidence_reference_invalid", [*loc, "evidence_refs", position], "Use an actually delivered evidence reference."))
+                errors.append(_error("review_evidence_reference_invalid", [*loc, "evidence_refs", position], evidence_reference_feedback(reference, context)))
         if issue["severity"] == "blocking":
             if not issue["evidence_refs"]:
                 errors.append(_error("review_issue_evidence_missing", [*loc, "evidence_refs"], "A blocking finding needs delivered evidence."))

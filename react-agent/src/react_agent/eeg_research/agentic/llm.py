@@ -59,6 +59,62 @@ class LlmUnavailable(RuntimeError):
         self.diagnostics = diagnostics or {}
 
 
+class _CoderProtocolRecoveryReady(Exception):
+    """The settled parent can enter its one bounded recovery operation."""
+
+
+def _coder_operation_progress(camp: Path, operation: str) -> tuple[list[dict], dict | None]:
+    from .api_policy import ATTEMPTS
+
+    def rows(name):
+        path = camp / name
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.is_file() else []
+
+    attempts = [row for row in rows(ATTEMPTS) if row.get("operation_id") == operation]
+    calls = [row for row in rows("llm_calls.jsonl") if row.get("operation_id") == operation]
+    return attempts, calls[-1] if calls else None
+
+
+def _recorded_coder_route(camp: Path, attempts: list[dict], base):
+    """Restore the last reserved route before paid replay or another request."""
+    if not attempts:
+        return None
+    from .role_config import FIELDS, resolve_role_config
+
+    row = attempts[-1]
+    saved = row.get("role_model_config")
+    try:
+        if not isinstance(saved, dict) or saved.get("base_url") != base.base_url:
+            raise ValueError("base_url")
+        route = resolve_role_config(camp, "candidate_coder",
+            {name: saved[name] for name in FIELDS},
+            environ={"DEEPSEEK_BASE_URL": saved["base_url"]})
+        if (route.semantics() != saved or row.get("role_config_hash") != route.role_config_hash
+                or row.get("requested_model") != route.model):
+            raise ValueError("role_config_hash")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LlmUnavailable("coder_recovery_config_invalid") from exc
+    return route
+
+
+def _coder_protocol_route(camp: Path, base):
+    from .research_execution import research_goal
+    from .role_config import FIELDS, resolve_role_config
+
+    policy = research_goal(camp).get("coding_recovery") or {}
+    values = {name: getattr(base, name) for name in FIELDS}
+    values.update(model=policy.get("escalation_model", "deepseek-v4-pro"),
+                  thinking=policy.get("escalation_thinking", True),
+                  reasoning_effort=policy.get("escalation_reasoning_effort", "high"))
+    return resolve_role_config(camp, "candidate_coder", values,
+                               environ={"DEEPSEEK_BASE_URL": base.base_url})
+
+
+def _same_coder_route(first, second) -> bool:
+    return all(getattr(first, key) == getattr(second, key)
+               for key in ("model", "thinking", "reasoning_effort"))
+
+
 def context_budget_trace(camp: Path, role: str, *, system: str,
                         payload: dict, projected: dict) -> dict:
     """Preserve a complete local failed preflight without reserving an API call."""
@@ -1141,7 +1197,30 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             return ResearchProposalDraft
         return domain_model_for(role,memory,camp=camp,review_stage=active_review_stage)
 
+    def activate_coder_route(route, scope: dict) -> None:
+        nonlocal resolved
+        if route is None or route.role_config_hash == resolved.role_config_hash:
+            return
+        scope.setdefault("previous_route", (resolved, config.fast, call.model, call.role_config))
+        resolved, config.fast = route, route.profile()
+        call.model, call.role_config = route.model, route
+
     def call(payload: dict[str, Any], *, critic_context: dict | None = None) -> dict[str, Any]:
+        nonlocal resolved
+        scope: dict = {}
+        try:
+            try:
+                return call_operation(payload, critic_context=critic_context, route_scope=scope)
+            except _CoderProtocolRecoveryReady:
+                # The parent is already settled. Reentry selects its sole child
+                # from the same native request; no tool/candidate attempt moves.
+                return call_operation(payload, critic_context=critic_context, route_scope=scope)
+        finally:
+            if "previous_route" in scope:
+                resolved, config.fast, call.model, call.role_config = scope["previous_route"]
+
+    def call_operation(payload: dict[str, Any], *, critic_context: dict | None,
+                       route_scope: dict) -> dict[str, Any]:
         nonlocal resolved, system, prompt_hash, active_review_stage
         from .context.compiler import is_research_planning_input, is_analysis_scientific_input
         scientific_planning = is_research_planning_input(role, payload)
@@ -1304,10 +1383,21 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                 raise LlmUnavailable("designer_native_input_invalid", diagnostics={"native_errors": native_errors})
         if role == "candidate_coder":
             from .coder_format_recovery import coder_format_recovery
-            format_recovery = coder_format_recovery(camp, logical_operation, payload=payload,
+            coder_attempts, coder_latest = _coder_operation_progress(camp, logical_operation)
+            activate_coder_route(_recorded_coder_route(camp, coder_attempts, resolved), route_scope)
+            recovery = coder_format_recovery(camp, logical_operation, payload=payload,
                 bound=bound, revision=CODER_FORMAT_FEEDBACK_REVISION)
-            if format_recovery is not None:
-                logical_operation = format_recovery["operation_id"]
+            if recovery is not None:
+                child_attempts, child_latest = _coder_operation_progress(camp, recovery["operation_id"])
+                target = (_recorded_coder_route(camp, child_attempts, resolved)
+                          if child_attempts else _coder_protocol_route(camp, resolved))
+                # Existing children keep their paid routing, including older
+                # Flash children. A new child must actually change the route.
+                if child_attempts or not _same_coder_route(resolved, target):
+                    format_recovery = recovery
+                    logical_operation = recovery["operation_id"]
+                    coder_attempts, coder_latest = child_attempts, child_latest
+                    activate_coder_route(target, route_scope)
 
         def validate_recovered(reply, frozen_payload, frozen_prompt_hash):
             parsed = dict(reply)
@@ -1437,6 +1527,25 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
         schema_feedback = None
         attempt_limit = PARSE_ATTEMPTS
         first_attempt = 0
+        resumed_feedback = None
+        if role == "candidate_coder":
+            first_attempt = len(coder_attempts)
+            attempt_limit = min([PARSE_ATTEMPTS, *[
+                row["max_operation_attempts"] for row in coder_attempts]])
+            if (coder_latest and coder_latest.get("transport_outcome") == "confirmed_response"
+                    and not coder_latest.get("unconfirmed_charge_possible")
+                    and coder_latest.get("role_request_semantics_digest") == request_semantics):
+                if coder_latest.get("failure_kind") in {"format_error", "missing_final_content"}:
+                    resumed_feedback = coder_format_feedback(coder_latest.get("raw_excerpt") or "",
+                        finish_reason=coder_latest.get("finish_reason"))
+                elif coder_latest.get("success") is True:
+                    response = json.loads((camp / "llm_responses" /
+                                           (coder_latest["call_id"] + ".json")).read_text())
+                    if response.get("validation") == "coder_tool_request_invalid":
+                        resumed_feedback = {"kind": "coder_tool_request_invalid",
+                            "tool_executed": False, "validation_errors": response.get("schema_errors"),
+                            "rejected_format": json.dumps(response.get("reply"), ensure_ascii=False),
+                            "instruction": "Correct the reported tool envelope/arguments against OUTPUT_SCHEMA. No tool executed."}
         if designer_wire or planning_wire or reviewer_wire:
             from .api_policy import ATTEMPTS
             from .research_execution import role_api_attempt_limit
@@ -1483,7 +1592,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             from .review_format_recovery import operation_attempt_limit
             attempt_limit = operation_attempt_limit(camp, logical_operation, attempt_limit)
         for _attempt in range(first_attempt, attempt_limit):
-            request_mode = "repair" if external_repair or last is not None or schema_error is not None or format_recovery is not None else "normal"
+            request_mode = "repair" if external_repair or last is not None or schema_error is not None or format_recovery is not None or resumed_feedback is not None else "normal"
             call_payload = ((reviewer_frozen_input if reviewer_frozen_input is not None else reviewer_draft)
                 if reviewer_wire else designer_frozen_input if designer_frozen_input is not None
                 else analyst_frozen_input if analyst_frozen_input is not None else payload)
@@ -1492,6 +1601,8 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                     "previous_response_error": {**coder_format_feedback(format_recovery["rejected_format"]),
                         "recovery": {key: value for key, value in format_recovery.items()
                                      if key != "rejected_format"}}}
+            if resumed_feedback is not None:
+                call_payload = {**call_payload, "previous_response_error": resumed_feedback}
             if last is not None:
                 failure = getattr(last.usage, "failure_kind", None)
                 error_feedback = {
@@ -1627,7 +1738,7 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
                        reasoning_effort=resolved.reasoning_effort,
                        application_retry_kind=("domain_schema" if schema_error is not None else
                                                "output_truncated" if last is not None and getattr(last.usage, "failure_kind", None) == "output_truncated" else
-                                               "invalid_json" if last is not None else
+                                               "invalid_json" if last is not None or resumed_feedback is not None else
                                                "native_planner_repair" if external_repair else None),
                        role_context_revision=projection["revision"],
                        role_context_original_user_chars=projection["original_user_chars"],
@@ -1896,9 +2007,20 @@ def role_backend(camp: Path, role: str, *, overrides: dict | None = None) -> Cal
             if bound_reply is not None:
                 return bound_reply
             return parsed
+        if role == "candidate_coder" and format_recovery is None and schema_error is None:
+            from .coder_format_recovery import coder_format_recovery
+            recovery = coder_format_recovery(camp, logical_operation, payload=payload,
+                bound=bound, revision=CODER_FORMAT_FEEDBACK_REVISION)
+            if recovery is not None and not _same_coder_route(resolved, _coder_protocol_route(camp, resolved)):
+                raise _CoderProtocolRecoveryReady()
+        diagnostics = {"domain_schema_errors": schema_error} if schema_error is not None else {}
+        if role == "candidate_coder" and format_recovery is not None:
+            diagnostics.update(reason="coder_format_recovery_exhausted",
+                               operation_id=logical_operation,
+                               parent_operation_id=format_recovery["parent_operation_id"])
         raise LlmUnavailable(schema_error_kind if schema_error is not None else
                              (type(last).__name__ if last is not None else "DeepSeekParseError"),
-                             diagnostics={"domain_schema_errors": schema_error} if schema_error is not None else {}) from last
+                             diagnostics=diagnostics) from last
 
     call.model = config.fast.model  # type: ignore[attr-defined]
     call.bind = bind  # type: ignore[attr-defined]

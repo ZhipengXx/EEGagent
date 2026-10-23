@@ -234,7 +234,7 @@ def _returned_proof(camp, state, owner_id, returned):
     """Preserve local injected-backend delivery without pretending it is paid."""
     full, stages, _ = returned
     rid = round_id(full)
-    proof = {"source": "backend_return_receipt", "stage_inputs": {}}
+    proof = {"source": "backend_return_receipt", "stage_inputs": {}, "stage_payloads": {}}
     for stage in stages:
         path = camp / "research_round_inputs" / rid / (stage + ".json")
         if not path.is_file():
@@ -245,6 +245,7 @@ def _returned_proof(camp, state, owner_id, returned):
             {"round_id": rid, "owner_id": owner_id}, state=state)
         if _native_observation(_original_observation(native)) != _native_observation(full):
             raise ValueError("paid_staged_round_response_inputs_conflict")
+        proof["stage_payloads"][stage] = copy.deepcopy(model_input)
         if stage == "generation":
             proof["planner_delivery"] = _planner_delivery(model_input)
         if stage in CRITIC_STAGES:
@@ -320,6 +321,8 @@ def restore_staged_paid(camp, state):
     """Return original inputs/raw stages with native proof, without new calls."""
     camp = Path(camp).resolve()
     owner_id = (state.get("selected_plan") or {}).get("continuation_owner") or "bootstrap:initial_planner"
+    from .iteration_continuation import planning_continuation_owner
+    owner_id = planning_continuation_owner(camp, state.get("terminal_observation_digest"), owner_id)
     returned = _receipt_stages(camp, state, owner_id)
     journals = {name: paid._rows(camp, name) for name in
         ("llm_calls.jsonl", "llm_api_intents.jsonl", "api_operation_attempts.jsonl")}

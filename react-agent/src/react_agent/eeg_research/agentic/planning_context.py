@@ -349,6 +349,9 @@ def _build_v2_proposer_input(full, delivered):
     else:
         result["task_options"] = [_v2_task_view(task) for task in tasks]
     result["observations"] = _v2_observations(full, view)
+    history = (view.get("experiment_observations") or {}).get("history_index") if isinstance(view.get("experiment_observations"), dict) else None
+    if history:
+        result["history_index"] = copy.deepcopy(history)
     # Cards have already been scientifically projected and measured. Removing
     # duplicate conditions here would make the frozen measurement a different
     # view from the one the Planner and Critic actually receive.
@@ -379,7 +382,7 @@ def delivered_observation_ids(view: dict) -> frozenset[str]:
     cards = cards or []
     if isinstance(cards, dict):
         cards = [card.get("body") or card for card in cards.get("cards") or []]
-    rows = [*cards, *(view.get("experiment_history") or [])]
+    rows = [*cards, *(view.get("experiment_history") or []), *((view.get("history_index") or {}).get("items") or [])]
     return frozenset(row["observation_id"] for row in rows
         if isinstance(row, dict) and isinstance(row.get("observation_id"), str))
 
@@ -391,15 +394,20 @@ def delivered_observation_rows(view: dict, ids) -> list[dict]:
     cards = cards or []
     if isinstance(cards, dict):
         cards = [card.get("body") or card for card in cards.get("cards") or []]
-    return [copy.deepcopy(row) for row in [*cards, *(view.get("experiment_history") or [])]
-        if isinstance(row, dict) and row.get("observation_id") in wanted]
+    rows = [*cards, *(view.get("experiment_history") or []), *((view.get("history_index") or {}).get("items") or [])]
+    result, seen = [], set()
+    for row in rows:
+        if isinstance(row, dict) and row.get("observation_id") in wanted and row["observation_id"] not in seen:
+            result.append(copy.deepcopy(row))
+            seen.add(row["observation_id"])
+    return result
 
 
 def selection_basis(camp, plan: dict) -> dict | None:
     """Critic rationale and the delivered history rows behind the selected proposal.
 
-    Rows come from the frozen generation snapshot, i.e. what the Planner saw; no
-    new retrieval. Rounds without a staged snapshot (legacy wires) return None.
+    Rows come from the frozen Planner and Critic snapshots, never a new
+    retrieval. Prefer delivered detail over a compact history-index entry.
     """
     import json
     from pathlib import Path
@@ -417,6 +425,22 @@ def selection_basis(camp, plan: dict) -> dict | None:
                               *(round_record.get("selected_basis_observation_ids") or [])]))
     result = {"selection_rationale": round_record.get("selection_rationale"),
               "basis_observation_ids": ids, "basis_observations": delivered_observation_rows(view, ids)}
+    critic_path = paths[1].with_name("critic.json")
+    if critic_path.is_file():
+        critic_view = json.loads(critic_path.read_text(encoding="utf-8")).get("model_input") or {}
+        rows = delivered_observation_rows(critic_view, ids) + result["basis_observations"]
+        # Detail in either frozen input takes precedence over index-only facts.
+        detail_ids = {row.get("observation_id") for source in (view, critic_view)
+                      for row in source.get("observations") or []}
+        indexed = {}
+        for source in (view, critic_view):
+            for row in source.get("observations") or []:
+                if row.get("observation_id") in ids:
+                    indexed[row["observation_id"]] = copy.deepcopy(row)
+        for row in rows:
+            if row["observation_id"] not in detail_ids:
+                indexed.setdefault(row["observation_id"], row)
+        result["basis_observations"] = [indexed[identity] for identity in ids if identity in indexed]
     selected_id = plan.get("originating_proposal") or proposal.get("proposal_id")
     selected = next((row for row in round_record.get("evaluations") or []
                      if row.get("proposal_id") == selected_id), None)
@@ -473,6 +497,8 @@ def _critic_v2_comparison(pool, full, critic_context):
             "implementation_risk": copy.deepcopy(native.get("implementation_risk")),
             "basis_observation_ids": copy.deepcopy(native.get("basis_observation_ids") or []),
             "required_context_refs": copy.deepcopy(native.get("required_context_refs") or [])})
+        if "related_observation_ids_by_proposal" in context:
+            rows[-1]["related_observation_ids"] = copy.deepcopy(context["related_observation_ids_by_proposal"].get(proposal_id, []))
         # Use the admitted native task binding; a phase label alone cannot
         # represent candidate, controls, fold population or training seed.
         tasks.append({"task_kind": copy.deepcopy(native["task_kind"]),
@@ -503,8 +529,8 @@ def critic_pool_input(pool: dict, full: dict | None = None, *, critic_context: d
 
 def build_critic_input(full: dict, delivered: dict, native_pool: dict,
                        critic_context: dict | None = None) -> dict:
-    # These science blocks were already delivered to the Planner. Do not
-    # re-read sources, refill memory, or repeat protocol assembly here.
+    # The caller has frozen proposal-specific retrieval before this pure view.
+    # Protocol, baseline and resources remain the Planner's original science.
     required = ("research_goal", "protocol", "baseline_method", "observations", "knowledge", "resources")
     if delivered.get("planning_context_version") != VERSION_V2 or any(key not in delivered for key in required):
         raise ValueError("critic_frozen_science_input_missing")
@@ -513,9 +539,76 @@ def build_critic_input(full: dict, delivered: dict, native_pool: dict,
         raise ValueError("critic_delivered_observations_changed")
     result = {"planning_context_version": VERSION_V2, "planning_stage": "critic"}
     result.update({key: copy.deepcopy(delivered[key]) for key in required})
+    if "history_index" in delivered:
+        result["history_index"] = copy.deepcopy(delivered["history_index"])
     result["research_goal"].pop("target_k", None)
     result["resources"].pop("native_cost_basis", None)
     result["comparison"] = critic_pool_input(native_pool, full, critic_context=context)
     return result
+
+
+def prepare_critic_science(camp, full: dict, proposer_input: dict, pool: dict) -> dict:
+    """Retrieve by method once, with per-experiment quotas and a balanced set."""
+    from .embedding import memory_config
+    from .experiment_observations import planner_applicability_context
+    from .memory_delivery import project_memory_card, select_memory_cards
+    from .semantic_memory import retrieve_proposal_observations
+
+    view = copy.deepcopy(proposer_input)
+    config = memory_config(camp)
+    if not config.enabled:
+        return view
+    bundle = retrieve_proposal_observations(camp, pool["proposals"],
+        context=planner_applicability_context(camp, full))
+    if bundle["status"] in {"disabled", "empty"}:
+        return view
+    lists = [bundle["by_proposal"][row["proposal_id"]] for row in pool["proposals"]]
+    cited_ids = {identity for proposal in pool["proposals"] for identity in proposal.get("basis_observation_ids") or []}
+    cited_refs = {reference for proposal in pool["proposals"] for reference in proposal.get("required_context_refs") or []}
+    def referenced(value):
+        if isinstance(value, str):
+            return value in cited_refs
+        if isinstance(value, dict):
+            return any(referenced(child) for child in value.values())
+        if isinstance(value, list):
+            return any(referenced(child) for child in value)
+        return False
+    current, cited = [], []
+    for row in view["observations"]:
+        card = {"record_type": "experiment_observation", "record_id": row["observation_id"], "body": row,
+                "current_feedback": row.get("current_feedback", False)}
+        if row.get("current_feedback"):
+            current.append(card)
+        elif row["observation_id"] in cited_ids or referenced(row):
+            cited.append(card)
+    knowledge = list((view.get("knowledge") or {}).get("items") or [])
+    cited.extend(card for card in knowledge if referenced(card))
+    knowledge = [card for card in knowledge if not referenced(card)]
+    # Round-robin relevance avoids filling every related slot from p1 alone.
+    related = [project_memory_card(rows[index], role="research_planner")
+               for index in range(max((len(rows) for rows in lists), default=0))
+               for rows in lists if index < len(rows)]
+    # Admitted proposals already cite this frozen science. New retrieval must
+    # not displace it and leave dangling basis IDs or required references.
+    cards = current + cited + related + knowledge
+    selected = select_memory_cards(cards, content_chars_budget=config.content_chars_budget,
+                                  per_observation_tokens_budget=config.per_observation_tokens_budget)
+    cited_count = sum(card["record_type"] == "experiment_observation" for card in cited)
+    related_limit = max(max(0, min(config.top_k, 32)), cited_count)
+    observations, other, optional_count = [], [], 0
+    for card in selected.cards:
+        if card["record_type"] != "experiment_observation":
+            other.append(card)
+        elif card.get("current_feedback") or optional_count < related_limit:
+            observations.append(card)
+            optional_count += not bool(card.get("current_feedback"))
+    view["observations"] = _v2_observations(full, {"experiment_observations": {"cards":
+        observations}})
+    knowledge = [card for card in other if card["record_type"] in {"lesson", "knowledge"}]
+    view["knowledge"] = {"status": "ready" if knowledge else "no_related_knowledge", "items": knowledge}
+    delivered = delivered_observation_ids(view)
+    view["related_observation_ids_by_proposal"] = {pid: [row["record_id"] for row in rows
+        if row["record_id"] in delivered] for pid, rows in bundle["by_proposal"].items()}
+    return view
 
 

@@ -166,6 +166,7 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
     from .critic_contract import freeze_critic_context, verify_critic_context
     proof_inputs = (recovery_proof or {}).get("stage_inputs") or {}
     critic_context = None
+    critic_science = None
     for stage in CRITIC_STAGES:
         original = proof_inputs.get(stage)
         if original is not None and (original.get("proposal_pool_digest") != pool["pool_digest"]
@@ -178,13 +179,20 @@ def decide_staged_plan(camp, state, full, delivered, planner, critic, planning_o
             if critic_context is not None and critic_context != frozen_context:
                 raise ValueError("paid_critic_original_context_changed")
             critic_context = copy.deepcopy(frozen_context)
+            original_payload = ((recovery_proof or {}).get("stage_payloads") or {}).get(stage)
+            if critic_science is None and original_payload is not None:
+                critic_science = copy.deepcopy(original_payload)
     if critic_context is None:
-        critic_context = freeze_critic_context(pool, proposer_input)
+        from .planning_context import prepare_critic_science
+        critic_science = prepare_critic_science(camp, full, proposer_input, pool)
+        critic_context = freeze_critic_context(pool, critic_science)
+    elif critic_science is None:
+        raise ValueError("paid_critic_original_science_missing")
     native_errors = verify_critic_context(critic_context, pool)
     if native_errors:
         return {"ok": False, "detail": "critic_native_input_invalid", "native_errors": native_errors,
                 "validation_records": [], "proposal_history": list(stages.values())}
-    critic_input = build_critic_input(full, proposer_input, pool, critic_context=critic_context)
+    critic_input = build_critic_input(full, critic_science, pool, critic_context=critic_context)
     raw = request("critic", critic, critic_input, native_pool=pool, critic_context=critic_context)
     result = normalize_critique(raw, pool, checked, critic_context=critic_context)
     if result.get("native_errors"):

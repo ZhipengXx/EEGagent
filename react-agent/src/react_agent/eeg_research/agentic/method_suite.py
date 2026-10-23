@@ -174,7 +174,8 @@ def _method(camp: Path, target: str, state: dict) -> dict:
     return body
 
 
-def validate_suite(camp: Path, suite_id: str, *, verify_data: bool = False) -> dict:
+def validate_suite(camp: Path, suite_id: str, *, verify_data: bool = False,
+                   fold_ids: list[str] | None = None) -> dict:
     path = camp / "suites" / suite_id / "suite_manifest.json"
     body = read(path)
     if identity({k: v for k, v in body.items() if k != "suite_hash"}) != body["suite_hash"]:
@@ -186,7 +187,15 @@ def validate_suite(camp: Path, suite_id: str, *, verify_data: bool = False) -> d
     if verify_data:
         verify_dependencies(parent["data_dependencies"] + parent["cache_dependencies"])
     validate_manifest_rows(body["folds"])
+    selected = set(fold_ids) if fold_ids is not None else None
+    if selected is not None and not selected <= {row["fold_id"] for row in body["folds"]}:
+        raise ValueError("method_suite_unknown_validation_fold")
     for row in body["folds"]:
+        # The complete manifest/layout remains bound above. A two-fold read
+        # consumes only these protocol files; launch/confirmation keep the
+        # default full validation and cannot inherit this narrower scope.
+        if selected is not None and row["fold_id"] not in selected:
+            continue
         protocol = read(Path(row["protocol_path"]))
         if protocol != row["protocol"] or protocol["method_revision"] != body["method"]["method_revision"]:
             raise ValueError("method_suite_fold_protocol_changed")
@@ -477,10 +486,14 @@ def verify_score(camp: Path, suite: dict, score: dict) -> None:
     # native recovery never silently scores a replacement cache or subject file.
 
 
-def verified_suite_records(camp: Path, state: dict) -> list[dict]:
+def verified_suite_records(camp: Path, state: dict, *, target_ids: set[str] | None = None,
+                           evidence_ids: set[str] | None = None) -> list[dict]:
     records = []
     for row in state.get("evidence") or []:
         if row.get("kind") != "method_suite" or row.get("evaluation_valid") is not True:
+            continue
+        if (target_ids is not None and row.get("candidate_id") not in target_ids
+                or evidence_ids is not None and row.get("evidence_id") not in evidence_ids):
             continue
         try:
             result = read_aggregate(camp, row["suite_id"])
@@ -989,7 +1002,7 @@ def recover(camp: Path, state: dict) -> dict:
     recover_probes(camp, state)
     if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
         from react_agent.eeg_research.agentic.screening import recover as recover_phase
-        return recover_phase(camp, state)
+        return recover_phase(camp, state, probes_recovered=True)
     for path in sorted((camp / "suites").glob("*/suite_state.json")):
         progress = read(path)
         suite = validate_suite(camp, path.parent.name)

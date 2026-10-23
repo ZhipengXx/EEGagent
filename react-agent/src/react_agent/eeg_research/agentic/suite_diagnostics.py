@@ -2,6 +2,7 @@
 from __future__ import annotations
 import hashlib
 import json
+import math
 from pathlib import Path
 
 from .artifacts import file_digest, register, resolve_verified_artifact, lookup
@@ -16,14 +17,15 @@ def _read(path):
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode()).hexdigest()
 
-def sources(camp: Path, state: dict) -> list[dict]:
+def sources(camp: Path, state: dict, *, verified_records: list[dict] | None = None) -> list[dict]:
     """Use native verified scores/freezes, retaining phase rather than inventing a job."""
     camp = Path(camp).resolve()
     rows = []
     if state.get("evaluation_mode") == "loso_method_search":
         from .method_suite import verified_suite_records
         from .screening import verified_screening_records
-        records = [*verified_screening_records(camp, state), *verified_suite_records(camp, state)]
+        records = (verified_records if verified_records is not None else
+                   [*verified_screening_records(camp, state), *verified_suite_records(camp, state)])
         for record in records:
             scientific = record.get("screening") or record.get("aggregate") or {}
             for score in scientific.get("scores") or []:
@@ -73,27 +75,66 @@ def _dependencies(rows):
                 result[str(path)] = {"path": str(path), "sha256": file_digest(path)}
     return list(result.values())
 
-def input_epochs(camp: Path, state: dict) -> dict:
-    rows = sources(camp, state)
+def input_epochs(camp: Path, state: dict, *, verified_records: list[dict] | None = None) -> dict:
+    rows = sources(camp, state, verified_records=verified_records)
     dependencies = _dependencies(rows)
     return {action: _digest({"version": VERSION, "action": action, "sources": rows,
                              "dependencies": dependencies})
             for action in ("collect_diagnostics", "diagnose_results")}
 
+def learning_profile(points: list[dict], selected_checkpoint: dict, *, read_coverage: dict | None = None) -> dict:
+    """Describe existing rows; a recent trend is neither a stopping rule nor convergence.
+
+    Checkpoint identity comes from the trainer's selection record, including its
+    tie policy, rather than selecting a new checkpoint from the curve.
+    """
+    def number(value):
+        return type(value) in (int, float) and math.isfinite(value)
+
+    coverage = dict(read_coverage or {"valid_rows": len(points), "complete": bool(points)})
+    losses = [row for row in points if number(row.get("train_loss"))]
+    measured = [row for row in points if number(row.get("fixed_bank_top1"))]
+    # Ten recorded epochs is a descriptive window only. Sparse rows retain their
+    # epoch identities so readers cannot mistake them for consecutive epochs.
+    tail = losses[-10:]
+    first, last = (losses[0], losses[-1]) if losses else ({}, {})
+    tail_first, tail_last = (tail[0], tail[-1]) if tail else ({}, {})
+    start, end = tail_first.get("train_loss"), tail_last.get("train_loss")
+    best_epoch = selected_checkpoint.get("best_epoch")
+    selected_row = next((row for row in measured if row.get("epoch") == best_epoch), {})
+    recorded_best = selected_checkpoint.get("best_fixed_bank_top1")
+    if not number(recorded_best):
+        recorded_best = selected_row.get("fixed_bank_top1")
+    last_epoch = points[-1].get("epoch") if points else None
+    since_best = (last_epoch - best_epoch if number(last_epoch) and number(best_epoch)
+                  and last_epoch >= best_epoch else None)
+    return {"status": "partial" if coverage.get("diagnostics") or coverage.get("complete") is False and points
+            else "ready" if points else "unavailable",
+        "epochs": len(points), "last_epoch": last_epoch,
+        "first_train_loss": first.get("train_loss"), "last_train_loss": last.get("train_loss"),
+        "tail_loss": {"rows": len(tail), "first_epoch": tail_first.get("epoch"),
+            "last_epoch": tail_last.get("epoch"), "start": start, "end": end,
+            "decrease": start - end if start is not None and end is not None else None,
+            "relative_decrease": (start - end) / abs(start) if start not in (None, 0) and end is not None else None},
+        "first_fixed_bank_top1": measured[0]["fixed_bank_top1"] if measured else None,
+        "last_fixed_bank_top1": measured[-1]["fixed_bank_top1"] if measured else None,
+        "best_epoch": best_epoch, "best_fixed_bank_top1": recorded_best,
+        "epochs_since_selected_checkpoint": since_best,
+        "checkpoint_selection_status": "recorded" if best_epoch is not None else "unavailable",
+        "read_coverage": coverage, "metric_scope": "source_subject_development_curve"}
+
+
 def curve(job: Path) -> dict:
     read = read_jsonl(job / "history.jsonl")
     points = read["rows"]
-    measured = [row for row in points if type(row.get("fixed_bank_top1")) in (int, float)]
-    best = max(measured, key=lambda row: row["fixed_bank_top1"]) if measured else {}
-    return {"status": "partial" if read["diagnostics"] else "ready" if points else "unavailable",
+    selected_path = job / "selected_checkpoint.json"
+    selected = _read(selected_path) if selected_path.is_file() else {}
+    coverage = {"valid_rows": len(points), "complete": bool(points) and not read["diagnostics"] and not read["truncated"],
+                "truncated": read["truncated"], "diagnostics": read["diagnostics"]}
+    return {**learning_profile(points, selected, read_coverage=coverage),
         "reason": "history_missing_or_empty" if not points else None,
-        "epochs": len(points), "epoch_ids": [row.get("epoch") for row in points],
-        "best_epoch": best.get("epoch"), "best_fixed_bank_top1": best.get("fixed_bank_top1"),
-        "first_train_loss": points[0].get("train_loss") if points else None,
-        "last_train_loss": points[-1].get("train_loss") if points else None,
-        "fixed_bank_trend": [row.get("fixed_bank_top1") for row in points],
-        "read_coverage": {"valid_rows": len(points), "truncated": read["truncated"], "diagnostics": read["diagnostics"]},
-        "metric_scope": "source_subject_development_curve"}
+        "epoch_ids": [row.get("epoch") for row in points],
+        "fixed_bank_trend": [row.get("fixed_bank_top1") for row in points]}
 
 def collect(camp: Path, state: dict, *, kind="diagnostic_bundle") -> dict:
     """Campaign-history annotation; targets remain annotations as in the cost contract."""

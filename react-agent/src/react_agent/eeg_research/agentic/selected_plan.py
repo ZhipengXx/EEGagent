@@ -998,14 +998,17 @@ def tick_selected_plan(camp: Path, state: dict, backend, services: dict, runner=
         row = _measurement(state, plan)
         if not row:
             return _blocked(camp, state, plan, "selected_plan_verified_measurement_missing")
-        if not _analysis_ref(state, row["evidence_id"]):
+        analysis_ref = _analysis_ref(state, row["evidence_id"])
+        if not analysis_ref:
             analyst = services.get("analyze")
             if analyst is None:
                 return _blocked(camp, state, plan, "selected_plan_analyst_missing")
             with budget_owner(camp, plan["budget_owner"], purpose="mainline"):
                 analyst(camp, state)
-            if not _analysis_ref(state, row["evidence_id"]):
+            analysis_ref = _analysis_ref(state, row["evidence_id"])
+            if not analysis_ref:
                 return _blocked(camp, state, plan, "selected_plan_analysis_incomplete")
+        plan["analysis_artifact_ref"] = analysis_ref
         plan["current_step"] = "observation"
         save_plan(camp, state, plan)
         return state

@@ -10,7 +10,7 @@ import copy
 import json
 from dataclasses import dataclass
 
-PROJECTION_VERSION = "scientific_memory_delivery.v1"
+PROJECTION_VERSION = "scientific_memory_delivery.v2"
 
 
 def _canonical(value):
@@ -34,7 +34,11 @@ _NATIVE = frozenset({"phase", "scope", "fidelity", "seed", "coverage", "required
     "full_required_fold_count", "independently_replicated", "screening_fold_ids", "screening_subjects",
     "promotion", "missing", "metrics", "scores", "paired_scores", "paired_delta_pp", "measurement_kind",
     "summary", "native_diagnostics", "diagnostic_selection", "training_recipe", "input_geometry",
-    "learning_profile", "folds", "fold_id", "held_out_subject", "baseline_metrics", "candidate_metrics"})
+    "learning_profile", "learning_profiles", "folds", "fold_id", "held_out_subject", "baseline_metrics", "candidate_metrics"})
+_LEARNING_PROFILE = frozenset({"status", "epochs", "last_epoch", "first_train_loss", "last_train_loss",
+    "tail_loss", "first_fixed_bank_top1", "last_fixed_bank_top1", "best_epoch", "best_fixed_bank_top1",
+    "epochs_since_selected_checkpoint", "checkpoint_selection_status", "read_coverage", "metric_scope",
+    "tail_loss_relative_decrease"})
 _CONDITIONS = frozenset({"dataset", "modality", "task_type", "regime", "scope", "seed", "fold_id",
     "fold_count", "fold_ids", "screening_subjects", "input_geometry", "training_recipe", "feature_target",
     "intervention", "fidelity", "negative_sampling_policy", "evaluation_mode", "generalization_target"})
@@ -45,9 +49,15 @@ _SCHEMAS = {
     ("evaluation_scope",): frozenset({"phase", "scope", "folds", "fold_ids", "seed", "seeds",
         "fold_count", "required_fold_count", "subjects", "subject_ids", "held_out_subject", "fidelity"}),
     ("analyst_interpretation",): frozenset({"hypothesis_assessment", "summary_zh", "summary", "limitations",
-        "findings", "next_steps", "points"}),
+        "findings", "findings_coverage", "next_steps", "points"}),
     ("analyst_interpretation", "points"): frozenset({"hypothesis_assessment", "summary_zh", "summary",
         "limitations", "findings", "next_steps"}),
+    ("analyst_interpretation", "findings", "*"): frozenset({"observation", "interpretation", "implication", "next_step"}),
+    ("analyst_interpretation", "findings_coverage"): frozenset({"delivered", "total"}),
+    ("native_facts", "learning_profiles", "*"): frozenset({"arm", "candidate_id", "fold_id", "held_out_subject", "seed", "learning_profile"}),
+    ("native_facts", "learning_profiles", "*", "learning_profile"): _LEARNING_PROFILE,
+    ("native_facts", "learning_profiles", "*", "learning_profile", "tail_loss"): frozenset({"rows", "first_epoch", "last_epoch", "start", "end", "decrease", "relative_decrease"}),
+    ("native_facts", "learning_profiles", "*", "learning_profile", "read_coverage"): frozenset({"valid_rows", "complete", "truncated", "diagnostics"}),
     ("engineering_failure",): frozenset({"error", "error_category", "reason", "summary", "blocking_issues"}),
     ("evidence_updates", "*"): frozenset({"scope", "verified_fold_coverage", "relation",
         "scientific_strength", "summary", "limitations"}),
@@ -89,6 +99,10 @@ def _metadata(path):
         return _IDENTITY_METADATA
     if path == ("analyst_interpretation",):
         return _ANALYSIS_METADATA
+    if path == ("analyst_interpretation", "findings", "*"):
+        return frozenset({"evidence_refs"})
+    if path == ("native_facts", "learning_profiles", "*", "learning_profile"):
+        return frozenset({"source_ref"})
     if path == ("evidence_updates", "*"):
         return frozenset({"source", "episode_id"})
     return frozenset()
@@ -144,6 +158,10 @@ def _clean_body(value, path=()):
             ignored = ignored - {"candidate_id"}
         elif path == ("analyst_interpretation",):
             ignored = ignored - {"interpretation_only"}
+        elif path == ("analyst_interpretation", "findings", "*"):
+            ignored = ignored - {"evidence_refs"}
+        elif path == ("native_facts", "learning_profiles", "*", "learning_profile"):
+            ignored = ignored - {"source_ref"}
         elif path == ("evidence_updates", "*"):
             ignored = ignored - {"episode_id"}
         result = {}
@@ -239,37 +257,49 @@ def _schema(path, record_type):
     return frozenset()
 
 
-def _count(value, path, record_type):
+def _content_parts(value, path, record_type):
     if isinstance(value, dict):
         ignored = _metadata(path)
         fixed = _schema(path, record_type)
-        return sum((0 if key in fixed else len(key)) + _count(child, path + (key,), record_type)
-                   for key, child in value.items() if key not in ignored)
-    if isinstance(value, list):
-        return sum(_count(child, path + ("*",), record_type) for child in value)
-    if isinstance(value, str):
-        return len(value)
-    return len(_canonical(value))
+        for key, child in value.items():
+            if key not in ignored:
+                if key not in fixed:
+                    yield key
+                yield from _content_parts(child, path + (key,), record_type)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _content_parts(child, path + ("*",), record_type)
+    else:
+        yield value if isinstance(value, str) else _canonical(value)
 
 
-def memory_content_chars(card, *, record_type=None, role=None):
-    """Count science, excluding fixed structural labels and known citation IDs.
-
-    An explicit ``record_type`` also supports the final role row without a body
-    envelope. Open maps remain open even if a custom key matches a schema label.
-    """
+def _card_content_parts(card, record_type=None):
     body = card.get("body", card)
     kind = record_type or _kind(card, body)
-    result = _count(body, (), kind)
+    yield from _content_parts(body, (), kind)
     if body is not card:
         # An envelope may add applicability labels or differences. Count those
         # once, without charging the duplicated body-level scientific condition.
         for key in ("applicability", "condition_differences", "precondition_status"):
             if key in card and (key not in body or card[key] != body[key]):
-                result += _count(card[key], (key,), kind)
+                yield from _content_parts(card[key], (key,), kind)
         if "current_feedback" in card and "current_feedback" not in body:
-            result += _count(card["current_feedback"], ("current_feedback",), kind)
-    return result
+            yield from _content_parts(card["current_feedback"], ("current_feedback",), kind)
+
+
+def memory_content_chars(card, *, record_type=None, role=None):
+    """Count science, excluding fixed structural labels and known citation IDs."""
+    return sum(map(len, _card_content_parts(card, record_type)))
+
+
+def memory_content_tokens(card, *, record_type=None, tokenizer=None):
+    """Estimate scientific-content tokens; the final compiler counts full wire.
+
+    Uses the same content selection as the character quota, including open-map
+    scientific parameter names. No tokenizer model is downloaded or loaded.
+    """
+    from .context.budget import token_count
+    return token_count("\n".join(_card_content_parts(card, record_type)), tokenizer)
 
 
 @dataclass(frozen=True)
@@ -278,14 +308,20 @@ class Selection:
     report: dict
 
 
-def select_memory_cards(cards, *, content_chars_budget: int, mandatory_ids=(), dedup_keys=None):
+def select_memory_cards(cards, *, content_chars_budget: int, mandatory_ids=(), dedup_keys=None,
+                        per_observation_tokens_budget: int | None = None, tokenizer=None):
     """Select complete preordered cards; a large optional card does not stop us.
 
+    When configured, each observation has its own scientific-token allowance;
+    the shared character allowance only applies to other kinds of prior.
     ``dedup_keys`` maps (record_type, record_id) to caller-verified scientific
     support identities. It stays local and only selected cards claim support.
     """
     if isinstance(content_chars_budget, bool) or not isinstance(content_chars_budget, int) or content_chars_budget < 0:
         raise ValueError("memory_content_chars_budget_must_be_nonnegative_integer")
+    if per_observation_tokens_budget is not None and (isinstance(per_observation_tokens_budget, bool)
+            or not isinstance(per_observation_tokens_budget, int) or per_observation_tokens_budget < 0):
+        raise ValueError("per_observation_tokens_budget_must_be_nonnegative_integer")
     cards = list(cards)
     mandatory = {str(value) for value in mandatory_ids}
     mandatory.update(str(card["record_id"]) for card in cards if card.get("current_feedback") is True)
@@ -295,7 +331,8 @@ def select_memory_cards(cards, *, content_chars_budget: int, mandatory_ids=(), d
     seen = set()
     seen_sources = set()
     omitted = []
-    used = required = 0
+    used = required = observation_chars = 0
+    observation_usage = []
     for card in cards:
         record_id = str(card["record_id"])
         identity = (card.get("record_type"), record_id)
@@ -312,7 +349,19 @@ def select_memory_cards(cards, *, content_chars_budget: int, mandatory_ids=(), d
         if not is_mandatory and source_identity is not None and source_identity in seen_sources:
             omitted.append({"record_id": record_id, "record_type": identity[0], "reason": "duplicate_source"})
             continue
-        if not is_mandatory and used + cost > content_chars_budget:
+        individual_observation = identity[0] == "experiment_observation" and per_observation_tokens_budget is not None
+        if individual_observation:
+            tokens, precision, version = memory_content_tokens(card, tokenizer=tokenizer)
+            exceeds = tokens > per_observation_tokens_budget
+            observation_usage.append({"record_id": record_id, "content_tokens": tokens,
+                "token_precision": precision, "tokenizer_version": version,
+                "budget_tokens": per_observation_tokens_budget, "over_budget": exceeds,
+                "mandatory": is_mandatory, "selected": is_mandatory or not exceeds})
+            if exceeds and not is_mandatory:
+                omitted.append({"record_id": record_id, "record_type": identity[0],
+                    "reason": "per_observation_tokens_budget", "content_tokens": tokens})
+                continue
+        elif not is_mandatory and used + cost > content_chars_budget:
             omitted.append({"record_id": record_id, "record_type": identity[0],
                             "reason": "content_chars_budget", "content_chars": cost})
             continue
@@ -321,9 +370,13 @@ def select_memory_cards(cards, *, content_chars_budget: int, mandatory_ids=(), d
             seen_sources.add(source_identity)
         if is_mandatory:
             required += cost
-        else:
+        if individual_observation:
+            observation_chars += cost
+        elif not is_mandatory:
             used += cost
     return Selection(result, {"projection_version": PROJECTION_VERSION,
         "content_chars_budget": content_chars_budget, "content_chars_used": used,
         "mandatory_content_chars": required, "selected_ids": [card["record_id"] for card in result],
+        "per_observation_tokens_budget": per_observation_tokens_budget,
+        "observation_content_chars": observation_chars, "observation_token_usage": observation_usage,
         "omitted": omitted, "packet_chars": len(_canonical(result))})

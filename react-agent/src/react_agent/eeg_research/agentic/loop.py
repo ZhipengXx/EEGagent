@@ -779,10 +779,10 @@ def observation(camp: Path) -> dict[str, Any]:
     sync(camp, state)
     authoritative_state = state
     from .suite_diagnostics import input_epochs
-    state = {**state, "action_input_epochs": input_epochs(camp, state)}
     method_mode = state.get("evaluation_mode") == "loso_method_search"
     method_suites = []
     method_screenings = []
+    verified = []
     if method_mode:
         from react_agent.eeg_research.agentic.method_suite import manifest, verified_suite_records
         from react_agent.eeg_research.agentic.handoffs import method_suite_scalar_view
@@ -790,6 +790,9 @@ def observation(camp: Path) -> dict[str, Any]:
         if manifest(camp).get("evaluation_schedule") == "screen_then_confirm":
             from react_agent.eeg_research.agentic.screening import verified_screening_records
             method_screenings = verified_screening_records(camp, state)
+    state = {**state, "action_input_epochs": input_epochs(camp, state,
+        verified_records=[*method_screenings, *verified] if method_mode else None)}
+    if method_mode:
         method_permission = manifest(camp)["benchmark_permission"]
         verified_ids = {row["evidence_id"] for row in [*verified, *method_screenings]}
         ancillary_kinds = {"analysis", "audit", "data_audit", "method_hits", "report_revision",
@@ -847,10 +850,16 @@ def observation(camp: Path) -> dict[str, Any]:
         artifact_index, bounded_history, bounded_control_view, verified_read_context, read_history, read_epoch, READS_PER_EVIDENCE_EPOCH,
     )
     feedback = audit_feedback(camp, state)
-    analysis_views = load_analysis_views(camp, state)
+    # These dictionaries exist for this read-only assembly only. They are not
+    # state or a tick-wide cache: the next stage/write must validate anew.
+    sources_by_evidence_id = {row["evidence_id"]: row for row in [*verified, *method_screenings]}
+    artifacts_by_id = {}
+    analysis_views = load_analysis_views(camp, state, sources_by_evidence_id=sources_by_evidence_id,
+                                         artifacts_by_id=artifacts_by_id)
     superseded_analysis_ids = {ref for view in analysis_views
         for ref in view.get("superseded_analysis_evidence_ids") or []}
-    index = artifact_index(camp, state)
+    index = artifact_index(camp, state, sources_by_evidence_id=sources_by_evidence_id,
+                           artifacts_by_id=artifacts_by_id)
     reads = read_history(camp)
     remaining_reads = max(0, READS_PER_EVIDENCE_EPOCH - sum(row.get("epoch") == read_epoch(state) for row in reads))
     state["_has_development_artifacts"] = any(row["verification_status"] == "verified" for row in index)
@@ -1746,6 +1755,8 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     diagnostics = matched_diagnostics(state, parent)
     method_parent = None
     screening_parent = None
+    sources_by_evidence_id = {}
+    artifacts_by_id = {}
     if state.get("evaluation_mode") == "loso_method_search":
         from react_agent.eeg_research.agentic.method_suite import verified_suite_records
         from react_agent.eeg_research.agentic.handoffs import method_suite_scalar_view
@@ -1753,7 +1764,8 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
         # the Analyst's aggregate/sibling shape. Use the same verified scalar
         # view as Planner before wrapping it, keeping every fold and measured
         # scalar while referring to immutable raw freeze detail by hash.
-        rows = verified_suite_records(camp, state)
+        rows = verified_suite_records(camp, state, target_ids={parent, control})
+        sources_by_evidence_id.update((row["evidence_id"], row) for row in rows)
         source = next((row for row in reversed(rows) if row.get("candidate_id") == parent), None)
         if source is not None:
             method_parent = method_suite_scalar_view(source)
@@ -1762,11 +1774,26 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
             diagnostics = None
             if _read(camp / "goal.json").get("evaluation_schedule") == "screen_then_confirm":
                 from react_agent.eeg_research.agentic.screening import verified_screening_records
-                screening_parent = next((row for row in reversed(verified_screening_records(camp, state))
+                screening_rows = verified_screening_records(camp, state, target_ids={parent, control})
+                sources_by_evidence_id.update((row["evidence_id"], row) for row in screening_rows)
+                screening_parent = next((row for row in reversed(screening_rows)
                                          if row.get("candidate_id") == parent), None)
                 if screening_parent is not None:
                     diagnostics = {"status": "verified_two_fold_screening", "scope": "two_fold_development",
                         "screening": screening_parent["screening"], "independent_final_test": False}
+                elif parent == "baseline":
+                    # A baseline trained for a candidate's screen may have no
+                    # standalone evidence row. Follow that accepted pair's
+                    # exact control binding instead of treating it as cold start.
+                    latest_pair = next((row for row in reversed(state.get("evidence") or [])
+                        if row.get("kind") == "method_screening" and row.get("evaluation_valid") is True
+                        and (row.get("screening") or {}).get("baseline_scores")), None)
+                    if latest_pair is not None:
+                        pairs = verified_screening_records(camp, state, evidence_ids={latest_pair["evidence_id"]})
+                        if pairs:
+                            from .handoffs import matched_screening_baseline_diagnostics
+                            sources_by_evidence_id[pairs[0]["evidence_id"]] = pairs[0]
+                            diagnostics = matched_screening_baseline_diagnostics(camp, pairs[0])
     if diagnostics is None:
         missing.append("diagnostics")
     methods = state.get("method_hits") or []
@@ -1789,7 +1816,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
     context = development_view({
         "evaluation_mode": state.get("evaluation_mode", "single_target"),
         "verified_development_facts": verified_diagnostic_facts(camp, state, target_ids={parent, control}, max_facts=12),
-        "verified_encoder_structural_facts": verified_encoder_structural_facts(camp, state),
+        "verified_encoder_structural_facts": verified_encoder_structural_facts(camp, state, target_ids={parent, control}),
         "previous_design_failure": state.get("design_failure"),
         "artifact_reads": selected_read_context(camp, state),
         "audit_issues": [row for row in audit_feedback(camp, state)["issues"] if row["issue_id"] in (state.get("active_issue_ids") or [])],
@@ -1804,7 +1831,8 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
         "control_candidate_id": spec.get("control_candidate_id") or "baseline",
         "parent_source": candidate_context(camp, parent),
         "control_source": candidate_context(camp, control),
-        "analyses": load_analysis_views(camp, state, target=parent),
+        "analyses": load_analysis_views(camp, state, target=parent,
+            sources_by_evidence_id=sources_by_evidence_id, artifacts_by_id=artifacts_by_id),
         "cold_start_prior": diagnostics is None,
         "capability_status_semantics": "available=wired and usable; verified=false=no execution receipt yet, not missing",
         "evaluation_contract": {
@@ -1828,12 +1856,7 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
             science_scope=screening_parent.get("science_scope"), scientific_unit="fixed_two_fold_development_seed0",
             method_screening_identity={key: screening_parent.get(key) for key in (
                 "evidence_id", "suite_id", "suite_ref", "suite_hash", "method_revision", "source_hash", "result_hash")})
-    from react_agent.eeg_research.agentic.semantic_memory import role_memory, standalone_delivery
-    bundle = role_memory(camp, state=state, experiment=spec, role="experiment_designer")
-    if bundle is not None:
-        delivery = standalone_delivery(bundle)
-        if delivery is not None:
-            context["retrieved_memory"] = delivery
+    memory_experiment = spec
     from .research_execution import single_plan_enabled
     if single_plan_enabled(camp):
         from .selected_plan import load_plan
@@ -1842,11 +1865,19 @@ def _design_context(camp: Path, state: dict[str, Any], spec: dict[str, Any]) -> 
             context["selected_research_task"] = {"plan_id": selected["plan_id"],
                 **{key: selected["proposal"][key] for key in ("question", "task_description", "scientific_intent",
                     "evaluation_scope", "expected_observation", "completion_condition")}}
+            # Bind retrieval to this task without changing the design spec.
+            memory_experiment = {**spec, "evaluation_scope": selected["proposal"]["evaluation_scope"]}
             # Separate key: selected_research_task is compared verbatim in review revalidation.
             from .planning_context import selection_basis
             basis = selection_basis(camp, selected)
             if basis is not None:
                 context["selection_basis"] = basis
+    from react_agent.eeg_research.agentic.semantic_memory import role_memory, standalone_delivery
+    bundle = role_memory(camp, state=state, experiment=memory_experiment, role="experiment_designer")
+    if bundle is not None:
+        delivery = standalone_delivery(bundle)
+        if delivery is not None:
+            context["retrieved_memory"] = delivery
     return context
 
 

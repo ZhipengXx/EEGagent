@@ -147,6 +147,27 @@ def _resource_limits(budget: Any) -> dict:
     return result
 
 
+def _share_basis_observations(result: dict) -> None:
+    """Keep an identical observation body once, without merging scope/detail."""
+    basis = result.get("selection_basis") or {}
+    rows = basis.get("basis_observations") if isinstance(basis, dict) else None
+    if not isinstance(rows, list):
+        return
+    by_id = {row["observation_id"]: (index, row) for index, row in enumerate(rows)
+             if isinstance(row, dict) and isinstance(row.get("observation_id"), str)}
+    memory = result.get("retrieved_memory") or {}
+    for item in memory.get("items") or []:
+        if not isinstance(item, dict) or not isinstance(item.get("body"), dict):
+            continue
+        body = item["body"]
+        shared = by_id.get(body.get("observation_id"))
+        # Same identity alone is insufficient: an index row and a detail card
+        # can legitimately expose different facts. Retain both unless exact.
+        if shared and body == shared[1]:
+            item["body"] = {"observation_id": body["observation_id"],
+                            "provided_in": "/selection_basis/basis_observations/" + str(shared[0])}
+
+
 def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
     """Pure, idempotent provider view; never substitute this for native task data."""
     assert_visible_payload(full_payload, "experiment_designer")
@@ -253,6 +274,7 @@ def project_designer_input(full_payload: dict[str, Any]) -> dict[str, Any]:
     for key in ("previous", "previous_reply", "previous_response"):
         if view.get(key) is not None:
             result[key] = _science(view[key])
+    _share_basis_observations(result)
     return deduplicate(result)
 
 

@@ -60,7 +60,8 @@ def maybe_complete_research(camp: Path, state: dict) -> bool:
         if memory.get("degraded"):
             raise ValueError("research_iteration_final_memory_unavailable:" + str(memory.get("reason")))
         indexing = embedding_health(memory)
-    path = camp / "research_completion.json"
+    from .iteration_continuation import completion_path
+    path = completion_path(camp)
     existing = _read(path)
     if existing:
         if existing.get("iterations") != completed or existing.get("requested_rounds") != limit:
@@ -74,6 +75,7 @@ def maybe_complete_research(camp: Path, state: dict) -> bool:
     finish_planner_round(camp, pointer["continuation_owner"])
     state.update(status="finished", stop_reason="requested_iterations_completed",
                  completed_research_rounds=len(completed))
+    state["research_completion_ref"] = str(path.relative_to(camp))
     state.pop("failure", None)
     state.pop("detail", None)
     if not existing:

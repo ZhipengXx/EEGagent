@@ -56,6 +56,20 @@ def load_trials(path: Path, channels: list[str] | None) -> dict[str, object]:
     }
 
 
+def load_trial_image_ids(path: Path) -> list[str]:
+    """Read sample identities without applying EEG preprocessing.
+
+    Legacy NumPy-backed trial files still require unpickling the container, but
+    protocol construction must not select channels or average its EEG values.
+    Only detached image strings survive this read; EEG arrays are not cached.
+    """
+    _alias_numpy_core()
+    if not path.is_file():
+        raise SplitError(f"trial_file_missing:{path}")
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    return _column(loaded["img"])
+
+
 def _column(value: object) -> list[str]:
     if torch.is_tensor(value):
         rows = value[:, 0].tolist() if value.ndim > 1 else value.tolist()

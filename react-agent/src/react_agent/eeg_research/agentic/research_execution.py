@@ -16,7 +16,11 @@ def research_goal(value: Mapping | Path | str) -> dict:
     path = Path(value)
     if path.is_dir():
         path = path / "goal.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    goal = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    if path.name == "goal.json" and goal:
+        from .iteration_continuation import apply_continuation_goal
+        return apply_continuation_goal(path.parent, goal)
+    return goal
 
 
 def single_plan_enabled(value: Mapping | Path | str) -> bool:

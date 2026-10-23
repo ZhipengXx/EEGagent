@@ -77,20 +77,24 @@ def suites_for_target(camp: Path, target: str) -> list[dict]:
             if read(path).get("method", {}).get("candidate_id") == target]
 
 
-def valid_scores(camp: Path, suite: dict, ids: list[str] | None = None) -> list[dict]:
+def valid_scores(camp: Path, suite: dict, ids: list[str] | None = None, *,
+                 suite_verified: bool = False) -> list[dict]:
     from react_agent.eeg_research.agentic import method_suite as ms
     # This validates real score/freezes/dependencies, not suite_state's counters.
-    ms.validate_suite(camp, suite["suite_id"], verify_data=True)
+    paths = [(fold, camp / "suites" / suite["suite_id"] / fold["fold_id"] / "benchmark.json")
+             for fold in suite["folds"] if ids is None or fold["fold_id"] in ids]
+    paths = [(fold, path) for fold, path in paths if path.exists()]
+    if not suite_verified:
+        # Coverage queries consume score-bearing folds. Missing folds are not
+        # executed here; their protocols are validated at the launch boundary.
+        ms.validate_suite(camp, suite["suite_id"], verify_data=True,
+                          fold_ids=[fold["fold_id"] for fold, _path in paths])
     scores = []
-    for fold in suite["folds"]:
-        if ids is not None and fold["fold_id"] not in ids:
-            continue
-        path = camp / "suites" / suite["suite_id"] / fold["fold_id"] / "benchmark.json"
-        if path.exists():
-            score = read(path)
-            ms.verify_score(camp, suite, score)
-            ms.aggregate_records(suite, [score])
-            scores.append(score)
+    for _fold, path in paths:
+        score = read(path)
+        ms.verify_score(camp, suite, score)
+        ms.aggregate_records(suite, [score])
+        scores.append(score)
     return scores
 
 
@@ -515,26 +519,47 @@ def commit_screening(camp: Path, state: dict, suite: dict) -> dict:
     return row
 
 
-def read_screening(camp: Path, suite_id: str) -> dict:
+def read_screening(camp: Path, suite_id: str, *, verified_suites: dict | None = None) -> dict:
     from react_agent.eeg_research.agentic import method_suite as ms
-    suite = ms.validate_suite(camp, suite_id, verify_data=True)
+    common = ms.manifest(camp)
+    ids = phase_fold_ids(common, SCREENING)
+    suite = ms.validate_suite(camp, suite_id, verify_data=True, fold_ids=ids)
     wrapper = read(camp / "suites" / suite_id / "screening.json")
     ms.verify_dependencies(wrapper["score_dependencies"])
     baseline_hash = wrapper["screening"].get("baseline_suite_hash")
-    baseline = suite if suite["method"]["candidate_id"] == "baseline" else next(
-        (s for s in suites_for_target(camp, "baseline") if s["suite_hash"] == baseline_hash), None)
-    scores = valid_scores(camp, suite, phase_fold_ids(ms.manifest(camp), SCREENING))
-    b_scores = valid_scores(camp, baseline, phase_fold_ids(ms.manifest(camp), SCREENING)) if baseline is not None else []
-    actual = screening_result(ms.manifest(camp), suite, scores, baseline, b_scores)
+    baseline = suite if suite["method"]["candidate_id"] == "baseline" else None
+    if baseline is None:
+        # The accepted score names its exact control suite. Do not enumerate
+        # and validate unrelated historical suites to rediscover that binding.
+        baseline_ids = {Path(score["freeze_ref"]).parent.parent.name
+                        for score in wrapper["screening"].get("baseline_scores") or [] if score.get("freeze_ref")}
+        if len(baseline_ids) == 1:
+            baseline_id = baseline_ids.pop()
+            baseline = ms.validate_suite(camp, baseline_id, verify_data=True, fold_ids=ids)
+            if baseline["suite_hash"] != baseline_hash or baseline["method"]["candidate_id"] != "baseline":
+                raise ValueError("screening_matched_baseline_identity_mismatch")
+    scores = valid_scores(camp, suite, ids, suite_verified=True)
+    b_scores = (scores if baseline is suite else valid_scores(camp, baseline, ids, suite_verified=True)) if baseline is not None else []
+    actual = screening_result(common, suite, scores, baseline, b_scores)
     if actual != wrapper["screening"] or actual["status"] != "complete":
         raise ValueError("method_screening_result_changed")
+    # Optional output for the same input assembly, e.g. Memory's recipe view.
+    # This is not consulted as an input cache on later verification calls.
+    if verified_suites is not None:
+        verified_suites[suite["suite_id"]] = suite
+        if baseline is not None:
+            verified_suites[baseline["suite_id"]] = baseline
     return actual
 
 
-def verified_screening_records(camp: Path, state: dict) -> list[dict]:
+def verified_screening_records(camp: Path, state: dict, *, target_ids: set[str] | None = None,
+                               evidence_ids: set[str] | None = None) -> list[dict]:
     rows = []
     for row in state.get("evidence", []):
         if row.get("kind") != "method_screening" or not row.get("evaluation_valid"):
+            continue
+        if (target_ids is not None and row.get("candidate_id") not in target_ids
+                or evidence_ids is not None and row.get("evidence_id") not in evidence_ids):
             continue
         try:
             if read_screening(camp, row["suite_id"]) == row["screening"] and digest(Path(row["suite_ref"])) == row["result_hash"]:
@@ -700,12 +725,13 @@ def progress_context(camp: Path, state: dict, goal: dict, budget: dict, actions:
             "limitations": ["fixed_development_gallery", "two_fold_selection_bias", "no_independent_final_test", "no_statistical_significance"]}
 
 
-def recover(camp: Path, state: dict) -> dict:
+def recover(camp: Path, state: dict, *, probes_recovered: bool = False) -> dict:
     from react_agent.eeg_research.agentic import method_suite as ms
     from react_agent.eeg_research.agentic.budget import phase_reservation, consume_phase_job
     from react_agent.eeg_research.agentic.loop import _write
     from react_agent.eeg_research.agentic.multigpu_check import recover_probes
-    recover_probes(camp, state)
+    if not probes_recovered:
+        recover_probes(camp, state)
     # Reconcile billing while preserving paid job/probe reconstruction. The
     # launch boundary blocks new GPU work until all unknown API outcomes settle.
     reconcile_api_usage(camp, state, block=False)

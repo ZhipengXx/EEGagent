@@ -32,11 +32,13 @@ def _parser() -> argparse.ArgumentParser:
         "command",
         choices=["create", "start", "run", "status", "pause", "resume", "stop", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "retry-coder", "authorize-gpu-sharing", "recover-api-intents", "validate-goal", "evaluate-export", "evaluate-pack",
                  "study-create", "study-status", "study-run", "study-freeze", "study-evaluate", "study-aggregate",
-                 "suite-retry-fold", "role-config-preview", "configure-roles", "screening-dry-run", "dispose-unknown-intent", "detach-candidate", "cancel-selected-plan", "historical-runtime-preview", "authorize-research-recovery"],
+                 "suite-retry-fold", "role-config-preview", "configure-roles", "screening-dry-run", "dispose-unknown-intent", "detach-candidate", "cancel-selected-plan", "historical-runtime-preview", "authorize-research-recovery", "continue-research"],
     )
     parser.add_argument("--campaign", default="eeg_retrieval_research_v1")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--request-id", default="")
+    parser.add_argument("--additional-rounds", type=int, default=None,
+                        help="continue-research only: additional iterations after a completed study")
     parser.add_argument("--max-candidates", type=int, default=20,
                         help="authorize-research-recovery only: explicitly approved candidate scope")
     parser.add_argument("--planner-recovery-max-calls", type=int, default=2)
@@ -674,7 +676,7 @@ def main(argv: list[str] | None = None) -> int:
         if error:
             print(json.dumps({"error": error}))
             return 2
-    if args.command in {"start", "resume", "run", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "retry-coder", "configure-roles", "authorize-gpu-sharing", "recover-api-intents", "authorize-research-recovery", "cancel-selected-plan"}:
+    if args.command in {"start", "resume", "run", "prepare-handoff", "revalidate-feedback", "revalidate-review", "retry-design", "retry-coder", "configure-roles", "authorize-gpu-sharing", "recover-api-intents", "authorize-research-recovery", "cancel-selected-plan", "continue-research"}:
         from react_agent.eeg_research.agentic.budget_inheritance import delegated_successor
         successor = delegated_successor(camp)
         if successor:
@@ -696,6 +698,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "status":
         print(json.dumps(status_view(camp), ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "continue-research":
+        from .iteration_continuation import continue_research
+        try:
+            receipt = continue_research(camp, request_id=args.request_id,
+                                        additional_rounds=args.additional_rounds)
+        except (ValueError, OSError, KeyError) as exc:
+            print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+            return 2
+        print(json.dumps({"status": "research_continuation_prepared", "continuation": receipt},
+                         ensure_ascii=False))
         return 0
     if args.command == "authorize-research-recovery":
         from .native_authorization import authorize_research_recovery

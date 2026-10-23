@@ -61,36 +61,43 @@ def read_query_rows(
     channels: list[str] | None,
     subject_fallback: str,
 ) -> list[tuple[str, str]]:
-    """Read (query_id, image_id) rows. Missing files are an error."""
-    from react_agent.eeg_research.agentic.verification_cache import file_memo
-
+    """Build split-specific queries from reusable file-level image identities."""
     found: list[tuple[str, str]] = []
     for path in paths:
         if not path.is_file():
             raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
-        found.extend(file_memo("query_rows", (path,), (tuple(channels or ()), subject_fallback),
-                               lambda path=path: tuple(_file_query_rows(path, channels, subject_fallback))))
+        found.extend(_file_query_rows(path, channels, subject_fallback))
     return found
 
 
 def _file_query_rows(path: Path, channels: list[str] | None, subject_fallback: str) -> list[tuple[str, str]]:
+    from react_agent.eeg_research.agentic.verification_cache import file_memo
+
+    # Image identity is intrinsic to the file, independent of fold, setting and
+    # channel selection. Query subjects belong to the caller's path/fallback,
+    # so they must be applied after the shared immutable metadata is retrieved.
+    images = file_memo("trial_image_ids", (path,), (), lambda: _file_image_ids(path))
+    subject = _subject_from_path(path, subject_fallback)
+    return [(query_id(subject, image), image) for image in images]
+
+
+def _file_image_ids(path: Path) -> tuple[str, ...]:
     with path.open("rb") as handle:
         head = handle.read(4096).lstrip()
     if not head:
         raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
-    subject = _subject_from_path(path, subject_fallback)
     if head[:1] in (b"[", b"{"):
         data = json.loads(path.read_bytes().decode("utf-8"))
         rows = data.get("img") if isinstance(data, dict) else data
         if not isinstance(rows, list) or not rows:
             raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
-        return [(query_id(subject, str(item)), str(item)) for item in rows]
-    from react_agent.eeg_training.data import load_trials
+        return tuple(str(item) for item in rows)
+    from react_agent.eeg_training.data import load_trial_image_ids
 
-    images = load_trials(path, channels)["img"]
+    images = load_trial_image_ids(path)
     if not isinstance(images, list) or not images:
         raise ProtocolError(f"缺少样本文件，不能冻结空的执行协议：{path}")
-    return [(query_id(subject, str(item)), str(item)) for item in images]
+    return tuple(str(item) for item in images)
 
 
 def _channels(design: Design) -> list[str] | None:
